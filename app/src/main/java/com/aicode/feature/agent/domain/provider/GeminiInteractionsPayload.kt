@@ -24,7 +24,7 @@ internal fun buildInteractionsTools(tools: List<AgentTool>): List<Map<String, An
             "type" to "function",
             "name" to tool.name,
             "description" to tool.description,
-            "parameters" to tool.toJsonSchema()
+            "parameters" to tool.toModelJsonSchema()
         )
     }
 

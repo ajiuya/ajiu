@@ -1,0 +1,45 @@
+{
+  "ownerId": "783809",
+  "slug": "dev-god",
+  "version": "1.2.4",
+  "publishedAt": 1791925341880,
+  "source": {
+    "author": "阿客实验室",
+    "identifier": "@ake/dev-god",
+    "page": "https://skillhub.cn/skills/ake/dev-god",
+    "installationGuide": "https://skillhub.cn/install/skillhub.md",
+    "download": "https://api.skillhub.cn/api/v1/download?slug=@ake/dev-god",
+    "archiveSha256": "760a86b6452a656ff88af56740f130b4029dfd561d9fcfffcfdf48d762bc1a98",
+    "archiveBytes": 172922,
+    "fileCount": 73,
+    "uncompressedBytes": 386000,
+    "licenseStatus": "not_declared_in_package",
+    "thirdPartyNotices": [
+      "references/harmonyos/sources.md",
+      "references/harmonyos/arkui/index.md",
+      "references/harmonyos/runtime/index.md",
+      "references/wechat-devtools/sources.md"
+    ]
+  },
+  "adaptation": {
+    "product": "阿九工作台",
+    "revision": 1,
+    "modifiedFiles": [
+      "SKILL.md",
+      "_meta.json",
+      "agents/openai.yaml",
+      "scripts/project_probe.py",
+      "references/continuity.md",
+      "references/dependency-downloads.md",
+      "references/wechat-devtools/index.md"
+    ],
+    "changes": [
+      "保留上游技能标识、版本和配套技术资料，标明来源及许可未声明状态",
+      "按实际工具名称、已解析技能目录和当前执行环境定位参考资料及可选脚本",
+      "服从当前用户范围、独立计划审批、显式禁止及宿主 Root 逐次审批",
+      "环境依赖与换源须先取得批准，提交推送和其他共享状态操作不自动执行",
+      "探测仅面向显式目标代码库，拒绝文件系统根和家目录并跳过凭据目录",
+      "第三方 IDE 异步任务与 App 后台通知分别处理，不嵌套派发子代理"
+    ]
+  }
+}

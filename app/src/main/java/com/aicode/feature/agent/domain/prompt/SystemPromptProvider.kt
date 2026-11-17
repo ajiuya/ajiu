@@ -6,7 +6,6 @@ import com.aicode.feature.agent.domain.container.ContainerInstaller
 import com.aicode.feature.agent.domain.memory.MemoryRepository
 import com.aicode.feature.agent.domain.memory.MemoryScope
 import com.aicode.feature.agent.domain.model.AgentContext
-import com.aicode.feature.agent.domain.model.AgentMode
 import com.aicode.feature.agent.domain.model.GoalStatus
 import com.aicode.feature.agent.domain.skill.SkillRepository
 import com.aicode.feature.agent.domain.subagent.AgentDefinition
@@ -26,7 +25,7 @@ import javax.inject.Singleton
  *
  * 片段分两类：
  * - 静态基线：`prompts/` 顶层 `<NN>-<名称>.md`，可被 `prompts.custom/` 按数字身份覆盖或新增；
- * - 按需叶子：`prompts/agent/` 下的无数字片段（模式提醒、子代理基线、压缩/标题提示词），按精确同名覆盖。
+ * - 按需叶子：`prompts/agent/` 下的无数字片段（子代理基线、压缩/标题提示词），按精确同名覆盖。
  *
  * `prompts.custom/` 存在 [PromptFragmentResolver.DISABLE_BUILTIN_FILE] 时，主代理提示词只由自定义数字片段组成，
  * 不再注入任何内置来源；此时用 `{{AICODE_*}}` 变量按需取回动态内容。
@@ -79,7 +78,7 @@ class SystemPromptProvider @Inject constructor(
         }
     }
 
-    /** 子代理专用精简基线：只保留工具用法、路径约定与安全边界，不含模式切换、结尾总结等主代理专属规则。 */
+    /** 子代理专用精简基线：只保留工具用法、路径约定与安全边界，不含结尾总结等主代理专属规则。 */
     private inner class SubAgentBaseSource : PromptSource {
         // 每次读盘：与静态基线同理，未编辑时内容一致不影响 KV 缓存，编辑 subagent-base.md 后立即生效。
         override fun build(ctx: AgentContext): String =
@@ -97,11 +96,9 @@ class SystemPromptProvider @Inject constructor(
         private val cachedByKey = ConcurrentHashMap<SourceCacheKey, String>()
 
         override fun build(ctx: AgentContext): String? {
-            // key 里带 mode：能力摘要随模式变化（PLAN 下写/命令不可用），切换模式必须重建缓存。
             val key = SourceCacheKey(
                 ctx.sessionId,
                 ctx.projectRoot,
-                ctx.mode,
                 agentDefinitionRepository.definitionsVersion
             )
             val cached = cachedByKey[key]
@@ -117,12 +114,11 @@ class SystemPromptProvider @Inject constructor(
                 return null
             }
 
-            // 每行除「名称: 用途」外再标注读/写/命令能力，避免主代理把写任务派给只读子代理。
-            // 按当前会话模式计算：PLAN 下子代理继承只读，能力要如实显示，否则主代理会照摘要派错活。
+            // 每行除「名称: 用途」外再标注读/写/命令能力，避免把任务派给缺少所需工具的子代理。
             val list = entries.joinToString("\n") { entry ->
                 val definition = entry.definition
                 "- ${definition.name}: ${definition.description.ifBlank { "（无描述）" }}" +
-                    "｜${definition.capabilitySummary(ctx.mode)}"
+                    "｜${definition.capabilitySummary()}"
             }
             val content = list
             cachedByKey[key] = content
@@ -239,7 +235,6 @@ class SystemPromptProvider @Inject constructor(
     private data class SourceCacheKey(
         val sessionId: String?,
         val projectRoot: String,
-        val mode: AgentMode? = null,
         val definitionVersion: Long = 0
     )
 
@@ -454,8 +449,10 @@ class SystemPromptProvider @Inject constructor(
      * 本地副本由 [ContainerInstaller.extractPrompts] 在启动时全量释放，App 升级后随之更新。
      */
     fun resolvePrompt(name: String): String {
-        PromptFragmentResolver.parseNumber(name)
-            ?.let { number -> readFileOrNull(customFragmentsByNumber[number])?.let { return it } }
+        PromptFragmentResolver.parseNumber(name)?.let { number ->
+            val fragment = promptFragmentCatalog.fragment(number, null)
+            return fragment?.takeIf { it.enabled }?.content.orEmpty()
+        }
         readFileOrNull(File(customDir, name))?.let { return it }
         readFileOrNull(File(File(containerInstaller.aicodeDir, "prompts"), name))?.let { return it }
         return context.assets.open("prompts/$name").bufferedReader().use { it.readText() }

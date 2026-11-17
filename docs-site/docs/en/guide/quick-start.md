@@ -1,6 +1,6 @@
 # Quick Start
 
-From installation to your first AI conversation.
+From installing Ajiu Workbench (阿九工作台) to your first AI conversation.
 
 ## System Requirements
 
@@ -25,13 +25,13 @@ Tip: you can also tap "Download APK" on the [homepage](/en/), which fetches the 
 
 ## 1. First Launch & Onboarding Guide
 
-Open AiCode and you will land on the chat home with a fresh empty conversation. Grant storage permission on first use — otherwise the AI cannot access files on your phone.
+Open Ajiu Workbench and you will land on the chat home with a fresh empty conversation. Grant storage permission on first use — otherwise the AI cannot access files on your phone.
 
 On first launch, the app automatically starts an interactive spotlight onboarding guide, walking you through the complete flow: "Open sidebar → Enter Settings to configure a vendor and fetch models → Return home to select model → Send first message". In each step, you can tap the highlighted target or the "Next" button on the card to proceed, or tap "Skip" at any time. If you want to review the walkthrough later, you can restart it anytime via "Settings → Re-run onboarding".
 
 ## 2. Configure an AI Vendor
 
-AiCode does not provide models itself; you need to connect a model service first.
+Ajiu Workbench does not provide models itself; you need to connect a model service first.
 
 1. Tap the menu button at the top-left of the home page to open the sidebar, then tap "Settings" at the bottom.
 2. Go to "AI Config → AI Vendors" and tap the + at the top-right to create one.
@@ -70,7 +70,13 @@ The first-time container preparation (extracting the system, installing base too
 
 ## 6. Start a Conversation
 
-Type in the input box and hit send. The mode button on the left of the input box switches between BUILD, PLAN and AUTO — see the full documentation on the three modes for the differences.
+Type in the input box and hit send. There is no Agent work-mode selector. Local containers and remote SSH remain available as execution environments.
+
+Ordinary tools run automatically, subject to explicit project/global deny rules. When Shizuku, explicit `sudo`/`su`, or high-risk commands require approval, the dialog offers **Reject**, **Allow once**, and **Always allow in this session**.
+
+Session approvals are kept in private app storage and survive an app restart for the same chat session. They are not inherited by other chats or subagents. Shizuku is remembered per tool; root and elevated high-risk commands are matched against the exact full command, not a command prefix. High-risk commands still require `elevate: true` even when remembered. Deny rules always take precedence, and old project/global allow rules no longer affect decisions.
+
+Automatic tool approval does not authorize out-of-scope, irreversible, or shared-state operations. Pushing, deleting, and similar actions still require your explicit confirmation for the operation.
 
 ## Useful Tips
 

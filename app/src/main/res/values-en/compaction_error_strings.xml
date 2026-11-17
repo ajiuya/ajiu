@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="compaction_error_timeout">Context compression timed out. The original history was retained. Try again later.</string>
+    <string name="compaction_error_authentication">The compression model could not authenticate. The original history was retained. Check the provider settings.</string>
+    <string name="compaction_error_rate_limit">The compression model is rate-limited. The original history was retained. Try again later.</string>
+    <string name="compaction_error_service">The compression service is temporarily unavailable. The original history was retained. Try again later.</string>
+    <string name="compaction_error_network">The connection was interrupted during compression. The original history was retained. Check the connection and try again.</string>
+    <string name="compaction_error_truncated">The summary was still truncated, so the incomplete result was not used. The original history was retained.</string>
+    <string name="compaction_error_budget">The current history could not be fully processed within the compression budget. The original history was retained. Try a different compression model.</string>
+    <string name="compaction_error_busy">This session already has a compression task. Wait for it to finish.</string>
+    <string name="compaction_error_incomplete">Context compression did not finish or returned an invalid result. The original history was retained.</string>
+</resources>

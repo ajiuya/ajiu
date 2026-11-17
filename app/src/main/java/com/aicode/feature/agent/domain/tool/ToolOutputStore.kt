@@ -53,6 +53,8 @@ class ToolOutputStore @Inject constructor(
     val outputDir: File get() = File(containerInstaller.aicodeDir, OUTPUT_DIR)
 
     fun process(toolName: String, callId: String, result: ToolResult): ToolResult {
+        // 宿主输出由 Root 执行器限长，不能沿当前 SSH 环境自动归档到远端。
+        if (toolName == "Root") return result
         return when (result) {
             is ToolResult.Success -> ToolResult.Success(processElement(toolName, callId, result.data))
             is ToolResult.Partial -> ToolResult.Partial(processElement(toolName, callId, result.data), result.message)

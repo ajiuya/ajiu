@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="task_operation_create">派发任务</string>
+    <string name="task_operation_send">发送指令</string>
+    <string name="task_operation_read">读取进度</string>
+    <string name="task_operation_stop">停止任务</string>
+    <string name="task_operation_delete">删除任务</string>
+    <string name="task_operation_list">查看子代理列表</string>
+    <string name="task_operation_unknown">子代理操作</string>
+    <string name="task_operation_running">正在执行</string>
+    <string name="task_operation_completed">执行完成</string>
+    <string name="task_operation_queued">已排队</string>
+    <string name="task_operation_delivered">指令已送达</string>
+    <string name="task_operation_stopping">正在停止</string>
+    <string name="task_operation_stopped">已停止</string>
+    <string name="task_operation_deleted">已删除</string>
+    <string name="task_operation_failed">执行失败</string>
+    <string name="task_operation_interrupted">执行中断</string>
+    <string name="task_operation_awaiting_confirmation">等待用户确认</string>
+    <string name="task_operation_recorded">已读取记录</string>
+    <string name="task_operation_status_unknown">状态未知</string>
+    <string name="task_operation_route">%1$s → %2$s</string>
+    <string name="task_operation_task_title">任务：%1$s</string>
+    <string name="task_operation_generic_agent">子代理</string>
+    <string name="task_operation_unnamed">未命名子代理</string>
+    <string name="task_operation_assignment">派发指令</string>
+    <string name="task_operation_supplement">补充指令</string>
+    <string name="task_operation_latest_output">本次读取的输出</string>
+    <string name="task_operation_delivered_hint">送达仅表示指令已接收，不代表子代理任务已经完成。</string>
+    <string name="task_operation_empty">暂无子代理记录</string>
+    <string name="task_operation_partial">部分结果可用，请查看警告或错误。</string>
+    <string name="task_operation_history_instruction_missing">历史记录没有保存完整指令，不能从任务摘要恢复原指令。</string>
+    <string name="task_operation_preparing">正在等待可展示的子代理操作信息。</string>
+    <string name="task_operation_unparsed">暂不能解析此操作，安全详情仍可查看。</string>
+    <string name="task_operation_show_technical">展开安全详情</string>
+    <string name="task_operation_hide_technical">收起安全详情</string>
+    <string name="task_operation_safe_args">安全参数</string>
+    <string name="task_operation_safe_result">安全结果</string>
+</resources>

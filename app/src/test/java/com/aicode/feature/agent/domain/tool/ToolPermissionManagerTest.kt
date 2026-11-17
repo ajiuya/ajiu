@@ -1,111 +1,224 @@
 package com.aicode.feature.agent.domain.tool
 
 import com.aicode.feature.agent.domain.permission.PermissionChoice
+import com.aicode.feature.agent.domain.permission.SessionPermissionGrantRepository
+import io.mockk.coVerify
+import io.mockk.mockk
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withTimeout
-import kotlinx.coroutines.yield
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-/**
- * 多会话并行授权语义：不同会话可同时挂起各自的授权请求（互不阻塞），
- * 侧边栏据 [ToolPermissionManager.awaitingSessionIds] 点亮，弹窗按插入顺序逐个展示，
- * resolve 按请求 id 精确唤醒对应会话。
- */
 @OptIn(ExperimentalCoroutinesApi::class)
 class ToolPermissionManagerTest {
 
-    private fun req(id: String, sessionId: String) = PendingToolPermission(
+    private val grants = mockk<SessionPermissionGrantRepository>(relaxed = true)
+    private val manager = ToolPermissionManager(grants)
+
+    private fun request(id: String, sessionId: String, grant: String? = null) = PendingToolPermission(
         id = id,
         toolName = "Bash",
         title = "确认执行工具",
         summary = "",
         details = "",
         argsPreview = "",
-        sessionId = sessionId
+        sessionId = sessionId,
+        sessionGrant = grant
     )
 
     @Test
-    fun twoSessionsPendSimultaneously_resolveByIdTargetsCorrectSession() = runBlocking {
-        val mgr = ToolPermissionManager()
+    fun simultaneousSessions_resolveByRequestIdAndKeepInsertionOrder() = runTest {
+        val first = request("id1", "s1", "root:sudo id")
+        val second = request("id2", "s2", "tool:Shizuku")
+        val d1 = async { manager.awaitApproval(first) }
+        val d2 = async { manager.awaitApproval(second) }
+        runCurrent()
 
-        val d1 = async { mgr.awaitApproval(req("id1", "s1")) }
-        val d2 = async { mgr.awaitApproval(req("id2", "s2")) }
+        assertEquals(setOf("s1", "s2"), manager.awaitingSessionIds.value)
+        assertEquals(first, manager.pendingRequest.value)
+        assertEquals(second, manager.pendingForSession("s2"))
 
-        withTimeout(1000) { while (mgr.awaitingSessionIds.value.size < 2) yield() }
+        manager.resolve("s1", PermissionChoice.REJECT)
+        runCurrent()
+        assertFalse(d1.isCompleted)
+        assertFalse(d2.isCompleted)
 
-        // 两个会话都点亮，互不阻塞
-        assertEquals(setOf("s1", "s2"), mgr.awaitingSessionIds.value)
-        // 弹窗展示最早进入的请求
-        assertEquals("id1", mgr.pendingRequest.value?.id)
-        // 按会话查询待决请求
-        assertEquals("id2", mgr.pendingForSession("s2")?.id)
+        manager.resolve(second.id, PermissionChoice.ALWAYS_SESSION)
+        assertEquals(PermissionChoice.ALWAYS_SESSION, d2.await())
+        assertFalse(d1.isCompleted)
+        assertEquals(setOf("s1"), manager.awaitingSessionIds.value)
+        assertEquals(first, manager.pendingRequest.value)
+        assertNull(manager.pendingForSession("s2"))
+        coVerify(exactly = 1) { grants.allow("s2", "tool:Shizuku") }
+        coVerify(exactly = 0) { grants.allow("s1", any()) }
 
-        // 先解决 s2（乱序），只唤醒 s2
-        mgr.resolve("id2", PermissionChoice.ONCE)
+        manager.resolve(first.id, PermissionChoice.REJECT)
+        assertEquals(PermissionChoice.REJECT, d1.await())
+        assertNull(manager.pendingRequest.value)
+        assertTrue(manager.awaitingSessionIds.value.isEmpty())
+        coVerify(exactly = 1) { grants.allow(any(), any()) }
+    }
+
+    @Test
+    fun resolvingFirstRequest_displaysNextPendingRequest() = runTest {
+        val first = request("id1", "s1")
+        val second = request("id2", "s2")
+        val d1 = async { manager.awaitApproval(first) }
+        val d2 = async { manager.awaitApproval(second) }
+        runCurrent()
+
+        manager.resolve(first.id, PermissionChoice.ONCE)
+        assertEquals(PermissionChoice.ONCE, d1.await())
+        assertEquals(second, manager.pendingRequest.value)
+        assertEquals(setOf("s2"), manager.awaitingSessionIds.value)
+
+        manager.resolve(second.id, PermissionChoice.ONCE)
         assertEquals(PermissionChoice.ONCE, d2.await())
-
-        withTimeout(1000) { while (mgr.awaitingSessionIds.value != setOf("s1")) yield() }
-        assertEquals("id1", mgr.pendingRequest.value?.id)
-        assertNull(mgr.pendingForSession("s2"))
-
-        mgr.resolve("id1", PermissionChoice.ALWAYS)
-        assertEquals(PermissionChoice.ALWAYS, d1.await())
-
-        assertNull(mgr.pendingRequest.value)
-        assertTrue(mgr.awaitingSessionIds.value.isEmpty())
+        assertNull(manager.pendingRequest.value)
+        assertTrue(manager.awaitingSessionIds.value.isEmpty())
+        coVerify(exactly = 0) { grants.allow(any(), any()) }
     }
 
     @Test
     fun cancelledRequest_oldIdDoesNotApproveSameSessionReplacement() = runTest {
-        val mgr = ToolPermissionManager()
-        val oldRequest = req("old-id", "s1")
-        val old = async { mgr.awaitApproval(oldRequest) }
+        val oldRequest = request("old-id", "s1", "root:sudo id")
+        val old = async { manager.awaitApproval(oldRequest) }
         runCurrent()
-        assertEquals(oldRequest, mgr.pendingRequest.value)
+        assertEquals(oldRequest, manager.pendingRequest.value)
 
         old.cancelAndJoin()
-        assertNull(mgr.pendingRequest.value)
-        assertTrue(mgr.awaitingSessionIds.value.isEmpty())
+        assertNull(manager.pendingRequest.value)
+        assertTrue(manager.awaitingSessionIds.value.isEmpty())
 
-        val replacementRequest = req("new-id", "s1")
-        val replacement = async { mgr.awaitApproval(replacementRequest) }
-        runCurrent()
-        assertEquals(oldRequest.toolName, replacementRequest.toolName)
-
-        mgr.resolve(oldRequest.id, PermissionChoice.ONCE)
+        val replacementRequest = request("new-id", "s1", "root:sudo id")
+        val replacement = async { manager.awaitApproval(replacementRequest) }
         runCurrent()
 
-        assertTrue(replacement.isActive)
-        assertEquals(replacementRequest, mgr.pendingRequest.value)
-        assertEquals(replacementRequest, mgr.pendingForSession("s1"))
-        assertEquals(setOf("s1"), mgr.awaitingSessionIds.value)
+        manager.resolve(oldRequest.id, PermissionChoice.ALWAYS_SESSION)
+        runCurrent()
 
-        mgr.resolve(replacementRequest.id, PermissionChoice.ONCE)
+        assertFalse(replacement.isCompleted)
+        assertEquals(replacementRequest, manager.pendingRequest.value)
+        assertEquals(replacementRequest, manager.pendingForSession("s1"))
+        assertEquals(setOf("s1"), manager.awaitingSessionIds.value)
+        coVerify(exactly = 0) { grants.allow(any(), any()) }
+
+        manager.resolve(replacementRequest.id, PermissionChoice.ONCE)
         assertEquals(PermissionChoice.ONCE, replacement.await())
-        assertNull(mgr.pendingRequest.value)
-        assertTrue(mgr.awaitingSessionIds.value.isEmpty())
+        assertNull(manager.pendingRequest.value)
+        assertTrue(manager.awaitingSessionIds.value.isEmpty())
+        coVerify(exactly = 0) { grants.allow(any(), any()) }
     }
 
     @Test
-    fun resolveUnknownId_isNoop() = runBlocking {
-        val mgr = ToolPermissionManager()
-        val d1 = async { mgr.awaitApproval(req("id1", "s1")) }
-        withTimeout(1000) { while (mgr.pendingRequest.value == null) yield() }
+    fun rejectionAndSingleApproval_doNotSaveSessionGrant() = runTest {
+        for (choice in listOf(PermissionChoice.REJECT, PermissionChoice.ONCE)) {
+            val request = request(choice.name, "s1", "tool:Shizuku")
+            val pending = async { manager.awaitApproval(request) }
+            runCurrent()
 
-        mgr.resolve("nonexistent", PermissionChoice.REJECT)
-        // 原请求仍挂起
-        assertTrue(d1.isActive)
-        assertEquals("id1", mgr.pendingRequest.value?.id)
+            manager.resolve(request.id, choice)
 
-        mgr.resolve("id1", PermissionChoice.REJECT)
-        assertEquals(PermissionChoice.REJECT, d1.await())
+            assertEquals(choice, pending.await())
+            assertNull(manager.pendingRequest.value)
+            assertTrue(manager.awaitingSessionIds.value.isEmpty())
+        }
+        coVerify(exactly = 0) { grants.allow(any(), any()) }
+    }
+
+    @Test
+    fun alwaysSessionChoice_savesOnlyRequestedGrantAndSession() = runTest {
+        val sessionGrants = listOf("tool:Shizuku", "root:sudo id", "elevate:rm -rf \$(pwd)/build")
+        for ((index, grant) in sessionGrants.withIndex()) {
+            val sessionId = "session-$index"
+            val request = request("id-$index", sessionId, grant)
+            val pending = async { manager.awaitApproval(request) }
+            runCurrent()
+
+            manager.resolve(request.id, PermissionChoice.ALWAYS_SESSION)
+
+            assertEquals(PermissionChoice.ALWAYS_SESSION, pending.await())
+            coVerify(exactly = 1) { grants.allow(sessionId, grant) }
+            assertNull(manager.pendingRequest.value)
+            assertTrue(manager.awaitingSessionIds.value.isEmpty())
+        }
+        coVerify(exactly = sessionGrants.size) { grants.allow(any(), any()) }
+    }
+
+    @Test
+    fun alwaysSessionChoice_withoutGrantDoesNotSave() = runTest {
+        val request = request("no-grant", "s1")
+        val pending = async { manager.awaitApproval(request) }
+        runCurrent()
+
+        manager.resolve(request.id, PermissionChoice.ALWAYS_SESSION)
+
+        assertEquals(PermissionChoice.ALWAYS_SESSION, pending.await())
+        coVerify(exactly = 0) { grants.allow(any(), any()) }
+        assertNull(manager.pendingRequest.value)
+        assertTrue(manager.awaitingSessionIds.value.isEmpty())
+    }
+
+    @Test
+    fun alwaysSessionChoice_withBlankSessionDoesNotSaveOrMarkSessionAwaiting() = runTest {
+        for (sessionId in listOf("", "  ")) {
+            val request = request("blank-${sessionId.length}", sessionId, "tool:Shizuku")
+            val pending = async { manager.awaitApproval(request) }
+            runCurrent()
+
+            assertEquals(request, manager.pendingRequest.value)
+            assertTrue(manager.awaitingSessionIds.value.isEmpty())
+            manager.resolve(request.id, PermissionChoice.ALWAYS_SESSION)
+
+            assertEquals(PermissionChoice.ALWAYS_SESSION, pending.await())
+            assertNull(manager.pendingRequest.value)
+        }
+        coVerify(exactly = 0) { grants.allow(any(), any()) }
+    }
+
+    @Test
+    fun disablingRootRejectsOnlyPendingHostRootRequests() = runTest {
+        val rootRequest = request("root-id", "s1").copy(toolName = "Root")
+        val otherRequest = request("bash-id", "s2")
+        val root = async { manager.awaitApproval(rootRequest) }
+        val other = async { manager.awaitApproval(otherRequest) }
+        runCurrent()
+
+        manager.rejectForTool("Root")
+        assertEquals(PermissionChoice.REJECT, root.await())
+        assertFalse(other.isCompleted)
+        manager.resolve("root-id", PermissionChoice.ONCE)
+        assertEquals(otherRequest, manager.pendingRequest.value)
+        manager.resolve("bash-id", PermissionChoice.ONCE)
+        assertEquals(PermissionChoice.ONCE, other.await())
+        coVerify(exactly = 0) { grants.allow(any(), any()) }
+    }
+
+    @Test
+    fun resolveUnknownOrAlreadyResolvedId_doesNotChangePendingRequestOrSaveGrant() = runTest {
+        val request = request("id1", "s1", "root:sudo id")
+        val pending = async { manager.awaitApproval(request) }
+        runCurrent()
+
+        manager.resolve("nonexistent", PermissionChoice.ALWAYS_SESSION)
+        runCurrent()
+        assertFalse(pending.isCompleted)
+        assertEquals(request, manager.pendingRequest.value)
+        coVerify(exactly = 0) { grants.allow(any(), any()) }
+
+        manager.resolve(request.id, PermissionChoice.REJECT)
+        manager.resolve(request.id, PermissionChoice.ALWAYS_SESSION)
+        assertEquals(PermissionChoice.REJECT, pending.await())
+        manager.resolve(request.id, PermissionChoice.ALWAYS_SESSION)
+
+        assertNull(manager.pendingRequest.value)
+        assertTrue(manager.awaitingSessionIds.value.isEmpty())
+        coVerify(exactly = 0) { grants.allow(any(), any()) }
     }
 }

@@ -107,6 +107,19 @@ class TurnUsageTest {
     }
 
     @Test
+    fun backgroundNotificationDoesNotDiscardEarlierUsage() {
+        val messages = listOf(user("u1", 1_000), assistant("a1", 2_000, input = 100),
+            user("notice", 3_000).copy(isBackgroundNotification = true), assistant("a2", 4_000, input = 200))
+        assertEquals(300, computeTurnUsage(messages, true).getValue("a2").inputTokens)
+    }
+
+    @Test
+    fun measuredLeadingDurationDoesNotPretendLoadedTokensAreTheWholeTurn() {
+        val messages = listOf(assistant("a1", 2_000, input = 100).copy(turnDurationMs = 3_000))
+        assertTrue(computeTurnUsage(messages, true).isEmpty())
+    }
+
+    @Test
     fun assistant_without_a_preceding_user_message_has_no_total() {
         val messages = listOf(assistant("a1", 2_000, input = 100))
         assertTrue(computeTurnUsage(messages, lastTurnFinished = true).isEmpty())

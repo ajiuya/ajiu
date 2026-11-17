@@ -4,9 +4,11 @@ import android.content.Context
 import android.system.Os
 import com.aicode.core.util.FileLogger
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.withContext
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
@@ -88,26 +90,20 @@ class ContainerInstaller @Inject constructor(
             }
         }
 
-        /**
-         * 从 assets 提取内置子代理定义（如 Explore）到 ~/.aicode/agents/。
-         * 若文件已存在则不覆盖，以保留用户的修改与删除后的重建选择。
-         */
-        fun extractAgents(context: Context) {
-            val destDir = File(File(context.filesDir, "aicode"), "agents")
-            destDir.mkdirs()
-            runCatching {
-                val entries = context.assets.list("agents") ?: return@runCatching
-                for (entry in entries) {
-                    val destFile = File(destDir, entry)
-                    if (!destFile.exists()) {
-                        context.assets.open("agents/$entry").use { input ->
-                            destFile.outputStream().use { output -> input.copyTo(output) }
-                        }
-                    }
-                }
-            }.onFailure {
-                FileLogger.w(TAG, "提取内置子代理定义失败: ${it.message}", it)
+        suspend fun extractBuiltinDefinitions(context: Context): BuiltinInstallReport = try {
+            runInterruptible(Dispatchers.IO) {
+                val agents = BuiltinDefinitionAssets.agents(context)
+                val skills = BuiltinDefinitionAssets.skills(context)
+                LocalBuiltinDefinitionStore.install(
+                    File(context.filesDir.canonicalFile, "aicode"), agents, skills,
+                    onFailure = { name, error -> FileLogger.w(TAG, "提取内置定义失败: $name", error) }
+                )
             }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            FileLogger.w(TAG, "读取内置定义资源失败", e)
+            BuiltinInstallReport()
         }
 
         /**

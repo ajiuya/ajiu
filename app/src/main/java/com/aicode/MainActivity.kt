@@ -96,6 +96,9 @@ import com.aicode.feature.onboarding.domain.OnboardingStep
 import com.aicode.feature.onboarding.presentation.LocalOnboardingTargetRegistry
 import com.aicode.feature.onboarding.presentation.OnboardingOverlay
 import com.aicode.feature.onboarding.presentation.OnboardingTargetRegistry
+import com.aicode.feature.player.domain.PlayerMediaTypes
+import com.aicode.feature.player.domain.PlayerRequest
+import com.aicode.feature.player.presentation.PlayerActivity
 import com.aicode.feature.settings.data.repository.KeepaliveSettingsRepository
 import com.aicode.feature.settings.data.repository.AppThemeMode
 import com.aicode.feature.settings.data.repository.BackgroundSettingsRepository
@@ -110,7 +113,8 @@ import com.aicode.feature.settings.presentation.component.UpdateCheckDialog
 import com.aicode.feature.settings.presentation.component.decodeBackgroundBitmap
 import com.aicode.feature.settings.presentation.component.openUrl
 import com.aicode.feature.settings.presentation.component.settingsPageBackground
-import com.aicode.feature.terminal.domain.TerminalKeepaliveService
+import com.aicode.feature.terminal.domain.KeepaliveWorker
+import com.aicode.feature.terminal.domain.TaskKeepaliveController
 import com.aicode.feature.terminal.presentation.TerminalViewModel
 import com.aicode.feature.terminal.presentation.component.TerminalScreen
 import com.aicode.feature.workspace.presentation.WorkspaceViewModel
@@ -307,16 +311,18 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // 此时处于前台，启动前台服务一定被允许：若用户曾开启常驻保活，补上通知。
-        lifecycleScope.launch {
-            if (keepaliveSettings.isEnabled()) {
-                TerminalKeepaliveService.enablePersistent(this@MainActivity)
-            }
-        }
     }
 
     override fun onResume() {
         super.onResume()
+        TaskKeepaliveController.onAppVisible(this)
+        val persistentRevision = TaskKeepaliveController.persistentRevision()
+        lifecycleScope.launch {
+            if (keepaliveSettings.isEnabled() &&
+                TaskKeepaliveController.restorePersistent(this@MainActivity, persistentRevision)) {
+                KeepaliveWorker.schedule(this@MainActivity)
+            }
+        }
         // 远程模式回到前台时，若 SSH 断了立即触发重连，不等 supervisor 轮询
         if (executionModeHolder.currentMode() == com.aicode.feature.settings.data.repository.ExecutionMode.REMOTE_SSH) {
             lifecycleScope.launch {
@@ -416,7 +422,7 @@ fun AppNavigation(
     val sessions by agentViewModel.sessions.collectAsStateWithLifecycle()
     val currentSessionId by agentViewModel.currentSessionId.collectAsStateWithLifecycle()
     val agentStates by agentViewModel.agentStates.collectAsStateWithLifecycle()
-    val awaitingPermissionSessionIds by agentViewModel.awaitingPermissionSessionIds.collectAsStateWithLifecycle()
+    val approvalSessionIds by agentViewModel.approvalSessionIds.collectAsStateWithLifecycle()
     val subSessionsByParent by agentViewModel.subSessionsByParent.collectAsStateWithLifecycle()
     val expandedPaths by agentViewModel.expandedPaths.collectAsStateWithLifecycle()
     val expandingPath by agentViewModel.expandingPath.collectAsStateWithLifecycle()
@@ -512,7 +518,6 @@ fun AppNavigation(
         }
     }
 
-    // 文件树里点文件：图片进内置全屏查看器、APK 走系统安装器，其余仍进编辑器。
     val drawerImageViewerState = rememberImageViewerState()
     val drawerDecodeSpec = rememberViewerDecodeSpec()
     val drawerImageLoad = remember(agentViewModel.fileAccess, drawerDecodeSpec) {
@@ -525,6 +530,7 @@ fun AppNavigation(
             ext in PREVIEWABLE_IMAGE_EXTS -> drawerImageViewerState.show(
                 ImageViewerRequest(listOf(ImageSource.ContainerPath(path)), name)
             )
+            PlayerMediaTypes.supports(path) -> PlayerActivity.open(context, PlayerMediaTypes.request(path, name))
             ext in INSTALLABLE_APK_EXTS -> scope.launch {
                 openSentAttachment(
                     context,
@@ -570,7 +576,7 @@ fun AppNavigation(
             sessions = sessions,
             currentSessionId = currentSessionId,
             agentStates = agentStates,
-            awaitingPermissionSessionIds = awaitingPermissionSessionIds,
+            awaitingPermissionSessionIds = approvalSessionIds,
             subSessionsByParent = subSessionsByParent,
             browseState = browseState,
             expandedPaths = expandedPaths,
@@ -628,6 +634,10 @@ fun AppNavigation(
             },
             onNavigateToBrowser = {
                 openWorkbench(WorkbenchPaneKind.BROWSER)
+                if (!permanentDrawer) scope.launch { drawerState.close() }
+            },
+            onNavigateToPlayer = {
+                PlayerActivity.open(context, PlayerRequest())
                 if (!permanentDrawer) scope.launch { drawerState.close() }
             },
             onNavigateToSettings = {
@@ -694,6 +704,7 @@ fun AppNavigation(
                                     onNavigateToTerminal = { openWorkbench(WorkbenchPaneKind.TERMINAL) },
                                     onNavigateToGit = { openWorkbench(WorkbenchPaneKind.GIT) },
                                     onNavigateToBrowser = { openWorkbench(WorkbenchPaneKind.BROWSER) },
+                                    onOpenMcp = { navController.navigate("mcp") },
                                     terminalActive = paneOpen && paneKind == WorkbenchPaneKind.TERMINAL,
                                     gitActive = paneOpen && paneKind == WorkbenchPaneKind.GIT,
                                     browserActive = paneOpen && paneKind == WorkbenchPaneKind.BROWSER,
@@ -745,6 +756,7 @@ fun AppNavigation(
                 // 这是侧边栏点设置「卡一下」的主因。
                 SettingsScreen(
                     viewModel = settingsViewModel,
+                    currentSessionId = currentSessionId,
                     onNavigateBack = {
                         navController.popBackStack()
                         // 大屏返回聊天页后侧栏本就常驻，不再弹 modal 抽屉。
@@ -773,6 +785,15 @@ fun AppNavigation(
                             onboardingCoordinator.goToStep(OnboardingStep.PROVIDER_FETCH_MODELS)
                         }
                     }
+                )
+            }
+            composable("mcp") {
+                SettingsScreen(
+                    viewModel = settingsViewModel,
+                    currentSessionId = currentSessionId,
+                    onNavigateBack = { navController.popBackStack() },
+                    onStopAllAndCloseTerminal = { agentViewModel.stopAllAndCloseTerminal() },
+                    openMcpOnEntry = true
                 )
             }
             composable("terminal") { entry ->

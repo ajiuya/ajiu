@@ -37,6 +37,7 @@ class PromptFragmentResolverTest {
         assertNull("名称不能为空", PromptFragmentResolver.parseNumber("10-.md"))
         assertNull("子目录不算顶层片段", PromptFragmentResolver.parseNumber("agent/title-generator.md"))
         assertNull(PromptFragmentResolver.parseNumber(".no-builtin"))
+        assertNull(PromptFragmentResolver.parseNumber("prompts.json"))
     }
 
     @Test
@@ -46,6 +47,8 @@ class PromptFragmentResolverTest {
         File(dir, "notes.md").writeText("c")
         File(dir, "agent").apply { mkdirs() }
         File(dir, "agent/title-generator.md").writeText("d")
+        File(dir, "agent/10-internal.md").writeText("e")
+        File(dir, "prompts.json").writeText("""{"enabled":{"5":false}}""")
         File(dir, ".no-builtin").writeText("")
 
         val result = PromptFragmentResolver.numberedFragments(dir)

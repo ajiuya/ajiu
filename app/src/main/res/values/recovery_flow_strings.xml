@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="recovery_continue_request">继续已中断的任务</string>
+    <string name="recovery_continue_failed">无法继续该请求。请确认当前项目、执行环境和模型配置后重试。</string>
+    <string name="recovery_continuation_limit">已达到本次请求的自动续写预算。已保存现有结果，请核对后再决定下一步。</string>
+    <string name="recovery_request_not_saved">请求尚未保存，未开始执行。请检查存储空间后重试。</string>
+</resources>

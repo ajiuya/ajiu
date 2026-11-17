@@ -1,21 +1,25 @@
 package com.aicode.feature.agent.domain.tool.editor
 
+import android.content.Context
 import com.aicode.feature.agent.domain.model.AgentContext
 import com.aicode.feature.agent.domain.tool.AgentTool
 import com.aicode.feature.agent.domain.tool.FileVersionRegistry
 import com.aicode.feature.agent.domain.tool.ParameterType
 import com.aicode.feature.agent.domain.tool.PendingToolPermission
+import com.aicode.feature.agent.domain.tool.RECOVERY_READ_REQUIRED_CODE
 import com.aicode.feature.agent.domain.tool.STALE_FILE_CODE
 import com.aicode.feature.agent.domain.tool.ToolParameter
 import com.aicode.feature.agent.domain.tool.ToolCapability
 import com.aicode.feature.agent.domain.tool.ToolPermissionPolicy
 import com.aicode.feature.agent.domain.tool.ToolResult
 import com.aicode.feature.agent.domain.tool.WorkspaceFileLock
+import com.aicode.feature.agent.domain.tool.recoveryReadRequiredMessage
 import com.aicode.feature.agent.domain.tool.staleFileMessage
 import com.aicode.core.util.FileLogger
 import com.aicode.core.util.LineDiff
 import com.aicode.feature.workspace.domain.FileAccessProvider
 import com.aicode.feature.workspace.domain.sha256Fingerprint
+import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -59,7 +63,8 @@ private const val TAG = "EditFileTool"
 class EditFileTool @Inject constructor(
     private val fileAccess: FileAccessProvider,
     private val fileLock: WorkspaceFileLock,
-    private val versions: FileVersionRegistry
+    private val versions: FileVersionRegistry,
+    @param:ApplicationContext private val appContext: Context? = null
 ) : AgentTool() {
     override val name = "editFile"
     override val description =
@@ -132,7 +137,7 @@ class EditFileTool @Inject constructor(
     ): ToolResult {
         val path = args["path"]?.jsonPrimitive?.contentOrNull
             ?: return ToolResult.Error("缺少必需参数：path", "MISSING_PATH")
-        return withEditGuards(path, context.sessionId) { performEdit(path, args) }
+        return withEditGuards(path, context.sessionId, context.requireFreshFileRead) { performEdit(path, args) }
     }
 
     /**
@@ -158,13 +163,14 @@ class EditFileTool @Inject constructor(
     private suspend fun withEditGuards(
         path: String,
         sessionId: String?,
+        requireFreshRead: Boolean,
         block: suspend () -> ToolResult
     ): ToolResult {
         val key = fileAccess.toDisplayPath(path)
-        checkVersion(path, key, sessionId)?.let { return it }
+        checkVersion(path, key, sessionId, requireFreshRead)?.let { return it }
 
         return fileLock.withLock(key) {
-            checkVersion(path, key, sessionId)?.let { return@withLock it }
+            checkVersion(path, key, sessionId, requireFreshRead)?.let { return@withLock it }
             val result = block()
             // 写成功后把新版本登记下来，使同一会话的连续编辑不被自己判为冲突。
             // 用 runCatching 包住：写已经落盘，登记失败不能反过来把成功报成失败
@@ -185,16 +191,27 @@ class EditFileTool @Inject constructor(
      * [path] 用于访问文件，[key] 用于查登记表——两者必须分开传：key 是给用户看的逻辑路径
      * （`~/workspace/...`），虽然 [FileAccessProvider] 也能接受它，但显式区分意图更不容易出错。
      *
-     * **fail-open**：拿不到当前指纹时（远端文件超上限、IO 瞬时失败）放行并记日志。
-     * 版本校验是**辅助保护**，它自己的失败绝不能阻塞正常编辑——宁可漏判一次过期写，
-     * 也不能因为算不出指纹就让用户改不了文件。
+     * 普通会话拿不到当前指纹时放行；要求新读取的会话必须同时具有读取记录与当前指纹。
      */
-    private fun checkVersion(path: String, key: String, sessionId: String?): ToolResult? {
-        val recorded = versions.get(sessionId, key) ?: return null
-        val current = runCatching { fileAccess.fingerprint(path) }.getOrElse { e ->
-            FileLogger.w(TAG, "edit_file 无法计算当前指纹，跳过版本校验: $key", e)
-            return null
-        } ?: return null
+    private fun checkVersion(
+        path: String,
+        key: String,
+        sessionId: String?,
+        requireFreshRead: Boolean
+    ): ToolResult? {
+        if (requireFreshRead && !fileAccess.exists(path)) return null
+        val recorded = versions.get(sessionId, key)
+        if (requireFreshRead && !versions.wasReadSinceRecovery(sessionId, key)) {
+            return ToolResult.Error(recoveryReadRequiredMessage(appContext, key), RECOVERY_READ_REQUIRED_CODE)
+        }
+        val current = if (recorded != null) runCatching { fileAccess.fingerprint(path) }
+            .onFailure { FileLogger.w(TAG, "edit_file 无法计算当前指纹: $key", it) }
+            .getOrNull() else null
+        if (recorded.isNullOrBlank() || current.isNullOrBlank()) {
+            return if (requireFreshRead) {
+                ToolResult.Error(recoveryReadRequiredMessage(appContext, key), RECOVERY_READ_REQUIRED_CODE)
+            } else null
+        }
         if (recorded == current) return null
         FileLogger.w(TAG, "edit_file 拒绝过期写: $key（记录版本与当前不一致）")
         return ToolResult.Error(staleFileMessage(key), STALE_FILE_CODE)

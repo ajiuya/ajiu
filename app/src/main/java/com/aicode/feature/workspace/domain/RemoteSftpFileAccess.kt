@@ -2,11 +2,19 @@ package com.aicode.feature.workspace.domain
 
 import com.aicode.core.util.BoundedLineReader
 import com.aicode.core.util.FileLogger
+import com.aicode.core.util.boundedLines
 import com.aicode.feature.agent.domain.container.RemoteSshConnection
+import com.aicode.feature.agent.domain.container.RemoteConnectionIdentity
 import com.aicode.feature.agent.domain.container.friendlySshError
 import com.aicode.feature.workspace.data.repository.WorkspaceRepository
 import com.aicode.feature.workspace.domain.WorkspacePathMapper.Companion.CONTAINER_ROOT
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.DisposableHandle
+import kotlinx.coroutines.InternalCoroutinesApi
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -26,6 +34,7 @@ import java.nio.file.Paths
 import java.nio.file.FileAlreadyExistsException
 import java.nio.file.NoSuchFileException
 import java.util.EnumSet
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.inject.Inject
 
 private const val TAG = "RemoteSftpFileAccess"
@@ -64,23 +73,57 @@ class RemoteSftpFileAccess @Inject constructor(
         return if (path.isNotBlank() && path != "/") path else cfg.remoteWorkspacePath.trimEnd('/')
     }
 
+    internal data class ExecutionSource(val identity: RemoteConnectionIdentity, val workspaceRoot: String)
+
+    internal fun captureExecutionSource(): ExecutionSource {
+        val identity = connection.captureIdentity()
+        return ExecutionSource(identity, currentWorkspaceRoot()).also(::checkExecutionSource)
+    }
+
+    internal fun checkExecutionSource(source: ExecutionSource) {
+        connection.checkIdentity(source.identity)
+        if (currentWorkspaceRoot() != source.workspaceRoot) throw CancellationException("Remote workspace changed")
+    }
+
+    private fun executionSource(): ExecutionSource? = WorkspaceExecutionContext.current()?.let {
+        it.requireMode(com.aicode.feature.settings.data.repository.ExecutionMode.REMOTE_SSH)
+        it.remoteSource ?: throw CancellationException("Remote execution source missing")
+    }
+
     /** 把 AI 路径映射到远程服务器上的真实路径。 */
-    private fun toRemotePath(path: String): String =
-        remotePathFor(path, currentWorkspaceRoot(), connection.remoteHome)
+    private fun toRemotePath(path: String): String {
+        val source = executionSource()
+        return remotePathFor(path, source?.workspaceRoot ?: currentWorkspaceRoot(), source?.identity?.home ?: connection.remoteHome)
+    }
 
     /** 把远程路径还原为 AI 视角的容器路径（回显用）。 */
     private fun toDisplayPathFromRemote(remotePath: String): String =
-        displayPathFor(remotePath, currentWorkspaceRoot())
+        displayPathFor(remotePath, executionSource()?.workspaceRoot ?: currentWorkspaceRoot())
 
     /**
      * 在独立 SFTP 通道上串行执行 [block]。传输层异常时丢弃当前通道（下次调用自动重建）后原样抛出；
      * 业务错误（文件不存在/已存在、SFTP 状态码错误）不重建。不做自动重试——写操作重试可能重复落盘。
      */
-    private fun <T> withSftp(block: (SFTPClient) -> T): T = runBlocking {
+    private fun <T> withSftp(block: (SFTPClient) -> T): T = runBlocking(WorkspaceExecutionContext.blockingContext()) {
         withContext(Dispatchers.IO) {
+            val execution = WorkspaceExecutionContext.current()
+            if (execution != null) {
+                val source = executionSource() ?: throw CancellationException("Remote execution source missing")
+                val channel = connection.openReadChannel(source.identity)
+                val cancellation = execution.onCancellation { channel.close() }
+                try {
+                    execution.checkCurrent()
+                    return@withContext block(channel).also { execution.checkCurrent() }
+                } finally {
+                    cancellation?.dispose()
+                    runCatching { channel.close() }
+                }
+            }
             sftpMutex.withLock {
                 val sftp = try {
                     connection.sftp()
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (e: Exception) {
                     throw IOException(friendlySshError(e), e)
                 }
@@ -93,13 +136,15 @@ class RemoteSftpFileAccess @Inject constructor(
      * 复用已打开的 SFTP 通道执行一次操作（不重新取 client）。供 [readLines] 惰性迭代使用：每次只锁住
      * 一次读取，`yield` 在锁外，调用方中途放弃迭代时不会把 [sftpMutex] 永久占住。
      */
-    private fun <T> onSftp(block: () -> T): T = runBlocking {
+    private fun <T> onSftp(block: () -> T): T = runBlocking(WorkspaceExecutionContext.blockingContext()) {
         withContext(Dispatchers.IO) { sftpMutex.withLock { guarded(block) } }
     }
 
     /** 传输层异常时丢弃 SFTP 通道（下次调用自动重建）后原样抛出；业务错误不重建。 */
     private suspend fun <T> guarded(block: () -> T): T = try {
         block()
+    } catch (e: CancellationException) {
+        throw e
     } catch (e: Exception) {
         if (e !is SFTPException && e !is NoSuchFileException && e !is FileAlreadyExistsException) {
             runCatching { connection.invalidateSftp() }
@@ -114,6 +159,10 @@ class RemoteSftpFileAccess @Inject constructor(
      * 序列可重复迭代（每次迭代重新打开远程文件）；调用方需在 IO 线程上迭代。
      */
     override fun readLines(path: String): Sequence<String> {
+        WorkspaceExecutionContext.current()?.let { execution ->
+            execution.requireMode(com.aicode.feature.settings.data.repository.ExecutionMode.REMOTE_SSH)
+            return boundedLines { InputStreamReader(openRead(path, execution.fileCacheIdentity)) }
+        }
         val remote = toRemotePath(path)
         return sequence {
             val reader = withSftp { sftp ->
@@ -152,20 +201,58 @@ class RemoteSftpFileAccess @Inject constructor(
     /**
      * 远端内容指纹。**必须按内容哈希而非 mtime**：SFTP 的 mtime 只到秒
      * （[lastModified] 就是把秒乘 1000），同一秒内的两次写入无法区分，会让并发校验漏判。
-     * 复用 [readAll]，因此受同一 8MB 上限约束——超限时抛 [RemoteOutputTooLargeException]，
-     * 由调用方决定是放行还是报错。
+     * 私有捕获通道流式计算，仍受同一 8MB 上限约束；通道关闭可唤醒阻塞读取。
      */
-    override fun fingerprint(path: String): String? {
-        val remote = toRemotePath(path)
-        return withSftp { sftp ->
-            val attrs = sftp.statExistence(remote) ?: return@withSftp null
-            if (attrs.type != FileMode.Type.REGULAR) return@withSftp null
-            if (attrs.size > MAX_REMOTE_READ_BYTES) {
-                throw RemoteOutputTooLargeException(
-                    "远程文件超过 ${MAX_REMOTE_READ_BYTES / 1024 / 1024}MB，无法计算内容指纹"
-                )
+    override fun fingerprint(path: String): String? = runBlocking(WorkspaceExecutionContext.blockingContext() + Dispatchers.IO) {
+        val execution = WorkspaceExecutionContext.current()
+        val source = executionSource() ?: captureExecutionSource()
+        fun checkSource() {
+            coroutineContext.ensureActive()
+            execution?.checkCurrent()
+            checkExecutionSource(source)
+        }
+        checkSource()
+        val remote = remotePathFor(path, source.workspaceRoot, source.identity.home)
+        val channel = connection.openReadChannel(source.identity)
+        val closed = AtomicBoolean()
+        fun closeChannel() {
+            if (closed.compareAndSet(false, true)) channel.close()
+        }
+        val cancellation = execution?.onCancellation { closeChannel() }
+        var file: RemoteFile? = null
+        try {
+            checkSource()
+            val attrs = channel.statExistence(remote) ?: return@runBlocking null.also { checkSource() }
+            checkSource()
+            if (attrs.type != FileMode.Type.REGULAR) return@runBlocking null
+            if (attrs.size > MAX_REMOTE_READ_BYTES) throw RemoteOutputTooLargeException("Remote file exceeds the fingerprint read limit")
+            val opened = channel.open(remote)
+            file = opened
+            val digest = java.security.MessageDigest.getInstance("SHA-256")
+            val buffer = ByteArray(IO_CHUNK)
+            var offset = 0L
+            while (true) {
+                checkSource()
+                val length = minOf(buffer.size.toLong(), MAX_REMOTE_READ_BYTES - offset + 1).toInt()
+                val count = opened.read(offset, buffer, 0, length)
+                checkSource()
+                if (count < 0) break
+                if (count == 0) throw IOException("Remote file read made no progress")
+                if (offset + count > MAX_REMOTE_READ_BYTES) throw RemoteOutputTooLargeException("Remote file exceeded the read limit during transfer")
+                digest.update(buffer, 0, count)
+                offset += count
             }
-            sftp.open(remote).use { rf -> sha256Fingerprint(readFully(rf)) }
+            checkSource()
+            "sha256:" + digest.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
+        } catch (failure: Throwable) {
+            try { checkSource() } catch (changed: CancellationException) {
+                if (changed !== failure) changed.addSuppressed(failure)
+                throw changed
+            }
+            throw failure
+        } finally {
+            cancellation?.dispose()
+            try { closeChannel() } finally { runCatching { file?.close() } }
         }
     }
 
@@ -210,6 +297,246 @@ class RemoteSftpFileAccess @Inject constructor(
             walk(remote, "", 1)
             result
         }
+    }
+
+    private fun cacheIdentity(identity: RemoteConnectionIdentity, workspaceRoot: String): String =
+        "sftp:${identity.generation}:${identity.home.length}:${identity.home}:$workspaceRoot"
+
+    override fun cacheIdentity(): String {
+        WorkspaceExecutionContext.current()?.let {
+            it.requireMode(com.aicode.feature.settings.data.repository.ExecutionMode.REMOTE_SSH)
+            return it.fileCacheIdentity
+        }
+        val identity = connection.captureIdentity()
+        val root = currentWorkspaceRoot()
+        connection.checkIdentity(identity)
+        return cacheIdentity(identity, root)
+    }
+
+    override fun openRead(path: String): InputStream = openRead(path, cacheIdentity())
+
+    override fun openRead(path: String, expectedCacheIdentity: String): InputStream =
+        openRead(path, expectedCacheIdentity, playbackRoot = null)
+
+    internal data class ReadRoot(
+        val source: ExecutionSource,
+        val remotePath: String,
+        val canonicalPath: String,
+    )
+
+    internal fun captureReadRoot(path: String): ReadRoot =
+        runBlocking(WorkspaceExecutionContext.blockingContext() + Dispatchers.IO) {
+            val source = executionSource() ?: captureExecutionSource()
+            val remote = Paths.get(remotePathFor(path, source.workspaceRoot, source.identity.home)).normalize()
+            if (!remote.isAbsolute || remote.parent == null) throw IOException("Directory read root required")
+            try {
+                rootReadChannel(source).use { owned ->
+                    checkReadSource(source)
+                    val canonical = Paths.get(owned.channel.canonicalize(remote.toString())).normalize()
+                    if (!canonical.isAbsolute || canonical.parent == null) throw IOException("Directory read root required")
+                    val attrs = owned.channel.statExistence(canonical.toString())
+                        ?: throw NoSuchFileException(File(path))
+                    if (attrs.type != FileMode.Type.DIRECTORY) throw IOException("Directory read root required")
+                    checkReadSource(source)
+                    ReadRoot(source, remote.toString(), canonical.toString())
+                }
+            } catch (failure: IOException) {
+                currentCoroutineContext().ensureActive()
+                checkReadSource(source)
+                throw failure
+            }
+        }
+
+    internal fun rootReadSize(path: String, root: ReadRoot): Long =
+        runBlocking(WorkspaceExecutionContext.blockingContext() + Dispatchers.IO) {
+            try {
+                rootReadChannel(root.source).use { owned ->
+                    val readable = confinedReadPath(owned.channel, path, root)
+                    val size = owned.channel.statExistence(readable)?.size ?: throw NoSuchFileException(File(path))
+                    if (size < 0) throw IOException("Invalid remote file size")
+                    checkReadSource(root.source)
+                    size
+                }
+            } catch (failure: IOException) {
+                currentCoroutineContext().ensureActive()
+                checkReadSource(root.source)
+                throw failure
+            }
+        }
+
+    internal fun openRootRead(path: String, root: ReadRoot, maxBytes: Long): InputStream =
+        runBlocking(WorkspaceExecutionContext.blockingContext() + Dispatchers.IO) {
+            val execution = WorkspaceExecutionContext.current()
+            val owned = rootReadChannel(root.source)
+            var file: RemoteFile? = null
+            try {
+                val readable = confinedReadPath(owned.channel, path, root)
+                val size = owned.channel.statExistence(readable)?.size ?: throw NoSuchFileException(File(path))
+                if (size < 0 || size > maxBytes) throw IOException("File exceeds read limit")
+                checkReadSource(root.source)
+                val opened = owned.channel.open(readable)
+                file = opened
+                if (confinedReadPath(owned.channel, path, root) != readable) {
+                    throw CancellationException("Remote read target changed")
+                }
+                val stream = object : InputStream() {
+                    private val input = RemoteFileInputStream(opened)
+                    private val closed = AtomicBoolean()
+                    private val single = ByteArray(1)
+                    private var count = 0L
+                    override fun read(): Int = if (read(single, 0, 1) < 0) -1 else single[0].toInt() and 0xff
+                    override fun read(b: ByteArray, off: Int, len: Int): Int {
+                        val length = input.read(b, off, minOf(len.toLong(), IO_CHUNK.toLong(), maxBytes - count + 1).toInt())
+                        if (length > maxBytes - count) throw IOException("File exceeded read limit during transfer")
+                        if (length > 0) count += length
+                        return length
+                    }
+                    override fun close() {
+                        if (closed.compareAndSet(false, true)) {
+                            try { owned.close() } finally { runCatching { input.close() } }
+                        }
+                    }
+                }
+                // An open handle stays bound to the authorized file; later path changes are checked on the next open.
+                val checked = identityCheckedRead(stream) { checkReadSource(root.source) }
+                execution?.protectRead(checked) ?: checked
+            } catch (failure: Throwable) {
+                val reported = try { currentCoroutineContext().ensureActive(); checkReadSource(root.source); failure } catch (changed: CancellationException) {
+                    if (changed !== failure) changed.addSuppressed(failure)
+                    changed
+                }
+                runCatching { owned.close() }.exceptionOrNull()?.let(reported::addSuppressed)
+                runCatching { file?.close() }.exceptionOrNull()?.let(reported::addSuppressed)
+                throw reported
+            }
+        }
+
+    private fun checkReadSource(source: ExecutionSource) {
+        WorkspaceExecutionContext.blockingContext()[Job]?.ensureActive()
+        WorkspaceExecutionContext.current()?.checkCurrent()
+        checkExecutionSource(source)
+    }
+
+    private fun confinedReadPath(channel: SFTPClient, path: String, root: ReadRoot): String {
+        checkReadSource(root.source)
+        val remote = Paths.get(remotePathFor(path, root.source.workspaceRoot, root.source.identity.home)).normalize()
+        if (!remote.isAbsolute || !remote.startsWith(Paths.get(root.remotePath)) || remote.toString() == root.remotePath) {
+            throw IOException("File outside read root")
+        }
+        val currentRoot = Paths.get(channel.canonicalize(root.remotePath)).normalize()
+        if (currentRoot.toString() != root.canonicalPath) throw CancellationException("Remote read root changed")
+        val target = Paths.get(channel.canonicalize(remote.toString())).normalize()
+        if (!target.isAbsolute || !target.startsWith(currentRoot) || target == currentRoot) {
+            throw IOException("File outside read root")
+        }
+        // SFTP v3 cannot atomically combine canonicalization with a no-follow open.
+        val attrs = channel.statExistence(target.toString()) ?: throw NoSuchFileException(File(path))
+        if (attrs.type != FileMode.Type.REGULAR) throw IOException("Existing regular file required")
+        checkReadSource(root.source)
+        return target.toString()
+    }
+
+    private suspend fun rootReadChannel(source: ExecutionSource): RootReadChannel {
+        currentCoroutineContext().ensureActive()
+        checkReadSource(source)
+        val owner = WorkspaceExecutionContext.blockingContext()[Job] ?: currentCoroutineContext()[Job]
+        val owned = RootReadChannel(connection.openReadChannel(source.identity), owner)
+        try {
+            currentCoroutineContext().ensureActive()
+            checkReadSource(source)
+            return owned
+        } catch (failure: Throwable) {
+            runCatching { owned.close() }.exceptionOrNull()?.let(failure::addSuppressed)
+            throw failure
+        }
+    }
+
+    @OptIn(InternalCoroutinesApi::class)
+    private class RootReadChannel(val channel: SFTPClient, job: Job?) : AutoCloseable {
+        private val closed = AtomicBoolean()
+        private var cancellation: DisposableHandle? = null
+
+        init {
+            cancellation = job?.invokeOnCompletion(onCancelling = true, invokeImmediately = true) { cause ->
+                if (cause is CancellationException) runCatching { close() }
+            }
+        }
+
+        override fun close() {
+            cancellation?.dispose()
+            if (closed.compareAndSet(false, true)) channel.close()
+        }
+    }
+
+    internal fun checkPlaybackPath(path: String, root: String, expectedCacheIdentity: String) {
+        if (cacheIdentity() != expectedCacheIdentity) throw CancellationException("Remote file source changed")
+        withSftp { channel ->
+            confinedPlaybackPath(channel, toRemotePath(path), toRemotePath(root))
+            if (cacheIdentity() != expectedCacheIdentity) throw CancellationException("Remote file source changed")
+        }
+    }
+
+    internal fun openPlaybackRead(path: String, root: String, expectedCacheIdentity: String): InputStream =
+        openRead(path, expectedCacheIdentity, playbackRoot = root)
+
+    private fun confinedPlaybackPath(channel: SFTPClient, remote: String, root: String): String {
+        val canonicalRoot = Paths.get(channel.canonicalize(root)).normalize()
+        val canonicalPath = Paths.get(channel.canonicalize(remote)).normalize()
+        if (!canonicalRoot.isAbsolute || !canonicalPath.isAbsolute || !canonicalPath.startsWith(canonicalRoot)) {
+            throw IOException("Media path outside playback root")
+        }
+        return canonicalPath.toString()
+    }
+
+    private fun openRead(path: String, expectedCacheIdentity: String, playbackRoot: String?): InputStream = runBlocking(WorkspaceExecutionContext.blockingContext() + Dispatchers.IO) {
+        val execution = WorkspaceExecutionContext.current()
+        val source = executionSource()
+        val identity = source?.identity ?: connection.captureIdentity()
+        val root = source?.workspaceRoot ?: currentWorkspaceRoot()
+        fun checkSource() {
+            execution?.checkCurrent()
+            connection.checkIdentity(identity)
+            if (cacheIdentity(identity, root) != expectedCacheIdentity || currentWorkspaceRoot() != root) {
+                throw CancellationException("Remote file source changed")
+            }
+        }
+        checkSource()
+        val remote = remotePathFor(path, root, identity.home)
+        val channel = connection.openReadChannel(identity)
+        val file = try {
+            checkSource()
+            val readable = if (playbackRoot == null) remote else
+                confinedPlaybackPath(channel, remote, remotePathFor(playbackRoot, root, identity.home))
+            val attrs = channel.statExistence(readable) ?: throw NoSuchFileException(File(remote))
+            if (attrs.type == FileMode.Type.DIRECTORY) throw IOException("Is a directory: $remote")
+            if (playbackRoot != null && attrs.type != FileMode.Type.REGULAR) throw IOException("Regular media file required")
+            checkSource()
+            channel.open(readable)
+        } catch (failure: Throwable) {
+            val reported = try { checkSource(); failure } catch (changed: CancellationException) {
+                if (changed !== failure) changed.addSuppressed(failure)
+                changed
+            }
+            runCatching { channel.close() }.exceptionOrNull()?.let(reported::addSuppressed)
+            throw reported
+        }
+        val stream = object : InputStream() {
+            private val input = RemoteFileInputStream(file)
+            private val closed = AtomicBoolean()
+
+            override fun read(): Int = input.read()
+
+            override fun read(b: ByteArray, off: Int, len: Int): Int =
+                input.read(b, off, minOf(len, IO_CHUNK))
+
+            override fun close() {
+                if (!closed.compareAndSet(false, true)) return
+                // Closing the private channel wakes an in-flight read before releasing its handle.
+                try { channel.close() } finally { runCatching { input.close() } }
+            }
+        }
+        val checked = identityCheckedRead(stream, ::checkSource)
+        execution?.protectRead(checked) ?: checked
     }
 
     override fun readBytes(path: String): ByteArray = readAll(toRemotePath(path))
@@ -292,7 +619,7 @@ class RemoteSftpFileAccess @Inject constructor(
         } catch (e: Exception) {
             // 用完即删：临时文件不依赖 deleteOnExit（只在进程退出清），失败路径也回收，避免长会话累积。
             runCatching { tempFile.delete() }
-            if (e is NoSuchFileException) throw e
+            if (e is CancellationException || e is NoSuchFileException) throw e
             FileLogger.e(TAG, "copyToLocal 失败: $remote", e)
             throw NoSuchFileException(File(remote))
         }
@@ -385,8 +712,11 @@ class RemoteSftpFileAccess @Inject constructor(
         val buf = ByteArray(IO_CHUNK)
         var offset = 0L
         while (true) {
-            val n = rf.read(offset, buf, 0, buf.size)
+            val n = rf.read(offset, buf, 0, minOf(buf.size.toLong(), MAX_REMOTE_READ_BYTES - offset + 1).toInt())
             if (n <= 0) break
+            if (offset + n > MAX_REMOTE_READ_BYTES) {
+                throw RemoteOutputTooLargeException("Remote file exceeded the read limit during transfer")
+            }
             out.write(buf, 0, n)
             offset += n
         }

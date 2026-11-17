@@ -22,9 +22,30 @@ class DelegatingFileAccess @Inject constructor(
     private val remoteSftpFileAccess: RemoteSftpFileAccess
 ) : FileAccessProvider {
 
-    private fun delegate(): FileAccessProvider =
-        if (modeHolder.currentMode() == ExecutionMode.REMOTE_SSH) remoteSftpFileAccess
-        else localFileAccess
+    private fun delegate(): FileAccessProvider {
+        WorkspaceExecutionContext.current()?.let {
+            it.checkCurrent()
+            return it.fileAccess
+        }
+        return if (modeHolder.currentMode() == ExecutionMode.REMOTE_SSH) remoteSftpFileAccess else localFileAccess
+    }
+
+    override fun cacheIdentity(): String = delegate().cacheIdentity()
+
+    override fun openRead(path: String): InputStream = openRead(path, cacheIdentity())
+
+    override fun openRead(path: String, expectedCacheIdentity: String): InputStream {
+        val execution = WorkspaceExecutionContext.current()
+        val source = delegate()
+        fun checkSource() {
+            execution?.checkCurrent()
+            if (cacheIdentity() != expectedCacheIdentity) {
+                throw java.util.concurrent.CancellationException("File execution mode changed")
+            }
+        }
+        checkSource()
+        return identityCheckedRead(source.openRead(path, expectedCacheIdentity), ::checkSource)
+    }
 
     override fun readFile(path: String): String = delegate().readFile(path)
 

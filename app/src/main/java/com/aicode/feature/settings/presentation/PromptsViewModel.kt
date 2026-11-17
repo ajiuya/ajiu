@@ -2,15 +2,19 @@ package com.aicode.feature.settings.presentation
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.aicode.R
 import com.aicode.feature.agent.domain.prompt.PromptFragment
 import com.aicode.feature.agent.domain.prompt.PromptFragmentCatalog
 import com.aicode.feature.agent.domain.prompt.PromptFragmentSource
 import com.aicode.feature.workspace.data.repository.WorkspaceRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -38,6 +42,9 @@ class PromptsViewModel @Inject constructor(
 
     private val _state = MutableStateFlow(PromptsUiState())
     val state: StateFlow<PromptsUiState> = _state.asStateFlow()
+    private val _errors = Channel<Int>(Channel.BUFFERED)
+    val errors: Flow<Int> = _errors.receiveAsFlow()
+    private var loadedProjectRoot: String? = null
 
     init {
         refresh()
@@ -54,7 +61,28 @@ class PromptsViewModel @Inject constructor(
                     loading = false
                 )
             }
-            _state.value = loaded
+            if (workspaceRepository.currentPath() == projectRoot) {
+                loadedProjectRoot = projectRoot
+                _state.value = loaded
+            }
+        }
+    }
+
+    private fun displayedProjectRoot(): String? {
+        val projectRoot = workspaceRepository.currentPath()
+        if (projectRoot == loadedProjectRoot) return projectRoot
+        refresh()
+        return null
+    }
+
+    fun setFragmentEnabled(number: Int, enabled: Boolean) {
+        val projectRoot = displayedProjectRoot() ?: return
+        viewModelScope.launch {
+            val saved = withContext(Dispatchers.IO) {
+                catalog.setFragmentEnabled(number, enabled, projectRoot)
+            }
+            if (!saved) _errors.send(R.string.prompts_fragment_toggle_failed)
+            refresh()
         }
     }
 
@@ -66,8 +94,8 @@ class PromptsViewModel @Inject constructor(
         content: String,
         previousNumber: Int? = null
     ) {
+        val projectRoot = displayedProjectRoot() ?: return
         viewModelScope.launch {
-            val projectRoot = workspaceRepository.currentPath()
             withContext(Dispatchers.IO) {
                 catalog.saveOverride(
                     number,
@@ -91,8 +119,8 @@ class PromptsViewModel @Inject constructor(
      */
     fun deleteFragments(numbers: List<Int>) {
         if (numbers.isEmpty()) return
+        val projectRoot = displayedProjectRoot() ?: return
         viewModelScope.launch {
-            val projectRoot = workspaceRepository.currentPath()
             withContext(Dispatchers.IO) {
                 numbers.forEach { catalog.deleteOverride(it, projectRoot) }
             }
@@ -102,8 +130,8 @@ class PromptsViewModel @Inject constructor(
 
     /** 重置：清空项目层与全局层的所有自定义片段，各编号回落到内置提示词。 */
     fun resetCustomFragments() {
+        val projectRoot = displayedProjectRoot() ?: return
         viewModelScope.launch {
-            val projectRoot = workspaceRepository.currentPath()
             withContext(Dispatchers.IO) { catalog.deleteAllCustom(projectRoot) }
             refresh()
         }
@@ -111,15 +139,15 @@ class PromptsViewModel @Inject constructor(
 
     /** 拖拽重排：按新顺序重新编号并落盘，改变注入顺序。乐观更新本地状态，避免重读导致列表跳动。 */
     fun reorderFragments(reordered: List<PromptFragment>) {
+        val projectRoot = displayedProjectRoot() ?: return
         val numbers = reordered.map { it.number }.sorted()
         val renumbered = reordered.mapIndexed { index, fragment -> fragment.copy(number = numbers[index]) }
         _state.update { it.copy(fragments = renumbered) }
         viewModelScope.launch {
-            val projectRoot = workspaceRepository.currentPath()
             val refreshed = withContext(Dispatchers.IO) {
                 if (catalog.reorder(renumbered, projectRoot)) catalog.list(projectRoot) else null
             }
-            if (refreshed != null) {
+            if (refreshed != null && workspaceRepository.currentPath() == projectRoot) {
                 _state.update { it.copy(fragments = refreshed) }
             } else {
                 refresh()

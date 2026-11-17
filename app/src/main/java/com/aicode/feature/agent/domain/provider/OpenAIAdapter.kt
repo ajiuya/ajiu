@@ -9,6 +9,8 @@ import com.aicode.feature.agent.data.remote.openai.ChatCompletionRequest
 import com.aicode.feature.agent.data.remote.openai.OpenAIChatMessage
 import com.aicode.feature.agent.domain.model.AgentImage
 import com.aicode.feature.agent.domain.model.AgentMessage
+import com.aicode.feature.agent.domain.model.SpeedTier
+import com.aicode.feature.agent.domain.model.SpeedTierPolicy
 import com.aicode.feature.agent.domain.model.DisableFieldKind
 import com.aicode.feature.agent.domain.model.ReasoningCapability
 import com.aicode.feature.agent.domain.model.ReasoningPlan
@@ -58,6 +60,17 @@ class OpenAIAdapter @Inject constructor(
      * Responses API 路径官方原生支持，无条件发送，不受本开关影响。
      */
     var chatCacheKeyEnabled: Boolean = false
+
+    var speedTierSource: suspend () -> SpeedTier = { SpeedTier.STANDARD }
+
+    private suspend fun serviceTier(): String? = SpeedTierPolicy.effective(
+        chosen = speedTierSource(),
+        providerType = ProviderType.OPENAI,
+        baseUrl = baseUrl,
+        providerId = providerId,
+        useResponses = useResponseApi,
+        model = model
+    ).wireValue
 
     /** 自定义请求头：占位符替换后写出，完全覆盖同名默认头。 */
     override var customHeaders: Map<String, String> = emptyMap()
@@ -109,7 +122,7 @@ class OpenAIAdapter @Inject constructor(
                 function = OpenAIFunctionDefinition(
                     name = tool.name,
                     description = tool.description,
-                    parameters = tool.toJsonSchema()
+                    parameters = tool.toModelJsonSchema()
                 )
             )
         }
@@ -127,7 +140,8 @@ class OpenAIAdapter @Inject constructor(
             tools = toolDefs,
             tool_choice = if (toolDefs != null) "auto" else null,
             stream = false,
-            prompt_cache_key = if (chatCacheKeyEnabled) logSessionId else null
+            prompt_cache_key = if (chatCacheKeyEnabled) logSessionId else null,
+            service_tier = serviceTier()
         )
         val seq = AILogger.logRequest(logSessionId, "OpenAI", model, "POST", url, request)
 
@@ -192,7 +206,7 @@ class OpenAIAdapter @Inject constructor(
      * Responses 请求体。system prompt 作为首个 message item 进 `input`（与顶层 `instructions` 等价，
      * 服务端同样按首条 system 消息处理），因此不再单独发 `instructions`。
      */
-    private fun buildResponsesRequest(
+    private suspend fun buildResponsesRequest(
         systemPrompt: String,
         messages: List<AgentMessage>,
         tools: List<AgentTool>,
@@ -248,6 +262,7 @@ class OpenAIAdapter @Inject constructor(
         // OpenAI 官方 Responses 原生支持 prompt_cache_key（同会话路由到同一缓存 shard）；
         // 自动管理缓存的服务（如 DeepSeek）会静默忽略该字段，不会报错。
         logSessionId?.let { request["prompt_cache_key"] = it }
+        serviceTier()?.let { request["service_tier"] = it }
         return request
     }
 
@@ -329,7 +344,7 @@ class OpenAIAdapter @Inject constructor(
                 function = OpenAIFunctionDefinition(
                     name = tool.name,
                     description = tool.description,
-                    parameters = tool.toJsonSchema()
+                    parameters = tool.toModelJsonSchema()
                 )
             )
         }
@@ -349,7 +364,8 @@ class OpenAIAdapter @Inject constructor(
             tool_choice = if (toolDefs != null) "auto" else null,
             stream = true,
             stream_options = StreamOptions(include_usage = true),
-            prompt_cache_key = if (chatCacheKeyEnabled) logSessionId else null
+            prompt_cache_key = if (chatCacheKeyEnabled) logSessionId else null,
+            service_tier = serviceTier()
         )
         val seq = AILogger.logRequest(logSessionId, "OpenAI", model, "POST", url, request)
         // 原始 SSE 分批落盘（见 AILogger.beginRawSse），本轮结束在 finally 收尾。
@@ -373,6 +389,7 @@ class OpenAIAdapter @Inject constructor(
             val budget = StreamBudget()
             // tool_call index -> 累积中的工具调用（保序）。
             val toolAccs = LinkedHashMap<Int, OpenAIToolAcc>()
+            val argumentPreviews = ToolArgumentsPreview()
             // 生图扩展：部分兼容服务在 delta.images 里整块返回图片（image_url 的 data URL）。
             val streamedImages = mutableListOf<AgentImage>()
             var finishReason: String? = null
@@ -484,6 +501,7 @@ class OpenAIAdapter @Inject constructor(
                                     }
                                     fn.get("arguments")?.takeIf { !it.isJsonNull }?.asString?.let { budget.add(it); acc.args.append(it) }
                                 }
+                                argumentPreviews.update(acc.id, acc.name, acc.args)?.let { send(it) }
                             }
                             // 生图扩展：图片整块到达、无增量，累积待 Final 交工作流落盘。
                             delta.getAsJsonArray("images")?.forEach { el ->
@@ -509,10 +527,14 @@ class OpenAIAdapter @Inject constructor(
                 }
             }
 
+            val requestDurationMillis = firstContent.requestDurationMillis()
+            toolAccs.values.forEach { acc ->
+                argumentPreviews.update(acc.id, acc.name, acc.args, force = true)?.let { send(it) }
+            }
             val toolCalls = toolAccs.values
                 .filter { it.id.isNotEmpty() || it.name.isNotEmpty() }
                 .map { acc -> ToolCall(id = acc.id, name = acc.name, arguments = parseToolArguments(acc.args.toString())) }
-            send(AIStreamChunk.Final(AIResponse(content = textBuilder.toString(), toolCalls = toolCalls, stopReason = finishReason, inputTokens = streamInputTokens, outputTokens = streamOutputTokens, cachedInputTokens = streamCachedInputTokens, cacheCreationTokens = streamCacheCreationTokens, images = streamedImages)))
+            send(AIStreamChunk.Final(AIResponse(content = textBuilder.toString(), toolCalls = toolCalls, stopReason = finishReason, inputTokens = streamInputTokens, outputTokens = streamOutputTokens, cachedInputTokens = streamCachedInputTokens, cacheCreationTokens = streamCacheCreationTokens, images = streamedImages), requestDurationMillis))
                     }
             },
             onRetry = { attempt, max, error -> send(AIStreamChunk.Retrying(attempt, max, error)) }
@@ -633,6 +655,7 @@ class OpenAIAdapter @Inject constructor(
                                     }
                                     null -> {}
                                 }
+                                acc.argumentPreviews().forEach { send(it) }
                             }
                         } finally {
                             idleWatchdog.cancel()
@@ -640,7 +663,9 @@ class OpenAIAdapter @Inject constructor(
                         }
                     }
 
-                    send(AIStreamChunk.Final(acc.toResponse()))
+                    val requestDurationMillis = firstContent.requestDurationMillis()
+                    acc.argumentPreviews(force = true).forEach { send(it) }
+                    send(AIStreamChunk.Final(acc.toResponse(), requestDurationMillis))
                     }
                 },
                 onRetry = { attempt, max, error -> send(AIStreamChunk.Retrying(attempt, max, error)) }

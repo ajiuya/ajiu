@@ -13,7 +13,6 @@ import androidx.lifecycle.ProcessLifecycleOwner
 import com.aicode.MainActivity
 import com.aicode.R
 import com.aicode.feature.agent.domain.permission.PermissionChoice
-import com.aicode.feature.agent.domain.tool.mode.PlanApprovalChoice
 import com.aicode.feature.settings.data.repository.ApprovalNotificationSettingsRepository
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CoroutineScope
@@ -26,7 +25,7 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
- * 授权审批通知：AI 在后台阻塞等待用户确认（工具授权 / askUserQuestion 提问 / 退出 PLAN 计划审批）时弹出。
+ * 授权审批通知：AI 在后台阻塞等待用户确认（工具授权 / askUserQuestion 提问）时弹出。
  *
  * 多会话聚合为一条通知；仅在 App 处于后台且开关开启时展示，回到前台或全部解决后立即撤销。
  * 与 [AgentLiveNotificationManager] 的静默常驻通知不同，本通知需要弹窗+声音提醒用户处理。
@@ -119,11 +118,7 @@ class AgentApprovalNotificationManager @Inject constructor(
                     builder.addAction(0, context.getString(R.string.notification_approval_action_reject), actionIntent(ApprovalKind.PERMISSION, PermissionChoice.REJECT.name, requestId, 11))
                     builder.addAction(0, context.getString(R.string.notification_approval_action_allow), actionIntent(ApprovalKind.PERMISSION, PermissionChoice.ONCE.name, requestId, 12))
                 }
-                ApprovalKind.PLAN -> {
-                    builder.addAction(0, context.getString(R.string.notification_approval_action_approve_plan), actionIntent(ApprovalKind.PLAN, PlanApprovalChoice.APPROVE.name, requestId, 13))
-                    builder.addAction(0, context.getString(R.string.notification_approval_action_reject), actionIntent(ApprovalKind.PLAN, PlanApprovalChoice.REFINE.name, requestId, 14))
-                }
-                ApprovalKind.QUESTION -> Unit
+                ApprovalKind.QUESTION, ApprovalKind.PLAN -> Unit
             }
         }
         runCatching { manager.notify(NOTIFICATION_ID, builder.build()) }

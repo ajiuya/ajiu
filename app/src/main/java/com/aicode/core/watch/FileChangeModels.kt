@@ -2,6 +2,8 @@ package com.aicode.core.watch
 
 import com.aicode.core.util.GitIgnoreMatcher
 import java.io.File
+import java.util.Collections
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 
@@ -49,7 +51,7 @@ data class WatchFilter(
 }
 
 /** 目录剪枝判定（纯逻辑，便于单测）。 */
-class IgnoreRules internal constructor(
+class IgnoreRules private constructor(
     private val ignoredNames: Set<String>,
     private val patterns: List<String>
 ) {
@@ -60,9 +62,78 @@ class IgnoreRules internal constructor(
         return patterns.isNotEmpty() && GitIgnoreMatcher.isIgnored(patterns, relativeParts)
     }
 
+    override fun equals(other: Any?): Boolean =
+        other is IgnoreRules && ignoredNames == other.ignoredNames && patterns == other.patterns
+
+    override fun hashCode(): Int = 31 * ignoredNames.hashCode() + patterns.hashCode()
+
     companion object {
         fun of(filter: WatchFilter, gitignorePatterns: List<String>): IgnoreRules =
-            IgnoreRules(filter.ignoredNames, gitignorePatterns + filter.extraPatterns)
+            IgnoreRules(
+                Collections.unmodifiableSet(HashSet(filter.ignoredNames)),
+                Collections.unmodifiableList(ArrayList(gitignorePatterns + filter.extraPatterns))
+            )
+    }
+}
+
+internal data class SnapshotScope(val root: String, val recursive: Boolean, val rules: IgnoreRules)
+
+internal data class ScopeSnapshot(val entries: Map<String, String>, val complete: Boolean)
+
+internal fun snapshotOfScope(key: SnapshotScope, maxEntries: Int): ScopeSnapshot {
+    val root = File(key.root)
+    val entries = LinkedHashMap<String, String>()
+    if (!root.isDirectory) return ScopeSnapshot(entries, !root.exists())
+    var complete = true
+    fun walk(dir: File, rel: String) {
+        val children = dir.listFiles()
+        if (children == null) {
+            complete = false
+            return
+        }
+        for (child in children) {
+            if (entries.size >= maxEntries) {
+                complete = false
+                return
+            }
+            val childRel = if (rel.isEmpty()) child.name else "$rel/${child.name}"
+            if (child.isDirectory) {
+                entries[childRel] = "d"
+                if (key.recursive && !key.rules.isIgnoredDir(relativePartsOf(root, child)) &&
+                    !java.nio.file.Files.isSymbolicLink(child.toPath())) walk(child, childRel)
+            } else {
+                entries[childRel] = "f:${child.lastModified()}:${child.length()}"
+            }
+        }
+    }
+    walk(root, "")
+    return ScopeSnapshot(entries, complete)
+}
+
+internal class PendingFileChanges(private val capacity: Int) {
+    private val paths = LinkedHashMap<String, ChangeKind>()
+    private var truncated = false
+    val wakeup = Channel<Unit>(Channel.CONFLATED)
+
+    @Synchronized fun offer(path: String, kind: ChangeKind) {
+        val previous = paths[path]
+        if (previous != null) paths[path] = mergeKind(previous, kind)
+        else if (paths.size < capacity) paths[path] = kind
+        else truncated = true
+        wakeup.trySend(Unit)
+    }
+
+    @Synchronized fun invalidate() {
+        truncated = true
+        wakeup.trySend(Unit)
+    }
+
+    @Synchronized fun drain(limit: Int): Pair<Map<String, ChangeKind>, Boolean> {
+        val batch = paths.entries.take(limit).associateTo(LinkedHashMap()) { it.key to it.value }
+        val incomplete = truncated || paths.size > limit
+        paths.clear()
+        truncated = false
+        return batch to incomplete
     }
 }
 

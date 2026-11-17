@@ -172,6 +172,7 @@ internal class GeminiInteractionsStreamAccumulator {
     }
 
     private val steps = LinkedHashMap<Int, StepAcc>()
+    private val previews = ToolArgumentsPreview()
     private val budget = StreamBudget()
     private var status: String? = null
     private var statusDetail: String? = null
@@ -300,6 +301,20 @@ internal class GeminiInteractionsStreamAccumulator {
         interaction?.arr("errors")?.firstOrNull()?.takeIf { it.isJsonObject }?.asJsonObject
             ?.str("message")?.let { statusDetail = it }
         if (status in TERMINAL_STATUSES) terminated = true
+    }
+
+    fun argumentPreviews(force: Boolean = false): List<AIStreamChunk.ToolCallArgumentsDelta> = buildList {
+        steps.values.forEach { acc ->
+            if (acc.effectiveType() == InteractionStep.FUNCTION_CALL) {
+                val raw = if (acc.argsDelta.isNotEmpty()) acc.argsDelta else acc.argsComplete.orEmpty()
+                previews.update(acc.id, acc.name, raw, force)?.let { add(it) }
+            }
+        }
+        if (terminated) finalOutput?.toolCalls?.forEach { call ->
+            if (steps.values.none { it.id == call.id && it.name.isNotBlank() && (it.argsDelta.isNotEmpty() || !it.argsComplete.isNullOrEmpty()) }) {
+                previews.update(call.id, call.name, kotlinx.serialization.json.JsonObject(call.arguments).toString(), force)?.let { add(it) }
+            }
+        }
     }
 
     fun toResponse(): AIResponse {

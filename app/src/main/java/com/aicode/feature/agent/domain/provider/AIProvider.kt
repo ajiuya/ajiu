@@ -114,7 +114,15 @@ sealed class AIStreamChunk {
      * 状态换成具体场景（「正在编辑文件」）。不参与任何执行判定，纯粹是 UI 提示。
      */
     data class ToolCallDeclared(val name: String) : AIStreamChunk()
-    data class Final(val response: AIResponse) : AIStreamChunk()
+    /** 有界累计预览与未截断参数的字符计数；可能是不完整 JSON，不得用于执行或历史回放。 */
+    data class ToolCallArgumentsDelta(
+        val id: String,
+        val name: String,
+        val accumulated: String,
+        val totalAsciiChars: Int = accumulated.count { it.code < 128 },
+        val totalOtherChars: Int = accumulated.length - totalAsciiChars
+    ) : AIStreamChunk()
+    data class Final(val response: AIResponse, val requestDurationMillis: Long? = null) : AIStreamChunk()
     /** 网络请求正在重试。仅用于 UI 实时展示，不进入上下文回放。[error] 为触发重试的错误摘要，供 UI 展示具体原因。 */
     data class Retrying(val attempt: Int, val maxRetries: Int, val error: RetryErrorInfo) : AIStreamChunk()
     /** 当前 Key 不可用，已自动切到第 [newIndex]/[total] 个 Key 并重发本次请求。仅用于 UI 提示。 */

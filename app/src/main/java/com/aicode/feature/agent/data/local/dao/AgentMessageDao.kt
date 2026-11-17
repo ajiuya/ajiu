@@ -6,6 +6,7 @@ import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import androidx.room.Transaction
 import com.aicode.feature.agent.data.local.entity.AgentMessageEntity
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 
 @Dao
@@ -16,11 +17,149 @@ interface AgentMessageDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertAll(messages: List<AgentMessageEntity>)
 
+    @Query("SELECT EXISTS(SELECT 1 FROM chat_sessions WHERE id = :sessionId)")
+    suspend fun sessionExists(sessionId: String): Boolean
+
+    @Query("SELECT EXISTS(SELECT 1 FROM chat_sessions WHERE id = :sessionId AND (:generation IS NULL OR executionGeneration = :generation))")
+    suspend fun sessionGenerationMatches(sessionId: String, generation: Long?): Boolean
+
+    @Query("""
+        UPDATE agent_messages SET modelInputSnapshotJson = :snapshotJson
+        WHERE sessionId = :sessionId AND id = :messageId AND role = 'USER' AND modelInputSnapshotJson IS NULL
+          AND EXISTS(SELECT 1 FROM chat_sessions WHERE id = :sessionId
+              AND (:generation IS NULL OR executionGeneration = :generation))
+    """)
+    suspend fun writeModelInputSnapshotIfAbsent(sessionId: String, messageId: String, snapshotJson: String, generation: Long?): Int
+
+    @Transaction
+    suspend fun freezeModelInputSnapshot(
+        sessionId: String,
+        messageId: String,
+        snapshotJson: String,
+        generation: Long? = null
+    ): String? {
+        if (!sessionGenerationMatches(sessionId, generation)) return null
+        val message = getMessageById(messageId) ?: return null
+        if (message.sessionId != sessionId || message.role != "USER") return null
+        message.modelInputSnapshotJson?.let { return it }
+        writeModelInputSnapshotIfAbsent(sessionId, messageId, snapshotJson, generation)
+        return getMessageById(messageId)?.modelInputSnapshotJson
+    }
+
+    @Query(
+        """
+        UPDATE agent_messages
+        SET toolStartedAtMs = COALESCE(toolStartedAtMs, :startedAtMs),
+            toolDurationMs = COALESCE(toolDurationMs, :durationMs)
+        WHERE sessionId = :sessionId AND toolCallId = :callId
+          AND id = 'tool_' || :callId AND role = 'TOOL'
+          AND EXISTS(SELECT 1 FROM chat_sessions WHERE id = :sessionId)
+        """
+    )
+    suspend fun updateToolTiming(sessionId: String, callId: String, startedAtMs: Long?, durationMs: Long?): Int
+
+    @Query(
+        """
+        UPDATE agent_messages SET turnDurationMs = COALESCE(turnDurationMs, :durationMs)
+        WHERE sessionId = :sessionId AND id = :messageId AND role = 'ASSISTANT'
+          AND EXISTS(SELECT 1 FROM chat_sessions WHERE id = :sessionId)
+        """
+    )
+    suspend fun updateTurnDuration(sessionId: String, messageId: String, durationMs: Long): Int
+
+    @Transaction
+    suspend fun insertToolMessagePreservingMetadata(message: AgentMessageEntity): Boolean {
+        if (!sessionExists(message.sessionId)) return false
+        val existing = getMessageById(message.id)
+        if (existing != null && (
+            existing.sessionId != message.sessionId || existing.role != message.role ||
+                existing.toolCallId != message.toolCallId
+        )) return false
+        insert(message.copy(
+            timestamp = existing?.timestamp ?: message.timestamp,
+            toolActionTitle = existing?.toolActionTitle ?: message.toolActionTitle,
+            toolStartedAtMs = existing?.toolStartedAtMs ?: message.toolStartedAtMs,
+            toolDurationMs = existing?.toolDurationMs ?: message.toolDurationMs
+        ))
+        return true
+    }
+
+    @Transaction
+    suspend fun insertMessageIfSessionExists(message: AgentMessageEntity) {
+        if (!sessionExists(message.sessionId)) return
+        if (message.role == "TOOL") {
+            insertToolMessagePreservingMetadata(message)
+        } else {
+            val existing = getMessageById(message.id)
+            if (existing != null && (existing.sessionId != message.sessionId || existing.role != message.role)) return
+            insert(if (message.role == "USER") message.copy(modelInputSnapshotJson = existing?.modelInputSnapshotJson ?: message.modelInputSnapshotJson) else message)
+        }
+    }
+
     @Query("SELECT * FROM agent_messages WHERE sessionId = :sessionId ORDER BY timestamp ASC")
     fun getMessagesBySession(sessionId: String): Flow<List<AgentMessageEntity>>
 
+    @Query("SELECT * FROM agent_messages WHERE sessionId = :sessionId AND role = 'TOOL' AND isCompacted = 0 ORDER BY timestamp ASC, rowid ASC")
+    fun getToolMessagesBySession(sessionId: String): Flow<List<AgentMessageEntity>>
+
     @Query("SELECT * FROM (SELECT * FROM agent_messages WHERE sessionId = :sessionId ORDER BY timestamp DESC LIMIT :limit) ORDER BY timestamp ASC")
     fun getMessagesBySessionPaged(sessionId: String, limit: Int): Flow<List<AgentMessageEntity>>
+
+    @Query("""
+        SELECT m.sessionId AS sessionId,
+               SUM(CASE WHEN m.role = 'USER' THEN 1 ELSE 0 END) AS userMessages,
+               SUM(CASE WHEN m.role = 'ASSISTANT' THEN 1 ELSE 0 END) AS assistantMessages,
+               SUM(CASE WHEN m.role = 'TOOL' THEN 1 ELSE 0 END) AS toolCallCount,
+               MAX(m.timestamp) AS lastActivityAtMs,
+               (SELECT substr(a.content, 1, 240) FROM agent_messages a
+                WHERE a.sessionId = m.sessionId AND a.role = 'ASSISTANT'
+                  AND a.content != '' AND a.isContextSummary = 0 AND a.isCompactionMarker = 0
+                ORDER BY a.timestamp DESC, a.rowid DESC LIMIT 1) AS lastAssistantPreview
+        FROM agent_messages m JOIN chat_sessions s ON s.id = m.sessionId
+        WHERE s.parentId = :parentId
+          AND m.isContextSummary = 0 AND m.isCompactionMarker = 0
+          AND m.role IN ('USER', 'ASSISTANT', 'TOOL')
+          AND (m.content != '' OR m.role = 'TOOL' OR (m.attachmentsJson IS NOT NULL AND m.attachmentsJson NOT IN ('', '[]')))
+        GROUP BY m.sessionId
+    """)
+    fun observeSubAgentHistoryStats(parentId: String): Flow<List<SubAgentHistoryStats>>
+
+    @Query(SUB_AGENT_LEGACY_MESSAGE_PROJECTION + """
+        WHERE m.sessionId = :childId AND s.parentId = :parentId
+          AND m.rowid IN (
+            SELECT recent.rowid FROM agent_messages recent
+            WHERE recent.sessionId = :childId
+              AND recent.isContextSummary = 0 AND recent.isCompactionMarker = 0
+              AND recent.role IN ('USER', 'ASSISTANT', 'TOOL')
+              AND (recent.content != '' OR recent.role = 'TOOL' OR (recent.attachmentsJson IS NOT NULL AND recent.attachmentsJson NOT IN ('', '[]'))
+                OR (recent.role = 'ASSISTANT' AND recent.toolCallsJson IS NOT NULL AND recent.toolCallsJson NOT IN ('', '[]', 'null')))
+              AND recent.timestamp < COALESCE(
+                (SELECT MIN(i.timestamp) FROM subagent_interactions i
+                 WHERE i.parentSessionId = :parentId AND i.subSessionId = :childId),
+                9223372036854775807)
+              AND NOT EXISTS (
+                SELECT 1 FROM subagent_interactions recorded
+                WHERE recorded.parentSessionId = :parentId AND recorded.subSessionId = :childId
+                  AND recorded.sourceMessageId = recent.id)
+            ORDER BY recent.timestamp DESC, recent.rowid DESC LIMIT :limit
+          )
+        ORDER BY m.timestamp ASC, m.rowid ASC
+    """)
+    fun observeSubAgentLegacyMessages(parentId: String, childId: String, limit: Int): Flow<List<AgentMessageEntity>>
+
+    @Query(SUB_AGENT_EXECUTION_MESSAGE_PROJECTION + """
+        WHERE m.sessionId = :childId AND s.parentId = :parentId
+          AND m.rowid IN (
+            SELECT recent.rowid FROM agent_messages recent
+            WHERE recent.sessionId = :childId
+              AND recent.isContextSummary = 0 AND recent.isCompactionMarker = 0
+              AND recent.role IN ('USER', 'ASSISTANT', 'TOOL')
+              AND (recent.content != '' OR recent.role = 'TOOL' OR (recent.attachmentsJson IS NOT NULL AND recent.attachmentsJson NOT IN ('', '[]')))
+            ORDER BY recent.timestamp DESC, recent.rowid DESC LIMIT :limit
+          )
+        ORDER BY m.timestamp ASC, m.rowid ASC
+    """)
+    fun observeSubAgentExecutionMessages(parentId: String, childId: String, limit: Int): Flow<List<AgentMessageEntity>>
 
     /** 一次性读取（非 Flow），用于跨请求重建上下文历史。 */
     @Query("SELECT * FROM agent_messages WHERE sessionId = :sessionId ORDER BY timestamp ASC")
@@ -28,6 +167,9 @@ interface AgentMessageDao {
 
     @Query("DELETE FROM agent_messages WHERE sessionId = :sessionId")
     suspend fun deleteBySession(sessionId: String)
+
+    @Query("SELECT COUNT(*) FROM agent_messages WHERE sessionId = :sessionId AND id IN (:headIds) AND isCompacted = 0 AND isContextExcluded = 0")
+    suspend fun countActiveCompactionMessages(sessionId: String, headIds: List<String>): Int
 
     @Query("UPDATE agent_messages SET isCompacted = 1, compactedBySummaryId = :summaryId WHERE sessionId = :sessionId AND id IN (:headIds) AND isContextExcluded = 0")
     suspend fun markMessagesCompactedByIds(sessionId: String, headIds: List<String>, summaryId: String)
@@ -42,7 +184,23 @@ interface AgentMessageDao {
         messages: List<AgentMessageEntity>,
         summaryId: String
     ) {
-        headIds.chunked(900).forEach { ids ->
+        if (!sessionExists(sessionId)) throw CancellationException("Target session deleted")
+        require(messages.all { it.sessionId == sessionId } && messages.map { it.id }.distinct().size == messages.size) {
+            "Compaction messages must belong to the target session and have distinct IDs"
+        }
+        require(messages.any { it.id == summaryId && it.role == "ASSISTANT" && it.isContextSummary }) {
+            "Compaction summary is missing"
+        }
+        val headChunks = headIds.distinct().chunked(900)
+        for (ids in headChunks) {
+            if (countActiveCompactionMessages(sessionId, ids) != ids.size) {
+                throw CancellationException("Compaction history changed")
+            }
+        }
+        for (message in messages) {
+            if (getMessageById(message.id) != null) throw CancellationException("Compaction message ID already exists")
+        }
+        headChunks.forEach { ids ->
             markMessagesCompactedByIds(sessionId, ids, summaryId)
         }
         insertAll(messages)
@@ -90,7 +248,20 @@ interface AgentMessageDao {
      * 用于冷启动：上次进程被杀时正在执行的工具不可能仍在跑，否则其占位行会永久显示转圈。
      * 返回受影响的行数。
      */
-    @Query("UPDATE agent_messages SET content = :interruptedContent, isError = 1 WHERE role = :toolRole AND content LIKE :pendingPrefix")
+    @Query("""
+        UPDATE agent_messages SET content = :interruptedContent, isError = 1
+        WHERE role = :toolRole AND content LIKE :pendingPrefix
+          AND NOT EXISTS (
+              SELECT 1 FROM agent_recovery_tools t
+              JOIN agent_recovery_runs r ON r.id = t.runId
+              JOIN agent_recovery_requests q ON q.id = r.requestId AND q.activeRunId = r.id
+              JOIN chat_sessions s ON s.id = r.sessionId
+              WHERE r.sessionId = agent_messages.sessionId AND t.toolCallId = agent_messages.toolCallId
+                AND t.assistantMessageId IS NOT NULL AND t.status IN ('DECLARED', 'WAITING_APPROVAL', 'STARTED')
+                AND r.status = 'RUNNING' AND q.status = 'RUNNING'
+                AND r.generation = s.executionGeneration AND q.generation = s.executionGeneration
+          )
+    """)
     suspend fun markPendingToolsInterrupted(
         toolRole: String,
         pendingPrefix: String,
@@ -169,6 +340,30 @@ interface AgentMessageDao {
     )
     suspend fun sessionStorageUsage(limit: Int): List<SessionStorageUsage>
 }
+
+// 旧交互恢复需要 messageParent 的公开调用参数；两类历史均不物化私有思考块。
+private const val SUB_AGENT_VISIBLE_MESSAGE_COLUMNS = """
+           m.id, m.sessionId, m.role, m.content, m.timestamp,
+           m.toolCallId, m.toolName, m.toolArgs, m.isError,
+           NULL AS reasoning, NULL AS signature, m.attachmentsJson,
+           m.isCompacted, m.isContextSummary, m.isCompactionMarker, m.inputTokens, m.outputTokens,
+           NULL AS thinkingBlocksJson, m.cachedInputTokens, m.isContextExcluded, m.compactedBySummaryId,
+           m.contextInputTokens, m.contextInputBudget, m.contextEstimated, m.contextBreakdownJson,
+           m.toolActionTitle, m.toolStartedAtMs, m.toolDurationMs, m.turnDurationMs,
+           NULL AS modelInputSnapshotJson
+    FROM agent_messages m JOIN chat_sessions s ON s.id = m.sessionId
+"""
+private const val SUB_AGENT_LEGACY_MESSAGE_PROJECTION = "SELECT m.toolCallsJson, " + SUB_AGENT_VISIBLE_MESSAGE_COLUMNS
+private const val SUB_AGENT_EXECUTION_MESSAGE_PROJECTION = "SELECT NULL AS toolCallsJson, " + SUB_AGENT_VISIBLE_MESSAGE_COLUMNS
+
+data class SubAgentHistoryStats(
+    val sessionId: String,
+    val userMessages: Int,
+    val assistantMessages: Int,
+    val toolCallCount: Int,
+    val lastActivityAtMs: Long,
+    val lastAssistantPreview: String?
+)
 
 /** 跨会话聊天记录搜索的命中投影（[AgentMessageDao.searchInWorkspace] 的投影）。 */
 data class ChatSearchMatch(

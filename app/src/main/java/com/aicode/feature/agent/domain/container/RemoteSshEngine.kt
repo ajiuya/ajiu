@@ -1,23 +1,24 @@
 package com.aicode.feature.agent.domain.container
 
-import com.aicode.core.util.BoundedLineReader
 import com.aicode.core.util.FileLogger
-import com.aicode.core.util.LINE_TRUNCATED_NOTE
-import com.aicode.feature.agent.domain.container.CommandEngine
 import com.aicode.feature.agent.domain.tool.explorer.shellQuote
+import com.aicode.feature.settings.data.repository.ExecutionMode
+import com.aicode.feature.workspace.domain.WorkspaceExecutionContext
+import net.schmizz.sshj.connection.channel.direct.Session
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.InternalCoroutinesApi
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
@@ -25,7 +26,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import java.io.InputStreamReader
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.inject.Inject
 
@@ -61,6 +61,7 @@ class RemoteSshEngine @Inject constructor(
         emitAll(streamExec(command, projectPath, timeoutMs))
     }.flowOn(Dispatchers.IO)
 
+    @OptIn(InternalCoroutinesApi::class)
     private fun streamExec(
         command: String,
         projectPath: String?,
@@ -68,29 +69,32 @@ class RemoteSshEngine @Inject constructor(
     ): Flow<CommandEvent> = flow {
         val effectiveTimeout = timeoutMs.coerceIn(1L, CommandEngine.MAX_TIMEOUT_MS)
         FileLogger.d(TAG, "执行命令(远程流式) cwd=$projectPath timeout=${effectiveTimeout}ms: ${sanitizeCommandForLog(command)}")
-        val session = connection.startExecSession(buildCdCommand(command, projectPath))
+        val session = acquireSshResource(close = { it: Session.Command -> it.close() }) {
+            startExecSession(buildCdCommand(command, projectPath))
+        }
+        val resources = SshCommandResources(session)
         val timedOut = AtomicBoolean(false)
         val watchScope = CoroutineScope(Dispatchers.IO + Job())
         val watchdog = watchScope.launch {
             delay(effectiveTimeout)
-            if (session.isOpen) {
-                timedOut.set(true)
-                FileLogger.w(TAG, "命令超时(${effectiveTimeout}ms)已终止: ${sanitizeCommandForLog(command)}")
-                runCatching { session.close() }
-            }
+            timedOut.set(true)
+            FileLogger.w(TAG, "命令超时(${effectiveTimeout}ms)已终止: ${sanitizeCommandForLog(command)}")
+            resources.close()
         }
-        val cancellationHook = currentCoroutineContext()[Job]?.invokeOnCompletion { cause ->
-            if (cause is CancellationException && session.isOpen) {
-                FileLogger.i(TAG, "命令被取消，关闭 session: ${sanitizeCommandForLog(command)}")
-                runCatching { session.close() }
-            }
-        }
-        val reader = BoundedLineReader(InputStreamReader(session.inputStream))
+        val execution = WorkspaceExecutionContext.current()
+        val sourceCancellation = execution?.onCancellation(resources::close)
+        val cancellationHook = currentCoroutineContext()[Job]?.invokeOnCompletion(
+            onCancelling = true, invokeImmediately = true
+        ) { cause -> if (cause != null) resources.close() }
         try {
-            while (true) {
-                val line = reader.readLine() ?: break
-                emit(CommandEvent.Line(if (line.truncated) "${line.text}\n$LINE_TRUNCATED_NOTE" else line.text))
+            drainSshOutput(resources).collect { line ->
+                execution?.checkCurrent()
+                emit(CommandEvent.Line(line))
             }
+            // EOF 不代表 exit-status 已到达，超时保护必须覆盖 join。
+            session.join()
+            currentCoroutineContext().ensureActive()
+            execution?.checkCurrent()
             val exitCode = session.exitStatus
             watchdog.cancel()
             if (timedOut.get()) {
@@ -104,6 +108,8 @@ class RemoteSshEngine @Inject constructor(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
+            currentCoroutineContext().ensureActive()
+            execution?.checkCurrent()
             watchdog.cancel()
             if (timedOut.get()) {
                 emit(CommandEvent.Line("[命令执行超时：超过 ${effectiveTimeout}ms 已被强制终止]"))
@@ -114,11 +120,11 @@ class RemoteSshEngine @Inject constructor(
                 emit(CommandEvent.Exit(null))
             }
         } finally {
+            sourceCancellation?.dispose()
             cancellationHook?.dispose()
             watchdog.cancel()
             watchScope.cancel()
-            runCatching { reader.close() }
-            runCatching { session.close() }
+            resources.close()
         }
     }.flowOn(Dispatchers.IO)
 
@@ -145,12 +151,18 @@ class RemoteSshEngine @Inject constructor(
         projectPath: String?,
         timeoutMs: Long
     ): CommandResult? {
+        WorkspaceExecutionContext.current()?.requireMode(ExecutionMode.REMOTE_SSH)
         if (!isContainerInstalled()) return null
-        return runCatching { execCaptured(command, projectPath, timeoutMs) }
-            .getOrElse {
-                FileLogger.w(TAG, "远程命令执行失败(连接可能已断): ${sanitizeCommandForLog(command)}", it)
-                null
-            }
+        return try {
+            execCaptured(command, projectPath, timeoutMs)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            currentCoroutineContext().ensureActive()
+            WorkspaceExecutionContext.current()?.checkCurrent()
+            FileLogger.w(TAG, "远程命令执行失败(连接可能已断): ${sanitizeCommandForLog(command)}", failure)
+            null
+        }
     }
 
     override suspend fun runCommandSyncUnbounded(
@@ -162,6 +174,7 @@ class RemoteSshEngine @Inject constructor(
         execCaptured(command, projectPath, timeoutMs, unbounded = true)
     }
 
+    @OptIn(InternalCoroutinesApi::class)
     private suspend fun execCaptured(
         command: String,
         projectPath: String?,
@@ -170,50 +183,52 @@ class RemoteSshEngine @Inject constructor(
     ): CommandResult = withContext(Dispatchers.IO) {
         val effectiveTimeout = timeoutMs.coerceIn(1L, CommandEngine.MAX_TIMEOUT_MS)
         FileLogger.d(TAG, "执行命令(远程同步) cwd=$projectPath timeout=${effectiveTimeout}ms: ${sanitizeCommandForLog(command)}")
-        val session = connection.startExecSession(buildCdCommand(command, projectPath))
+        val session = acquireSshResource(close = { it: Session.Command -> it.close() }) {
+            startExecSession(buildCdCommand(command, projectPath))
+        }
         val output = if (unbounded) BoundedOutput.hardCapped(MAX_UNBOUNDED_CHARS) else BoundedOutput()
+        val resources = SshCommandResources(session)
+        val timedOut = AtomicBoolean(false)
+        val watchScope = CoroutineScope(Dispatchers.IO + Job())
+        val watchdog = watchScope.launch {
+            delay(effectiveTimeout)
+            timedOut.set(true)
+            FileLogger.w(TAG, "命令超时(${effectiveTimeout}ms)已终止: ${sanitizeCommandForLog(command)}")
+            resources.close()
+        }
         var exitCode: Int? = null
+        val execution = WorkspaceExecutionContext.current()
+        val sourceCancellation = execution?.onCancellation(resources::close)
+        val cancellationHook = currentCoroutineContext()[Job]?.invokeOnCompletion(
+            onCancelling = true, invokeImmediately = true
+        ) { cause -> if (cause != null) resources.close() }
         try {
-            coroutineScope {
-                val watchdog = launch {
-                    delay(effectiveTimeout)
-                    if (session.isOpen) {
-                        FileLogger.w(TAG, "命令超时(${effectiveTimeout}ms)已终止: ${sanitizeCommandForLog(command)}")
-                        runCatching { session.close() }
-                    }
-                }
-                val reader = BoundedLineReader(InputStreamReader(session.inputStream))
-                try {
-                    while (true) {
-                        val line = reader.readLine() ?: break
-                        output.append(if (line.truncated) "${line.text}\n$LINE_TRUNCATED_NOTE" else line.text)
-                        output.append("\n")
-                    }
-                } finally {
-                    watchdog.cancel()
-                    runCatching { reader.close() }
-                }
-                // 并发读 stderr 合并进 output：本地引擎 redirectErrorStream(true) 是合并语义，
-                // 远程若不合并，命令报错（如 rg 未安装时的 command not found）只写 stderr 会被静默丢弃。
-                val stderrJob = launch {
-                    val errReader = BoundedLineReader(InputStreamReader(session.errorStream))
-                    try {
-                        while (true) {
-                            val errLine = errReader.readLine() ?: break
-                            output.append(if (errLine.truncated) "${errLine.text}\n$LINE_TRUNCATED_NOTE" else errLine.text)
-                            output.append("\n")
-                        }
-                    } finally {
-                        runCatching { errReader.close() }
-                    }
-                }
-                stderrJob.join()
-                // sshj 的 exitStatus 在流 EOF 后未必就绪，close 后才保证有值
-                runCatching { session.close() }
-                exitCode = session.exitStatus
+            drainSshOutput(resources).collect { line ->
+                execution?.checkCurrent()
+                output.append(line + "\n")
             }
+            session.join()
+            currentCoroutineContext().ensureActive()
+            execution?.checkCurrent()
+            exitCode = session.exitStatus
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            currentCoroutineContext().ensureActive()
+            execution?.checkCurrent()
+            if (!timedOut.get()) throw failure
         } finally {
-            runCatching { session.close() }
+            sourceCancellation?.dispose()
+            cancellationHook?.dispose()
+            watchdog.cancel()
+            watchScope.cancel()
+            resources.close()
+        }
+        currentCoroutineContext().ensureActive()
+        execution?.checkCurrent()
+        if (timedOut.get()) {
+            output.append("[命令执行超时：超过 ${effectiveTimeout}ms 已被强制终止]\n")
+            exitCode = null
         }
         FileLogger.v(TAG, "命令完成(远程, 退出码 $exitCode，输出 ${output.totalChars} 字符): ${sanitizeCommandForLog(command)}")
         CommandResult(output.build(), exitCode, output.truncated)
@@ -226,6 +241,10 @@ class RemoteSshEngine @Inject constructor(
     override fun defaultShell(): String = "/bin/bash"
 
     override suspend fun ensureInstalled() = connectMutex.withLock {
+        WorkspaceExecutionContext.current()?.let {
+            it.requireMode(ExecutionMode.REMOTE_SSH)
+            return@withLock
+        }
         if (connection.isConnected()) {
             _initProgress.value = ContainerInitState.Ready
             return@withLock
@@ -234,11 +253,30 @@ class RemoteSshEngine @Inject constructor(
         try {
             connection.connect()
             _initProgress.value = ContainerInitState.Ready
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
+            currentCoroutineContext().ensureActive()
             FileLogger.e(TAG, "SSH 连接失败", e)
             val friendly = friendlySshError(e)
             _initProgress.value = ContainerInitState.Failed(friendly)
             throw RuntimeException(friendly, e)
+        }
+    }
+
+    private fun startExecSession(command: String): Session.Command {
+        val execution = WorkspaceExecutionContext.current() ?: return connection.startExecSession(command)
+        execution.requireMode(ExecutionMode.REMOTE_SSH)
+        val identity = execution.remoteSource?.identity ?: throw CancellationException("Remote execution identity missing")
+        connection.checkIdentity(identity)
+        return withSshSetup(identity.owner.startSession()) { session ->
+            execution.checkCurrent()
+            connection.checkIdentity(identity)
+            session.exec(command).also {
+                execution.checkCurrent()
+                connection.checkIdentity(identity)
+                runCatching { it.outputStream.close() }
+            }
         }
     }
 
@@ -251,6 +289,11 @@ class RemoteSshEngine @Inject constructor(
     private fun buildCdCommand(command: String, projectPath: String?): String {
         val prefix = "export GIT_CONFIG_GLOBAL=\"\$HOME/.aicode/gitconfig\"; "
         if (projectPath == null) return prefix + command
+        WorkspaceExecutionContext.current()?.let { execution ->
+            execution.requireMode(ExecutionMode.REMOTE_SSH)
+            val root = execution.remoteSource?.workspaceRoot ?: throw CancellationException("Remote execution root missing")
+            return prefix + "cd ${shellQuote(root)} && $command"
+        }
         return prefix + "cd ~/workspace 2>/dev/null || cd ${shellQuote(projectPath)} 2>/dev/null; $command"
     }
 }

@@ -14,7 +14,7 @@ import com.aicode.feature.agent.data.remote.openai.OpenAIApi
 import com.aicode.feature.agent.domain.model.AgentContext
 import com.aicode.feature.agent.domain.model.AgentImage
 import com.aicode.feature.agent.domain.model.AgentMessage
-import com.aicode.feature.agent.domain.model.AgentMode
+import com.aicode.feature.agent.domain.root.RootCommandManager
 import com.aicode.feature.agent.domain.notification.AgentEventInjector
 import com.aicode.feature.agent.domain.notification.AgentNotificationCenter
 import com.aicode.feature.agent.domain.notification.AgentNotificationKind
@@ -23,7 +23,6 @@ import com.aicode.feature.agent.domain.session.SessionUseCase
 import com.aicode.feature.agent.domain.session.MessagePersistenceUseCase
 import com.aicode.feature.agent.domain.checkpoint.CheckpointManager
 import com.aicode.feature.agent.domain.permission.PermissionChoice
-import com.aicode.feature.agent.domain.permission.PermissionScope
 import com.aicode.feature.agent.domain.permission.ToolPermissionPolicyEngine
 import com.aicode.feature.agent.domain.prompt.SystemPromptProvider
 import com.aicode.feature.agent.domain.provider.AIProvider
@@ -32,14 +31,13 @@ import com.aicode.feature.agent.domain.provider.AIStreamChunk
 import com.aicode.feature.agent.domain.tool.AgentTool
 import com.aicode.feature.agent.domain.tool.StreamingAgentTool
 import com.aicode.feature.agent.domain.tool.ToolCall
-import com.aicode.feature.agent.domain.tool.mode.PlanApprovalChoice
-import com.aicode.feature.agent.domain.tool.mode.PlanApprovalManager
 import com.aicode.feature.agent.domain.tool.ToolPermissionManager
-import com.aicode.feature.agent.domain.tool.ToolPermissionPolicy
+import com.aicode.feature.agent.domain.tool.plan.SubmitPlanTool
 import com.aicode.feature.agent.domain.tool.ToolRegistry
 import com.aicode.feature.agent.domain.tool.ToolResult
 import com.aicode.feature.agent.domain.tool.ToolOutputStore
 import com.aicode.feature.agent.domain.tool.ToolStreamEvent
+import com.aicode.feature.agent.domain.tool.ToolPresentation
 import com.aicode.feature.agent.domain.tool.modelToolResultText
 import com.aicode.feature.agent.domain.tool.toTransportString
 import com.aicode.feature.agent.presentation.AgentAttachment
@@ -67,10 +65,15 @@ import com.aicode.feature.agent.domain.provider.wireSummary
 import com.aicode.feature.settings.domain.repository.AIProviderRepository
 import com.aicode.feature.workspace.domain.FileAccessProvider
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -106,7 +109,6 @@ class StatefulAgentWorkflow @Inject constructor(
     private val permissionManager: ToolPermissionManager,
     private val policyEngine: ToolPermissionPolicyEngine,
     private val contextCompactor: ContextCompactor,
-    private val planApprovalManager: PlanApprovalManager,
     private val toolOutputStore: ToolOutputStore,
     private val modelMetadataService: ModelMetadataService,
     private val compactionModelSettingsRepository: CompactionModelSettingsRepository,
@@ -121,7 +123,10 @@ class StatefulAgentWorkflow @Inject constructor(
     private val agentNotificationCenter: AgentNotificationCenter,
     private val eventInjector: AgentEventInjector,
     private val fileAccess: FileAccessProvider,
-    @param:ApplicationContext private val appContext: Context
+    @param:ApplicationContext private val appContext: Context,
+    private val rootCommandManager: RootCommandManager,
+    private val recoveryRepository: com.aicode.feature.agent.domain.recovery.RecoveryRepository,
+    private val workspaceExecutionContextFactory: com.aicode.feature.workspace.domain.WorkspaceExecutionContextFactory
 ) : AgentWorkflow {
 
     private companion object {
@@ -132,21 +137,11 @@ class StatefulAgentWorkflow @Inject constructor(
         const val TITLE_GENERATOR_FILE = "agent/title-generator.md"
         const val TITLE_MAX_CHARS = 50
         const val COMMIT_GENERATOR_FILE = "agent/commit-generator.md"
-        /** 模式提醒提示词：复用 prompts 目录文件（用户可自定义覆盖），切换时随消息注入而非进 system。 */
-        const val MODE_REMINDER_PLAN_FILE = "agent/plan-mode.md"
-        const val MODE_REMINDER_AUTO_FILE = "agent/auto-mode.md"
         val LEADING_COMMENT = Regex("(?s)^\\s*<!--.*?-->\\s*")
         /** 模型直出图片落盘目录（与 GenerateImageTool 保持一致）。 */
         const val GENERATED_IMAGE_DIR = "~/.aicode/generated-images"
         const val MAX_GENERATED_IMAGE_BYTES = 20L * 1024 * 1024
     }
-
-    /**
-     * 每会话「上次已注入模式提醒的模式」。模式提醒只在变化时注入，避免每轮把同一段文本
-     * 重复拼到最新用户消息上——那样下一轮重建历史时该位置（Anthropic 缓存断点）内容不一致，
-     * 会白白丢掉一段前缀缓存。进程内缓存，重启后首轮再注入一次（无害）。
-     */
-    private val lastInjectedMode = java.util.concurrent.ConcurrentHashMap<String, AgentMode>()
 
     /** 不可变状态树 */
     data class AgentSessionState(
@@ -169,7 +164,12 @@ class StatefulAgentWorkflow @Inject constructor(
     /** 改变状态的动作 (Action) */
     sealed interface AgentAction {
         data class InitRequest(val initialMessages: List<AgentMessage>) : AgentAction
-        data class LlmResponse(val response: AIResponse, val messageId: String) : AgentAction
+        data class LlmResponse(
+            val response: AIResponse,
+            val messageId: String,
+            val planBatchDeferredReason: String,
+            val continuationAllowed: Boolean = true
+        ) : AgentAction
         data class LlmError(val error: String, val reasonCode: String? = null) : AgentAction
         data class PermissionEvaluated(
             val toolCall: ToolCall,
@@ -186,7 +186,8 @@ class StatefulAgentWorkflow @Inject constructor(
     private data class PermissionCheckResult(
         val approved: Boolean,
         val denyReason: String = "用户拒绝执行该工具",
-        val errorCode: String = "USER_REJECTED"
+        val errorCode: String = "USER_REJECTED",
+        val rootApprovalId: String? = null
     )
 
     private data class ToolRunResult(
@@ -194,7 +195,8 @@ class StatefulAgentWorkflow @Inject constructor(
         val isError: Boolean,
         /** 仅 sendFile 等展示型工具：随结果附带的文件卡片元数据，供 UI 渲染，不回放进模型上下文。 */
         val attachments: List<AgentAttachment> = emptyList(),
-        val images: List<AgentImage> = emptyList()
+        val images: List<AgentImage> = emptyList(),
+        val timing: ToolCallTimer.Finished? = null
     )
 
     /** 批量工具执行结果：携带 toolCall 元信息，供最后按原始顺序组装 ToolResultMessage。 */
@@ -216,7 +218,12 @@ class StatefulAgentWorkflow @Inject constructor(
         /** 批量并行执行已批准的工具；传入空列表表示本批无工具可执行，直接进入收尾。 */
         data class ExecuteToolBatch(val toolCalls: List<ToolCall>) : AgentSideEffect
         /** 整批取消（用户拒绝批次中某个调用）：补发已启动工具的完成事件，清理 UI「执行中」状态。 */
-        data class CancelToolBatch(val toolCalls: List<ToolCall>) : AgentSideEffect
+        data class CancelToolBatch(
+            val toolCalls: List<ToolCall>,
+            val reason: String = "用户拒绝了本轮工具调用，该调用未执行。",
+            val errorCode: String = USER_REJECTED_CODE
+        ) : AgentSideEffect
+        object PlanRejected : AgentSideEffect
     }
 
     private suspend fun getEffectiveProvider(sessionId: String?): AIProvider {
@@ -257,7 +264,13 @@ class StatefulAgentWorkflow @Inject constructor(
         return null
     }
 
-    override suspend fun compactSession(sessionId: String, onEvent: suspend (AgentEvent) -> Unit): Boolean {
+    override suspend fun compactSession(
+        sessionId: String,
+        context: AgentContext,
+        tools: List<AgentTool>,
+        onEvent: suspend (AgentEvent) -> Unit
+    ): Boolean {
+        require(context.sessionId == sessionId)
         val config = resolveProviderConfig(sessionId)
             ?: throw IllegalStateException("尚未配置 AI 供应商，请到设置中添加并选择一个")
         if (!config.hasUsableApiKey) throw IllegalStateException("「${config.name}」未填写 API Key")
@@ -266,9 +279,10 @@ class StatefulAgentWorkflow @Inject constructor(
         val history = messagePersistenceUseCase.buildHistory(sessionId, "__manual_compress__")
         if (history.size <= 2) return false
         val compactionProvider = resolveCompactionFallbackProvider(sessionId) ?: provider
-        // 摘要仍用专用压缩模型（尊重用户选择），但保留最近消息的窗口预算按主聊天模型算，
-        // 与自动压缩一致——否则小窗口的压缩模型会让手动压缩保留的最近上下文偏少。
-        val result = contextCompactor.compactIfNeeded(history, compactionProvider, sessionId, force = true, windowProvider = provider, onEvent = onEvent)
+        val systemPrompt = withContext(Dispatchers.IO) { promptProvider.build(context.copy(history = history)) }
+        // 摘要模型独立选择；窗口、固定开销与有效工具仍按同一主会话快照校验。
+        val result = contextCompactor.compactIfNeeded(history, compactionProvider, sessionId,
+            force = true, windowProvider = provider, systemPrompt = systemPrompt, tools = tools, onEvent = onEvent)
         return result.compacted
     }
 
@@ -285,6 +299,7 @@ class StatefulAgentWorkflow @Inject constructor(
             ProviderType.GEMINI -> GeminiAdapter(geminiApi)
             else -> OpenAIAdapter(openAIApi).also {
                 it.chatCacheKeyEnabled = config.openaiChatCacheKey
+                it.speedTierSource = generalSettingsRepository::speedTier
             }
         }
         // 多 Key 模式下由轮换器决定本次用哪个 Key（会话内粘住，Key 不可用时切下一个并重发）。
@@ -332,7 +347,7 @@ class StatefulAgentWorkflow @Inject constructor(
     }
 
     /** 核心 Reducer，接收旧状态与 Action，返回新状态以及触发的副作用列表 (纯函数) */
-    private fun reduce(
+    internal fun reduce(
         state: AgentSessionState,
         action: AgentAction
     ): Pair<AgentSessionState, List<AgentSideEffect>> {
@@ -368,6 +383,8 @@ class StatefulAgentWorkflow @Inject constructor(
                             error = action.response.stopDetail ?: "",
                             errorCode = action.response.stopReason
                         )
+                    } else if (action.response.isTruncated && !action.continuationAllowed) {
+                        newState = newState.copy(isFinished = true, error = "", errorCode = "continuation_budget_exceeded")
                     } else if (action.response.isTruncated) {
                         val continuation = AgentMessage.UserMessage(content = "Your response was truncated. Continue from where it stopped.")
                         newState = newState.copy(messages = newState.messages + continuation)
@@ -377,16 +394,28 @@ class StatefulAgentWorkflow @Inject constructor(
                         newState = newState.copy(isFinished = true)
                     }
                 } else {
-                    // 本批多个 tool_call：全部进入待权限队列，逐个弹窗收集批准；
-                    // 全部批准后才进入并行执行阶段（见 PermissionEvaluated / ToolBatchFinished）。
                     val toolCalls = action.response.toolCalls.toList()
+                    val planCall = toolCalls.firstOrNull { it.name == SubmitPlanTool.NAME }
+                    val pendingCalls = if (planCall == null) toolCalls else listOf(planCall)
+                    val deferredCalls = if (planCall == null) emptyList() else toolCalls.filter { it !== planCall }
+                    val deferredResults = deferredCalls.associate { call ->
+                        call.id to ToolBatchResult(
+                            call.id,
+                            call.name,
+                            ToolResult.Error(action.planBatchDeferredReason, "PLAN_BATCH_DEFERRED").toTransportString(),
+                            true
+                        )
+                    }
                     newState = newState.copy(
                         batchToolCalls = toolCalls,
-                        pendingPermissionCalls = toolCalls,
+                        pendingPermissionCalls = pendingCalls,
                         approvedToolCalls = emptyList(),
-                        rejectedToolResults = emptyMap()
+                        rejectedToolResults = deferredResults
                     )
-                    effects.add(AgentSideEffect.RequestPermission(toolCalls.first()))
+                    if (deferredCalls.isNotEmpty()) {
+                        effects.add(AgentSideEffect.CancelToolBatch(deferredCalls, action.planBatchDeferredReason, "PLAN_BATCH_DEFERRED"))
+                    }
+                    effects.add(AgentSideEffect.RequestPermission(pendingCalls.first()))
                 }
             }
             is AgentAction.LlmError -> {
@@ -430,14 +459,13 @@ class StatefulAgentWorkflow @Inject constructor(
                             approvedToolCalls = emptyList(),
                             isFinished = true
                         )
-                        // 已批准未执行（已收到 ToolCallStarted）的工具需补发完成事件，
-                        // 否则 UI 与落库消息会一直停留在「执行中」。
-                        if (state.approvedToolCalls.isNotEmpty()) {
-                            effects.add(AgentSideEffect.CancelToolBatch(state.approvedToolCalls))
-                        }
+                        val notExecuted = (state.approvedToolCalls + state.pendingPermissionCalls)
+                            .filterNot { it.id == action.toolCall.id || it.id in state.rejectedToolResults }
+                            .distinctBy { it.id }
+                        if (notExecuted.isNotEmpty()) effects.add(AgentSideEffect.CancelToolBatch(notExecuted))
                         return newState to effects
                     }
-                    // 策略/系统拒绝（如 PLAN 模式禁止执行）：记录拒绝结果，继续收集后续权限。
+                    // 策略/系统拒绝：记录拒绝结果，继续收集后续权限。
                     val remaining = newState.pendingPermissionCalls.filterNot { it.id == action.toolCall.id }
                     newState = newState.copy(
                         pendingPermissionCalls = remaining,
@@ -474,14 +502,18 @@ class StatefulAgentWorkflow @Inject constructor(
                         )
                     )
                 }
+                val planCall = state.batchToolCalls.firstOrNull { it.name == SubmitPlanTool.NAME }
+                val planResult = planCall?.let { state.rejectedToolResults[it.id] ?: resultsById[it.id] }
+                val planRejected = planCall != null && planResult?.isError != false
                 newState = state.copy(
                     messages = state.messages + appendedMessages,
                     batchToolCalls = emptyList(),
                     pendingPermissionCalls = emptyList(),
                     approvedToolCalls = emptyList(),
-                    rejectedToolResults = emptyMap()
+                    rejectedToolResults = emptyMap(),
+                    isFinished = planRejected
                 )
-                effects.add(AgentSideEffect.CallLlm)
+                effects.add(if (planRejected) AgentSideEffect.PlanRejected else AgentSideEffect.CallLlm)
             }
         }
         
@@ -493,19 +525,19 @@ class StatefulAgentWorkflow @Inject constructor(
         context: AgentContext,
         tools: List<AgentTool>
     ): Flow<AgentEvent> = channelFlow {
+        val turnStartedElapsed = SystemClock.elapsedRealtime()
+        val toolTimer = ToolCallTimer(System::currentTimeMillis, SystemClock::elapsedRealtime)
+        var lastPersistedAssistantId: String? = null
         var currentContext = context
         var state = AgentSessionState()
         var currentTools = tools
         val actionQueue = ArrayDeque<AgentAction>()
-        // 模式提醒仅在模式变化时随最新用户消息注入一次（不进 system，避免切换时 system 前缀变化打断缓存）。
-        val modeReminder = takeModeReminderIfChanged(currentContext.sessionId, currentContext.mode)
         actionQueue.addLast(
             AgentAction.InitRequest(
-                currentContext.history + AgentMessage.UserMessage(
-                    id = currentContext.inputMessageId,
-                    content = if (modeReminder == null) userRequest else "$userRequest\n\n$modeReminder",
-                    images = currentContext.inputImages
-                )
+                currentContext.history + if (currentContext.persistInputSnapshot) {
+                    messagePersistenceUseCase.prepareModelInput(currentContext, userRequest)
+                } else com.aicode.feature.agent.domain.model.ModelInputSnapshot.prepare(currentContext, userRequest)
+                    .messages(currentContext.inputMessageId, currentContext.inputImages, persisted = !currentContext.transientInput, snapshotStored = false)
             )
         )
 
@@ -513,7 +545,7 @@ class StatefulAgentWorkflow @Inject constructor(
         // 否则远程模式下每次会话首次发消息都会在主线程做多次文件/网络往返。
         val promptStartedNs = System.nanoTime()
         FileLogger.memoryCheckpoint(TAG, "prompt.start", details = "operation=$promptStartedNs")
-        val systemPrompt = withContext(Dispatchers.IO) { promptProvider.build(currentContext) }
+        var systemPrompt = withContext(Dispatchers.IO) { promptProvider.build(currentContext) }
         FileLogger.memoryCheckpoint(
             TAG,
             "prompt.ready",
@@ -551,7 +583,12 @@ class StatefulAgentWorkflow @Inject constructor(
             (currentContext.history[lastAssistantIndex] as AgentMessage.AssistantMessage).inputTokens
         } else 0
         var overflowRecoveryAttempted = false
+        var overflowRecoveryStep: com.aicode.feature.agent.domain.recovery.RecoveryStep? = null
+        var continuationCount = 0
+        var continuationOutputTokens = 0L
 
+        val rootApprovals = mutableMapOf<String, String>()
+        try {
         while (!state.isFinished && actionQueue.isNotEmpty()) {
             val action = actionQueue.removeFirst()
             val (newState, effects) = reduce(state, action)
@@ -562,11 +599,27 @@ class StatefulAgentWorkflow @Inject constructor(
                     is AgentSideEffect.PersistUser -> {
                         currentContext.sessionId?.let { sessionId ->
                             messagePersistenceUseCase.persist(sessionId, com.aicode.feature.agent.presentation.MessageRole.USER,
-                                effect.message.content, id = effect.message.id)
+                                effect.message.content, id = effect.message.id,
+                                recoveryRunId = currentContext.recoveryRunId, recoverySupplemental = currentContext.recoveryRunId != null)
                             messagePersistenceUseCase.invalidateHistory(sessionId)
                         }
                     }
                     is AgentSideEffect.CallLlm -> {
+                        currentContext.projectMemoryCapture?.assertCurrent()
+                        var recoveryStep = currentContext.recoveryRunId?.let { runId ->
+                            val previous = overflowRecoveryStep
+                            overflowRecoveryStep = null
+                            (if (previous == null) recoveryRepository.beginStep(runId) else recoveryRepository.restartStream(runId, previous))
+                                ?: throw CancellationException("Recovery request is no longer current")
+                        }
+                        if (state.iterations > 0) {
+                            val refreshedPrompt = withContext(Dispatchers.IO) { promptProvider.build(currentContext) }
+                            if (refreshedPrompt != systemPrompt) {
+                                systemPrompt = refreshedPrompt
+                                baselineUsage = 0
+                                baselineEstimate = 0
+                            }
+                        }
                         val providerInUse = aiProvider
                         // 压缩轮：若配置了压缩专用模型，使用独立压缩模型压缩
                         val compactionProvider = resolveCompactionFallbackProvider(currentContext.sessionId) ?: providerInUse
@@ -589,9 +642,10 @@ class StatefulAgentWorkflow @Inject constructor(
                                 baselineEstimate = 0
                             }
                         }
-                        val requestEstimate = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
-                            ContextTokenEstimator.estimate(systemPrompt, compactedMessages, currentTools)
+                        val requestBreakdown = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
+                            ContextTokenEstimator.breakdown(systemPrompt, compactedMessages, currentTools)
                         }
+                        val requestEstimate = requestBreakdown.estimatedTotal
                         val predictedInput = ContextTokenEstimator.calibrated(requestEstimate, baselineEstimate, baselineUsage)
                         send(AgentEvent.ContextUsage(predictedInput, inputBudget, true))
                         if (predictedInput >= inputBudget) {
@@ -606,21 +660,56 @@ class StatefulAgentWorkflow @Inject constructor(
                         var callError: String? = null
                         var callCompleted = false
                         val stream = StreamAccumulator(callStartElapsed) { send(it) }
+                        val draftWindow = com.aicode.feature.agent.domain.recovery.RecoveryDraftWindow()
+                        send(AgentEvent.GenerationStarted)
 
                         try {
                             // 发送前按实际模型的视觉能力处理图片（同 execute 路径）。
                             val supportsVision = activeModelSupportsVision(currentContext.sessionId)
                             val messagesToSend = sanitizeImagesForModel(compactedMessages, supportsVision)
-                            providerInUse.completeStream(systemPrompt, messagesToSend, currentTools, currentContext.reasoningEffort)
-                                .collect { stream.onChunk(it) }
+                            coroutineScope {
+                                val speedUpdates = launch {
+                                    while (isActive) {
+                                        delay(GenerationSpeedTracker.UPDATE_INTERVAL_MS)
+                                        stream.emitSpeed()
+                                    }
+                                }
+                                try {
+                                    providerInUse.completeStream(systemPrompt, messagesToSend, currentTools, currentContext.reasoningEffort)
+                                        .collect { chunk ->
+                                            currentContext.projectMemoryCapture?.assertCurrent()
+                                            if (chunk is AIStreamChunk.Retrying || chunk is AIStreamChunk.KeySwitched) {
+                                                currentContext.recoveryRunId?.let { runId ->
+                                                    recoveryStep = recoveryRepository.restartStream(runId, requireNotNull(recoveryStep))
+                                                        ?: throw CancellationException("Recovery stream is no longer current")
+                                                }
+                                            }
+                                            stream.onChunk(chunk)
+                                            if (chunk is AIStreamChunk.TextDelta) currentContext.recoveryRunId?.let { runId ->
+                                                val step = requireNotNull(recoveryStep)
+                                                val draftStartedAt = SystemClock.elapsedRealtime()
+                                                if (draftWindow.isDue(step, draftStartedAt) &&
+                                                    recoveryRepository.saveDraft(runId, step, stream.text.toString())) {
+                                                    draftWindow.saved(step, draftStartedAt)
+                                                }
+                                                if (!recoveryRepository.isCurrent(runId)) throw CancellationException("Recovery draft is no longer current")
+                                            }
+                                        }
+                                } finally {
+                                    speedUpdates.cancelAndJoin()
+                                }
+                            }
                             // 节流窗口内可能还压着最新累积文本：补发，保证 UI 尾巴拿到完整文本再交接落库。
                             stream.flush()
                             val aiResponse = stream.finalResponse ?: AIResponse(content = stream.text.toString())
+                            stream.finishSpeed(aiResponse.outputTokens)
                             // 模型直出图片（Gemini 图像模型）不随流式增量到达，整块在 Final 里：
                             // 先把 base64 落盘到 ~/.aicode/generated-images/ 并构造 UI 附件（只存路径不存 base64），
                             // 再随 LlmResponse 把带 path 的 images 交 reduce 挂上 AssistantMessage 供下一回放。
                             val (persistedImages, attachments) =
-                                if (aiResponse.images.isNotEmpty()) persistModelImages(aiResponse.images) else emptyList<AgentImage>() to emptyList()
+                                if (aiResponse.images.isNotEmpty()) withContext(workspaceExecutionContextFactory.freeze(currentContext.projectMemoryCapture)) {
+                                    persistModelImages(aiResponse.images)
+                                } else emptyList<AgentImage>() to emptyList()
                             callCompleted = true
                             // 将本轮 reasoning 附加到 AIResponse，以便 reduce 时存入 AssistantMessage 并在下一轮回传
                             if (aiResponse.stopReason == "model_context_window_exceeded" && !overflowRecoveryAttempted) {
@@ -632,21 +721,35 @@ class StatefulAgentWorkflow @Inject constructor(
                                     state = state.copy(messages = recovery.messages)
                                     baselineUsage = 0
                                     baselineEstimate = 0
+                                    overflowRecoveryStep = recoveryStep
                                     actionQueue.addLast(AgentAction.InitRequest(recovery.messages))
                                     continue
                                 }
                             }
+                            val continuationAllowed = if (aiResponse.isTruncated && aiResponse.toolCalls.isEmpty()) {
+                                currentContext.recoveryRunId?.let { runId ->
+                                    recoveryRepository.incrementContinuationBudget(runId,
+                                        aiResponse.outputTokens.takeIf { it > 0 } ?: ModelContextPolicy.estimateTextTokens(aiResponse.content),
+                                        aiResponse.content.length)
+                                } ?: run {
+                                    continuationCount++
+                                    continuationOutputTokens += aiResponse.outputTokens.takeIf { it > 0 }
+                                        ?: ModelContextPolicy.estimateTextTokens(aiResponse.content)
+                                    continuationCount <= 3 && continuationOutputTokens <= 64_000
+                                }
+                            } else true
                             baselineEstimate = requestEstimate
                             baselineUsage = aiResponse.inputTokens
-                            send(AgentEvent.ContextUsage(
-                                if (baselineUsage > 0) baselineUsage else requestEstimate, inputBudget, baselineUsage <= 0
-                            ))
+                            val responseContextUsage = AgentEvent.ContextUsage(
+                                if (baselineUsage > 0) baselineUsage else predictedInput, inputBudget, baselineUsage <= 0
+                            )
+                            send(responseContextUsage)
                             val responseMessageId = UUID.randomUUID().toString()
                             val responseWithReasoning = if (stream.reasoning.isNotEmpty()) {
                                 aiResponse.copy(reasoning = stream.reasoning.toString())
                             } else aiResponse
 
-                            if (aiResponse.content.isNotBlank() || aiResponse.toolCalls.isNotEmpty() || attachments.isNotEmpty()) {
+                            if (currentContext.recoveryRunId != null || aiResponse.content.isNotBlank() || aiResponse.toolCalls.isNotEmpty() || attachments.isNotEmpty()) {
                                 val persisted = kotlinx.coroutines.CompletableDeferred<Unit>()
                                 send(
                                     AgentEvent.AssistantText(
@@ -660,19 +763,30 @@ class StatefulAgentWorkflow @Inject constructor(
                                         aiResponse.thinkingBlocksJson ?: "",
                                         attachments = attachments,
                                         messageId = responseMessageId,
-                                        persisted = persisted
+                                        persisted = persisted,
+                                        contextUsage = responseContextUsage,
+                                        contextBreakdown = requestBreakdown,
+                                        recoveryStep = recoveryStep
                                     )
                                 )
                                 persisted.await()
+                                lastPersistedAssistantId = responseMessageId
                             }
                             actionQueue.addLast(
                                 AgentAction.LlmResponse(
                                     if (persistedImages.isNotEmpty()) responseWithReasoning.copy(images = persistedImages)
                                     else responseWithReasoning,
-                                    messageId = responseMessageId
+                                    messageId = responseMessageId,
+                                    planBatchDeferredReason = appContext.getString(R.string.plan_approval_batch_deferred),
+                                    continuationAllowed = continuationAllowed
                                 )
                             )
                         } catch (e: CancellationException) {
+                            if (currentContext.recoveryRunId != null && recoveryStep != null && stream.text.isNotEmpty()) {
+                                withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
+                                    runCatching { recoveryRepository.saveDraft(currentContext.recoveryRunId, requireNotNull(recoveryStep), stream.text.toString(), force = true) }
+                                }
+                            }
                             throw e
                         } catch (e: Exception) {
                             if (!overflowRecoveryAttempted && stream.text.isEmpty() && stream.reasoning.isEmpty() && isContextOverflow(e)) {
@@ -684,6 +798,7 @@ class StatefulAgentWorkflow @Inject constructor(
                                     state = state.copy(messages = recovery.messages)
                                     baselineUsage = 0
                                     baselineEstimate = 0
+                                    overflowRecoveryStep = recoveryStep
                                     actionQueue.addLast(AgentAction.InitRequest(recovery.messages))
                                     callError = e.message
                                     continue
@@ -694,8 +809,20 @@ class StatefulAgentWorkflow @Inject constructor(
                             // 流式被中断时也要落库已收到的思考：否则下方 finally 会清空流式思考气泡，
                             // 而落库的接力消息又没产生，表现为「思考显示后凭空消失且无报错」。
                             // 有正文或有思考其一即落库；两者皆空则不写空消息。
-                            if (partial.isNotEmpty() || reasoning.isNotBlank()) {
-                                send(AgentEvent.AssistantText(partial, emptyList(), reasoning))
+                            if (currentContext.recoveryRunId != null && partial.isNotEmpty()) {
+                                recoveryRepository.saveDraft(currentContext.recoveryRunId, requireNotNull(recoveryStep), partial, force = true)
+                            }
+                            if (currentContext.recoveryRunId == null && (partial.isNotEmpty() || reasoning.isNotBlank())) {
+                                val partialEvent = AgentEvent.AssistantText(
+                                    partial,
+                                    emptyList(),
+                                    reasoning,
+                                    contextUsage = AgentEvent.ContextUsage(predictedInput, inputBudget, true),
+                                    contextBreakdown = requestBreakdown,
+                                    recoveryStep = recoveryStep
+                                )
+                                send(partialEvent)
+                                lastPersistedAssistantId = partialEvent.messageId
                             }
                             // 多 Key 的自动切换与重发已在 adapter 内完成（见 AIProvider.keySwitcher）；
                             // 走到这里说明不是 Key 问题、或候选 Key 已全部失败，直接上报原始错误。
@@ -739,15 +866,29 @@ class StatefulAgentWorkflow @Inject constructor(
                         }
                     }
                     is AgentSideEffect.RequestPermission -> {
+                        currentContext.recoveryRunId?.let { runId ->
+                            if (!recoveryRepository.markToolWaitingApproval(runId, effect.toolCall.id)) {
+                                throw CancellationException("Tool approval request is no longer current")
+                            }
+                        }
                         val tool = toolRegistry.getTool(effect.toolCall.name)
-                        val argsPreview = JsonObject(effect.toolCall.arguments).toString().take(500)
-                        val checkResult = requestPermissionIfNeeded(tool, effect.toolCall.id, effect.toolCall.arguments, argsPreview, currentContext.permissionMode, currentContext.sessionId)
+                        val executionArgs = tool?.let { ToolPresentation.executionArguments(it, effect.toolCall.arguments) }
+                            ?: effect.toolCall.arguments
+                        val argsPreview = JsonObject(executionArgs).toString()
+                        val actionTitle = ToolPresentation.titleOf(effect.toolCall)
+                        val checkResult = requestPermissionIfNeeded(tool, effect.toolCall.id, executionArgs, argsPreview, currentContext.sessionId)
 
                         if (!checkResult.approved) {
                             val rawResult = ToolResult.Error(checkResult.denyReason, checkResult.errorCode).toTransportString()
-                            send(AgentEvent.ToolCallFinished(effect.toolCall.id, effect.toolCall.name, rawResult, true, argsPreview))
+                            val persisted = kotlinx.coroutines.CompletableDeferred<Unit>()
+                            send(AgentEvent.ToolCallFinished(
+                                effect.toolCall.id, effect.toolCall.name, rawResult, true, argsPreview,
+                                actionTitle = actionTitle, persisted = persisted
+                            ))
+                            persisted.await()
                         } else {
-                            send(AgentEvent.ToolCallStarted(effect.toolCall.id, effect.toolCall.name, argsPreview))
+                            checkResult.rootApprovalId?.let { rootApprovals[effect.toolCall.id] = it }
+                            send(AgentEvent.ToolCallStarted(effect.toolCall.id, effect.toolCall.name, argsPreview, actionTitle))
                         }
                         actionQueue.addLast(AgentAction.PermissionEvaluated(effect.toolCall, checkResult.approved, argsPreview, checkResult.denyReason, checkResult.errorCode))
                     }
@@ -755,153 +896,136 @@ class StatefulAgentWorkflow @Inject constructor(
                         // 整批取消：已批准未执行的工具补发完成事件（内容为未执行），
                         // 让 ViewModel 清理 runningTool 并 REPLACE 掉「执行中」占位消息。
                         effect.toolCalls.forEach { toolCall ->
+                            rootApprovals.remove(toolCall.id)?.let { rootCommandManager.revokePermit(it) }
+                            val persisted = kotlinx.coroutines.CompletableDeferred<Unit>()
                             send(
                                 AgentEvent.ToolCallFinished(
                                     id = toolCall.id,
                                     toolName = toolCall.name,
                                     result = ToolResult.Error(
-                                        "用户拒绝了本轮工具调用，该调用未执行。",
-                                        USER_REJECTED_CODE
+                                        effect.reason,
+                                        effect.errorCode
                                     ).toTransportString(),
-                                    isError = true
+                                    isError = true,
+                                    argsPreview = JsonObject(toolRegistry.getTool(toolCall.name)?.let {
+                                        ToolPresentation.executionArguments(it, toolCall.arguments)
+                                    } ?: toolCall.arguments).toString(),
+                                    actionTitle = ToolPresentation.titleOf(toolCall),
+                                    persisted = persisted
                                 )
                             )
+                            persisted.await()
                         }
                     }
+                    AgentSideEffect.PlanRejected -> send(AgentEvent.PlanRejected)
                     is AgentSideEffect.ExecuteToolBatch -> {
-                        // 并行执行本批已批准的工具。先统一记录 checkpoint（editFile/writeFile 修改前快照），
-                        // 再并行执行；mode 切换检查在结果收集后于主协程串行处理（planApproval 单例）。
+                        // 计划审批在进入此批次前已与其他调用隔离，避免并行工具越过审批。
                         val toolCalls = effect.toolCalls
                         toolCalls.forEach { toolCall ->
                             if (toolCall.name == "editFile" || toolCall.name == "writeFile") {
                                 (toolCall.arguments["path"] as? JsonPrimitive)?.contentOrNull?.let { path ->
                                     currentContext.sessionId?.let { sid ->
-                                        checkpointManager.beforeFileModified(sid, path)
+                                        withContext(workspaceExecutionContextFactory.freeze(currentContext.projectMemoryCapture)) {
+                                            checkpointManager.beforeFileModified(sid, path)
+                                        }
                                     }
                                 }
                             }
                         }
 
+                        val executionContexts = toolCalls.associate { call ->
+                            call.id to currentContext.copy(rootApprovalId = rootApprovals[call.id])
+                        }
                         val runResults = if (toolCalls.isEmpty()) {
                             emptyList()
                         } else {
                             coroutineScope {
                                 val pathLocks = ConcurrentHashMap<String, Mutex>()
+                                val notificationSelection = Mutex()
+                                val reservedNotifications = mutableSetOf<Long>()
                                 toolCalls.map { toolCall ->
                                     async {
                                         val run: suspend () -> ToolRunResult = {
+                                            val execution = workspaceExecutionContextFactory.freeze(currentContext.projectMemoryCapture)
+                                            withContext(execution) {
+                                            currentContext.projectMemoryCapture?.assertCurrent()
+                                            currentContext.recoveryRunId?.let { runId ->
+                                                if (!recoveryRepository.markToolStarted(runId, toolCall.id)) {
+                                                    throw CancellationException("Tool execution is no longer current")
+                                                }
+                                            }
+                                            val started = toolTimer.start()
+                                            send(AgentEvent.ToolExecutionStarted(toolCall.id, started.startedAtMs, started.startedElapsedMs))
                                             val tool = toolRegistry.getTool(toolCall.name)
-                                            if (tool is StreamingAgentTool) {
-                                                runToolStream(tool, toolCall, currentContext) { send(it) }
+                                            val executableCall = toolCall.copy(arguments = tool?.let {
+                                                ToolPresentation.executionArguments(it, toolCall.arguments)
+                                            } ?: toolCall.arguments)
+                                            val result = if (tool is StreamingAgentTool) {
+                                                runToolStream(tool, executableCall, executionContexts.getValue(toolCall.id)) { send(it) }
                                             } else {
-                                                runToolSync(tool, toolCall, currentContext)
+                                                runToolSync(tool, executableCall, executionContexts.getValue(toolCall.id))
+                                            }
+                                            execution.checkCurrent()
+                                            result.copy(timing = toolTimer.finish(started))
                                             }
                                         }
                                         // 同一批里针对同一路径的调用必须串行：并行会让「读-改-写」互相覆盖，
                                         // 并让写入方的回读校验看到别人的内容而误报失败。不同路径仍并行。
                                         val path = (toolCall.arguments["path"] as? JsonPrimitive)?.contentOrNull
-                                        if (path.isNullOrBlank()) run()
+                                        val result = if (path.isNullOrBlank()) run()
                                         else pathLocks.computeIfAbsent(path) { Mutex() }.withLock { run() }
+                                        val sessionId = currentContext.sessionId
+                                        val notifications = notificationSelection.withLock {
+                                            (if (sessionId != null) agentNotificationCenter.peek(sessionId) else emptyList())
+                                                .filter { reservedNotifications.add(it.seq) }
+                                        }
+                                        val committedResult = if (notifications.isEmpty()) result else
+                                            result.copy(raw = eventInjector.inject(result.raw, notifications))
+                                        val persisted = kotlinx.coroutines.CompletableDeferred<Unit>()
+                                        send(AgentEvent.ToolCallFinished(
+                                            toolCall.id, toolCall.name, committedResult.raw, result.isError,
+                                            argsPreview = JsonObject(toolRegistry.getTool(toolCall.name)?.let {
+                                                ToolPresentation.executionArguments(it, toolCall.arguments)
+                                            } ?: toolCall.arguments).toString(),
+                                            attachments = result.attachments, persisted = persisted,
+                                            actionTitle = ToolPresentation.titleOf(toolCall),
+                                            startedAtMs = result.timing?.startedAtMs,
+                                            durationMs = result.timing?.durationMs,
+                                            notificationSeqs = notifications.map { it.seq }
+                                        ))
+                                        persisted.await()
+                                        committedResult
                                     }
                                 }.awaitAll()
                             }
                         }
 
-                        // 串行处理 mode 切换并组装批量结果。
-                        val batchResults = mutableListOf<ToolBatchResult>()
-                        toolCalls.forEachIndexed { index, toolCall ->
+                        val batchResults = toolCalls.mapIndexed { index, toolCall ->
                             val runResult = runResults.getOrNull(index)
                                 ?: ToolRunResult(ToolResult.Error("工具未执行", "TOOL_NOT_EXECUTED").toTransportString(), true)
-                            var rawResult = runResult.raw
-                            var isError = runResult.isError
-                            val (newCtx, updated) = checkAndUpdateMode(toolCall, isError, currentContext)
-                            if (updated) {
-                                val reason = (toolCall.arguments["reason"] as? JsonPrimitive)?.content?.trim()
-                                    ?: toolCall.arguments["reason"]?.toString()?.replace("\"", "")?.trim()
-                                    ?: ""
-                                send(AgentEvent.ModeChanged(newCtx.mode, reason))
+                            ToolBatchResult(
+                                toolCall.id,
+                                toolCall.name,
+                                runResult.raw,
+                                runResult.isError,
+                                runResult.attachments,
+                                runResult.images
+                            )
+                        }.toMutableList()
 
-                                // 退出 PLAN 时挂起 workflow，等待用户在计划审查面板批准后才继续
-                                if (currentContext.mode == AgentMode.PLAN && newCtx.mode != AgentMode.PLAN) {
-                                    val choice = planApprovalManager.awaitApproval(reason, currentContext.sessionId)
-                                    if (choice == PlanApprovalChoice.APPROVE) {
-                                        currentContext = newCtx
-                                        // system 与 mode 已解耦（SystemPromptProvider 不再注入模式提示词），
-                                        // 切换不重建 systemPrompt，避免 system 前缀变化打断缓存；模式状态通过工具结果与下轮消息提醒告知。
-                                        rawResult = appendPlanModeNotice(rawResult, buildModeSwitchNotice(newCtx.mode))
-                                    } else {
-                                        // 用户选择继续反馈，回滚到 PLAN 模式，修正工具结果让 AI 知道切换被取消并等待用户反馈
-                                        currentContext = currentContext.copy(mode = AgentMode.PLAN)
-                                        rawResult = ToolResult.Error(
-                                            appContext.getString(R.string.plan_mode_refinement_requested),
-                                            "MODE_SWITCH_REJECTED"
-                                        ).toTransportString()
-                                        isError = true
-                                    }
-                                } else {
-                                    currentContext = newCtx
-                                    rawResult = appendPlanModeNotice(rawResult, buildModeSwitchNotice(newCtx.mode))
-                                }
-                            }
-                            batchResults.add(ToolBatchResult(toolCall.id, toolCall.name, rawResult, isError, runResult.attachments, runResult.images))
-                        }
-
-                        // 本轮内到达的后台任务/子代理完成通知：搭在本批最后一条工具结果上立即送达，
-                        // AI 当轮即可感知，不必等本轮结束再起新一轮。ack 放到完成事件发出（结果已落库）之后：
-                        // 中途被取消时通知仍留在队列里，由后续批次或本轮结束的兜底路径送达。
-                        val notifySessionId = currentContext.sessionId
-                        val notifications = if (notifySessionId != null && batchResults.isNotEmpty()) {
-                            agentNotificationCenter.peek(notifySessionId)
-                        } else {
-                            emptyList()
-                        }
-                        if (notifications.isNotEmpty()) {
-                            val modeChange = notifications.lastOrNull { it.kind == AgentNotificationKind.MODE_CHANGE }
-                            val newMode = modeChange?.newMode
-                            if (newMode != null) {
-                                // 用户在工作期间切换模式：本轮后续批次的权限判定立即改用新模式。
-                                // 与 SessionUseCase.updateMode 保持同一套语义：进入 PLAN 记下进入前的模式，其余情况清空。
-                                val prevMode = currentContext.mode
-                                currentContext = if (newMode == AgentMode.PLAN) {
-                                    currentContext.copy(
-                                        mode = AgentMode.PLAN,
-                                        modeBeforePlan = if (prevMode != AgentMode.PLAN) prevMode else currentContext.modeBeforePlan
-                                    )
-                                } else {
-                                    currentContext.copy(mode = newMode, modeBeforePlan = null)
-                                }
-                            }
-                            val last = batchResults.last()
-                            val outgoingNotifications = if (newMode != null) {
-                                notifications.map { item ->
-                                    if (item === modeChange) {
-                                        item.copy(detail = listOfNotNull(
-                                            item.detail?.takeIf { it.isNotBlank() },
-                                            buildExternalModeSwitchNotice(newMode).trim()
-                                        ).joinToString("\n\n"))
-                                    } else item
-                                }
-                            } else notifications
-                            val injected = eventInjector.inject(last.result, outgoingNotifications)
-                            batchResults[batchResults.lastIndex] = last.copy(result = injected)
-                        }
-
-                        // 逐个推送完成事件（保持与 batchToolCalls 一致顺序），并进入收尾。
-                        batchResults.forEach { br ->
-                            val persisted = kotlinx.coroutines.CompletableDeferred<Unit>()
-                            send(AgentEvent.ToolCallFinished(br.id, br.toolName, br.result, br.isError,
-                                attachments = br.attachments, persisted = persisted))
-                            persisted.await()
-                        }
-                        if (notifySessionId != null && notifications.isNotEmpty()) {
-                            agentNotificationCenter.ack(notifySessionId, notifications.map { it.seq })
-                        }
                         actionQueue.addLast(AgentAction.ToolBatchFinished(batchResults))
                     }
                 }
             }
         }
         
+        } finally {
+            rootApprovals.values.forEach(rootCommandManager::revokePermit)
+        }
+        send(AgentEvent.TurnFinished(
+            lastPersistedAssistantId,
+            (SystemClock.elapsedRealtime() - turnStartedElapsed).coerceAtLeast(0L)
+        ))
         state.error?.let { send(AgentEvent.Failed(it, state.errorCode)) }
         send(AgentEvent.Completed)
     }
@@ -938,12 +1062,24 @@ class StatefulAgentWorkflow @Inject constructor(
         private var pendingReasoning: String? = null
         private var lastTextSentAt = 0L
         private var lastReasoningSentAt = 0L
+        private var requestDurationMillis: Long? = null
+        private val speed = GenerationSpeedTracker()
+        private val argumentPreviews = mutableMapOf<String, AIStreamChunk.ToolCallArgumentsDelta>()
+
+        suspend fun emitSpeed() {
+            speed.sample(SystemClock.elapsedRealtime())?.let { emit(it) }
+        }
+
+        suspend fun finishSpeed(outputTokens: Int) {
+            speed.finish(outputTokens, requestDurationMillis)?.let { emit(it) }
+        }
 
         suspend fun onChunk(chunk: AIStreamChunk) {
             when (chunk) {
                 is AIStreamChunk.TextDelta -> {
                     markTtfb()
                     text.append(chunk.text)
+                    speed.append(chunk.text, SystemClock.elapsedRealtime())
                     pendingText = text.toString()
                     val now = SystemClock.elapsedRealtime()
                     if (now - lastTextSentAt >= DELTA_THROTTLE_MS) {
@@ -955,6 +1091,7 @@ class StatefulAgentWorkflow @Inject constructor(
                     // 思考内容也算首字（推理模型先吐思考再吐正文）
                     markTtfb()
                     reasoning.append(chunk.text)
+                    speed.append(chunk.text, SystemClock.elapsedRealtime())
                     pendingReasoning = reasoning.toString()
                     val now = SystemClock.elapsedRealtime()
                     if (now - lastReasoningSentAt >= DELTA_THROTTLE_MS) {
@@ -975,11 +1112,20 @@ class StatefulAgentWorkflow @Inject constructor(
                     // 纯工具调用轮没有文本/思考增量，Final 是首个内容事件，兜底记为 TTFB
                     markTtfb()
                     finalResponse = chunk.response
+                    requestDurationMillis = chunk.requestDurationMillis
+                }
+                is AIStreamChunk.ToolCallArgumentsDelta -> {
+                    speed.appendToolArguments(chunk.id, chunk.totalAsciiChars, chunk.totalOtherChars, SystemClock.elapsedRealtime())
+                    val previous = argumentPreviews.put(chunk.id, chunk)
+                    if (previous?.name != chunk.name || previous.accumulated != chunk.accumulated) {
+                        emit(AgentEvent.ToolCallArgumentsPreview(chunk.id, chunk.name, chunk.accumulated))
+                    }
                 }
                 is AIStreamChunk.ToolCallDeclared -> {
                     // 工具名先于参数到达：立刻告诉 UI「模型准备调什么」，
                     // 免得长参数流式期间一直停在「正在思考」。
                     markTtfb()
+                    speed.begin(SystemClock.elapsedRealtime())
                     emit(AgentEvent.ToolCallPreparing(chunk.name))
                 }
             }
@@ -997,6 +1143,9 @@ class StatefulAgentWorkflow @Inject constructor(
 
         /** 重试/换 Key 后重放：丢弃已推送内容，避免新旧文本拼接。 */
         private fun reset() {
+            speed.reset()
+            requestDurationMillis = null
+            argumentPreviews.clear()
             text.setLength(0)
             reasoning.setLength(0)
             pendingText = null
@@ -1035,9 +1184,14 @@ class StatefulAgentWorkflow @Inject constructor(
             // 同步文件/网络 IO 阻塞主线程。依赖主线程的工具（浏览器）在自身实现内已切回 Main。
             withContext(Dispatchers.IO) {
                 val result = tool.executeWithContext(toolCall.arguments, context)
-                val attachments = if (name == "sendFile" || name == "generateImage") extractAttachments(result) else emptyList()
+                val fileAttachments = if (name == "sendFile" || name == "generateImage") extractAttachments(result) else emptyList()
                 val images = if (result is ToolResult.Success) result.images else emptyList()
-                val transportResult = if (attachments.isNotEmpty()) stripAttachments(result) else result
+                val previewAttachments = if (fileAttachments.isEmpty() && images.isNotEmpty()) runCatching {
+                    ToolPreviewImageCache(java.io.File(appContext.cacheDir.canonicalFile, ToolPreviewImageCache.DIRECTORY))
+                        .store(context.sessionId, toolCall.id, name, images)
+                }.getOrDefault(emptyList()) else emptyList()
+                val attachments = (fileAttachments + previewAttachments).distinct()
+                val transportResult = if (fileAttachments.isNotEmpty()) stripAttachments(result) else result
                 val processed = toolOutputStore.process(name, toolCall.id, transportResult)
                 ToolRunResult(processed.toTransportString(), processed is ToolResult.Error, attachments, images)
             }
@@ -1214,7 +1368,11 @@ class StatefulAgentWorkflow @Inject constructor(
                 val result = finalResult ?: ToolResult.Error("流式工具未返回结果", "MISSING_STREAM_RESULT")
                 val processed = toolOutputStore.process(toolCall.name, toolCall.id, result)
                 val images = if (result is ToolResult.Success) result.images else emptyList()
-                ToolRunResult(processed.toTransportString(), processed is ToolResult.Error, images = images)
+                val attachments = if (images.isNotEmpty()) runCatching {
+                    ToolPreviewImageCache(java.io.File(appContext.cacheDir.canonicalFile, ToolPreviewImageCache.DIRECTORY))
+                        .store(context.sessionId, toolCall.id, toolCall.name, images)
+                }.getOrDefault(emptyList()) else emptyList()
+                ToolRunResult(processed.toTransportString(), processed is ToolResult.Error, attachments.distinct(), images)
             }
         } catch (e: CancellationException) {
             throw e
@@ -1264,67 +1422,6 @@ class StatefulAgentWorkflow @Inject constructor(
         else -> "png"
     }
 
-    private fun checkAndUpdateMode(toolCall: ToolCall, isError: Boolean, currentContext: AgentContext): Pair<AgentContext, Boolean> {
-        if (toolCall.name == "planMode" && !isError) {
-            val action = (toolCall.arguments["action"] as? JsonPrimitive)?.content?.trim()?.lowercase()
-                ?: toolCall.arguments["action"]?.toString()?.replace("\"", "")?.trim()?.lowercase()
-            when (action) {
-                // 进入 PLAN 时记住当前模式；退出时恢复到它（AUTO→PLAN 的规划往返结束后回到 AUTO 而非 BUILD）。
-                "enter" -> if (currentContext.mode != AgentMode.PLAN) {
-                    return currentContext.copy(mode = AgentMode.PLAN, modeBeforePlan = currentContext.mode) to true
-                }
-                "exit" -> if (currentContext.mode == AgentMode.PLAN) {
-                    return currentContext.copy(mode = currentContext.modeBeforePlan ?: AgentMode.BUILD) to true
-                }
-            }
-        }
-        return currentContext to false
-    }
-
-    /**
-     * 当前模式提醒：随最新用户消息注入（借鉴 opencode SessionReminders 的思路）。
-     * 模式提示词不进 system——一旦切换就要重建 system、打断前缀缓存；
-     * 改为消息级提醒：每次用户请求拼在最新用户消息末尾，位置在消息流尾部，前缀保持稳定。
-     */
-    private fun buildModeReminder(mode: AgentMode): String? = when (mode) {
-        AgentMode.PLAN -> promptProvider.resolvePrompt(MODE_REMINDER_PLAN_FILE)
-            .replace(LEADING_COMMENT, "")
-            .trim()
-            .let { "【模式提醒】$it" }
-        AgentMode.AUTO -> promptProvider.resolvePrompt(MODE_REMINDER_AUTO_FILE)
-            .replace(LEADING_COMMENT, "")
-            .trim()
-            .let { "【模式提醒】$it" }
-        AgentMode.BUILD -> null
-    }
-
-    /**
-     * 取本次应注入的模式提醒：仅当模式与上次注入时不同（含首次）才返回文本并记录，否则为 null。
-     */
-    private fun takeModeReminderIfChanged(sessionId: String?, mode: AgentMode): String? {
-        if (sessionId == null) return buildModeReminder(mode)
-        if (lastInjectedMode[sessionId] == mode) return null
-        lastInjectedMode[sessionId] = mode
-        return buildModeReminder(mode)
-    }
-
-    /** 工具调用成功后写入 planMode 结果 data 的模式状态通知（当轮即可见）。 */
-    private fun buildModeSwitchNotice(mode: AgentMode): String = when (mode) {
-        AgentMode.PLAN -> promptProvider.resolvePrompt(MODE_REMINDER_PLAN_FILE)
-            .replace(LEADING_COMMENT, "")
-            .trim()
-        AgentMode.BUILD -> "【模式切换】" + appContext.getString(R.string.plan_mode_approved_build)
-        AgentMode.AUTO -> "【模式切换】" + appContext.getString(R.string.plan_mode_approved_auto)
-    }
-
-    /** 界面手动切换时写入模式通知 detail 的提示，区分计划审批与用户直接切换。 */
-    private fun buildExternalModeSwitchNotice(mode: AgentMode): String = when (mode) {
-        AgentMode.PLAN -> promptProvider.resolvePrompt(MODE_REMINDER_PLAN_FILE)
-            .replace(LEADING_COMMENT, "")
-            .trim()
-        AgentMode.BUILD -> "【模式切换】" + appContext.getString(R.string.plan_mode_external_build)
-        AgentMode.AUTO -> "【模式切换】" + appContext.getString(R.string.plan_mode_external_auto)
-    }
 
     /**
      * 从 sendFile 工具结果的 `files` 数组提取文件卡片元数据（含宿主本地路径，供 UI 打开文件用）。
@@ -1371,31 +1468,16 @@ class StatefulAgentWorkflow @Inject constructor(
         callId: String,
         arguments: Map<String, JsonElement>,
         argsPreview: String,
-        mode: AgentMode,
         sessionId: String?
     ): PermissionCheckResult {
         if (tool == null) {
             return PermissionCheckResult(true)
         }
 
-        // planMode 退出 PLAN 时，后续会有计划审查面板兜底用户决策，
-        // 此处权限弹窗冗余，直接放行；进入 PLAN 的方向无后续审查面板，仍走权限弹窗。
-        if (tool.name == "planMode" && mode == AgentMode.PLAN) {
-            val action = (arguments["action"] as? JsonPrimitive)?.contentOrNull?.trim()?.lowercase()
-            if (action == "exit") {
-                return PermissionCheckResult(true)
-            }
-        }
-
-        val eval = policyEngine.evaluate(tool, tool.name, arguments, mode)
+        val eval = policyEngine.evaluate(tool.name, arguments, sessionId)
         if (eval.verdict == ToolPermissionPolicyEngine.Verdict.DENY) {
             val reason = eval.denyReason ?: "该工具被项目安全规则策略禁止执行"
-            val code = if (mode == AgentMode.PLAN) "PLAN_MODE_REJECTED" else "SYSTEM_DENIED"
-            return PermissionCheckResult(false, reason, code)
-        }
-
-        if (tool.permissionPolicy == ToolPermissionPolicy.AUTO_APPROVE) {
-            return PermissionCheckResult(true)
+            return PermissionCheckResult(false, reason, "SYSTEM_DENIED")
         }
 
         return when (eval.verdict) {
@@ -1404,28 +1486,46 @@ class StatefulAgentWorkflow @Inject constructor(
             ToolPermissionPolicyEngine.Verdict.ASK -> {
                 val base = tool.buildPermissionRequest(callId, arguments, argsPreview)
                 val request = base.copy(
+                    // 提供商的 tool call ID 可能跨会话重复，审批 ID 必须独立。
+                    id = UUID.randomUUID().toString(),
                     title = eval.askTitle ?: base.title,
-                    rememberablePatterns = eval.rememberablePatterns,
-                    rememberDisabledReason = eval.rememberDisabledReason,
+                    approvalNote = eval.approvalNote,
+                    sessionGrant = eval.sessionGrant,
                     sessionId = sessionId.orEmpty()
                 )
-                when (permissionManager.awaitApproval(request)) {
-                    PermissionChoice.REJECT -> PermissionCheckResult(false, "用户拒绝执行该工具", "USER_REJECTED")
-                    PermissionChoice.ONCE -> PermissionCheckResult(true)
-                    PermissionChoice.ALWAYS -> {
-                        if (eval.rememberablePatterns.isNotEmpty()) {
-                            policyEngine.remember(tool.name, eval.rememberablePatterns, PermissionScope.PROJECT)
+                val choice = if (eval.rootGeneration == null) {
+                    permissionManager.awaitApproval(request)
+                } else coroutineScope {
+                    val decision = async(start = CoroutineStart.UNDISPATCHED) { permissionManager.awaitApproval(request) }
+                    val revocation = launch(start = CoroutineStart.UNDISPATCHED) {
+                        rootCommandManager.accessState.collect { state ->
+                            if (!state.enabled || state.generation != eval.rootGeneration) {
+                                permissionManager.resolve(request.id, PermissionChoice.REJECT)
+                            }
                         }
-                        PermissionCheckResult(true)
+                    }
+                    try {
+                        decision.await()
+                    } finally {
+                        revocation.cancelAndJoin()
+                    }
+                }
+                when (choice) {
+                    PermissionChoice.REJECT -> PermissionCheckResult(false, "用户拒绝执行该工具", "USER_REJECTED")
+                    PermissionChoice.ONCE, PermissionChoice.ALWAYS_SESSION -> {
+                        if (eval.rootGeneration == null) {
+                            PermissionCheckResult(true)
+                        } else if (choice != PermissionChoice.ONCE || sessionId.isNullOrBlank()) {
+                            PermissionCheckResult(false, appContext.getString(R.string.root_approval_required), "ROOT_APPROVAL_REQUIRED")
+                        } else {
+                            val command = (arguments["command"] as? JsonPrimitive)?.content.orEmpty()
+                            val permit = rootCommandManager.authorize(sessionId, command, eval.rootGeneration)
+                            if (permit == null) PermissionCheckResult(false, appContext.getString(R.string.root_access_disabled), "ROOT_ACCESS_CHANGED")
+                            else PermissionCheckResult(true, rootApprovalId = permit)
+                        }
                     }
                 }
             }
         }
     }
-}
-
-internal fun appendPlanModeNotice(rawToolResult: String, notice: String): String {
-    val result = Json.parseToJsonElement(rawToolResult).jsonObject
-    val data = result.getValue("data").jsonPrimitive.content
-    return JsonObject(result + ("data" to JsonPrimitive("$data\n\n${notice.trim()}"))).toString()
 }

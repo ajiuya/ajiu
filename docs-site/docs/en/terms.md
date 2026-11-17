@@ -25,7 +25,7 @@ AI-generated code, commands, explanations, images, and other content may contain
 
 ## 3. Commands, Files, and Server Operations
 
-Within your selected operating mode and permissions, AI and tools may read, modify, overwrite, or delete files; execute commands; install dependencies; access networks; operate Git repositories; and connect to or modify remote servers. Some operations may run in sequence without a separate confirmation for every step.
+Within the current authorization rules and task scope, AI and tools may read, modify, overwrite, or delete files; execute commands; install dependencies; access networks; operate Git repositories; and connect to or modify remote servers. Ordinary tool calls may run in sequence; Shizuku, `sudo`/`su`, and high-risk operations still follow their approval and safety rules.
 
 Incorrect instructions, model errors, untrusted project content, or third-party tools may cause data loss, credential exposure, service interruptions, damaged configurations, or unexpected charges. Permission controls, checkpoints, and undo features cannot guarantee prevention or recovery of every loss. A local container does not provide absolute isolation from mounted directories, network resources, or remote servers.
 

@@ -15,6 +15,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Slider
 import com.aicode.core.ui.AdaptiveModalBottomSheet
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -22,6 +23,7 @@ import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -36,6 +38,8 @@ import com.aicode.core.theme.semanticColors
 import com.aicode.core.ui.AppSwitch
 import com.aicode.core.ui.AppTextField
 import com.aicode.feature.settings.data.repository.StartupSessionMode
+import com.aicode.feature.settings.data.repository.GeneralSettingsRepository
+import kotlin.math.roundToInt
 import compose.icons.FeatherIcons
 import compose.icons.feathericons.Check
 
@@ -65,7 +69,9 @@ internal fun GeneralSettingsSection(
     goalMaxTokens: Int,
     onSetGoalMaxTokens: (Int) -> Unit,
     deleteExternalWorkspaceSessions: Boolean,
-    onToggleDeleteExternalWorkspaceSessions: (Boolean) -> Unit
+    onToggleDeleteExternalWorkspaceSessions: (Boolean) -> Unit,
+    typewriterCharsPerSecond: Int = GeneralSettingsRepository.DEFAULT_TYPEWRITER_CHARS_PER_SECOND,
+    onSetTypewriterCharsPerSecond: (Int) -> Unit = {}
 ) {
     var showStartupSessionSheet by remember { mutableStateOf(false) }
     var editingFirstByteTimeout by remember { mutableStateOf(false) }
@@ -154,6 +160,31 @@ internal fun GeneralSettingsSection(
                     )
                 }
             )
+        }
+
+        SettingsGroupHeader(text = stringResource(R.string.settings_typewriter_speed))
+        SettingsGroup {
+            var speed by remember(typewriterCharsPerSecond) { mutableFloatStateOf(typewriterCharsPerSecond.toFloat()) }
+            Column(modifier = Modifier.fillMaxWidth().padding(Spacing.lg)) {
+                Text(
+                    text = stringResource(R.string.settings_typewriter_speed_value, speed.roundToInt()),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                Slider(
+                    value = speed,
+                    onValueChange = { speed = it },
+                    onValueChangeFinished = { onSetTypewriterCharsPerSecond(speed.roundToInt()) },
+                    valueRange = GeneralSettingsRepository.MIN_TYPEWRITER_CHARS_PER_SECOND.toFloat()..
+                        GeneralSettingsRepository.MAX_TYPEWRITER_CHARS_PER_SECOND.toFloat(),
+                    steps = 21
+                )
+                Text(
+                    text = stringResource(R.string.settings_typewriter_speed_hint),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
         }
 
         SettingsGroupHeader(text = stringResource(R.string.settings_general_network))

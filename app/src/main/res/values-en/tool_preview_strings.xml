@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="tool_preview_open_detail">View tool details</string>
+    <string name="tool_preview_options">Tool preview options</string>
+    <string name="tool_preview_enable">Enable thumbnails</string>
+    <string name="tool_preview_disable">Stop thumbnails</string>
+    <string name="tool_preview_follow_latest">Follow latest activity</string>
+    <string name="tool_preview_previous">Previous tool</string>
+    <string name="tool_preview_next">Next tool</string>
+    <string name="tool_preview_first">Jump to first tool</string>
+    <string name="tool_preview_last">Jump to last tool</string>
+    <string name="tool_preview_page">%1$d/%2$d</string>
+    <string name="tool_preview_preparing">Preparing</string>
+    <string name="tool_preview_running">Running</string>
+    <string name="tool_preview_completed">Completed</string>
+    <string name="tool_preview_failed">Failed</string>
+    <string name="tool_preview_image">Tool screen preview</string>
+    <string name="tool_preview_sensitive">Sensitive body hidden. Display and copy both use safe content.</string>
+    <string name="tool_preview_no_output">No output yet</string>
+    <string name="tool_preview_loading">Loading details…</string>
+    <string name="tool_preview_not_executed">Arguments are still being generated. This instruction has not run.</string>
+    <string name="tool_preview_open_browser">Open browser</string>
+    <string name="tool_preview_command">Instruction</string>
+    <string name="tool_preview_parameters">Safe arguments</string>
+    <string name="tool_preview_result">Result and output</string>
+    <string name="tool_preview_diff">File diff</string>
+    <string name="tool_preview_close">Close details</string>
+    <string name="tool_preview_copy_all">Copy safe display content</string>
+    <string name="tool_preview_copied">Copied</string>
+    <string name="tool_preview_copy_failed">Could not copy. Please try again.</string>
+    <string name="tool_preview_output_paused">Refresh paused to keep your reading position</string>
+    <string name="tool_preview_resume_output">Return to live tail</string>
+    <string name="tool_preview_bounded">Content exceeds the local preview limit. Display and copy both use bounded content; live output keeps the latest tail. Open the full-output path from the tool result if available.</string>
+    <string name="tool_preview_detail_page">%1$d / %2$d</string>
+    <string name="tool_preview_unknown_resource">—</string>
+    <string name="tool_preview_hud_cpu">APP CPU %1$s</string>
+    <string name="tool_preview_hud_pss">PSS %1$s</string>
+    <string name="tool_preview_hud_app_description">App process CPU %1$s, PSS %2$s; these are not remote command resource readings.</string>
+</resources>

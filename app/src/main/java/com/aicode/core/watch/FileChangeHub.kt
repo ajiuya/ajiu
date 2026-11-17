@@ -7,6 +7,7 @@ import com.aicode.feature.settings.data.repository.ExecutionMode
 import com.aicode.feature.settings.data.repository.ExecutionModeHolder
 import com.aicode.feature.workspace.data.repository.WorkspaceRepository
 import com.aicode.feature.workspace.domain.WorkspacePathMapper
+import java.io.Closeable
 import java.io.File
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
@@ -17,7 +18,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -31,7 +31,6 @@ import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * App 级文件变更监听中心：监听当前活动工作区与 `~/.aicode` 两个根（也可订阅任意宿主目录），
@@ -74,10 +73,10 @@ class FileChangeHub @Inject constructor(
         /** 单订阅可持有 inotify 句柄的目录数上限，防止大仓库把 inotify watch 用尽。 */
         private const val MAX_WATCHED_DIRS = 512
 
-        /** 待处理原始事件队列上限；超出时丢弃最旧事件（有快照轮询兜底），防止文件暴增时内存无界增长。 */
+        /** 待处理路径上限；超出时显式发布 truncated，由消费方重新对账。 */
         private const val MAX_PENDING_EVENTS = 4096
 
-        /** 待广播批次队列上限；超出时丢弃最旧批次。 */
+        /** 待广播批次队列上限；慢消费者施加背压，不静默丢批次。 */
         private const val MAX_PENDING_BATCHES = 256
 
         /** AI 看到的工作区根路径。 */
@@ -109,6 +108,13 @@ class FileChangeHub @Inject constructor(
 
     /** 宿主目录路径 → 该目录的观察器（多个订阅共享同一个）。 */
     private val dirWatches = ConcurrentHashMap<String, DirWatch>()
+
+    private val scopeSnapshots = SharedSnapshotPoller<SnapshotScope, ScopeSnapshot>(
+        scope = ioScope,
+        intervalMs = POLL_INTERVAL_MS,
+        snapshot = { snapshotOfScope(it, MAX_SNAPSHOT_ENTRIES) },
+        onError = { FileLogger.w(TAG, "目录快照失败，下轮继续", it) }
+    )
 
     /** 两个根都订阅，递归。 */
     fun watchAll(
@@ -210,8 +216,6 @@ class FileChangeHub @Inject constructor(
         }
     }
 
-    private data class RawEvent(val hostPath: String, val kind: ChangeKind)
-
     /** 一个订阅：持有自己注册的目录集合、过滤规则、批量窗口与快照轮询。 */
     private inner class Subscription(
         private val rootDir: File,
@@ -222,14 +226,8 @@ class FileChangeHub @Inject constructor(
         private val fallbackPoll: Boolean,
         private val windowMs: Int
     ) {
-        private val events = Channel<RawEvent>(
-            capacity = MAX_PENDING_EVENTS,
-            onBufferOverflow = BufferOverflow.DROP_OLDEST
-        )
-        private val batchesChannel = Channel<FileChangeBatch>(
-            capacity = MAX_PENDING_BATCHES,
-            onBufferOverflow = BufferOverflow.DROP_OLDEST
-        )
+        private val events = PendingFileChanges(MAX_PENDING_EVENTS)
+        private val batchesChannel = Channel<FileChangeBatch>(MAX_PENDING_BATCHES)
         val batches: Flow<FileChangeBatch> = batchesChannel.receiveAsFlow()
 
         private val myDirs = ConcurrentHashMap.newKeySet<String>()
@@ -237,8 +235,9 @@ class FileChangeHub @Inject constructor(
         @Volatile
         private var rules: IgnoreRules = IgnoreRules.of(filter, emptyList())
         private var mergeJob: Job? = null
-        private var pollJob: Job? = null
+        private var pollLease: Closeable? = null
         private var attachJob: Job? = null
+        @Volatile private var stopped = false
 
         fun start() {
             rules = IgnoreRules.of(
@@ -253,11 +252,12 @@ class FileChangeHub @Inject constructor(
             }
         }
 
-        fun stop() {
+        @Synchronized fun stop() {
+            stopped = true
             mergeJob?.cancel()
             mergeJob = null
-            pollJob?.cancel()
-            pollJob = null
+            pollLease?.close()
+            pollLease = null
             attachJob?.cancel()
             attachJob = null
             for (path in myDirs) dirWatches[path]?.unsubscribe(this)
@@ -275,21 +275,25 @@ class FileChangeHub @Inject constructor(
             attachJob = ioScope.launch {
                 while (isActive && !rootDir.isDirectory) delay(ROOT_WAIT_INTERVAL_MS)
                 if (!isActive) return@launch
-                events.trySend(RawEvent(rootDir.absolutePath, ChangeKind.CREATED))
+                offerEvent(rootDir.absolutePath, ChangeKind.CREATED)
                 attachTree()
             }
         }
 
         /** 递归注册目录；剪枝只针对父路径段，故先判后注册。[reportNew] 为真时对新挂上的目录补报其存量直接子项。 */
         private fun registerTree(dir: File, reportNew: Boolean) {
+            if (stopped) return
             val parts = relativePartsOf(rootDir, dir)
             if (parts.isNotEmpty() && rules.isIgnoredDir(parts)) return
             register(dir, reportNew)
             if (!recursive) return
-            dir.listFiles()?.forEach { child -> if (child.isDirectory) registerTree(child, reportNew) }
+            dir.listFiles()?.forEach { child ->
+                if (child.isDirectory && !java.nio.file.Files.isSymbolicLink(child.toPath())) registerTree(child, reportNew)
+            }
         }
 
-        private fun register(dir: File, reportNew: Boolean) {
+        @Synchronized private fun register(dir: File, reportNew: Boolean) {
+            if (stopped) return
             val path = dir.absolutePath
             if (!myDirs.add(path)) {
                 diag("目录监听已登记，跳过重复注册: $path")
@@ -315,7 +319,7 @@ class FileChangeHub @Inject constructor(
             val children = dir.listFiles() ?: return
             diag("补报新目录子项: ${dir.absolutePath} 数量=${children.size}")
             for (child in children) {
-                events.trySend(RawEvent(child.absolutePath, ChangeKind.CREATED))
+                offerEvent(child.absolutePath, ChangeKind.CREATED)
                 if (recursive && child.isDirectory) registerTree(child, reportNew = true)
             }
         }
@@ -332,7 +336,7 @@ class FileChangeHub @Inject constructor(
         }
 
         fun onEvent(watch: DirWatch, hostPath: String, kind: ChangeKind) {
-            events.trySend(RawEvent(hostPath, kind))
+            offerEvent(hostPath, kind)
             // 递归订阅：新出现的目录要补挂（回调在主线程，文件系统检查切到 IO）。
             if (recursive && kind == ChangeKind.CREATED) {
                 ioScope.launch {
@@ -346,53 +350,28 @@ class FileChangeHub @Inject constructor(
          * 快照轮询兜底：按订阅范围递归比对（非递归订阅只比根目录单层）。
          * 递归快照能发现 inotify 漏报的深层改动与「整棵子树被移动/替换」。
          */
-        private fun startPolling() {
-            if (!fallbackPoll || pollJob != null) return
-            pollJob = ioScope.launch {
-                var last = snapshotOfScope()
-                while (isActive) {
-                    delay(POLL_INTERVAL_MS)
-                    val now = snapshotOfScope()
-                    val diff = diffSnapshot(last, now)
-                    last = now
-                    for ((rel, kind) in diff) {
-                        val hostPath =
-                            if (rel.isEmpty()) rootDir.absolutePath else File(rootDir, rel).absolutePath
-                        events.trySend(RawEvent(hostPath, kind))
-                        if (recursive && kind == ChangeKind.CREATED) {
-                            val child = File(hostPath)
-                            if (child.isDirectory) registerTree(child, reportNew = true)
-                        }
+        @Synchronized private fun startPolling() {
+            if (stopped || !fallbackPoll || pollLease != null) return
+            val key = SnapshotScope(rootDir.absoluteFile.toPath().normalize().toString(), recursive, rules)
+            pollLease = scopeSnapshots.subscribe(key) { last, now ->
+                if (!last.complete || !now.complete) events.invalidate()
+                val diff = diffSnapshot(last.entries, now.entries)
+                for ((rel, kind) in diff) {
+                    // A capped/unreadable scan cannot prove that an omitted path was deleted.
+                    if (kind == ChangeKind.DELETED && !now.complete) continue
+                    val hostPath = if (rel.isEmpty()) rootDir.absolutePath else File(rootDir, rel).absolutePath
+                    offerEvent(hostPath, kind)
+                    if (recursive && kind == ChangeKind.CREATED) {
+                        val child = File(hostPath)
+                        if (child.isDirectory) registerTree(child, reportNew = true)
                     }
                 }
             }
         }
 
-        /** 订阅范围快照：键为相对订阅根的路径（根自身为空串）；剪枝目录不进入。 */
-        private fun snapshotOfScope(): Map<String, String> {
-            val out = HashMap<String, String>()
-            if (!rootDir.isDirectory) return out
-            var count = 0
-
-            fun walk(dir: File, rel: String) {
-                val children = dir.listFiles() ?: return
-                for (child in children) {
-                    if (count >= MAX_SNAPSHOT_ENTRIES) return
-                    val childRel = if (rel.isEmpty()) child.name else "$rel/${child.name}"
-                    count++
-                    if (child.isDirectory) {
-                        out[childRel] = "d"
-                        if (recursive && !rules.isIgnoredDir(relativePartsOf(rootDir, child))) {
-                            walk(child, childRel)
-                        }
-                    } else {
-                        out[childRel] = "f:${child.lastModified()}:${child.length()}"
-                    }
-                }
-            }
-
-            walk(rootDir, "")
-            return out
+        private fun offerEvent(hostPath: String, kind: ChangeKind) {
+            val parents = relativePartsOf(rootDir, File(hostPath)).dropLast(1)
+            if (!rules.isIgnoredDir(parents)) events.offer(hostPath, kind)
         }
 
         private fun containerPathOf(hostPath: String): String {
@@ -403,33 +382,23 @@ class FileChangeHub @Inject constructor(
 
         private suspend fun mergeLoop() {
             while (true) {
-                val first = events.receive()
-                val merged = LinkedHashMap<String, ChangeKind>()
-                var truncated = false
-
-                fun accept(event: RawEvent) {
-                    val existing = merged[event.hostPath]
-                    if (existing == null) {
-                        if (merged.size >= MAX_BATCH_SIZE) {
-                            truncated = true
-                            return
+                events.wakeup.receive()
+                delay(windowMs.toLong())
+                val (merged, truncated) = events.drain(MAX_BATCH_SIZE)
+                if (filter.followGitignore && File(rootDir, ".gitignore").absolutePath in merged) {
+                    val updated = IgnoreRules.of(filter, readGitignorePatterns(rootDir))
+                    synchronized(this) {
+                        if (rules != updated && !stopped) {
+                            rules = updated
+                            pollLease?.close()
+                            pollLease = null
+                            startPolling()
+                            events.invalidate()
+                            registerTree(rootDir, reportNew = true)
                         }
-                        merged[event.hostPath] = event.kind
-                    } else {
-                        merged[event.hostPath] = mergeKind(existing, event.kind)
                     }
                 }
-
-                accept(first)
-                // 固定窗口：到期必发。静默 debounce 会在编译这类持续变更期间一直不发出，把刷新吞掉。
-                val deadline = System.currentTimeMillis() + windowMs
-                while (true) {
-                    val remain = deadline - System.currentTimeMillis()
-                    if (remain <= 0) break
-                    val next = withTimeoutOrNull(remain) { events.receive() } ?: break
-                    accept(next)
-                }
-
+                if (merged.isEmpty() && !truncated) continue
                 val changes = merged.map { (path, kind) ->
                     FileChange(rootKind, path, containerPathOf(path), kind)
                 }
@@ -470,6 +439,7 @@ class FileChangeHub @Inject constructor(
 
         private fun startObserver(onReady: (() -> Unit)? = null) {
             mainScope.launch {
+                if (subscribers.isEmpty()) return@launch
                 if (observer != null) {
                     onReady?.invoke()
                     return@launch

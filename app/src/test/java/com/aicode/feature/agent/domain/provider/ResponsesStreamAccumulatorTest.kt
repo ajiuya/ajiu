@@ -78,6 +78,96 @@ class ResponsesStreamAccumulatorTest {
     }
 
     @Test
+    fun argumentPreviewsKeepParallelIdsAndItemOnlyDeltasIsolated() {
+        val acc = ResponsesStreamAccumulator()
+        val first = """{"tool_title":"Write a","path":"a","content":""""
+        val second = """{"tool_title":"Write b","path":"b","content":"other"}"""
+        acc.accept(itemEvent(ResponsesEvent.OUTPUT_ITEM_ADDED, 0, functionCallItem("c1", "writeFile")))
+        acc.accept(itemEvent(ResponsesEvent.OUTPUT_ITEM_ADDED, 1, functionCallItem("c2", "writeFile")))
+        acc.accept(argsDelta(0, first).apply {
+            remove("output_index")
+            addProperty("item_id", "fc_c1")
+        })
+        val partial = acc.argumentPreviews(force = true).single()
+        assertEquals("c1", partial.id)
+        assertEquals(first, partial.accumulated)
+        acc.accept(argsDelta(1, second).apply { addProperty("item_id", "fc_c2") })
+        val other = acc.argumentPreviews(force = true).single()
+        assertEquals("c2", other.id)
+        assertEquals(second, other.accumulated)
+
+        val body = "a".repeat(150_000)
+        acc.accept(argsDelta(0, "$body\"}").apply { addProperty("item_id", "fc_c1") })
+        val completed = acc.argumentPreviews(force = true).single()
+        assertEquals("c1", completed.id)
+        assertEquals(128 * 1024, completed.accumulated.length)
+        val calls = acc.toResponse().toolCalls
+        assertEquals(JsonPrimitive(body), calls[0].arguments["content"])
+        assertEquals(JsonPrimitive("Write a"), calls[0].arguments["tool_title"])
+        assertEquals(JsonPrimitive("other"), calls[1].arguments["content"])
+    }
+
+    @Test
+    fun terminalSnapshotsKeepRawArgumentCountsAndDoNotReplayCanonicalArguments() {
+        val acc = ResponsesStreamAccumulator()
+        val raw = """ { "content" : "\u6c49" } """
+        acc.accept(itemEvent(ResponsesEvent.OUTPUT_ITEM_ADDED, 0, functionCallItem("stream", "writeFile")))
+        acc.accept(argsDelta(0, raw))
+        val preview = acc.argumentPreviews(force = true).single()
+        assertEquals(raw.length, preview.totalAsciiChars)
+        assertEquals(0, preview.totalOtherChars)
+        acc.accept(terminalEvent(ResponsesEvent.COMPLETED, "completed", output = JsonArray().apply {
+            add(functionCallItem("stream", "writeFile", """{"content":"汉"}"""))
+        }))
+        repeat(3) { assertTrue(acc.argumentPreviews(force = true).isEmpty()) }
+        assertEquals(JsonPrimitive("汉"), acc.toResponse().toolCalls.single().arguments["content"])
+    }
+
+    @Test
+    fun toolNameArrivingOnlyAtTheTerminalEventCanStillPublishArgumentCounts() {
+        val acc = ResponsesStreamAccumulator()
+        val raw = """{"content":"汉"}"""
+        acc.accept(itemEvent(ResponsesEvent.OUTPUT_ITEM_ADDED, 0, functionCallItem("stream", "", raw)))
+        assertTrue(acc.argumentPreviews(force = true).isEmpty())
+        acc.accept(terminalEvent(ResponsesEvent.COMPLETED, "completed", output = JsonArray().apply {
+            add(functionCallItem("stream", "writeFile", raw))
+        }))
+        val preview = acc.argumentPreviews(force = true).single()
+        assertEquals("stream", preview.id)
+        assertEquals("writeFile", preview.name)
+        assertEquals(raw.length - 1, preview.totalAsciiChars)
+        assertEquals(1, preview.totalOtherChars)
+        assertTrue(acc.argumentPreviews(force = true).isEmpty())
+    }
+
+    @Test
+    fun terminalOnlyToolArgumentsStillProvideACompleteCountingSnapshot() {
+        val acc = ResponsesStreamAccumulator()
+        val raw = """{"content":"汉"}"""
+        acc.accept(terminalEvent(ResponsesEvent.COMPLETED, "completed", output = JsonArray().apply {
+            add(functionCallItem("final", "writeFile", raw))
+        }))
+        val preview = acc.argumentPreviews(force = true).single()
+        assertEquals("final", preview.id)
+        assertEquals(raw.length - 1, preview.totalAsciiChars)
+        assertEquals(1, preview.totalOtherChars)
+        assertTrue(acc.argumentPreviews(force = true).isEmpty())
+    }
+
+    @Test
+    fun argumentPreviewsWaitForKnownIdentityAndCanUseCompleteItemPayload() {
+        val acc = ResponsesStreamAccumulator()
+        acc.accept(argsDelta(0, "{\"tool_title\":"))
+        assertTrue(acc.argumentPreviews(force = true).isEmpty())
+        val full = """{"tool_title":"Inspect","path":"a.kt"}"""
+        acc.accept(itemEvent(ResponsesEvent.OUTPUT_ITEM_DONE, 0, functionCallItem("c1", "readFile", full)))
+        val preview = acc.argumentPreviews(force = true).single()
+        assertEquals("c1", preview.id)
+        assertEquals("readFile", preview.name)
+        assertEquals(full, preview.accumulated)
+    }
+
+    @Test
     fun text_deltas_accumulate_and_completed_maps_to_stop() {
         val acc = ResponsesStreamAccumulator()
 

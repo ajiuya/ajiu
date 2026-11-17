@@ -4,7 +4,11 @@ import com.aicode.core.util.FileLogger
 import com.aicode.feature.agent.domain.tool.explorer.shellQuote
 import com.aicode.feature.workspace.domain.remote.RemoteAuth
 import com.aicode.feature.credentials.domain.model.GitCredential
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -66,6 +70,7 @@ class RemoteSshConnection @Inject constructor(
     private val mutex = Mutex()
     private val sftpLock = Mutex()
     private val credentialSyncMutex = Mutex()
+    private val builtinDefinitionMutex = Mutex()
     internal val sftpOperationMutex = Mutex()
 
     private val _connectionState = MutableStateFlow(ConnectionState.DISCONNECTED)
@@ -81,6 +86,9 @@ class RemoteSshConnection @Inject constructor(
     var remoteHome: String? = null
         private set
 
+    @Volatile
+    private var activeIdentity: RemoteConnectionIdentity? = null
+
     /** 当前连接配置快照，供重连与路径映射使用。 */
     @Volatile
     var config: RemoteConnectionConfig? = null
@@ -92,26 +100,43 @@ class RemoteSshConnection @Inject constructor(
         this.config = config
         _connectionState.value = ConnectionState.CONNECTING
         try {
-            withContext(Dispatchers.IO) {
-                val client = newSshClient(config)
-                sshClient = client
-                // 查远程真实 home（root 是 /root，普通用户是 /home/xxx），供文件工具展开 ~
-                runCatching {
-                    val s = client.startSession()
-                    val cmd = s.exec("echo \$HOME")
-                    remoteHome = java.io.BufferedReader(java.io.InputStreamReader(cmd.inputStream))
-                        .readText().trim().ifEmpty { null }
-                    s.close()
+            var home: String? = null
+            val client = acquireSshResource(close = { it: SSHClient -> it.close() }) {
+                withSshSetup(newSshClient(config)) { client ->
+                    // 查远程真实 home（root 是 /root，普通用户是 /home/xxx），供文件工具展开 ~
+                    runCatching {
+                        client.startSession().use { session ->
+                            val cmd = session.exec("echo \$HOME")
+                            home = java.io.BufferedReader(java.io.InputStreamReader(cmd.inputStream))
+                                .use { it.readText().trim().ifEmpty { null } }
+                        }
+                    }
+                    // 注册 transport 断开监听：连接断开时即时推状态，不等 supervisor 轮询
+                    client.transport.setDisconnectListener { reason, info ->
+                        FileLogger.w(TAG, "SSH 连接断开: $reason, $info")
+                        if (sshClient === client) {
+                            activeIdentity = null
+                            _connectionState.value = ConnectionState.DISCONNECTED
+                        }
+                    }
+                    client
                 }
-                // 注册 transport 断开监听：连接断开时即时推状态，不等 supervisor 轮询
-                client.transport.setDisconnectListener { reason, info ->
-                    FileLogger.w(TAG, "SSH 连接断开: $reason, $info")
-                    _connectionState.value = ConnectionState.DISCONNECTED
-                }
-                FileLogger.i(TAG, "SSH 已连接 ${config.host}:${config.port} as ${config.username}")
             }
-            _connectionState.value = ConnectionState.CONNECTED
+            try {
+                currentCoroutineContext().ensureActive()
+                sshClient = client
+                remoteHome = home
+                home?.let { activeIdentity = RemoteConnectionIdentity(client, it) }
+                _connectionState.value = ConnectionState.CONNECTED
+                FileLogger.i(TAG, "SSH 已连接 ${config.host}:${config.port} as ${config.username}")
+            } catch (failure: Throwable) {
+                if (sshClient === client) sshClient = null
+                runCatching { client.close() }.exceptionOrNull()?.let(failure::addSuppressed)
+                throw failure
+            }
         } catch (e: Exception) {
+            activeIdentity = null
+            remoteHome = null
             _connectionState.value = ConnectionState.FAILED
             throw e
         }
@@ -133,6 +158,8 @@ class RemoteSshConnection @Inject constructor(
     }
 
     private fun disconnectInternal() {
+        activeIdentity = null
+        remoteHome = null
         closeSftpInternal()
         runCatching { sshClient?.disconnect() }
         sshClient = null
@@ -148,22 +175,24 @@ class RemoteSshConnection @Inject constructor(
     }
 
     /** 建立一条 SSH transport 并完成认证与保活（exec 与 SFTP 各建一条）。 */
-    private fun newSshClient(config: RemoteConnectionConfig): SSHClient = SSHClient().apply {
-        addHostKeyVerifier(hostKeyVerifier)
-        connect(config.host, config.port)
-        when (val auth = config.auth) {
-            is RemoteAuth.Password -> authPassword(config.username, auth.password)
-            is RemoteAuth.PrivateKey -> {
-                val pem = privateKeyStore.readPem(auth.privateKeyPath)
-                val passwordFinder = auth.passphrase?.let { PasswordUtils.createOneOff(it.toCharArray()) }
-                authPublickey(config.username, loadKeys(pem, null, passwordFinder))
+    private fun newSshClient(config: RemoteConnectionConfig): SSHClient = withSshSetup(SSHClient()) { client ->
+        client.apply {
+            addHostKeyVerifier(hostKeyVerifier)
+            connect(config.host, config.port)
+            when (val auth = config.auth) {
+                is RemoteAuth.Password -> authPassword(config.username, auth.password)
+                is RemoteAuth.PrivateKey -> {
+                    val pem = privateKeyStore.readPem(auth.privateKeyPath)
+                    val passwordFinder = auth.passphrase?.let { PasswordUtils.createOneOff(it.toCharArray()) }
+                    authPublickey(config.username, loadKeys(pem, null, passwordFinder))
+                }
             }
-        }
-        // 启用 SSH 心跳保活，防止空闲超时断连
-        runCatching {
-            connection.keepAlive?.let {
-                it.setKeepAliveInterval(30)
-                it.start()
+            // 启用 SSH 心跳保活，防止空闲超时断连
+            runCatching {
+                connection.keepAlive?.let {
+                    it.setKeepAliveInterval(30)
+                    it.start()
+                }
             }
         }
     }
@@ -174,12 +203,12 @@ class RemoteSshConnection @Inject constructor(
     /** 开一个 exec session 执行命令。调用方负责关闭返回的 Command。 */
     fun startExecSession(command: String): Session.Command {
         val client = sshClient ?: throw IllegalStateException("SSH 未连接")
-        val session = client.startSession()
-        val cmd = session.exec(command)
-        // 立即给远端进程的 stdin 送 EOF：所有调用方只读输出。不关的话，远端按「stdin 是否可读」
-        // 决定行为的程序（无路径参数的 rg 等）会把 channel 当待读输入，一直等到命令超时。
-        runCatching { cmd.outputStream.close() }
-        return cmd
+        return withSshSetup(client.startSession()) { session ->
+            session.exec(command).also { cmd ->
+                // 不发送 EOF 的非交互命令可能一直等待 stdin。
+                runCatching { cmd.outputStream.close() }
+            }
+        }
     }
 
     /**
@@ -188,7 +217,7 @@ class RemoteSshConnection @Inject constructor(
      */
     fun startExecSessionWithStdin(command: String): Session.Command {
         val client = sshClient ?: throw IllegalStateException("SSH 未连接")
-        return client.startSession().exec(command)
+        return withSshSetup(client.startSession()) { it.exec(command) }
     }
 
     /** 开一个新的 Session，供调用方分配 PTY 并启动 shell。调用方负责关闭 Session。 */
@@ -212,6 +241,42 @@ class RemoteSshConnection @Inject constructor(
         val sftp = withContext(Dispatchers.IO) { client.newSFTPClient() }
         sftpClient = sftp
         sftp
+    }
+
+    fun captureIdentity(): RemoteConnectionIdentity {
+        val identity = activeIdentity ?: throw IllegalStateException("SSH 未连接或远程 home 未就绪")
+        checkIdentity(identity)
+        return identity
+    }
+
+    /** A reconnect, even to the same host/home, invalidates a previously captured identity. */
+    fun checkIdentity(identity: RemoteConnectionIdentity) {
+        if (activeIdentity !== identity || sshClient !== identity.owner || remoteHome != identity.home || !isConnected()) {
+            throw CancellationException("SSH connection identity changed")
+        }
+    }
+
+    /** Caller owns this subsystem and must close it; it never shares or replaces the cached sftp(). */
+    suspend fun openReadChannel(identity: RemoteConnectionIdentity): SFTPClient {
+        var owned: SFTPClient? = null
+        return try {
+            val channel = withContext(Dispatchers.IO) {
+                mutex.withLock {
+                    checkIdentity(identity)
+                    identity.owner.newSFTPClient().also {
+                        owned = it
+                        currentCoroutineContext().ensureActive()
+                        checkIdentity(identity)
+                    }
+                }
+            }
+            checkIdentity(identity)
+            channel
+        } catch (failure: Throwable) {
+            // withContext may discard a successfully opened resource on prompt cancellation.
+            owned?.let { runCatching { it.close() }.exceptionOrNull()?.let(failure::addSuppressed) }
+            throw failure
+        }
     }
 
     /** 丢弃当前 SFTP 通道（通道异常后调用），下次 [sftp] 会重建。 */
@@ -356,6 +421,32 @@ class RemoteSshConnection @Inject constructor(
         }
     }
 
+    suspend fun uploadBuiltinDefinitions(
+        agents: Map<String, ByteArray>,
+        skills: Map<String, Map<String, ByteArray>>,
+        identity: RemoteConnectionIdentity = captureIdentity()
+    ): BuiltinInstallReport = builtinDefinitionMutex.withLock {
+        BuiltinDefinitionPaths.validate(agents, skills)
+        if (agents.isEmpty() && skills.isEmpty()) return@withLock BuiltinInstallReport()
+        withContext(Dispatchers.IO) {
+            openReadChannel(identity).use { channel ->
+                val installContext = currentCoroutineContext()
+                val validateScope = {
+                    installContext.ensureActive()
+                    checkBuiltinInstallThread()
+                    checkIdentity(identity)
+                }
+                runInterruptible {
+                    BuiltinDefinitionInstaller(
+                        RemoteBuiltinDefinitionStore(channel, identity.home, validateScope),
+                        checkActive = validateScope,
+                        onFailure = { name, error -> FileLogger.w(TAG, "释放远程内置定义失败: $name", error) }
+                    ).install(agents, skills)
+                }
+            }
+        }
+    }
+
     /**
      * 把 App 的 git 凭据注入远程服务器（仅当用户开启「自动注入」时调用）：
      * 写 `~/.aicode/git-credentials`（store 格式）+ `~/.aicode/gitconfig` + `~/.aicode/gitconfig.credential`。
@@ -473,6 +564,13 @@ class RemoteSshConnection @Inject constructor(
     private fun encodeCreds(plain: String): String =
         android.util.Base64.encodeToString(plain.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP).reversed()
 }
+
+/** Opaque transport generation; no password, private key or mutable connection configuration. */
+class RemoteConnectionIdentity internal constructor(
+    internal val owner: SSHClient,
+    val home: String,
+    val generation: UUID = UUID.randomUUID()
+)
 
 /** 远程 SSH 连接状态，供 UI 指示器与工作区初始化时序判断。 */
 enum class ConnectionState {

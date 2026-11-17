@@ -24,7 +24,14 @@ interface ChatSessionDao {
     @Query("SELECT * FROM chat_sessions WHERE workspacePath = :workspacePath AND parentId IS NULL ORDER BY isPinned DESC, updatedAt DESC")
     suspend fun getRootSessionsByWorkspaceOnce(workspacePath: String): List<ChatSessionEntity>
 
-    @Query("SELECT * FROM chat_sessions WHERE workspacePath = :workspacePath AND parentId IS NULL AND NOT EXISTS (SELECT 1 FROM agent_messages WHERE sessionId = chat_sessions.id) ORDER BY isPinned DESC, updatedAt DESC LIMIT 1")
+    @Query("""
+        SELECT * FROM chat_sessions WHERE workspacePath = :workspacePath AND parentId IS NULL
+          AND autoDispatchBlockedReason IS NULL
+          AND NOT EXISTS (SELECT 1 FROM agent_messages WHERE sessionId = chat_sessions.id)
+          AND NOT EXISTS (SELECT 1 FROM agent_recovery_requests q WHERE q.sessionId = chat_sessions.id
+              AND q.generation = chat_sessions.executionGeneration AND q.status NOT IN ('COMPLETED', 'ABANDONED'))
+        ORDER BY isPinned DESC, updatedAt DESC LIMIT 1
+    """)
     suspend fun getEmptyRootSessionByWorkspace(workspacePath: String): ChatSessionEntity?
 
     /** 最近更新的根会话（忽略置顶，仅按 updatedAt 降序），供启动时「打开最近会话」。 */
@@ -51,6 +58,22 @@ interface ChatSessionDao {
 
     @Query("SELECT * FROM chat_sessions WHERE id = :id")
     suspend fun getById(id: String): ChatSessionEntity?
+
+    @Query("SELECT EXISTS(SELECT 1 FROM chat_sessions WHERE id = :id)")
+    fun observeExists(id: String): Flow<Boolean>
+
+    @Query("SELECT id, executionGeneration, autoDispatchBlockedReason FROM chat_sessions WHERE id = :id")
+    suspend fun getRecoveryGate(id: String): RecoverySessionGate?
+
+    @Query("SELECT id, executionGeneration, autoDispatchBlockedReason FROM chat_sessions WHERE id = :id")
+    fun observeRecoveryGate(id: String): Flow<RecoverySessionGate?>
+
+    @Query("""
+        SELECT EXISTS(SELECT 1 FROM agent_recovery_requests q JOIN chat_sessions s ON s.id = q.sessionId
+            WHERE q.sessionId = :id AND q.generation = s.executionGeneration
+              AND q.status NOT IN ('COMPLETED', 'ABANDONED'))
+    """)
+    suspend fun hasPendingRecovery(id: String): Boolean
 
     /** 单个会话的实时流（根会话与子会话通用）。 */
     @Query("SELECT * FROM chat_sessions WHERE id = :id")

@@ -5,6 +5,7 @@ import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.annotation.StringRes
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -13,8 +14,9 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
@@ -34,11 +36,11 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.aicode.R
+import com.aicode.core.theme.Radius
 import com.aicode.core.theme.Spacing
 import com.aicode.feature.settings.data.repository.BackgroundSettingsRepository
 import kotlinx.coroutines.Dispatchers
@@ -52,6 +54,7 @@ internal fun decodeBackgroundBitmap(path: String, maxWidth: Int, maxHeight: Int)
     runCatching {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(path, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return@runCatching null
         var sample = 1
         while (bounds.outWidth / sample > maxWidth * 2 || bounds.outHeight / sample > maxHeight * 2) {
             sample *= 2
@@ -64,9 +67,9 @@ internal fun decodeBackgroundBitmap(path: String, maxWidth: Int, maxHeight: Int)
  * 自定义背景图设置弹窗：缩略图预览 + 透明度滑块 + 选图/移除。
  *
  * @param imagePath 当前背景图路径，null 表示未设置。
- * @param alpha 当前透明度（0.05~1.0）。
+ * @param alpha 当前透明度（0~[alphaMax]）。
  * @param onPickImage 用户选定图片后回调。
- * @param onAlphaChange 透明度变化回调（写 DataStore，全局背景随之变化；落盘节流在 ViewModel 侧）。
+ * @param onAlphaChange 透明度变化回调（落盘节流在 ViewModel 侧）。
  * @param onRemove 移除背景回调。
  * @param onDismiss 关闭弹窗。
  */
@@ -78,10 +81,12 @@ internal fun BackgroundImageSheet(
     onPickImage: (Uri) -> Unit,
     onAlphaChange: (Float) -> Unit,
     onRemove: () -> Unit,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    @StringRes titleRes: Int = R.string.settings_background_image,
+    alphaMax: Float = BackgroundSettingsRepository.MAX_ALPHA,
+    @StringRes hintRes: Int? = null
 ) {
     val sheetState = rememberModalBottomSheetState()
-    val context = LocalContext.current
     val imagePicker = rememberLauncherForActivityResult(
         ActivityResultContracts.PickVisualMedia()
     ) { uri -> if (uri != null) onPickImage(uri) }
@@ -97,7 +102,9 @@ internal fun BackgroundImageSheet(
 
     // 滑块位置由本地状态驱动：直接绑外部 alpha 会让每次拖动都走「写 DataStore → 回读 → 整个设置页重组」
     // 的往返，滑块因此跟不上手指。弹窗每次打开都重建，初值取当前设置即可。
-    var sliderPercent by remember { mutableFloatStateOf(BackgroundSettingsRepository.alphaToSlider(alpha)) }
+    var sliderPercent by remember(alphaMax) {
+        mutableFloatStateOf((alpha / alphaMax).coerceIn(0f, 1f) * 100f)
+    }
 
     AdaptiveModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -107,25 +114,35 @@ internal fun BackgroundImageSheet(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
                 .padding(horizontal = Spacing.lg)
                 .padding(bottom = Spacing.xl)
         ) {
             Text(
-                text = stringResource(R.string.settings_background_image),
+                text = stringResource(titleRes),
                 style = MaterialTheme.typography.titleSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(bottom = Spacing.md)
             )
 
+            if (hintRes != null) {
+                Text(
+                    text = stringResource(hintRes),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(bottom = Spacing.md)
+                )
+            }
+
             if (previewBitmap != null) {
                 Image(
                     bitmap = previewBitmap!!,
-                    contentDescription = stringResource(R.string.settings_background_image),
+                    contentDescription = stringResource(titleRes),
                     contentScale = ContentScale.Crop,
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(160.dp)
-                        .clip(RoundedCornerShape(12.dp))
+                        .clip(RoundedCornerShape(Radius.mdLarge))
                 )
                 Spacer(Modifier.height(Spacing.lg))
             }
@@ -141,7 +158,7 @@ internal fun BackgroundImageSheet(
                     modifier = Modifier.weight(1f)
                 )
                 Text(
-                    text = "${sliderPercent.toInt()}%",
+                    text = stringResource(R.string.settings_percent_value, sliderPercent.toInt()),
                     style = MaterialTheme.typography.bodyMedium,
                     fontWeight = FontWeight.SemiBold,
                     color = MaterialTheme.colorScheme.onSurface
@@ -151,7 +168,7 @@ internal fun BackgroundImageSheet(
                 value = sliderPercent,
                 onValueChange = { percent ->
                     sliderPercent = percent
-                    onAlphaChange(BackgroundSettingsRepository.sliderToAlpha(percent))
+                    onAlphaChange(alphaMax * (percent / 100f).coerceIn(0f, 1f))
                 },
                 valueRange = 0f..100f
             )

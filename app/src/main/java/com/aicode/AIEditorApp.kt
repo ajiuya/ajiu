@@ -22,7 +22,7 @@ import com.aicode.feature.settings.data.repository.LanguageSettingsRepository
 import com.aicode.feature.settings.data.repository.LogSettingsRepository
 import com.aicode.feature.settings.data.remote.ModelMetadataService
 import com.aicode.feature.terminal.domain.KeepaliveWorker
-import com.aicode.feature.terminal.domain.TerminalKeepaliveService
+import com.aicode.feature.terminal.domain.TaskKeepaliveController
 import dagger.hilt.android.HiltAndroidApp
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -274,9 +274,8 @@ class AIEditorApp : Application(), Configuration.Provider {
         appScope.launch {
             ContainerInstaller.extractScripts(this@AIEditorApp)
         }
-        // 启动即释放内置子代理定义（Explore）到 ~/.aicode/agents/；已存在不覆盖，用户改过或删掉都不会被升级拉回。
         appScope.launch {
-            ContainerInstaller.extractAgents(this@AIEditorApp)
+            ContainerInstaller.extractBuiltinDefinitions(this@AIEditorApp)
         }
         // 启动即把旧 Room git 凭据一次性迁移到 git-credentials 文件（真源已迁到文件，删表由迁移器完成）。
         appScope.launch {
@@ -351,21 +350,11 @@ class AIEditorApp : Application(), Configuration.Provider {
         }
         // 连接与同步的「跟随当前工作区」由 RemoteRepository 内部监听工作区变化自动执行（启动注入即就绪）：
         // 工作区就绪/切换时，自动断开非当前工作区的挂载，连接当前工作区里勾了「应用启动时自动连接」的挂载。
-        // 后台保活常驻通知的唯一反应器：监听开关，启停 TerminalKeepaliveService 的常驻模式。
-        // 既覆盖设置页实时切换，也覆盖冷启动恢复。仅在「由开变关」时发 disable，
-        // 避免为关闭而凭空拉起从未开过的 Service。
         appScope.launch {
-            var last: Boolean? = null
             keepaliveSettings.enabledFlow.distinctUntilChanged().collect { enabled ->
-                if (enabled) {
-                    TerminalKeepaliveService.enablePersistent(this@AIEditorApp)
-                    // WorkManager 兜底：周期检查服务存活，被杀后自动拉起。
-                    KeepaliveWorker.schedule(this@AIEditorApp)
-                } else if (last == true) {
-                    TerminalKeepaliveService.disablePersistent(this@AIEditorApp)
-                    KeepaliveWorker.cancel(this@AIEditorApp)
-                }
-                last = enabled
+                TaskKeepaliveController.setPersistent(this@AIEditorApp, enabled)
+                if (enabled) KeepaliveWorker.schedule(this@AIEditorApp)
+                else KeepaliveWorker.cancel(this@AIEditorApp)
             }
         }
         // 网络恢复或切换链路时立即重连 SSH，不等 supervisor 轮询（并带动远端工作区刷新）。
@@ -373,21 +362,6 @@ class AIEditorApp : Application(), Configuration.Provider {
             networkConnectivityObserver.recovered.collect {
                 runCatching { remoteSshConnection.tryReconnectIfDisconnected() }
                     .onFailure { FileLogger.w(TAG, "网络恢复后重连 SSH 失败", it) }
-            }
-        }
-        // 远程 SSH 连接期间维持前台服务：否则远程模式下的空闲会话切后台会被冻结、连接被切断。
-        // 用会话计数（而非用户常驻开关）表达，连接断开即释放，不影响用户对保活开关的选择。
-        appScope.launch {
-            var held = false
-            remoteSshConnection.connectionState.collect { state ->
-                val connected = state == com.aicode.feature.agent.domain.container.ConnectionState.CONNECTED
-                if (connected && !held) {
-                    TerminalKeepaliveService.startSession(this@AIEditorApp)
-                    held = true
-                } else if (!connected && held) {
-                    TerminalKeepaliveService.stopSession(this@AIEditorApp)
-                    held = false
-                }
             }
         }
         // 连接已配置的 MCP server，把其工具注册进 ToolRegistry（内部自有 scope，失败不影响启动）。
@@ -445,12 +419,11 @@ class AIEditorApp : Application(), Configuration.Provider {
         }.onFailure { FileLogger.w(TAG, "同步内置文档到远程失败", it) }
     }
 
-    /**
-     * 释放内置子代理定义（Explore）与面板示例脚本到远程 `~/.aicode/agents`、`~/.aicode/scripts`。
-     * 远程模式下全局 agents/scripts 以远端为准，内置默认需在远端存在才能开箱即用；仅补齐缺失、不覆盖用户修改。
-     */
     private suspend fun releaseBuiltinAssetsToRemote() {
-        remoteSshConnection.uploadBuiltinFiles("agents", collectAssetBytes("agents"))
+        val identity = remoteSshConnection.captureIdentity()
+        val agents = com.aicode.feature.agent.domain.container.BuiltinDefinitionAssets.agents(this)
+        val skills = com.aicode.feature.agent.domain.container.BuiltinDefinitionAssets.skills(this)
+        remoteSshConnection.uploadBuiltinDefinitions(agents, skills, identity)
         remoteSshConnection.uploadBuiltinFiles("scripts", collectAssetBytes("aicode/scripts"), executable = true)
     }
 
@@ -787,7 +760,7 @@ class AIEditorApp : Application(), Configuration.Provider {
             }
             notificationManager.createNotificationChannel(liveChannel)
 
-            // 授权审批通知：AI 在后台阻塞等待授权/提问/计划审批时弹出，需要弹窗+声音。
+            // 授权审批通知：AI 在后台阻塞等待授权/提问时弹出，需要弹窗+声音。
             val approvalChannel = NotificationChannel(
                 "agent_approval",
                 getString(R.string.notification_channel_agent_approval),

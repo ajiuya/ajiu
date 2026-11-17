@@ -228,18 +228,6 @@ class PermissionRulesRepository @Inject constructor(
         return project + global
     }
 
-    /** 按 scope 新增规则。PROJECT 写入当前项目；无当前项目则忽略并告警。 */
-    suspend fun add(scope: PermissionScope, rule: PermissionRule) {
-        when (scope) {
-            PermissionScope.GLOBAL -> editGlobal { if (rule !in it) it.add(rule) }
-            PermissionScope.PROJECT -> {
-                val workspacePath = workspaceRepository.currentPath()
-                editProject(workspacePath) { if (rule !in it) it.add(rule) }
-            }
-        }
-        FileLogger.i(TAG, "记忆授权规则[$scope]: ${rule.toolName} ${rule.pattern}")
-    }
-
     suspend fun removeGlobalRule(rule: PermissionRule) = editGlobal { it.remove(rule) }
 
     suspend fun removeProjectRule(projectName: String, rule: PermissionRule) {

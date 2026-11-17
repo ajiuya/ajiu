@@ -5,6 +5,9 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.io.File
+import java.io.IOException
+import java.io.RandomAccessFile
+import java.util.zip.CRC32
 
 /**
  * 单个文件上次成功同步后的指纹。索引按挂载持久化，用于「跳过未变文件」——远程 SFTP/FTP
@@ -18,53 +21,215 @@ data class FileFingerprint(
     val sha256: String? = null
 )
 
-/**
- * 同步指纹索引的持久化：每个挂载一个 JSON 文件（`<dir>/<mountId>.json`），key 为相对挂载根的路径。
- *
- * 用相对路径而非绝对路径作 key，挂载的本地路径被修改后索引仍可复用。文件读写均为 app 私有目录，
- * 与当前执行模式（本地/远程）无关。写入走「临时文件 + rename」原子落盘，避免写一半崩溃损坏索引。
- */
-class SyncIndexStore(private val dir: File) {
-
+/** 旧 JSON 只读保留；新格式使用带校验的快照与有序批次 journal。 */
+class SyncIndexStore internal constructor(
+    private val dir: File,
+    private val io: SyncIndexIo = SyncIndexIo(),
+    private val compactAfterFrames: Int = 256
+) {
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
 
-    private fun fileOf(mountId: String): File = File(dir, "$mountId.json")
+    @Serializable private data class Snapshot(
+        val version: Int = 1,
+        val sequence: Long,
+        val entries: Map<String, FileFingerprint>,
+        val observed: Map<String, FileFingerprint> = emptyMap(),
+        val observationInitialized: Boolean = false
+    )
+    @Serializable private data class CheckedSnapshot(val payload: String, val crc: Long)
+    @Serializable private data class Delta(val sequence: Long, val changes: Map<String, FileFingerprint?>)
+    private data class State(
+        val entries: MutableMap<String, FileFingerprint>,
+        var sequence: Long = 0,
+        var frames: Int = 0,
+        var initialized: Boolean = false,
+        var writable: Boolean = true,
+        var repairTo: Long? = null,
+        val observed: MutableMap<String, FileFingerprint> = linkedMapOf(),
+        var observationInitialized: Boolean = false
+    )
 
-    /** 读取索引；文件不存在或损坏时返回空（视为全部需要上传，保守）。 */
-    fun load(mountId: String): Map<String, FileFingerprint> {
-        val file = fileOf(mountId)
-        if (!file.isFile) return emptyMap()
-        return runCatching {
-            json.decodeFromString<Map<String, FileFingerprint>>(file.readText())
-        }.getOrElse { e ->
-            FileLogger.w(TAG, "读取同步索引失败，按空索引处理（将全量上传）: ${file.name}: ${e.message}")
-            emptyMap()
+    private val states = HashMap<String, State>()
+    private fun file(id: String, suffix: String): File {
+        require(id.isNotBlank() && id != "." && id != ".." && '/' !in id && '\\' !in id)
+        return File(dir, "$id.$suffix")
+    }
+    internal fun ownsPath(path: String): Boolean =
+        File(path).absoluteFile.toPath().normalize().startsWith(dir.absoluteFile.toPath().normalize())
+
+    @Synchronized fun load(mountId: String): Map<String, FileFingerprint> = HashMap(state(mountId).entries)
+
+    @Synchronized internal fun observationBaseline(mountId: String): Map<String, FileFingerprint>? =
+        state(mountId).let { if (it.observationInitialized) HashMap(it.observed) else null }
+
+    @Synchronized internal fun initializeObservationBaseline(mountId: String, baseline: Map<String, FileFingerprint>) {
+        val previous = state(mountId)
+        if (previous.observationInitialized) return
+        check(previous.writable) { "Sync index requires recovery: $mountId" }
+        baseline.forEach { (key, value) -> validate(key, value) }
+        ensureDirectory()
+        previous.repairTo?.let { io.truncate(file(mountId, "journal"), it) }
+        val candidate = previous.copy(observed = baseline.toMutableMap(), observationInitialized = true, repairTo = null)
+        compact(mountId, candidate)
+        states[mountId] = candidate
+    }
+
+    @Synchronized fun requireReconcile(mountId: String) {
+        val marker = file(mountId, "rescan")
+        if (marker.isFile) return
+        ensureDirectory()
+        io.atomicWrite(marker, byteArrayOf(1))
+    }
+
+    @Synchronized fun needsReconcile(mountId: String): Boolean =
+        file(mountId, "rescan").exists() || state(mountId).let { !it.writable || it.repairTo != null }
+
+    @Synchronized fun save(mountId: String, fingerprints: Map<String, FileFingerprint>) {
+        val previous = state(mountId).entries
+        val changes = LinkedHashMap<String, FileFingerprint?>()
+        for (key in previous.keys) if (key !in fingerprints) changes[key] = null
+        for ((key, value) in fingerprints) if (previous[key] != value) changes[key] = value
+        applyChanges(mountId, changes)
+    }
+
+    @Synchronized fun applyChanges(mountId: String, changes: Map<String, FileFingerprint?>) {
+        val state = state(mountId)
+        val actual = changes.filter { (key, value) -> state.entries[key] != value || key in state.observed }
+        if (actual.isEmpty()) return
+        check(state.writable) { "Sync index requires recovery: $mountId" }
+        actual.forEach { (key, value) -> validate(key, value) }
+        ensureDirectory()
+        state.repairTo?.let { valid ->
+            io.truncate(file(mountId, "journal"), valid)
+            state.repairTo = null
+        }
+        if (!state.initialized) compact(mountId, state)
+        check(state.sequence < Long.MAX_VALUE) { "Sync index sequence exhausted" }
+        val payload = json.encodeToString(Delta(state.sequence + 1, actual)).toByteArray(Charsets.UTF_8)
+        val journal = file(mountId, "journal")
+        val before = journal.length()
+        try {
+            io.append(journal, payload)
+        } catch (error: Exception) {
+            state.repairTo = before
+            try {
+                io.truncate(journal, before)
+                state.repairTo = null
+            } catch (rollback: Exception) {
+                error.addSuppressed(rollback)
+            }
+            throw error
+        }
+        actual.forEach { (key, value) ->
+            if (value == null) state.entries.remove(key) else state.entries[key] = value
+            state.observed.remove(key)
+        }
+        state.sequence++
+        state.frames++
+        if (state.frames >= compactAfterFrames || journal.length() >= 1024L * 1024) {
+            // The transaction is durable even if snapshot publication or rotation fails.
+            runCatching { compact(mountId, state) }
+                .onFailure { FileLogger.w(TAG, "同步索引压缩失败: $mountId", it) }
         }
     }
 
-    fun save(mountId: String, fingerprints: Map<String, FileFingerprint>) {
-        runCatching {
-            dir.mkdirs()
-            val payload = json.encodeToString(fingerprints)
-            val tmp = File(dir, "$mountId.json.tmp")
-            tmp.writeText(payload)
-            val target = fileOf(mountId)
-            if (!tmp.renameTo(target)) {
-                // rename 失败（罕见）回退直接写，避免丢索引
-                target.writeText(payload)
-                tmp.delete()
+    @Synchronized fun clear(mountId: String) {
+        val previous = state(mountId)
+        ensureDirectory()
+        val cleared = State(linkedMapOf(), sequence = previous.sequence,
+            observed = (previous.observed + previous.entries).toMutableMap(),
+            observationInitialized = previous.observationInitialized)
+        compact(mountId, cleared)
+        states[mountId] = cleared
+    }
+
+    private fun state(id: String): State = states.getOrPut(id) {
+        try {
+            val snapshot = file(id, "snapshot")
+            val legacy = file(id, "json")
+            val loaded = when {
+                snapshot.exists() -> {
+                    val checked = json.decodeFromString<CheckedSnapshot>(snapshot.readText())
+                    require(crc(checked.payload.toByteArray(Charsets.UTF_8)) == checked.crc) { "Snapshot checksum mismatch" }
+                    val data = json.decodeFromString<Snapshot>(checked.payload)
+                    require(data.version == 1 && data.sequence >= 0) { "Unsupported snapshot" }
+                    State(data.entries.toMutableMap(), sequence = data.sequence, initialized = true,
+                        observed = data.observed.toMutableMap(), observationInitialized = data.observationInitialized)
+                }
+                legacy.exists() -> State(json.decodeFromString<Map<String, FileFingerprint>>(legacy.readText()).toMutableMap())
+                else -> {
+                    require(!file(id, "journal").exists()) { "Journal baseline missing" }
+                    State(linkedMapOf())
+                }
             }
-        }.onFailure { FileLogger.w(TAG, "保存同步索引失败: $mountId", it) }
+            loaded.entries.forEach { (key, value) -> validate(key, value) }
+            loaded.observed.forEach { (key, value) -> validate(key, value) }
+            replay(id, loaded)
+            loaded
+        } catch (error: Exception) {
+            FileLogger.w(TAG, "同步索引不可验证，保留原文件并按未同步处理: $id", error)
+            State(linkedMapOf(), writable = false)
+        }
     }
 
-    /** 删除某挂载的索引（「清除同步记录」）；下次上传将视为全部未同步。 */
-    fun clear(mountId: String) {
-        runCatching { fileOf(mountId).delete() }
+    private fun replay(id: String, state: State) {
+        val journal = file(id, "journal")
+        if (!journal.exists()) return
+        var valid = 0L
+        try {
+            RandomAccessFile(journal, "r").use { input ->
+                var preceding: Long? = null
+                while (input.filePointer < input.length()) {
+                    val length = input.readInt()
+                    val checksum = input.readInt()
+                    require(length > 0 && length.toLong() <= input.length() - input.filePointer) { "Incomplete journal frame" }
+                    val payload = ByteArray(length)
+                    input.readFully(payload)
+                    require(crc(payload).toInt() == checksum) { "Journal checksum mismatch" }
+                    val delta = json.decodeFromString<Delta>(payload.toString(Charsets.UTF_8))
+                    require(delta.sequence > 0 && (preceding == null || delta.sequence == preceding + 1)) { "Journal sequence gap" }
+                    preceding = delta.sequence
+                    delta.changes.forEach { (key, value) -> validate(key, value) }
+                    if (delta.sequence > state.sequence) {
+                        require(delta.sequence == state.sequence + 1) { "Snapshot sequence gap" }
+                        delta.changes.forEach { (key, value) ->
+                            if (value == null) state.entries.remove(key) else state.entries[key] = value
+                            state.observed.remove(key)
+                        }
+                        state.sequence = delta.sequence
+                    }
+                    state.frames++
+                    valid = input.filePointer
+                }
+            }
+        } catch (error: Exception) {
+            // Preserve the bad tail for diagnosis. A later append first durably removes it.
+            state.repairTo = valid
+            FileLogger.w(TAG, "同步索引尾批次不可验证，要求重新对账: $id", error)
+        }
     }
 
-    private companion object {
-        const val TAG = "SyncIndexStore"
+    private fun compact(id: String, state: State) {
+        val payload = json.encodeToString(Snapshot(sequence = state.sequence, entries = state.entries,
+            observed = state.observed, observationInitialized = state.observationInitialized))
+        val checked = CheckedSnapshot(payload, crc(payload.toByteArray(Charsets.UTF_8)))
+        io.atomicWrite(file(id, "snapshot"), json.encodeToString(checked).toByteArray(Charsets.UTF_8))
+        state.initialized = true
+        io.atomicWrite(file(id, "journal"), ByteArray(0))
+        state.frames = 0
     }
+
+    private fun ensureDirectory() {
+        if (!dir.isDirectory && !dir.mkdirs()) throw IOException("Cannot create sync index directory")
+    }
+
+    private fun validate(key: String, value: FileFingerprint?) {
+        require(key.isNotEmpty() && !key.startsWith('/') && key.split('/').none { it == ".." || it == "." || it.isEmpty() })
+        require(value == null || (value.size >= -1 && value.mtimeMs >= 0))
+    }
+
+    private fun crc(bytes: ByteArray): Long = CRC32().apply { update(bytes) }.value
+    private companion object { const val TAG = "SyncIndexStore" }
 }
 
 /** 单文件是否需要上传的纯判定逻辑（与网络/磁盘副作用解耦，便于单测）。 */

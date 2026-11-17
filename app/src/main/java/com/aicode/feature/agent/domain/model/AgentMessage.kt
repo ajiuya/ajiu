@@ -10,7 +10,11 @@ sealed class AgentMessage {
     data class UserMessage(
         val id: String = java.util.UUID.randomUUID().toString(),
         val content: String,
-        val images: List<AgentImage> = emptyList()
+        val images: List<AgentImage> = emptyList(),
+        val isCompactionMarker: Boolean = false,
+        val isTransient: Boolean = false,
+        val modelInputOwnerId: String? = null,
+        val projectMemoryKey: String? = null
     ) : AgentMessage()
 
     @Serializable
@@ -29,7 +33,8 @@ sealed class AgentMessage {
          * 回放时按 path 重建 base64 喂模型；落库只存附件路径不存 base64（见 [MessagePersistenceUseCase]）。
          */
         val images: List<AgentImage> = emptyList(),
-        val inputTokens: Int = 0
+        val inputTokens: Int = 0,
+        val isContextSummary: Boolean = false
     ) : AgentMessage()
 
     @Serializable
@@ -72,9 +77,6 @@ data class AgentContext(
     val sessionId: String? = null,
     val inputMessageId: String = java.util.UUID.randomUUID().toString(),
     val lastInputTokens: Int = 0,
-    val mode: AgentMode = AgentMode.BUILD,
-    /** 进入 PLAN 前的模式（如 AUTO）：退出 PLAN 时恢复到它，null 视为 BUILD。 */
-    val modeBeforePlan: AgentMode? = null,
     /** 当前会话的持续目标文本；null 表示未设定目标。 */
     val goal: String? = null,
     /** 当前会话的 goal 生命周期状态；ACTIVE 表示自主循环进行中。 */
@@ -85,12 +87,17 @@ data class AgentContext(
      * 本会话绑定的自定义子代理定义；非空表示这是一个按定义运行的子代理会话，
      * 系统提示词与工具集都按其配置组装（见 [com.aicode.feature.agent.domain.prompt.SystemPromptProvider]）。
      */
-    val agentDefinition: AgentDefinition? = null
+    val agentDefinition: AgentDefinition? = null,
+    val rootApprovalId: String? = null,
+    val projectMemoryIdentity: com.aicode.feature.agent.domain.memory.ProjectMemoryIdentity? = null,
+    val projectMemoryContext: String? = null,
+    val projectMemoryProjectId: String? = null,
+    val originalUserRequest: String? = null,
+    val projectMemoryTurnOverride: com.aicode.feature.agent.domain.memory.ProjectMemoryTurnOverride? = null,
+    val projectMemoryCapture: com.aicode.feature.agent.domain.memory.ProjectMemoryCapture? = null,
+    val persistInputSnapshot: Boolean = false,
+    val transientInput: Boolean = false,
+    val recoveryRunId: String? = null,
+    val requireFreshFileRead: Boolean = false
 ) {
-    /**
-     * 工具授权判定用的有效模式：goal 自主循环激活期间按 AUTO 放行（保留灾难性安全防护），
-     * 与用户可见的 [mode] 解耦——goal 不改变会话显示的模式，只改变授权强度。
-     */
-    val permissionMode: AgentMode
-        get() = if (goalStatus == GoalStatus.ACTIVE) AgentMode.AUTO else mode
 }

@@ -69,18 +69,51 @@ class WorkspacePathMapper @Inject constructor(
             ?: ContainerProfile.BUILTIN_ALPINE
     }
 
+    internal data class ExecutionMapping(
+        val profile: ContainerProfile,
+        val workspaceRoot: File,
+        val rootfsRoot: File,
+        val aicodeRoot: File,
+        val home: String
+    )
+
+    internal fun captureExecutionMapping(): ExecutionMapping {
+        val profile = currentProfile
+        return ExecutionMapping(
+            profile,
+            File(workspaceRepository.currentPath()).canonicalFile,
+            containerInstaller.rootfsDirFor(profile).canonicalFile,
+            containerInstaller.aicodeDir.canonicalFile,
+            pathHomeResolver.home()
+        )
+    }
+
+    private fun executionMapping(): ExecutionMapping? = WorkspaceExecutionContext.current()?.let {
+        it.requireMode(com.aicode.feature.settings.data.repository.ExecutionMode.LOCAL_PROOT)
+        it.localMapping ?: throw java.util.concurrent.CancellationException("Local execution mapping missing")
+    }
+
+    private fun expandHome(path: String): String {
+        val home = executionMapping()?.home ?: return pathHomeResolver.expandHome(path)
+        return when {
+            path == "~" -> home
+            path.startsWith("~/") -> home.trimEnd('/') + path.removePrefix("~")
+            else -> path
+        }
+    }
+
     /** 当前工作区在宿主上的根目录。 */
-    private fun hostRoot(): File = File(workspaceRepository.currentPath())
+    private fun hostRoot(): File = executionMapping()?.workspaceRoot ?: File(workspaceRepository.currentPath())
 
     /** [CONTAINER_ROOT] 展开后的绝对路径（`$HOME/workspace`），供路径匹配使用。home 未就绪时回退 `/root`。 */
     private fun resolvedContainerRoot(): String =
-        pathHomeResolver.home().trimEnd('/') + "/workspace"
+        (executionMapping()?.home ?: pathHomeResolver.home()).trimEnd('/') + "/workspace"
 
     /** 容器 rootfs 在宿主上的根目录（容器内 `/` 即此目录，随当前 profile 变化）。 */
-    private fun rootfsRoot(): File = containerInstaller.rootfsDirFor(currentProfile)
+    private fun rootfsRoot(): File = executionMapping()?.rootfsRoot ?: containerInstaller.rootfsDirFor(currentProfile)
 
     /** AI 配置目录在宿主上的根（容器内 `/root/.aicode` 即此目录，独立于 rootfs）。 */
-    private fun aicodeRoot(): File = containerInstaller.aicodeDir
+    private fun aicodeRoot(): File = executionMapping()?.aicodeRoot ?: containerInstaller.aicodeDir
 
     /**
      * 把 AI 提供的路径解析为宿主真实文件。兼容以下写法：
@@ -94,7 +127,7 @@ class WorkspacePathMapper @Inject constructor(
     fun toHostFile(path: String): File {
         val root = hostRoot()
         val wsRoot = resolvedContainerRoot()
-        val p = pathHomeResolver.expandHome(path.trim())
+        val p = expandHome(path.trim())
         val file = when {
             p == wsRoot || p == "$wsRoot/" || p == CONTAINER_ROOT || p == "$CONTAINER_ROOT/" -> root
             p.startsWith("$wsRoot/") -> File(root, p.removePrefix("$wsRoot/"))
@@ -107,7 +140,7 @@ class WorkspacePathMapper @Inject constructor(
     }
 
     fun resolveFile(path: String, followFinalLink: Boolean = true): File {
-        val expanded = pathHomeResolver.expandHome(path.trim())
+        val expanded = expandHome(path.trim())
         val absolute = if (expanded.startsWith("/")) expanded else "${resolvedContainerRoot()}/$expanded"
         val pending = ArrayDeque(absolute.split('/').filter { it.isNotEmpty() })
         var current = "/"
@@ -181,11 +214,11 @@ class WorkspacePathMapper @Inject constructor(
      * 与容器内 shell（proot `-b` bind mount）看到的不一致。
      */
     private fun extraMounts(): List<Pair<String, String>> =
-        currentProfile.extraBindings.mapNotNull { binding ->
+        (executionMapping()?.profile ?: currentProfile).extraBindings.mapNotNull { binding ->
             val idx = binding.indexOf(':')
             val src = (if (idx >= 0) binding.substring(0, idx) else binding).trim()
             val dstRaw = if (idx >= 0) binding.substring(idx + 1) else binding
-            val dst = pathHomeResolver.expandHome(dstRaw.trim()).trimEnd('/')
+            val dst = expandHome(dstRaw.trim()).trimEnd('/')
             if (src.isEmpty() || dst.isEmpty()) null else src to dst
         }.sortedByDescending { it.second.length }
 

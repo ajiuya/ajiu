@@ -29,7 +29,8 @@ import javax.inject.Inject
  * AI 不需要查询或记忆 todo_id，也不需要区分创建、更新、删除动作。
  */
 class TodoTool @Inject constructor(
-    private val todoItemDao: TodoItemDao
+    private val todoItemDao: TodoItemDao,
+    private val recoveryRepository: com.aicode.feature.agent.domain.recovery.RecoveryRepository? = null
 ) : AbstractContextualTool() {
 
     private companion object {
@@ -85,14 +86,16 @@ class TodoTool @Inject constructor(
             ?: return ToolResult.Error("未关联会话", "NO_SESSION")
 
         return try {
-            replaceTodos(args, sessionId)
+            replaceTodos(args, sessionId, context.recoveryRunId)
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
         } catch (e: Exception) {
             FileLogger.e(TAG, "todo 工具执行失败: ${e.message}", e)
             ToolResult.Error("待办操作失败：${e.message}")
         }
     }
 
-    private suspend fun replaceTodos(args: Map<String, JsonElement>, sessionId: String): ToolResult {
+    private suspend fun replaceTodos(args: Map<String, JsonElement>, sessionId: String, runId: String?): ToolResult {
         val itemElements = args["items"] as? JsonArray
             ?: return ToolResult.Error("缺少必需参数：items", "MISSING_ITEMS")
         val existingBySubject = todoItemDao.getBySessionOnce(sessionId)
@@ -121,9 +124,13 @@ class TodoTool @Inject constructor(
             ))
         }
 
-        todoItemDao.deleteBySession(sessionId)
-        if (entities.isNotEmpty()) {
-            todoItemDao.upsertAll(entities)
+        if (runId != null) {
+            if (!checkNotNull(recoveryRepository).replaceTodos(runId, entities)) {
+                throw kotlinx.coroutines.CancellationException("Todo execution owner changed")
+            }
+        } else {
+            todoItemDao.deleteBySession(sessionId)
+            if (entities.isNotEmpty()) todoItemDao.upsertAll(entities)
         }
         FileLogger.d(TAG, "todo replace: 同步了 ${entities.size} 项待办")
 

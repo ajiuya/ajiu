@@ -1,20 +1,20 @@
 ---
 layout: home
-title: AiCode - 手机端 AI 编程工具与内置 Linux 终端
+title: 阿九工作台 - 手机端 AI 编程工具与内置 Linux 终端
 titleTemplate: false
-description: AiCode 是一款开源的 Android 端 AI 编程工具，无需电脑，在手机上即可完成完整开发流程。内置 Linux 容器与终端，AI Agent 可直接读写代码并执行构建；支持 Git 版本控制、MCP 协议与远程 SSH 开发。
+description: 阿九工作台是一款开源的 Android 端 AI 编程工具，无需电脑，在手机上即可完成完整开发流程。内置 Linux 容器与终端，AI Agent 可直接读写代码并执行构建；支持 Git 版本控制、MCP 协议与远程 SSH 开发。
 head:
   - - meta
     - name: keywords
-      content: AiCode, Android AI 编程, 手机编程, 移动端开发, Linux 终端, PRoot, Termux, AI Agent, MCP 协议, 手机代码编辑器, Git 客户端, 移动工作站, 手机跑终端, 远程 SSH 开发
+      content: 阿九工作台, Ajiu Workbench, AiCode, Android AI 编程, 手机编程, 移动端开发, Linux 终端, PRoot, Termux, AI Agent, MCP 协议, 手机代码编辑器, Git 客户端, 移动工作站, 手机跑终端, 远程 SSH 开发
 
 hero:
-  name: AiCode
+  name: 阿九工作台
   text: 手机上的 AI 编程工具与移动工作站
   tagline: 无需电脑，在手机上即可完成从写代码、调试到提交的完整开发流程。内置 Linux 容器与终端，AI Agent 可自主读写文件、执行 Shell 命令与运行构建，还支持 Git、MCP、远程 SSH 与完整模型生态。
   image:
     src: /logo.png
-    alt: AiCode
+    alt: 阿九工作台
   actions:
     - theme: brand
       text: 快速上手
@@ -28,7 +28,7 @@ hero:
 
 features:
   - title: AI Agent
-    details: 支持 OpenAI / Anthropic / Gemini 兼容协议，多供应商随时切换；内置文件读写、Shell 执行、后台终端、搜索与图片识别等工具，流式输出，长对话自动压缩上下文。
+    details: 支持 OpenAI / Anthropic / Gemini 兼容协议，多供应商随时切换；内置文件读写、Shell 执行、后台终端、搜索与图片识别等工具，流式输出，长对话自动压缩上下文。普通工具默认自动放行，明确禁止规则与高危审批仍生效。
   - title: 内置终端与 Linux 容器
     details: 基于 Termux 组件与 PRoot 的本地容器，内置 Alpine 镜像，可导入自定义 rootfs、挂载宿主目录，终端支持后台常驻。
   - title: 远程 SSH 模式

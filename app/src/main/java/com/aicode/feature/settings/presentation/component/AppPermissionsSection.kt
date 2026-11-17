@@ -62,7 +62,11 @@ internal fun AppPermissionsSection(
     shizukuState: ShizukuState,
     onRequestShizukuPermission: () -> Unit,
     onOpenShizuku: () -> Unit,
-    onRefreshShizuku: () -> Unit
+    onRefreshShizuku: () -> Unit,
+    rootEnabled: Boolean = false,
+    rootChanging: Boolean = false,
+    rootError: String? = null,
+    onSetRootEnabled: (Boolean) -> Unit = {}
 ) {
     val context = LocalContext.current
 
@@ -165,7 +169,7 @@ internal fun AppPermissionsSection(
             )
             SettingsDivider()
             val shizukuAction: (() -> Unit)? = when (shizukuState) {
-                ShizukuState.NOT_INSTALLED, ShizukuState.NOT_RUNNING -> onOpenShizuku
+                ShizukuState.NOT_INSTALLED, ShizukuState.NOT_RUNNING, ShizukuState.SHELL_REQUIRED -> onOpenShizuku
                 ShizukuState.PERMISSION_DENIED -> onRequestShizukuPermission
                 ShizukuState.READY -> null
             }
@@ -179,6 +183,19 @@ internal fun AppPermissionsSection(
                         text = stringResource(shizukuState.statusRes()),
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            )
+            SettingsDivider()
+            SettingsRow(
+                icon = FeatherIcons.Terminal,
+                title = stringResource(R.string.settings_root_access),
+                subtitle = rootError ?: stringResource(R.string.settings_root_access_hint),
+                trailing = {
+                    AppSwitch(
+                        checked = rootEnabled,
+                        enabled = !rootChanging,
+                        onCheckedChange = onSetRootEnabled
                     )
                 }
             )
@@ -348,6 +365,7 @@ private fun ShizukuState.statusRes(): Int = when (this) {
     ShizukuState.NOT_INSTALLED -> R.string.settings_shizuku_status_not_installed
     ShizukuState.NOT_RUNNING -> R.string.settings_shizuku_status_not_running
     ShizukuState.PERMISSION_DENIED -> R.string.settings_shizuku_status_denied
+    ShizukuState.SHELL_REQUIRED -> R.string.settings_shizuku_status_shell_required
     ShizukuState.READY -> R.string.settings_shizuku_status_ready
 }
 
@@ -357,6 +375,7 @@ private fun ShizukuState.hintRes(): Int = when (this) {
     ShizukuState.NOT_INSTALLED -> R.string.settings_shizuku_hint_not_installed
     ShizukuState.NOT_RUNNING -> R.string.settings_shizuku_hint_not_running
     ShizukuState.PERMISSION_DENIED -> R.string.settings_shizuku_hint_denied
+    ShizukuState.SHELL_REQUIRED -> R.string.shizuku_shell_required
     ShizukuState.READY -> R.string.settings_shizuku_hint_ready
 }
 

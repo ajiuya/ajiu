@@ -11,9 +11,9 @@ plugins {
     id("com.google.devtools.ksp")
 }
 
-// 从本地 keystore.properties 读取 release 签名密钥（已 gitignore，不入库）。
-// 若文件不存在（如 CI 环境）则跳过，release 产出 unsigned 包。
-val keystorePropertiesFile = file("keystore.properties")
+val keystorePropertiesFile = providers.gradleProperty("releaseSigningProperties")
+    .map { file(it) }
+    .getOrElse(file("keystore.properties"))
 val keystoreProperties = Properties()
 if (keystorePropertiesFile.exists()) {
     keystoreProperties.load(FileInputStream(keystorePropertiesFile))
@@ -102,7 +102,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.aicode"
+        applicationId = "com.ajiu"
         minSdk = 26
         // 仍锁 targetSdk 28，但阻塞项已不是 PRoot：proot 全套改由 jniLibs 装到 nativeLibraryDir
         // （见 sourceSets 与 packaging.jniLibs 注释），W^X 不再挡容器启动。升级前待解决：
@@ -112,8 +112,12 @@ android {
         //      保活需换 specialUse。
         // 代价：不能上 Google Play。
         targetSdk = 28
-        versionCode = gitCommitCount()
-        versionName = gitVersionName()
+        versionCode = providers.gradleProperty("appVersionCode")
+            .map { it.toInt().also { code -> require(code > 0) } }
+            .getOrElse(gitCommitCount())
+        versionName = providers.gradleProperty("appVersionName")
+            .map { it.also { name -> require(name.isNotBlank()) } }
+            .getOrElse(gitVersionName())
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -168,10 +172,7 @@ android {
     }
 
     buildTypes {
-        // debug 加包名后缀 .debug → applicationId 变 com.aicode.debug，与 release（com.aicode）
-        // 可同机共存、互不覆盖。IDE 跑 debug 不再因签名不同卸载已装的正式版。
-        // 注意：因 applicationId 不同，debug 变体私有目录为 /data/data/com.aicode.debug/，
-        // release 已解压的容器 rootfs 与工作区项目在 debug 下不可见（需重新解压/clone），属预期隔离行为。
+        // debug 使用独立应用 ID，与正式包的私有数据和签名互不干扰。
         debug {
             applicationIdSuffix = ".debug"
         }
@@ -189,8 +190,7 @@ android {
                 include = false
             }
         }
-        // beta 测试版：继承 release 的全部配置（签名/R8/资源压缩/proguard），仅包名后缀 .beta
-        // → applicationId 变 com.aicode.beta，可与正式版同机共存、互不覆盖。
+        // beta 测试版继承 release 配置，以 .beta 应用 ID 独立安装。
         // 由 .github/workflows/beta.yml 在 push main 时构建并上传 Artifacts，供测机验证。
         create("beta") {
             initWith(getByName("release"))
@@ -389,6 +389,7 @@ dependencies {
     // WorkManager — 保活兜底：周期检查 TerminalKeepaliveService 存活并拉起（KeepaliveWorker）
     implementation("androidx.work:work-runtime-ktx:2.10.0")
     implementation("androidx.hilt:hilt-work:1.2.0")
+    ksp("androidx.hilt:hilt-compiler:1.2.0")
 
     // Android WebKit 扩展（提供现代深色模式 WebSettingsCompat / ForceDark 支持）
     implementation("androidx.webkit:webkit:1.12.1")

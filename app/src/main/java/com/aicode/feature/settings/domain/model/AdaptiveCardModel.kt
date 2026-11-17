@@ -24,7 +24,6 @@ data class DashboardContext(
     val modelSupportsReasoning: Boolean = false,
     val messageCount: Int = 0,
     val agentState: String = "",
-    val sessionMode: String = "",
     val reasoningEffort: String = "",
     val refreshReason: String = ""
 )

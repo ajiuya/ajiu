@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="compaction_error_timeout">上下文压缩等待超时，已保留原历史。请稍后重试。</string>
+    <string name="compaction_error_authentication">压缩模型未通过身份验证，已保留原历史。请检查提供商配置。</string>
+    <string name="compaction_error_rate_limit">压缩模型请求受限，已保留原历史。请稍后重试。</string>
+    <string name="compaction_error_service">压缩服务暂不可用，已保留原历史。请稍后重试。</string>
+    <string name="compaction_error_network">压缩时网络连接中断，已保留原历史。请检查连接后重试。</string>
+    <string name="compaction_error_truncated">压缩摘要仍被截断，未采用不完整结果。原历史已保留。</string>
+    <string name="compaction_error_budget">当前历史无法在压缩预算内完整处理，原历史已保留。可调整压缩模型后重试。</string>
+    <string name="compaction_error_busy">该会话已有压缩任务，请等待其结束。</string>
+    <string name="compaction_error_incomplete">上下文压缩未完成或返回了无效结果，已保留原历史。</string>
+</resources>

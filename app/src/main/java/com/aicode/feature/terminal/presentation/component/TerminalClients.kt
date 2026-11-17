@@ -10,6 +10,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.aicode.core.util.FileLogger
+import com.termux.terminal.KeyHandler
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
 import com.termux.view.TerminalView
@@ -103,7 +104,8 @@ class AppTerminalViewClient(
     private val viewProvider: () -> TerminalView?,
     private val modifiers: TerminalKeyModifiers,
     private val currentFontSizeSp: () -> Int,
-    private val onFontSizeCommit: (Int) -> Unit
+    private val onFontSizeCommit: (Int) -> Unit,
+    private val onUserInput: (TerminalSession) -> Unit
 ) : TerminalViewClient {
 
     private companion object {
@@ -152,7 +154,14 @@ class AppTerminalViewClient(
     override fun isTerminalViewSelected(): Boolean = true
     override fun copyModeChanged(copyMode: Boolean) {}
 
-    override fun onKeyDown(keyCode: Int, e: KeyEvent?, session: TerminalSession?): Boolean = false
+    override fun onKeyDown(keyCode: Int, e: KeyEvent?, session: TerminalSession?): Boolean {
+        if (session != null && e != null && !e.isSystem) {
+            val sendsMultiple = e.action == KeyEvent.ACTION_MULTIPLE && keyCode == KeyEvent.KEYCODE_UNKNOWN && !e.characters.isNullOrEmpty()
+            val sendsKey = !e.isFunctionPressed && KeyHandler.getCode(keyCode, 0, false, false) != null
+            if (sendsMultiple || sendsKey) onUserInput(session)
+        }
+        return false
+    }
     override fun onKeyUp(keyCode: Int, e: KeyEvent?): Boolean = false
     override fun onLongPress(event: MotionEvent?): Boolean = false
 
@@ -162,6 +171,7 @@ class AppTerminalViewClient(
     override fun readFnKey(): Boolean = modifiers.fn
 
     override fun onCodePoint(codePoint: Int, ctrlDown: Boolean, session: TerminalSession?): Boolean {
+        if (session != null) onUserInput(session)
         // 字符已发出，复位一次性修饰键
         modifiers.consume()
         return false

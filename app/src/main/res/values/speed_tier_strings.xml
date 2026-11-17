@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="speed_tier_menu_entry">请求速度 · %1$s</string>
+    <string name="speed_tier_menu_back">返回</string>
+    <string name="speed_tier_standard">标准</string>
+    <string name="speed_tier_fast">快速</string>
+    <string name="speed_tier_ultrafast">极速</string>
+    <string name="speed_tier_chosen">全局偏好 · %1$s</string>
+    <string name="speed_tier_effective">当前配置的请求档位 · %1$s</string>
+    <string name="speed_tier_standard_hint">使用服务端默认等级</string>
+    <string name="speed_tier_fast_requirement">需使用明确的 xAI 通道，或 GPT 模型并开启 Responses API</string>
+    <string name="speed_tier_ultrafast_requirement">需使用 gpt-6-astra 前缀模型并开启 Responses API</string>
+    <string name="speed_tier_global_hint">对所有会话生效，从下次请求开始使用，当前请求重试不变。不支持时仅调整请求档位，保留全局偏好；不改变思考强度。</string>
+    <string name="speed_tier_cost_hint">快速或极速可能增加费用。是否接受与实际速度取决于提供商及账户，不代表官方权益。</string>
+    <string name="speed_tier_open_mcp">MCP 服务</string>
+</resources>

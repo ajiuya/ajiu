@@ -1,5 +1,12 @@
 package com.aicode.feature.agent.presentation.component
 
+import com.aicode.core.ui.KeyedDeferredCache
+import com.aicode.core.ui.WeightedLruCache
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import org.jsoup.parser.Parser
 import java.util.Base64
 
@@ -15,23 +22,33 @@ import java.util.Base64
  */
 internal object MarkdownPreprocessor {
 
-    // 进程级结果缓存：process 会在 item 每次滚入视口时被调（上层只有 remember(text)，滚出
-    // 被 dispose 后 remember 归零）。含数学定界符的文本要跑正则，快速 fling 时反复重跑拖慢主线程。
-    // 这里按原文做进程级 LRU，同一段只处理一次。
-    private const val CACHE_MAX = 256
-    private val cache = object : LinkedHashMap<String, String>(CACHE_MAX, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean = size > CACHE_MAX
+    private val cache = WeightedLruCache<String, String>(256, MarkdownCacheBudget.PREPROCESS, MarkdownCacheBudget::textPair)
+    private val tasks = KeyedDeferredCache<String, String>(
+        CoroutineScope(SupervisorJob() + Dispatchers.Default), 256, retain = { false },
+    )
+
+    fun peek(raw: String): String? = cache[raw]
+    fun stats() = cache.stats()
+
+    suspend fun resolve(raw: String): String = cache[raw] ?: tasks.get(raw) {
+        val context = currentCoroutineContext()
+        cache[raw] ?: processUncached(raw) { context.ensureActive() }.also {
+            context.ensureActive()
+            cache.put(raw, it)
+        }
     }
 
-    fun process(raw: String): String {
+    fun process(raw: String): String = cache[raw] ?: processUncached(raw).also { cache.put(raw, it) }
+
+    private fun processUncached(raw: String, checkpoint: () -> Unit = {}): String {
         if (raw.isEmpty()) return raw
         // 无需处理的快速路径：既没有 HTML 标签、没有 $ 或 \( / \[ 数学定界符，也没有 & 实体
         if (!raw.contains('<') && !raw.contains('$') && !raw.contains('\\') && !raw.contains('&')) return raw
 
-        synchronized(cache) { cache[raw] }?.let { return it }
-
+        checkpoint()
         val sb = StringBuilder(raw.length + 32)
-        for (seg in splitPreservingCode(raw)) {
+        for (seg in splitPreservingCode(raw, checkpoint)) {
+            checkpoint()
             when (seg.kind) {
                 SegmentKind.NORMAL -> sb.append(processNormal(seg.text))
                 // 行内代码也会被渲染器按 AST 遍历（CODE_SPAN 的子节点），HTML_TAG 同样会被丢弃，
@@ -40,9 +57,7 @@ internal object MarkdownPreprocessor {
                 SegmentKind.FENCE -> sb.append(seg.text)
             }
         }
-        val result = sb.toString()
-        synchronized(cache) { cache[raw] = result }
-        return result
+        return sb.toString()
     }
 
     private enum class SegmentKind { NORMAL, INLINE_CODE, FENCE }
@@ -50,7 +65,7 @@ internal object MarkdownPreprocessor {
     private data class Segment(val kind: SegmentKind, val text: String)
 
     /** 扫描文本，把围栏代码块与行内代码切成 isCode=true 的段原样保留，其余为普通文本段。 */
-    private fun splitPreservingCode(text: String): List<Segment> {
+    private fun splitPreservingCode(text: String, checkpoint: () -> Unit): List<Segment> {
         val result = ArrayList<Segment>()
         val normal = StringBuilder()
         val n = text.length
@@ -65,6 +80,7 @@ internal object MarkdownPreprocessor {
         }
 
         while (i < n) {
+            if (i % 1024 == 0) checkpoint()
             val c = text[i]
 
             // 围栏代码块：行首连续 >=3 个 ` 或 ~
@@ -79,6 +95,7 @@ internal object MarkdownPreprocessor {
                     var lineStart = if (lineEnd < n) lineEnd + 1 else n
                     var k = lineStart
                     while (k <= n) {
+                        if (k % 1024 == 0) checkpoint()
                         if (k == n || text[k] == '\n') {
                             var p = lineStart
                             while (p < k && text[p] == ' ') p++
@@ -109,6 +126,7 @@ internal object MarkdownPreprocessor {
                 var k = j
                 var found = -1
                 while (k < n && text[k] != '\n') {
+                    if (k % 1024 == 0) checkpoint()
                     if (text[k] == '`') {
                         var m = k
                         while (m < n && text[m] == '`') m++

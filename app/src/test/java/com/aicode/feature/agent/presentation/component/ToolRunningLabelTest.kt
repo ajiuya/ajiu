@@ -53,6 +53,8 @@ class ToolRunningLabelTest {
     fun shellTools_mapToRunningCommand() {
         assertEquals(R.string.chat_status_running_command, toolRunningLabelRes("bash"))
         assertEquals(R.string.chat_status_running_command, toolRunningLabelRes("terminal"))
+        assertEquals(R.string.chat_status_running_command, toolRunningLabelRes("Root"))
+        assertEquals(R.string.chat_status_running_command, toolRunningLabelRes("Shizuku"))
     }
 
     @Test

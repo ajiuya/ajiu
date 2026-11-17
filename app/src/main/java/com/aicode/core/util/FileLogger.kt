@@ -178,20 +178,17 @@ object FileLogger {
     private fun write(level: String, tag: String, message: String, throwable: Throwable?) {
         val dir = logDir ?: return // 未初始化则只走 logcat，不落盘
         val now = java.time.Instant.now()
-        // 落盘前过媒体脱敏：防超大 base64（图片等）撑爆按天日志文件；logcat 仍打印原样（有系统截断保护）。
-        val redacted = MediaRedactor.redact(message)
-        val line = buildString {
-            append(timestampFormat.format(now))
-            append(" ").append(level)
-            append(" [").append(tag).append("] ")
-            append(redacted)
-            if (throwable != null) {
-                append("\n").append(stackTraceToString(throwable))
-            }
-            append("\n")
-        }
         ioExecutor.execute {
             runCatching {
+                val redacted = MediaRedactor.redact(message)
+                val line = buildString {
+                    append(timestampFormat.format(now))
+                    append(" ").append(level)
+                    append(" [").append(tag).append("] ")
+                    append(redacted)
+                    if (throwable != null) append("\n").append(stackTraceToString(throwable))
+                    append("\n")
+                }
                 val date = fileNameFormat.format(now)
                 val file = File(dir, "log-$date.txt")
                 // 跨天换文件；单文件超上限则重置重开。writer 仅本线程访问。

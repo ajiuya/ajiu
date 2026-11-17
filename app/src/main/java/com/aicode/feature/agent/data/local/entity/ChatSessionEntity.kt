@@ -1,9 +1,9 @@
 package com.aicode.feature.agent.data.local.entity
 
+import androidx.room.ColumnInfo
 import androidx.room.Entity
 import androidx.room.Index
 import androidx.room.PrimaryKey
-import com.aicode.feature.agent.domain.model.AgentMode
 import com.aicode.feature.agent.domain.model.ChatSession
 import com.aicode.feature.agent.domain.model.GoalStatus
 import com.aicode.feature.agent.domain.model.ReasoningEffort
@@ -18,9 +18,6 @@ data class ChatSessionEntity(
     val createdAt: Long,
     val updatedAt: Long,
     val workspacePath: String = "",
-    val mode: String = AgentMode.BUILD.name,
-    /** 进入 PLAN 前的模式（如 AUTO）；退出 PLAN 时恢复，null 视为 BUILD。 */
-    val modeBeforePlan: String? = null,
     /** 会话级持续目标文本；null 表示未设定目标。 */
     val goal: String? = null,
     /** goal 生命周期状态；[goal] 为 null 时无意义。 */
@@ -38,7 +35,10 @@ data class ChatSessionEntity(
     /** 子代理会话：父会话 id；null 表示普通根会话。 */
     val parentId: String? = null,
     /** 子代理会话：派生子代理的类型（如 coder / researcher）；null 表示普通根会话。 */
-    val subagentType: String? = null
+    val subagentType: String? = null,
+    @ColumnInfo(defaultValue = "0")
+    val executionGeneration: Long = 0,
+    val autoDispatchBlockedReason: String? = null
 ) {
     fun toDomain(): ChatSession = ChatSession(
         id = id,
@@ -46,8 +46,6 @@ data class ChatSessionEntity(
         createdAt = createdAt,
         updatedAt = updatedAt,
         workspacePath = workspacePath,
-        mode = runCatching { AgentMode.valueOf(mode) }.getOrDefault(AgentMode.BUILD),
-        modeBeforePlan = modeBeforePlan?.let { runCatching { AgentMode.valueOf(it) }.getOrNull() },
         goal = goal,
         goalStatus = goalStatus?.let { runCatching { GoalStatus.valueOf(it) }.getOrNull() },
         goalTurnCount = goalTurnCount,
@@ -61,7 +59,9 @@ data class ChatSessionEntity(
         lastInputTokens = lastInputTokens,
         isPinned = isPinned,
         parentId = parentId,
-        subagentType = subagentType
+        subagentType = subagentType,
+        executionGeneration = executionGeneration,
+        autoDispatchBlockedReason = autoDispatchBlockedReason
     )
 
     companion object {
@@ -71,8 +71,6 @@ data class ChatSessionEntity(
             createdAt = session.createdAt,
             updatedAt = session.updatedAt,
             workspacePath = session.workspacePath,
-            mode = session.mode.name,
-            modeBeforePlan = session.modeBeforePlan?.name,
             goal = session.goal,
             goalStatus = session.goalStatus?.name,
             goalTurnCount = session.goalTurnCount,
@@ -86,7 +84,9 @@ data class ChatSessionEntity(
             lastInputTokens = session.lastInputTokens,
             isPinned = session.isPinned,
             parentId = session.parentId,
-            subagentType = session.subagentType
+            subagentType = session.subagentType,
+            executionGeneration = session.executionGeneration,
+            autoDispatchBlockedReason = session.autoDispatchBlockedReason
         )
     }
 }

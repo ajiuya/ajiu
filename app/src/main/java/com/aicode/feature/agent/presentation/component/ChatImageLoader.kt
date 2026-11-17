@@ -1,6 +1,12 @@
 package com.aicode.feature.agent.presentation.component
 
 import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asAndroidBitmap
+import com.aicode.core.ui.ImageDecodeSpec
+import com.aicode.core.ui.KeyedDeferredCache
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
 import com.aicode.core.ui.ImageSource
 import com.aicode.core.ui.ImageViewerRequest
 import com.aicode.core.ui.decodeSampledBitmap
@@ -18,7 +24,7 @@ private const val TAG = "ChatImageLoader"
  * 聊天区图片加载器：把 [ImageSource] 落成位图交给全屏查看器。全项目只有这一份解码策略。
  *
  * [ImageSource.ContainerPath] 经 [FileAccessProvider.copyToLocal] 落到宿主文件 —— 本地 PRoot 模式
- * 只是路径映射、不产生拷贝；远程 SSH 模式会把文件 base64 拉回来写进临时文件。
+ * 只是路径映射、不产生拷贝；远程 SSH 模式使用与 Markdown 共享的来源隔离文件租约。
  */
 internal fun chatImageLoader(
     fileAccess: FileAccessProvider,
@@ -28,25 +34,42 @@ internal fun chatImageLoader(
     withContext(Dispatchers.IO) {
         try {
             when (source) {
-                is ImageSource.LocalFile ->
-                    decodeExistingFile(File(source.path), maxEdge, maxPixels)
-
-                is ImageSource.ContainerPath ->
-                    decodeExistingFile(fileAccess.copyToLocal(source.path), maxEdge, maxPixels)
-
-                is ImageSource.Base64 ->
-                    decodeSampledBitmap(Base64.getDecoder().decode(source.data), maxEdge, maxPixels)
+                is ImageSource.ContainerPath -> ChatImageFiles.load(fileAccess, source.path, ImageDecodeSpec(maxEdge, maxPixels))
+                else -> ChatLocalImageCache.load(source, ImageDecodeSpec(maxEdge, maxPixels))
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            FileLogger.w(TAG, "图片加载失败: $source", e)
+            FileLogger.w(TAG, "图片加载失败", e)
             null
         }
     }
 }
 
-private fun decodeExistingFile(file: File, maxEdge: Int, maxPixels: Long): ImageBitmap? {
-    if (!file.isFile || file.length() <= 0L) return null
-    return decodeSampledBitmap(file.absolutePath, maxEdge, maxPixels)
+private object ChatLocalImageCache {
+    private data class Key(val source: ImageSource, val spec: ImageDecodeSpec, val size: Long = 0L, val modified: Long = 0L)
+    private val images = KeyedDeferredCache<Key, ImageBitmap?>(
+        CoroutineScope(SupervisorJob() + Dispatchers.IO), 32, retain = { it != null },
+        maxWeight = 48L * 1024 * 1024,
+        weigh = { key, image -> 256L + 2L * when (val source = key.source) {
+            is ImageSource.Base64 -> source.data.length
+            is ImageSource.LocalFile -> source.path.length
+            is ImageSource.ContainerPath -> source.path.length
+        } + (image?.asAndroidBitmap()?.allocationByteCount?.toLong() ?: 0L) },
+    )
+
+    suspend fun load(source: ImageSource, spec: ImageDecodeSpec): ImageBitmap? {
+        val file = (source as? ImageSource.LocalFile)?.let { File(it.path) }
+        val key = Key(source, spec, file?.length() ?: 0L, file?.lastModified() ?: 0L)
+        return images.get(key) {
+            when (source) {
+                is ImageSource.LocalFile -> file?.takeIf { it.isFile && it.length() > 0L }
+                    ?.let { decodeSampledBitmap(it.absolutePath, spec.maxEdge, spec.maxPixels) }
+                is ImageSource.Base64 -> decodeSampledBitmap(Base64.getDecoder().decode(source.data), spec.maxEdge, spec.maxPixels)
+                is ImageSource.ContainerPath -> error("Container images require a file lease")
+            }
+        }
+    }
 }
 
 /**

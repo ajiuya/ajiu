@@ -17,6 +17,8 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -30,6 +32,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
@@ -56,6 +59,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
@@ -91,7 +95,6 @@ import com.aicode.feature.onboarding.domain.OnboardingStep
 import com.aicode.feature.onboarding.presentation.onboardingTarget
 import com.aicode.feature.agent.domain.command.SlashCommand
 import com.aicode.feature.agent.domain.command.SlashCommandKind
-import com.aicode.feature.agent.domain.model.AgentMode
 import com.aicode.feature.agent.domain.model.GoalStatus
 import com.aicode.feature.agent.presentation.SessionGoalUi
 import com.aicode.feature.agent.domain.model.ReasoningEffort
@@ -101,7 +104,7 @@ import com.aicode.feature.agent.domain.provider.reasoningCapabilityOf
 import com.aicode.feature.agent.domain.provider.reasoningProtocolOf
 import com.aicode.feature.agent.domain.permission.PermissionChoice
 import com.aicode.feature.agent.domain.tool.PendingToolPermission
-import com.aicode.feature.agent.domain.tool.mode.PlanApprovalRequest
+import com.aicode.feature.agent.domain.workflow.AgentEvent
 import com.aicode.feature.agent.domain.mention.FileMentionState
 import com.aicode.feature.agent.domain.mention.fileMentionQuery
 import com.aicode.feature.agent.presentation.AgentUIState
@@ -130,21 +133,19 @@ import compose.icons.feathericons.Minimize
 import compose.icons.feathericons.Plus
 import compose.icons.feathericons.Square
 import compose.icons.feathericons.Shield
+import java.util.Locale
 import kotlinx.coroutines.launch
 
 /** 输入框区域蒙版高度：盖住圆角容器，滚动内容滑入时被渐变遮罩；随键盘（IME）上移。 */
 private val INPUT_BAR_MASK_HEIGHT = 110.dp
 
-/** 输入框高度上下限：超过上限后文本在框内滚动，右上角露出「展开」按钮。与 TextField 的 heightIn 一致。 */
-private val INPUT_FIELD_MIN_HEIGHT = 44.dp
-private val INPUT_FIELD_MAX_HEIGHT = 140.dp
+/** 输入框高度上下限：超过上限后文本在框内滚动，右上角露出「展开」按钮。 */
+private val INPUT_FIELD_MIN_HEIGHT = 40.dp
+private val INPUT_FIELD_MAX_HEIGHT = 120.dp
+private val INPUT_FIELD_HORIZONTAL_PADDING = Spacing.lg
+private val INPUT_FIELD_VERTICAL_PADDING = 6.dp
 
-/**
- * M3 无标签 TextField 的默认 contentPadding（上下左右各 16dp）。
- * 文本是否超过输入框高度要先用相同约束实测一遍，反推文本可视区域得靠这个值。
- */
-private val INPUT_FIELD_CONTENT_PADDING = 16.dp
-
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 internal fun ChatInputBar(
     value: String,
@@ -161,8 +162,6 @@ internal fun ChatInputBar(
     providers: List<AIProviderConfig>,
     modelMetadata: Map<String, ModelMetadata>,
     onSelectModel: (String, String) -> Unit,
-    currentMode: AgentMode,
-    onToggleMode: (AgentMode) -> Unit,
     currentGoal: SessionGoalUi? = null,
     onSetGoalPaused: (Boolean) -> Unit = {},
     onClearGoal: () -> Unit = {},
@@ -202,12 +201,15 @@ internal fun ChatInputBar(
     onModelSheetDismiss: (() -> Unit)? = null,
     /** 主页模型弹层的连通性测试：null（无设置页 ViewModel 的宿主）时弹层不显示测试按钮。 */
     onRunModelTest: (suspend (AIProviderConfig, String) -> ModelTestResult)? = null,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    generationSpeed: AgentEvent.GenerationSpeed? = null,
+    onFullScreenInputChanged: (Boolean) -> Unit = {}
 ) {
     val hasContent = value.isNotBlank() || pendingAttachments.isNotEmpty()
     val canSend = hasContent
     var showAttachmentSheet by remember { mutableStateOf(false) }
     var showFullScreenInput by remember { mutableStateOf(false) }
+    SideEffect { onFullScreenInputChanged(showFullScreenInput) }
     // TextField 的 String 重载在整串替换时会保留旧 selection 下标（点快捷命令补全时光标会停在中间），
     // 这里自持 TextFieldValue：外部改值时把光标移到末尾。
     var inputFieldValue by remember { mutableStateOf(TextFieldValue(value, TextRange(value.length))) }
@@ -251,11 +253,11 @@ internal fun ChatInputBar(
     val inputDensity = LocalDensity.current
     var inputFieldWidthPx by remember { mutableStateOf(0) }
     val inputTextStyle = MaterialTheme.typography.bodyLarge
-    val inputOverflows = remember(value, inputFieldWidthPx, inputDensity, inputTextStyle) {
-        val horizontalPaddingPx = with(inputDensity) { INPUT_FIELD_CONTENT_PADDING.toPx() }
-        val contentWidthPx = inputFieldWidthPx - (horizontalPaddingPx * 2).toInt()
+    val inputOverflows = remember(value, inputFieldWidthPx, inputDensity, inputTextStyle, textMeasurer) {
+        val horizontalPaddingPx = with(inputDensity) { INPUT_FIELD_HORIZONTAL_PADDING.roundToPx() }
+        val contentWidthPx = inputFieldWidthPx - horizontalPaddingPx * 2
         val maxTextHeightPx = with(inputDensity) {
-            (INPUT_FIELD_MAX_HEIGHT - INPUT_FIELD_CONTENT_PADDING * 2).toPx()
+            INPUT_FIELD_MAX_HEIGHT.roundToPx() - INPUT_FIELD_VERTICAL_PADDING.roundToPx() * 2
         }
         contentWidthPx > 0 && value.isNotEmpty() && textMeasurer.measure(
             text = AnnotatedString(value),
@@ -496,41 +498,18 @@ internal fun ChatInputBar(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.Top
                 ) {
-                    TextField(
+                    ChatComposerTextField(
                         value = inputFieldValue,
                         onValueChange = { new ->
                             inputFieldValue = new
                             onValueChange(new.text)
                         },
+                        placeholder = stringResource(if (isBusy) R.string.chat_queue_hint else R.string.chat_input_placeholder),
+                        enterToSend = enterToSend,
+                        onSend = onSend,
                         modifier = Modifier
                             .weight(1f)
-                            .heightIn(min = INPUT_FIELD_MIN_HEIGHT, max = INPUT_FIELD_MAX_HEIGHT)
-                            .onSizeChanged { inputFieldWidthPx = it.width },
-                        placeholder = {
-                            Text(
-                                stringResource(if (isBusy) R.string.chat_queue_hint else R.string.chat_input_placeholder),
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        },
-                        enabled = true,
-                        keyboardOptions = if (enterToSend) {
-                            KeyboardOptions(imeAction = ImeAction.Send)
-                        } else {
-                            KeyboardOptions(imeAction = ImeAction.Default)
-                        },
-                        keyboardActions = if (enterToSend) {
-                            KeyboardActions(onSend = { onSend() })
-                        } else {
-                            KeyboardActions.Default
-                        },
-                        colors = TextFieldDefaults.colors(
-                            focusedContainerColor = Color.Transparent,
-                            unfocusedContainerColor = Color.Transparent,
-                            disabledContainerColor = Color.Transparent,
-                            focusedIndicatorColor = Color.Transparent,
-                            unfocusedIndicatorColor = Color.Transparent,
-                            disabledIndicatorColor = Color.Transparent
-                        )
+                            .onSizeChanged { inputFieldWidthPx = it.width }
                     )
 
                     if (inputOverflows) {
@@ -554,50 +533,10 @@ internal fun ChatInputBar(
                         .padding(horizontal = Spacing.xs, vertical = Spacing.xs),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Row(
+                    FlowRow(
                         modifier = Modifier.weight(1f),
-                        verticalAlignment = Alignment.CenterVertically
+                        verticalArrangement = Arrangement.spacedBy(Spacing.xs)
                     ) {
-                        val modeColor = when (currentMode) {
-                            AgentMode.PLAN -> MaterialTheme.colorScheme.primaryContainer
-                            AgentMode.AUTO -> MaterialTheme.colorScheme.error
-                            AgentMode.BUILD -> MaterialTheme.semanticColors.success
-                        }
-                        val modeTextColor = when (currentMode) {
-                            AgentMode.PLAN -> MaterialTheme.colorScheme.onPrimaryContainer
-                            AgentMode.AUTO -> MaterialTheme.colorScheme.onError
-                            AgentMode.BUILD -> MaterialTheme.semanticColors.onSuccess
-                        }
-                        Surface(
-                            shape = RoundedCornerShape(16.dp),
-                            color = modeColor,
-                            modifier = Modifier
-                                .clickable {
-                                    val nextMode = when (currentMode) {
-                                        AgentMode.BUILD -> AgentMode.PLAN
-                                        AgentMode.PLAN -> AgentMode.AUTO
-                                        AgentMode.AUTO -> AgentMode.BUILD
-                                    }
-                                    onToggleMode(nextMode)
-                                }
-                        ) {
-                            Box(
-                                modifier = Modifier
-                                    .width(46.dp)
-                                    .padding(vertical = 4.dp),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Text(
-                                    text = currentMode.name,
-                                    style = MaterialTheme.typography.labelSmall.copy(
-                                        fontWeight = FontWeight.Bold,
-                                        color = modeTextColor
-                                    )
-                                )
-                            }
-                        }
-                        Spacer(Modifier.width(Spacing.xs))
-
                         ModelIconButton(
                             provider = activeProvider,
                             providers = providers,
@@ -633,6 +572,29 @@ internal fun ChatInputBar(
                                 model = activeProvider?.effectiveModel.orEmpty(),
                                 onChange = onReasoningEffortChange,
                                 enabled = !isBusy
+                            )
+                        }
+                        Box(
+                            modifier = Modifier
+                                .heightIn(min = 36.dp)
+                                .padding(horizontal = Spacing.xs),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            val speedLabel = if (generationSpeed == null) {
+                                stringResource(R.string.chat_token_speed_idle)
+                            } else {
+                                stringResource(
+                                    if (generationSpeed.estimated) R.string.chat_token_speed_estimated
+                                    else R.string.chat_token_speed,
+                                    formatGenerationSpeed(generationSpeed.tokensPerSecond)
+                                )
+                            }
+                            Text(
+                                text = speedLabel,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
                             )
                         }
                     }
@@ -678,6 +640,50 @@ internal fun ChatInputBar(
         )
     }
 }
+
+@Composable
+internal fun ChatComposerTextField(
+    value: TextFieldValue,
+    onValueChange: (TextFieldValue) -> Unit,
+    placeholder: String,
+    enterToSend: Boolean,
+    onSend: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val textStyle = MaterialTheme.typography.bodyLarge
+    // 外框已承担装饰，基础编辑器不引入 Material TextField 的 56dp 最小高度。
+    Box(
+        modifier = modifier
+            .heightIn(min = INPUT_FIELD_MIN_HEIGHT, max = INPUT_FIELD_MAX_HEIGHT)
+            .padding(horizontal = INPUT_FIELD_HORIZONTAL_PADDING, vertical = INPUT_FIELD_VERTICAL_PADDING)
+    ) {
+        if (value.text.isEmpty()) {
+            Text(
+                text = placeholder,
+                style = textStyle,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        BasicTextField(
+            value = value,
+            onValueChange = onValueChange,
+            modifier = Modifier.fillMaxWidth(),
+            textStyle = textStyle.copy(color = MaterialTheme.colorScheme.onSurface),
+            cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+            keyboardOptions = KeyboardOptions(
+                imeAction = if (enterToSend) ImeAction.Send else ImeAction.Default
+            ),
+            keyboardActions = if (enterToSend) {
+                KeyboardActions(onSend = { onSend() })
+            } else {
+                KeyboardActions.Default
+            }
+        )
+    }
+}
+
+internal fun formatGenerationSpeed(tokensPerSecond: Double): String =
+    String.format(Locale.US, "%.1f", tokensPerSecond)
 
 /**
  * 全屏输入框：底部输入框被高度上限截断、框内滚动时，点右上角「展开」进入这里，
@@ -1028,18 +1034,14 @@ internal fun ToolPermissionPanel(
                         }
                     }
 
-                    val canRemember = request.rememberablePatterns.isNotEmpty()
-                    val rememberLabel = when {
-                        !canRemember -> request.rememberDisabledReason ?: stringResource(R.string.chat_perm_single_use_desc)
-                        request.rememberablePatterns == listOf("*") -> stringResource(R.string.chat_perm_always_tool_desc)
-                        else -> stringResource(R.string.chat_perm_always_prefix) + request.rememberablePatterns.joinToString("、")
+                    if (!request.approvalNote.isNullOrBlank()) {
+                        Spacer(Modifier.height(Spacing.xs))
+                        Text(
+                            text = request.approvalNote,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                     }
-                    Spacer(Modifier.height(Spacing.xs))
-                    Text(
-                        text = rememberLabel,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
 
                     Spacer(Modifier.height(Spacing.sm))
                     Row(horizontalArrangement = Arrangement.spacedBy(Spacing.sm)) {
@@ -1050,17 +1052,19 @@ internal fun ToolPermissionPanel(
                             tone = AgentActionTone.Danger
                         )
                         AgentActionButton(
-                            text = stringResource(R.string.chat_perm_always_allow),
-                            onClick = { onChoice(PermissionChoice.ALWAYS) },
-                            modifier = Modifier.weight(1f),
-                            enabled = canRemember,
-                            tone = AgentActionTone.Neutral
-                        )
-                        AgentActionButton(
-                            text = stringResource(R.string.common_allow),
+                            text = stringResource(R.string.chat_perm_allow_once),
                             onClick = { onChoice(PermissionChoice.ONCE) },
                             modifier = Modifier.weight(1f),
                             tone = AgentActionTone.Success
+                        )
+                    }
+                    if (request.sessionGrant != null) {
+                        Spacer(Modifier.height(Spacing.sm))
+                        AgentActionButton(
+                            text = stringResource(R.string.chat_perm_session_allow),
+                            onClick = { onChoice(PermissionChoice.ALWAYS_SESSION) },
+                            modifier = Modifier.fillMaxWidth(),
+                            tone = AgentActionTone.Neutral
                         )
                     }
                 }
@@ -1169,112 +1173,6 @@ private fun ErrorBubble(message: String) {
     }
 }
 
-/**
- * 计划审查面板：AI 从 PLAN 模式切回 BUILD 时弹出，展示计划摘要供用户批准或继续反馈。
- * 风格与 ToolPermissionPanel / AskUserQuestionPanel 一致。
- */
-@Composable
-internal fun PlanApprovalPanel(
-    state: PlanApprovalRequest,
-    onApprove: () -> Unit,
-    onRefine: () -> Unit,
-    forceCollapse: Boolean = false,
-    sessionTitle: String = ""
-) {
-    var expanded by remember { mutableStateOf(true) }
-    // 余额面板展开时同帧收起本面板，避免叠加顶开输入框
-    val effectiveExpanded = expanded && !forceCollapse
-
-    Surface(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = Spacing.lg, vertical = Spacing.xs),
-        color = MaterialTheme.colorScheme.surface,
-        shape = RoundedCornerShape(Radius.md),
-        border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
-    ) {
-        Column(modifier = Modifier.padding(Spacing.md)) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(Radius.sm))
-                    .clickable { expanded = !expanded },
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Box(
-                    modifier = Modifier
-                        .size(8.dp)
-                        .clip(CircleShape)
-                        .background(MaterialTheme.colorScheme.tertiary)
-                )
-                Spacer(Modifier.width(Spacing.sm))
-                Text(
-                    text = stringResource(R.string.chat_plan_completed),
-                    style = MaterialTheme.typography.labelLarge,
-                    color = MaterialTheme.colorScheme.onSurface,
-                    fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier.weight(1f)
-                )
-                ExpandableChevronIcon(
-                    expanded = effectiveExpanded,
-                    contentDescription = null,
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                    size = 18.dp
-                )
-            }
-
-            AnimatedVisibility(
-                visible = effectiveExpanded,
-                enter = fadeIn(tween(180)) + expandVertically(tween(220)),
-                exit = fadeOut(tween(140)) + shrinkVertically(tween(180))
-            ) {
-                Column {
-                    // 多会话并行时标注这份计划属于哪个会话，避免用户批错对象
-                    if (sessionTitle.isNotBlank()) {
-                        Text(
-                            text = stringResource(R.string.chat_perm_session_label, sessionTitle),
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                        Spacer(Modifier.height(Spacing.xs))
-                    }
-                    if (state.reason.isNotBlank()) {
-                        Spacer(Modifier.height(Spacing.xs))
-                        SelectionContainer {
-                            Column(
-                                modifier = Modifier.heightIn(max = 160.dp).verticalScroll(rememberScrollState())
-                            ) {
-                                Text(
-                                    text = state.reason,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                        }
-                    }
-
-                    Spacer(Modifier.height(Spacing.md))
-                    Row(horizontalArrangement = Arrangement.spacedBy(Spacing.sm)) {
-                        AgentActionButton(
-                            text = stringResource(R.string.chat_continue_feedback),
-                            onClick = onRefine,
-                            modifier = Modifier.weight(1f),
-                            tone = AgentActionTone.Neutral
-                        )
-                        AgentActionButton(
-                            text = stringResource(R.string.chat_approve_and_implement),
-                            onClick = onApprove,
-                            modifier = Modifier.weight(1f),
-                            tone = AgentActionTone.Success
-                        )
-                    }
-                }
-            }
-        }
-    }
-}
 
 /**
  * 会话持续目标（goal）的常驻卡片：置于输入框上方，显示目标文本、状态与暂停/恢复、清除操作。

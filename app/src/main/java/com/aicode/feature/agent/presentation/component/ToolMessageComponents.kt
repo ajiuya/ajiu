@@ -12,7 +12,10 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.interaction.DragInteraction
@@ -33,8 +36,6 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.Construction
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -129,27 +130,17 @@ private val ToolSectionMaxHeight = 240.dp
 /** 工具窗口底部渐隐遮罩高度（仅当内容还可继续下滚时显示）。 */
 private val ToolSectionFadeHeight = 24.dp
 
-/**
- * 工具消息（DSH 扁平行）：一行「工具图标 + 工具名 + 路径 + 增删统计 + 箭头」，行上方一条
- * 1px 细线做分隔，不再套描边卡片；点击展开查看「指令 / 结果」，或对 editFile / writeFile
- * 展开为白底描边的差异卡（头部路径 + 复制，页脚增删统计）。
- *
- * 状态不再只用颜色表达：运行中图标脉冲、失败额外挂一个警示图标，读屏另有状态语义。
- * [liveOutput] 非空时进入「实时输出」模式：显示逐行累积输出。
- *
- * 展开态由 [expandedOverride] + [onExpandedChange] 受控（宿主持久化，见
- * [com.aicode.feature.agent.presentation.AIAgentViewModel.toolExpansionOverrides]）：
- * 从前用 `remember(message.id)` 存在这里，item 滚出视口被 LazyColumn 回收、或全屏路由
- * 把整棵聊天组合 dispose 后就会缩回默认态。null 表示用户还没手动开关过——此时**默认收起**，
- * 所有工具（含差异卡、待办卡）一视同仁，看细节要点开。
- */
+/** 展开态由宿主持有，避免列表回收或切页后丢失手动查看的详情。 */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 internal fun ToolMessageBody(
     message: AgentUIMessage,
     liveOutput: String? = null,
     expandedOverride: Boolean? = null,
     onExpandedChange: ((Boolean) -> Unit)? = null,
-    onToggle: (() -> Unit)? = null
+    onToggle: (() -> Unit)? = null,
+    durationMs: Long? = null,
+    onOpenPreview: (() -> Unit)? = null,
 ) {
     val streaming = liveOutput != null
     val running = message.isToolRunning(liveOutput)
@@ -177,136 +168,67 @@ internal fun ToolMessageBody(
             }
         }
     }
-    val argumentMetadata by key(message.id, message.toolArgs) {
-        produceState<ToolArgumentMetadata?>(initialValue = null) {
-            value = withContext(Dispatchers.Default) {
-                ToolArgumentMetadata(
-                    hint = toolArgHint(message.toolArgs),
-                    path = extractFilePathArg(message.toolArgs),
-                    hasArgs = hasToolArgs(message.toolArgs)
-                )
-            }
+    val hasArguments by key(message.id, message.toolArgs) {
+        produceState<Boolean?>(initialValue = null) {
+            value = withContext(Dispatchers.Default) { hasToolArgs(message.toolArgs) }
         }
     }
     val edit = metadata?.edit
     val todoData = metadata?.todo
-    val argHint = argumentMetadata?.hint
-    val notifications = metadata?.notifications.orEmpty()
+    val actionTitle = message.toolActionTitle?.takeIf { it.isNotBlank() }
+        ?: stringResource(toolActionPlaceholderRes(message.toolName))
+    val representedIds = LocalRepresentedSubAgentIds.current
+    val notifications = metadata?.notifications.orEmpty().filterNot { it.subSessionId in representedIds }
 
-    // 执行中也可折叠/展开（如 bash 刷屏时可收起只看标题行），无论当前是否有输出；无输出时折叠态无内容，但保持可点击与箭头一致
     val hasLiveOutput = !liveOutput.isNullOrBlank()
-    val expandable = streaming || (!running && (metadata == null || argumentMetadata == null ||
-        edit != null || metadata?.hasResult == true || argumentMetadata?.hasArgs == true ||
-        (todoData != null && todoData.items.isNotEmpty()) || metadata?.webSearch != null))
-    // 工具调用一律默认收起（差异卡、待办卡也不例外）：要不要看细节由用户点开，
-    // 手动开关过（expandedOverride 非 null）就以用户的选择为准。展开态由宿主保管，
-    // 因此滚出视口、切页返回都不会再丢。
+    val expandable = running || metadata == null || hasArguments == null ||
+        metadata?.hasResult == true || hasArguments == true ||
+        metadata?.subAgent != null || notifications.isNotEmpty()
     val effectiveExpanded = expandedOverride == true
 
-    val toolLabel = message.toolName ?: stringResource(R.string.common_tool)
-    // 文件相关工具：从结构化 diff 或工具参数里取路径，统一按「工具名 + 路径 + 文件名」展示
-    val filePath = if (edit != null) {
-        edit.path
-    } else {
-        argumentMetadata?.path
-    }
-
-    Column(modifier = Modifier.fillMaxWidth()) {
+    Column(modifier = Modifier.fillMaxWidth().padding(horizontal = Spacing.xs)) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .heightIn(min = ChatStyle.toolRowMinHeight)
+                .clip(RoundedCornerShape(Radius.pill))
+                .background(chatMutedSurfaceColor())
+                .border(ChatStyle.hairline, MaterialTheme.semanticColors.subtleBorder, RoundedCornerShape(Radius.pill))
                 .then(
-                    if (expandable) Modifier.clickable {
-                        onExpandedChange?.invoke(!effectiveExpanded)
-                        onToggle?.invoke()
-                    } else Modifier
-                ),
-            verticalAlignment = Alignment.CenterVertically
+                    if (expandable) Modifier.combinedClickable(
+                        onClick = {
+                            onExpandedChange?.invoke(!effectiveExpanded)
+                            onToggle?.invoke()
+                        },
+                        onLongClick = onOpenPreview
+                    ) else Modifier
+                )
+                .padding(horizontal = Spacing.md, vertical = Spacing.xs),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center
         ) {
             ToolStatusIcon(running = running, isError = message.isError, toolName = message.toolName)
             Spacer(Modifier.width(Spacing.sm))
-            Row(
-                modifier = Modifier.weight(1f),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                if (!filePath.isNullOrBlank()) {
-                    Text(
-                        text = toolLabel,
-                        color = MaterialTheme.colorScheme.onSurface,
-                        style = MaterialTheme.typography.labelLarge,
-                        fontWeight = FontWeight.Medium,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    Spacer(Modifier.width(Spacing.xs))
-                    // 路径段（可省略）+ 文件名段（永远完整，优先级最高）：等宽字，与代码卡头部一致
-                    val monoLabel = MaterialTheme.typography.labelSmall.copy(
-                        fontFamily = FontFamily.Monospace
-                    )
-                    val pathDir = filePath.substringBeforeLast('/')
-                    if (pathDir.isNotEmpty()) {
-                        Text(
-                            text = pathDir + "/",
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            style = monoLabel,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.weight(1f, fill = false)
-                        )
-                    }
-                    Text(
-                        text = filePath.substringAfterLast('/'),
-                        color = MaterialTheme.colorScheme.onSurface,
-                        style = monoLabel,
-                        maxLines = 1
-                    )
-                } else {
-                    Text(
-                        text = toolLabel,
-                        color = MaterialTheme.colorScheme.onSurface,
-                        style = MaterialTheme.typography.labelLarge,
-                        fontWeight = FontWeight.Medium,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    if (!argHint.isNullOrBlank()) {
-                        Spacer(Modifier.width(Spacing.sm))
-                        Text(
-                            text = argHint,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            style = MaterialTheme.typography.labelSmall.copy(
-                                fontFamily = FontFamily.Monospace
-                            ),
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.weight(1f, fill = false)
-                        )
-                    }
-                }
-            }
-            if (running) {
-                // 运行中的这条：行尾用统一的涟漪场景文案说明「正在做什么」。工具名在开始执行前
-                // 就已到达（AgentEvent.ToolCallStarted），所以不必停在笼统的「执行中」；
-                // 折叠态也看得见，不必展开才知道它在跑。
-                Spacer(Modifier.width(Spacing.sm))
-                RippleText(text = stringResource(toolRunningLabelRes(message.toolName)))
-            }
-            if (edit != null) {
-                DiffStat(added = edit.added, removed = edit.removed)
-                Spacer(Modifier.width(Spacing.sm))
-            }
-            if (todoData != null && todoData.total > 0) {
-                Text(
-                    text = "${todoData.completed}/${todoData.total}",
-                    color = if (todoData.completed == todoData.total) DiffAddText
-                            else MaterialTheme.colorScheme.onSurfaceVariant,
-                    style = MaterialTheme.typography.labelMedium,
-                    fontWeight = FontWeight.SemiBold
-                )
-                Spacer(Modifier.width(Spacing.sm))
-            }
+            Text(
+                text = actionTitle,
+                modifier = Modifier.weight(1f, fill = false),
+                color = MaterialTheme.colorScheme.onSurface,
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Spacer(Modifier.width(Spacing.sm))
+            Text(
+                text = durationMs?.let(::formatToolDuration)
+                    ?: if (running) stringResource(R.string.chat_tool_waiting_execution)
+                    else stringResource(R.string.chat_tool_group_duration_unknown),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.labelSmall,
+                maxLines = 1
+            )
             if (expandable) {
+                Spacer(Modifier.width(Spacing.xs))
                 ExpandableChevronIcon(
                     expanded = effectiveExpanded,
                     contentDescription = if (effectiveExpanded) stringResource(R.string.common_collapse_action) else stringResource(R.string.common_expand),
@@ -315,9 +237,17 @@ internal fun ToolMessageBody(
                 )
             }
         }
+        if (effectiveExpanded) {
+            Text(
+                text = "${stringResource(R.string.common_tool)} · ${message.toolName.orEmpty()}",
+                modifier = Modifier.padding(top = Spacing.sm),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.labelSmall
+            )
+        }
         if (streaming) {
             // 展开态与落库卡片同构：先「指令」（工具参数），再「结果」（实时输出尾部）；
-            // 折叠态只保留标题行。「还在跑」由标题行行尾的涟漪场景文案表达，不在这里重复一遍。
+            // 折叠态只保留胶囊标题。
             AnimatedVisibility(
                 visible = effectiveExpanded,
                 enter = expandVertically(expandFrom = Alignment.Top) + fadeIn(),
@@ -415,15 +345,15 @@ internal fun ToolMessageBody(
                 }
             }
         }
-        // 子代理派发卡片常显，不跟着「工具行展开」走：这是「谁在做什么、结果如何」的主信息，
-        // 藏进折叠里就失去意义。原始参数/结果仍可通过展开工具行查看。
-        metadata?.subAgent?.let { dispatch ->
-            Spacer(Modifier.height(Spacing.xs))
-            SubAgentDispatchCard(dispatch = dispatch)
-        }
-        if (notifications.isNotEmpty()) {
-            Spacer(Modifier.height(Spacing.sm))
-            notifications.forEach { ToolNotificationRow(it) }
+        if (effectiveExpanded) {
+            metadata?.subAgent?.let { dispatch ->
+                Spacer(Modifier.height(Spacing.xs))
+                SubAgentDispatchCard(dispatch = dispatch)
+            }
+            if (notifications.isNotEmpty()) {
+                Spacer(Modifier.height(Spacing.sm))
+                notifications.forEach { ToolNotificationRow(it) }
+            }
         }
         // 文件列表：工具结束后常显在消息底部，一行一个文件，点击用系统 app 打开。
         if (!running && message.attachments.isNotEmpty()) {
@@ -445,8 +375,6 @@ private data class ToolMessageMetadata(
     val hasResult: Boolean
 )
 
-private data class ToolArgumentMetadata(val hint: String?, val path: String?, val hasArgs: Boolean)
-
 private data class ToolMessageDetails(
     val args: String?,
     val result: String?,
@@ -454,7 +382,7 @@ private data class ToolMessageDetails(
     val diffCopyText: String?
 )
 
-internal data class ToolNotificationInfo(val summary: String, val succeeded: Boolean, val isMessage: Boolean = false)
+internal data class ToolNotificationInfo(val summary: String, val succeeded: Boolean, val isMessage: Boolean = false, val subSessionId: String? = null)
 
 /**
  * 从工具结果 transport JSON 顶层的 `notifications` 字段提取搭车通知（后台任务/子代理完成）。
@@ -463,15 +391,17 @@ internal data class ToolNotificationInfo(val summary: String, val succeeded: Boo
 internal fun parseToolNotifications(raw: String): List<ToolNotificationInfo> {
     val array = parseToolTransport(raw.withoutToolStatusPrefix())?.get("notifications") as? JsonArray
         ?: return emptyList()
-    return array.mapNotNull { element ->
-        val obj = element as? JsonObject ?: return@mapNotNull null
+    val identities = parseSubAgentNotificationMetadata(raw, toolResult = true).associateBy { it.ordinal }
+    return array.mapIndexedNotNull { index, element ->
+        val obj = element as? JsonObject ?: return@mapIndexedNotNull null
         val summary = (obj["summary"] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }
-            ?: return@mapNotNull null
+            ?: return@mapIndexedNotNull null
         val status = (obj["status"] as? JsonPrimitive)?.contentOrNull
         ToolNotificationInfo(
             summary = summary,
             succeeded = status == "completed",
-            isMessage = status == "message"
+            isMessage = status == "message",
+            subSessionId = identities[index]?.subSessionId
         )
     }
 }
@@ -558,19 +488,14 @@ private suspend fun AwaitPointerEventScope.awaitTapOrSwipe(
     }
 }
 
-/**
- * 工具状态图标：按工具类型给出字形（文件 / 终端 / 搜索 / 任务…），并按状态着色——
- * 运行中脉冲、失败整枚图标转红、成功回到中性色（满屏绿色会抢注意力）。
- *
- * 失败不再额外挂一枚警示图标：行首图标格保持一枚字形，状态只由颜色与读屏语义表达，
- * 免得同一行出现两个图标、行首位置还随成败跳动。色弱用户靠 [statusLabel]（读屏）分辨成败。
- */
+/** 状态同时提供读屏语义，颜色之外仍能区分执行中、成功与失败。 */
 @Composable
 internal fun ToolStatusIcon(running: Boolean, isError: Boolean, toolName: String?) {
-    val tint = when {
-        isError -> DiffRemoveText
-        running -> MaterialTheme.colorScheme.primary
-        else -> MaterialTheme.colorScheme.onSurfaceVariant
+    val state = toolExecutionState(running, isError)
+    val tint = when (state) {
+        ToolExecutionState.RUNNING -> MaterialTheme.colorScheme.primary
+        ToolExecutionState.FAILED -> MaterialTheme.colorScheme.error
+        ToolExecutionState.SUCCEEDED -> MaterialTheme.semanticColors.success
     }
     val pulseAlpha = if (running) {
         val transition = rememberInfiniteTransition(label = "tool-status-pulse")
@@ -584,10 +509,10 @@ internal fun ToolStatusIcon(running: Boolean, isError: Boolean, toolName: String
         1f
     }
     val statusLabel = stringResource(
-        when {
-            running -> R.string.chat_tool_running
-            isError -> R.string.chat_tool_failed
-            else -> R.string.chat_tool_succeeded
+        when (state) {
+            ToolExecutionState.RUNNING -> R.string.chat_tool_running
+            ToolExecutionState.FAILED -> R.string.chat_tool_failed
+            ToolExecutionState.SUCCEEDED -> R.string.chat_tool_succeeded
         }
     )
     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -610,8 +535,9 @@ private fun toolIcon(toolName: String?): ImageVector = when (toolName?.lowercase
     "viewimage" -> FeatherIcons.Image
     "search", "websearch", "webfetch" -> FeatherIcons.Search
     "browser" -> FeatherIcons.Globe
-    "bash", "terminal" -> FeatherIcons.Terminal
+    "bash", "terminal", "root", "shizuku" -> FeatherIcons.Terminal
     "askuserquestion" -> FeatherIcons.HelpCircle
+    "submitplan" -> FeatherIcons.FileText
     "todo" -> FeatherIcons.Check
     "task" -> FeatherIcons.Cpu
     "memory" -> FeatherIcons.Database
@@ -634,8 +560,9 @@ internal fun toolRunningLabelRes(toolName: String?): Int = when (toolName?.lower
     "viewimage" -> R.string.chat_status_viewing_image
     "search", "websearch", "webfetch" -> R.string.chat_status_searching_web
     "browser" -> R.string.chat_status_browsing_web
-    "bash", "terminal" -> R.string.chat_status_running_command
+    "bash", "terminal", "root", "shizuku" -> R.string.chat_status_running_command
     "askuserquestion" -> R.string.chat_status_asking_user
+    "submitplan" -> R.string.plan_approval_waiting
     "generateimage" -> R.string.chat_status_generating_image
     "todo" -> R.string.chat_status_updating_todo
     "task" -> R.string.chat_status_starting_subagent
@@ -645,67 +572,62 @@ internal fun toolRunningLabelRes(toolName: String?): Int = when (toolName?.lower
 
 /**
  * 工具是否仍在执行：实时输出中，或结果仍是 pending 占位。
- * [AIChatPanel] 判定工具调用分组是否要保持展开时复用这一条，避免两处判定漂移。
+ * [AIChatPanel] 的计时与失败统计复用相同判定。
  */
 internal fun AgentUIMessage.isToolRunning(liveOutput: String?): Boolean =
     liveOutput != null ||
         content.startsWith(SessionUseCase.PENDING_TOOL_MARKER) ||
         content.startsWith(SessionUseCase.LEGACY_PENDING_TOOL_MARKER)
 
-/**
- * 「N 次工具调用」分组头：DSH 把一轮任务里连续的工具调用折成一行，**默认收起**，
- * 点一下手动展开/收起（运行中也不自动弹开）。
- * 布局对齐思考行：左侧工具图标（锤子/施工） + 中间调用计数 + 折叠箭头。
- *
- * [running] 为真时给「N 次工具调用」这行文案本身走涟漪高光，表示这批调用还在跑。
- * 不再另挂三个跳动的点，也不在这里重复场景文案（「正在编辑文件」这类说的是**具体哪个工具**，
- * 展开后由每条工具行的运行状态给出，见 [ToolMessageBody]）。
- */
-@Composable
-internal fun ToolCallGroupHeader(
-    count: Int,
-    running: Boolean,
-    expanded: Boolean,
-    onToggle: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    Row(
-        modifier = modifier
-            .fillMaxWidth()
-            .heightIn(min = ChatStyle.toolRowMinHeight)
-            .clip(RoundedCornerShape(ChatStyle.panelCorner))
-            .clickable(
-                // 无障碍：点这一行会展开还是收起，读屏能念出来（展开状态本身由 count 文本表达）
-                onClickLabel = stringResource(
-                    if (expanded) R.string.common_collapse_action else R.string.common_expand
-                ),
-                onClick = onToggle
-            ),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Icon(
-            imageVector = Icons.Outlined.Construction,
-            contentDescription = null,
-            tint = Brand.IconGray,
-            modifier = Modifier.size(ChatStyle.rowIconSize)
-        )
-        Spacer(Modifier.width(Spacing.sm))
-        // 权重挂在外层占位，涟漪画在文字自身的尺寸上：光带只扫「N 次工具调用」这几个字，
-        // 不会在整行空白里慢慢爬（见 Modifier.rippleHighlight）。
-        Row(modifier = Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
-            RippleText(
-                text = stringResource(R.string.chat_tool_calls_count, count),
-                highlight = if (running) Color.White else null
-            )
-        }
-        ExpandableChevronIcon(
-            expanded = expanded,
-            contentDescription = if (expanded) stringResource(R.string.common_collapse_action) else stringResource(R.string.common_expand),
-            tint = Brand.IconGray,
-            size = 18.dp
-        )
-    }
+internal enum class ToolExecutionState { RUNNING, SUCCEEDED, FAILED }
+
+internal fun toolExecutionState(running: Boolean, isError: Boolean): ToolExecutionState = when {
+    running -> ToolExecutionState.RUNNING
+    isError -> ToolExecutionState.FAILED
+    else -> ToolExecutionState.SUCCEEDED
 }
+
+internal fun formatToolDuration(millis: Long): String {
+    val elapsed = millis.coerceAtLeast(0L)
+    if (elapsed < 100) return "<0.1s"
+    if (elapsed >= 60_000) return formatTaskDuration(elapsed)
+    val tenths = elapsed / 100
+    return "${tenths / 10}.${tenths % 10}s"
+}
+
+internal data class ToolGroupSummary(
+    val count: Int,
+    val running: Boolean,
+    val durationMs: Long?,
+    val failureCount: Int,
+)
+
+internal fun toolElapsedMs(message: AgentUIMessage, startElapsedMs: Long?, nowElapsedMs: Long): Long? =
+    message.toolDurationMs ?: startElapsedMs?.takeIf { message.isToolRunning(null) }?.let {
+        (nowElapsedMs - it).coerceAtLeast(0L)
+    }
+
+internal fun toolGroupSummary(
+    messages: List<AgentUIMessage>,
+    turnDurationMs: Long?,
+    runningIds: Set<String> = emptySet(),
+): ToolGroupSummary {
+    val running = messages.any { it.id in runningIds || it.isToolRunning(null) }
+    return ToolGroupSummary(
+        count = messages.size,
+        running = running,
+        durationMs = turnDurationMs,
+        failureCount = messages.count { it.isError && it.id !in runningIds && !it.isToolRunning(null) },
+    )
+}
+
+@Composable
+internal fun toolGroupSummaryText(summary: ToolGroupSummary): String = stringResource(
+    if (summary.running) R.string.chat_tool_group_summary_running else R.string.chat_tool_group_summary,
+    summary.count,
+    summary.durationMs?.let(::formatTaskDuration) ?: stringResource(R.string.chat_tool_group_duration_unknown),
+    summary.failureCount,
+)
 
 /** 展开区的一段带小标题的内容块（如「指令」「结果」）：弱底等宽小面板，超出限高后在窗口内滚动。 */
 @Composable
@@ -1082,27 +1004,4 @@ internal fun formatToolArgs(argsJson: String?): String? {
             "$k: $vv"
         }
     }.getOrNull() ?: argsJson.trim()
-}
-
-/** 标题行内联的参数摘要 */
-internal fun toolArgHint(argsJson: String?): String? {
-    if (argsJson.isNullOrBlank()) return null
-    return runCatching {
-        val obj = Json.parseToJsonElement(argsJson).jsonObject
-        val preferred = listOf("command", "cmd", "path", "file_path", "file", "query", "pattern", "url", "name")
-        val v = preferred.firstNotNullOfOrNull { obj[it] } ?: obj.values.firstOrNull()
-        val str = (v as? JsonPrimitive)?.contentOrNull ?: v?.toString()
-        str?.replace("\n", " ")?.trim()?.takeIf { it.isNotEmpty() }
-    }.getOrNull()
-}
-
-/** 从工具参数 JSON 中提取文件路径（readFile/editFile/writeFile 的 path 参数）。 */
-private fun extractFilePathArg(argsJson: String?): String? {
-    if (argsJson.isNullOrBlank()) return null
-    return runCatching {
-        val obj = Json.parseToJsonElement(argsJson).jsonObject
-        listOf("path", "file_path", "file").firstNotNullOfOrNull { key ->
-            (obj[key] as? JsonPrimitive)?.contentOrNull
-        }
-    }.getOrNull()
 }

@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="file_preview_title">文件预览</string>
+    <string name="file_preview_loading">正在加载文件…</string>
+    <string name="file_preview_error">无法预览此文件，可能已失效、格式不支持或超过预览限制。</string>
+    <string name="file_preview_environment_changed">文件环境已变化。请关闭预览，在正确的工作区或连接中重新打开。</string>
+    <string name="file_preview_page">第 %1$d 页，共 %2$d 页</string>
+    <string name="file_preview_truncated">当前仅显示部分内容，完整文件仍可分享、另存或外部打开。</string>
+    <string name="file_preview_cached">当前查看附件缓存，关联文件不可用。需要重新加载时，请先确认当前环境。</string>
+    <string name="file_preview_reload">从当前环境读取</string>
+    <string name="file_preview_reload_title">确认文件环境</string>
+    <string name="file_preview_reload_message">历史附件未记录完整的服务器与容器身份。将从当前工作区或连接读取“%1$s”，请确认这正是文件所属的环境。</string>
+    <string name="file_preview_open_external">外部打开</string>
+    <string name="file_preview_share">分享</string>
+    <string name="file_preview_save_as">另存为</string>
+    <string name="file_preview_action_failed">操作失败，请确认文件仍可访问。</string>
+    <string name="file_preview_saved">文件已保存</string>
+    <string name="file_preview_open_web_title">打开外部网页？</string>
+    <string name="file_preview_open_web_message">此链接将使用外部浏览器打开：
+%1$s</string>
+    <string name="file_preview_open_web">打开网页</string>
+    <string name="file_preview_local_only">网页预览仅加载授权目录内的资源，外部网络资源不会自动加载。</string>
+    <string name="file_preview_archive_notice">压缩包仅展示条目，不会自动解压或执行。</string>
+    <string name="file_preview_archive_empty">压缩包没有条目</string>
+    <string name="file_preview_table_empty">没有可显示的数据</string>
+    <string name="file_preview_file_name">文件名</string>
+    <string name="file_preview_file_path">文件位置</string>
+    <string name="file_preview_file_size">文件大小</string>
+    <string name="file_preview_file_type">文件类型</string>
+    <string name="file_preview_package_name">应用包名</string>
+    <string name="file_preview_package_version">应用版本</string>
+    <string name="file_preview_package_sdk">最低 Android SDK</string>
+    <string name="file_preview_install">安装应用</string>
+    <string name="file_preview_office_notice">此文档可保存或分享给支持该格式的应用查看。</string>
+    <string name="file_preview_binary_notice">此格式提供文件信息，可保存、分享或选择外部应用打开。</string>
+    <string name="file_preview_image_unavailable">图片无法解码</string>
+    <string name="file_preview_close">关闭预览</string>
+    <string name="file_preview_play">使用内置播放器</string>
+</resources>

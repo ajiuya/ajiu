@@ -1,6 +1,7 @@
 package com.aicode.feature.agent.domain.tool
 
 import com.aicode.feature.agent.domain.permission.PermissionChoice
+import com.aicode.feature.agent.domain.permission.SessionPermissionGrantRepository
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.CompletableDeferred
@@ -9,7 +10,9 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 @Singleton
-class ToolPermissionManager @Inject constructor() {
+class ToolPermissionManager @Inject constructor(
+    private val sessionPermissionGrants: SessionPermissionGrantRepository
+) {
     /**
      * 所有待决授权请求，按插入顺序保存（key = 请求 id）。多会话并行时每个会话可各自挂起一个请求，
      * 互不阻塞——这样侧边栏才能同时点亮所有等待授权的会话。同一会话内的权限请求由 workflow 串行处理，
@@ -26,7 +29,7 @@ class ToolPermissionManager @Inject constructor() {
     private val _awaitingSessionIds = MutableStateFlow<Set<String>>(emptySet())
     val awaitingSessionIds: StateFlow<Set<String>> = _awaitingSessionIds.asStateFlow()
 
-    /** 挂起等待用户在弹窗中的选择（拒绝/本次/始终）。不同会话可并行挂起，互不阻塞。 */
+    /** 挂起等待用户在弹窗中的选择。不同会话可并行挂起，互不阻塞。 */
     suspend fun awaitApproval(request: PendingToolPermission): PermissionChoice {
         val decision = CompletableDeferred<PermissionChoice>()
         synchronized(lock) {
@@ -34,7 +37,11 @@ class ToolPermissionManager @Inject constructor() {
             publish()
         }
         try {
-            return decision.await()
+            val choice = decision.await()
+            if (choice == PermissionChoice.ALWAYS_SESSION && request.sessionGrant != null && request.sessionId.isNotBlank()) {
+                sessionPermissionGrants.allow(request.sessionId, request.sessionGrant)
+            }
+            return choice
         } finally {
             synchronized(lock) {
                 pending.remove(request.id)
@@ -47,6 +54,11 @@ class ToolPermissionManager @Inject constructor() {
     fun resolve(id: String, choice: PermissionChoice) {
         val entry = synchronized(lock) { pending[id] } ?: return
         entry.decision.complete(choice)
+    }
+
+    fun rejectForTool(toolName: String) {
+        val entries = synchronized(lock) { pending.values.filter { it.request.toolName == toolName } }
+        entries.forEach { it.decision.complete(PermissionChoice.REJECT) }
     }
 
     /** 取某会话当前的待决请求（stopAgent 停止单个会话时用，避免误取其它会话的弹窗）。 */

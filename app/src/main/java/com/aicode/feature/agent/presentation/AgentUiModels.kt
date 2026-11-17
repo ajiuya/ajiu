@@ -2,6 +2,7 @@ package com.aicode.feature.agent.presentation
 
 import androidx.compose.runtime.Immutable
 import com.aicode.feature.agent.domain.model.AgentImage
+import com.aicode.feature.agent.domain.model.ContextUsageBreakdown
 import com.aicode.feature.agent.domain.model.GoalStatus
 import com.aicode.feature.agent.domain.provider.RetryErrorInfo
 import com.aicode.feature.workspace.domain.FileEntry
@@ -156,7 +157,17 @@ data class AgentUIMessage(
     val inputTokens: Int = 0,
     val outputTokens: Int = 0,
     // 仅 ASSISTANT 消息：本次调用输入中命中服务端缓存的 token 数，气泡下方据此算缓存命中率。
-    val cachedInputTokens: Int = 0
+    val cachedInputTokens: Int = 0,
+    val contextInputTokens: Int? = null,
+    val contextInputBudget: Int? = null,
+    val contextEstimated: Boolean = true,
+    val contextBreakdown: ContextUsageBreakdown? = null,
+    val toolActionTitle: String? = null,
+    val toolStartedAtMs: Long? = null,
+    val toolDurationMs: Long? = null,
+    val turnDurationMs: Long? = null,
+    val continuationOfMessageId: String? = null,
+    val continuationDraft: String? = null
 )
 
 @Immutable
@@ -261,7 +272,9 @@ data class QueuedRequest(
     val inputAttachments: List<AgentAttachment> = emptyList(),
     val isAutoTrigger: Boolean = false,
     /** 是否把本轮用户消息落库；goal 续跑等内部轮次置 false，避免污染会话历史。 */
-    val persistUserMessage: Boolean = true
+    val persistUserMessage: Boolean = true,
+    val subAgentInstructionId: String? = null,
+    val recoveryRequestId: String? = null
 )
 
 /** 会话级持续目标（goal）的 UI 快照：文本、状态与已续跑轮数。 */

@@ -122,6 +122,7 @@ import compose.icons.feathericons.Folder
 import compose.icons.feathericons.FolderPlus
 import compose.icons.feathericons.Globe
 import compose.icons.feathericons.HardDrive
+import compose.icons.feathericons.PlayCircle
 import compose.icons.feathericons.RefreshCw
 import compose.icons.feathericons.Server
 import compose.icons.feathericons.Settings
@@ -175,6 +176,7 @@ fun ChatDrawerContent(
     onCancelPasteOverwrite: () -> Unit,
     onClearClipboard: () -> Unit,
     onNavigateToBrowser: (() -> Unit)? = null,
+    onNavigateToPlayer: (() -> Unit)? = null,
     onNavigateToSettings: () -> Unit,
     searchQuery: String,
     searchState: ChatSearchState,
@@ -369,6 +371,14 @@ fun ChatDrawerContent(
         }
 
         SettingsGroup {
+            if (onNavigateToPlayer != null) {
+                SettingsRow(
+                    icon = FeatherIcons.PlayCircle,
+                    title = stringResource(R.string.player_title),
+                    onClick = onNavigateToPlayer
+                )
+                SettingsDivider()
+            }
             if (onNavigateToBrowser != null) {
                 SettingsRow(
                     icon = FeatherIcons.Globe,

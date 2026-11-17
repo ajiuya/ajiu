@@ -30,6 +30,27 @@ class SubAgentDigesterTest {
     )
 
     @Test
+    fun digestRunWithoutSourceDoesNotBorrowOldConclusionOrChangedFiles() {
+        val rows = listOf(
+            message("old", "ASSISTANT", "old result"),
+            message("old-tool", "TOOL", toolName = "editFile", toolArgs = """{"path":"old.kt"}"""),
+            message("current-tool", "TOOL", toolName = "editFile", toolArgs = """{"path":"current.kt"}""")
+        )
+        val digest = SubAgentDigester.digestRun(rows, null, setOf("current-tool"))
+        assertNull(digest.excerpt)
+        assertEquals(listOf("current.kt"), digest.changedFiles)
+        assertEquals(SubAgentDigest(), SubAgentDigester.digestRun(rows, "old", emptySet()))
+    }
+
+    @Test
+    fun digestRunSelectsOnlyItsExplicitAssistantSource() {
+        val rows = listOf(message("old", "ASSISTANT", "old"),
+            message("source", "ASSISTANT", "current"), message("later", "ASSISTANT", "other run"))
+        val digest = SubAgentDigester.digestRun(rows, "source", setOf("source", "later"))
+        assertEquals("current", digest.excerpt)
+    }
+
+    @Test
     fun digest_takesLastAssistantText() {
         val digest = SubAgentDigester.digest(
             listOf(

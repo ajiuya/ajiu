@@ -111,7 +111,26 @@ accordance with the respective license terms.
    APK at assets/licenses/JetBrainsMono-OFL-1.1.txt.
 
 ========================================================================
-9. Test-only components
+9. Web media playback
+------------------------------------------------------------------------
+   - hls.js 1.5.15, Copyright (c) 2017 Dailymotion — Apache License 2.0
+     Project: https://github.com/video-dev/hls.js
+     Includes code derived from video.js HLS, Copyright (c) 2013-2015
+     Brightcove. The unmodified playback script is bundled at
+     assets/player/vendor/hls-1.5.15.min.js. Copyright and license terms
+     are bundled at assets/licenses/hls.js-1.5.15-LICENSE.txt.
+
+   - dash.js 4.7.4, Copyright (c) 2015 Dash Industry Forum — BSD-3-Clause
+     Project: https://github.com/Dash-Industry-Forum/dash.js
+     The unmodified playback script is bundled at
+     assets/player/vendor/dash-4.7.4.all.min.js. Copyright and license
+     terms are bundled at assets/licenses/dash.js-4.7.4-LICENSE.txt;
+     bundled dependency notices are in
+     assets/player/vendor/dash.all.min.js.LICENSE.txt and
+     assets/licenses/dash.js-4.7.4-dependencies-LICENSE.txt.
+
+========================================================================
+10. Test-only components
 ------------------------------------------------------------------------
    These are used solely for testing and are not distributed in the
    released APK:

@@ -437,6 +437,9 @@ private fun TerminalSurface(
                     onFontSizeCommit = { sp ->
                         liveFontSizeSp = sp
                         viewModel.setFontSize(sp)
+                    },
+                    onUserInput = { session ->
+                        if (session === tab.session) tab.onUserInput()
                     }
                 )
             )

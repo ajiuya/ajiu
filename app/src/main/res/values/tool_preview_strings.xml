@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="tool_preview_open_detail">查看工具详情</string>
+    <string name="tool_preview_options">工具预览选项</string>
+    <string name="tool_preview_enable">开启缩略预览</string>
+    <string name="tool_preview_disable">停止缩略预览</string>
+    <string name="tool_preview_follow_latest">跟随最新活动</string>
+    <string name="tool_preview_previous">上一个工具</string>
+    <string name="tool_preview_next">下一个工具</string>
+    <string name="tool_preview_first">跳到第一个工具</string>
+    <string name="tool_preview_last">跳到最后一个工具</string>
+    <string name="tool_preview_page">%1$d/%2$d</string>
+    <string name="tool_preview_preparing">正在准备</string>
+    <string name="tool_preview_running">正在执行</string>
+    <string name="tool_preview_completed">执行完成</string>
+    <string name="tool_preview_failed">执行失败</string>
+    <string name="tool_preview_image">工具画面预览</string>
+    <string name="tool_preview_sensitive">敏感正文已隐藏，显示和复制均使用安全内容。</string>
+    <string name="tool_preview_no_output">暂无输出</string>
+    <string name="tool_preview_loading">正在加载详情…</string>
+    <string name="tool_preview_not_executed">参数正在生成，此指令尚未执行。</string>
+    <string name="tool_preview_open_browser">打开浏览器</string>
+    <string name="tool_preview_command">指令</string>
+    <string name="tool_preview_parameters">安全参数</string>
+    <string name="tool_preview_result">结果与输出</string>
+    <string name="tool_preview_diff">文件差异</string>
+    <string name="tool_preview_close">关闭详情</string>
+    <string name="tool_preview_copy_all">复制安全展示内容</string>
+    <string name="tool_preview_copied">已复制</string>
+    <string name="tool_preview_copy_failed">复制失败，请重试。</string>
+    <string name="tool_preview_output_paused">已暂停刷新，保留当前阅读位置</string>
+    <string name="tool_preview_resume_output">回到实时尾部</string>
+    <string name="tool_preview_bounded">内容超过本地预览上限，显示和复制均使用有界内容；运行输出保留最新尾部。工具结果中如有完整输出路径，请按需打开。</string>
+    <string name="tool_preview_detail_page">%1$d / %2$d</string>
+    <string name="tool_preview_unknown_resource">—</string>
+    <string name="tool_preview_hud_cpu">APP CPU %1$s</string>
+    <string name="tool_preview_hud_pss">PSS %1$s</string>
+    <string name="tool_preview_hud_app_description">本应用进程 CPU %1$s，PSS %2$s；不是远程命令的资源占用。</string>
+</resources>

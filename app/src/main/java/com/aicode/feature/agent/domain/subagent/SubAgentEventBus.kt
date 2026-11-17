@@ -1,6 +1,8 @@
 package com.aicode.feature.agent.domain.subagent
 
-import com.aicode.core.util.FileLogger
+import com.aicode.feature.agent.data.local.entity.SubAgentInteractionEntity
+import java.util.UUID
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -12,7 +14,7 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
- * 子代理事件类型。前五种为生命周期事件；后两种为收发消息事件，只投递内容，不影响活跃集合。
+ * 子代理事件类型。收发消息不影响活跃集合；指令开始与取消只审计，不派发工作。
  */
 enum class SubAgentEventType {
     SPAWNED, COMPLETED, FAILED, STOPPED,
@@ -28,8 +30,17 @@ enum class SubAgentEventType {
     MESSAGE_FROM_PARENT,
 
     /** 子代理向主会话发来一条消息（发送方是子会话）。 */
-    MESSAGE_FROM_SUB
+    MESSAGE_FROM_SUB,
+
+    STARTED,
+    INSTRUCTION_CANCELLED,
+    INTERRUPTED
 }
+
+private val subAgentEventClock = AtomicLong(0L)
+
+private fun nextSubAgentEventTimestamp(): Long =
+    subAgentEventClock.updateAndGet { previous -> maxOf(System.currentTimeMillis(), previous + 1) }
 
 /**
  * 子代理生命周期事件。
@@ -44,7 +55,16 @@ data class SubAgentEvent(
     val subSessionId: String,
     val parentSessionId: String,
     val type: SubAgentEventType,
-    val detail: String = ""
+    val detail: String = "",
+    val eventId: String = UUID.randomUUID().toString(),
+    val timestamp: Long = nextSubAgentEventTimestamp(),
+    val origin: String? = null,
+    val sourceMessageId: String? = null,
+    val instructionId: String? = null,
+    val runMessageIds: Set<String> = emptySet(),
+    val generation: Long? = null,
+    val parentGeneration: Long? = null,
+    val runId: String? = null
 )
 
 /**
@@ -57,9 +77,14 @@ data class SubAgentEvent(
  * 会并发触达这里，读-改-写不持锁会丢更新（多占或漏占名额）。
  */
 @Singleton
-class SubAgentEventBus @Inject constructor() {
+class SubAgentEventBus private constructor(
+    private val journal: SubAgentInteractionJournal?,
+    private val _events: MutableSharedFlow<SubAgentEvent>
+) {
+    @Inject
+    constructor(journal: SubAgentInteractionJournal) : this(journal, MutableSharedFlow(extraBufferCapacity = 64))
 
-    private val _events = MutableSharedFlow<SubAgentEvent>(extraBufferCapacity = 64)
+    constructor() : this(null, MutableSharedFlow(extraBufferCapacity = 64))
     val events: SharedFlow<SubAgentEvent> = _events.asSharedFlow()
 
     private val slotLock = Any()
@@ -117,32 +142,65 @@ class SubAgentEventBus @Inject constructor() {
         wasActive
     }
 
-    fun emit(event: SubAgentEvent) {
+    fun markStarted(subSessionId: String) = synchronized(slotLock) {
+        _activeSubSessionIds.update { it + subSessionId }
+    }
+
+    fun tryMarkStarted(subSessionId: String): Boolean = synchronized(slotLock) {
+        val active = _activeSubSessionIds.value
+        if (subSessionId in active) return@synchronized true
+        if (active.size + reservedSlots >= MAX_RUNNING) return@synchronized false
+        _activeSubSessionIds.value = active + subSessionId
+        true
+    }
+
+    suspend fun recordForDisplay(
+        event: SubAgentEvent,
+        finish: (suspend () -> Boolean)? = null
+    ): SubAgentInteractionEntity? = persist(event, finish)
+
+    suspend fun emit(event: SubAgentEvent, finish: (suspend () -> Boolean)? = null) {
+        val entry = persist(event, finish)
+        if (entry != null && journal?.isCurrent(entry) == false) {
+            if (event.type == SubAgentEventType.SPAWNED) synchronized(slotLock) {
+                reservedSlots = (reservedSlots - 1).coerceAtLeast(0)
+            }
+            return
+        }
+        if (event.type == SubAgentEventType.STARTED || event.type == SubAgentEventType.INSTRUCTION_CANCELLED) return
         synchronized(slotLock) {
             // 同步维护活跃集合；SPAWNED 同时把一个预留名额转为正式活跃
             when (event.type) {
                 SubAgentEventType.SPAWNED -> {
-                    _activeSubSessionIds.update { it + event.subSessionId }
-                    reservedSlots = (reservedSlots - 1).coerceAtLeast(0)
+                    if (event.subSessionId !in _activeSubSessionIds.value) {
+                        _activeSubSessionIds.update { it + event.subSessionId }
+                        reservedSlots = (reservedSlots - 1).coerceAtLeast(0)
+                    }
                 }
                 SubAgentEventType.COMPLETED, SubAgentEventType.FAILED,
-                SubAgentEventType.STOPPED, SubAgentEventType.DELETED -> {
+                SubAgentEventType.STOPPED, SubAgentEventType.DELETED, SubAgentEventType.INTERRUPTED -> {
                     _activeSubSessionIds.update { it - event.subSessionId }
                 }
-                SubAgentEventType.MESSAGE_FROM_PARENT, SubAgentEventType.MESSAGE_FROM_SUB -> {
-                    // 收发消息不改变运行状态，活跃集合保持不变。
-                }
+                SubAgentEventType.MESSAGE_FROM_PARENT, SubAgentEventType.MESSAGE_FROM_SUB,
+                SubAgentEventType.STARTED, SubAgentEventType.INSTRUCTION_CANCELLED -> Unit
             }
         }
-        // 缓冲满时丢弃事件会造成「子会话已建但永不启动」「父代理等不到完成通知」，
-        // 必须留痕便于排查（正常 5 个并发远够 64 的缓冲，出现即异常）。
-        if (!_events.tryEmit(event)) {
-            FileLogger.e(TAG, "事件缓冲已满，事件被丢弃: ${event.type} sub=${event.subSessionId}")
-        }
+        _events.emit(if (entry == null) event else event.copy(
+            generation = entry.generation, parentGeneration = entry.parentGeneration, runId = entry.runId
+        ))
+    }
+
+    private suspend fun persist(
+        event: SubAgentEvent,
+        finish: (suspend () -> Boolean)?
+    ): SubAgentInteractionEntity? {
+        val persistentJournal = journal
+        if (persistentJournal != null) return persistentJournal.record(event, finish)
+        if (finish != null && !finish()) throw kotlinx.coroutines.CancellationException("Subagent run no longer owned")
+        return null
     }
 
     companion object {
-        private const val TAG = "SubAgentEventBus"
 
         /** 同时运行的子代理上限。判定以此为准，工具层只引用不自己再写一份。 */
         const val MAX_RUNNING = 5

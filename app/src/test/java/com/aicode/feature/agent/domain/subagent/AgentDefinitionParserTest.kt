@@ -1,6 +1,5 @@
 package com.aicode.feature.agent.domain.subagent
 
-import com.aicode.feature.agent.domain.model.AgentMode
 import com.aicode.testutil.TestFileAccessProvider
 import java.io.File
 import org.junit.Assert.assertEquals
@@ -56,11 +55,23 @@ class AgentDefinitionParserTest {
         assertEquals("DeepSeek", def.providerId)
         assertEquals("deepseek-reasoner", def.model)
         assertEquals("high", def.reasoningEffort)
-        assertEquals(AgentMode.PLAN, def.mode)
         assertEquals(listOf("readFile", "search"), def.allowedTools)
         assertEquals(listOf("Bash"), def.disallowedTools)
         assertEquals(setOf(InjectPart.BASE, InjectPart.PROJECT_RULES), def.inject)
         assertEquals("你是调研专家。", def.prompt)
+    }
+
+    @Test
+    fun parse_legacyModeFieldIsIgnored() {
+        val expected = parseFile(write("legacy.md", "---\nname: legacy\ntools: [readFile]\n---\n正文"))!!
+
+        for (mode in listOf("plan", "auto", "manual", "unknown")) {
+            val actual = parseFile(
+                write("legacy.md", "---\nname: legacy\nmode: $mode\ntools: [readFile]\n---\n正文")
+            )
+
+            assertEquals("mode: $mode", expected, actual)
+        }
     }
 
     @Test
@@ -80,7 +91,6 @@ class AgentDefinitionParserTest {
         assertNull(def.providerId)
         assertNull(def.model)
         assertNull(def.reasoningEffort)
-        assertNull(def.mode)
     }
 
     @Test
@@ -114,7 +124,6 @@ class AgentDefinitionParserTest {
         )!!
 
         assertNull(def.reasoningEffort)
-        assertNull(def.mode)
     }
 
     @Test
@@ -181,7 +190,6 @@ class AgentDefinitionParserTest {
             providerId = "deepseek",
             model = "deepseek-reasoner",
             reasoningEffort = "high",
-            mode = AgentMode.PLAN,
             allowedTools = listOf("readFile", "search"),
             disallowedTools = listOf("Bash"),
             inject = setOf(InjectPart.BASE, InjectPart.PROJECT_RULES),
@@ -195,7 +203,6 @@ class AgentDefinitionParserTest {
         assertEquals("deepseek", def.providerId)
         assertEquals("deepseek-reasoner", def.model)
         assertEquals("high", def.reasoningEffort)
-        assertEquals(AgentMode.PLAN, def.mode)
         assertEquals(listOf("readFile", "search"), def.allowedTools)
         assertEquals(listOf("Bash"), def.disallowedTools)
         assertEquals(setOf(InjectPart.BASE, InjectPart.PROJECT_RULES), def.inject)
@@ -223,7 +230,6 @@ class AgentDefinitionParserTest {
         assertNull(def.providerId)
         assertNull(def.model)
         assertNull(def.reasoningEffort)
-        assertNull(def.mode)
         assertTrue(def.allowedTools.isEmpty())
     }
 

@@ -2,6 +2,7 @@ package com.aicode.feature.agent.domain.session
 
 import com.aicode.feature.agent.data.local.dao.AgentMessageDao
 import com.aicode.feature.agent.data.local.dao.ChatSessionDao
+import com.aicode.feature.agent.data.local.dao.SubAgentInteractionDao
 import com.aicode.feature.agent.data.local.entity.ChatSessionEntity
 import io.mockk.coEvery
 import io.mockk.coVerify
@@ -31,13 +32,50 @@ class SessionUseCaseWorkspaceDeletionTest {
             session("sub", "/ws/a", parentId = "root")
         )
 
-        val useCase = SessionUseCase(chatDao, messageDao)
+        val interactionDao = mockk<SubAgentInteractionDao>(relaxed = true)
+        val useCase = SessionUseCase(chatDao, messageDao, interactionDao)
         val deleted = useCase.deleteSessionsByWorkspace("/ws/a")
 
         assertEquals(2, deleted)
+        coVerify(exactly = 1) { interactionDao.deleteByParent("root") }
+        coVerify(exactly = 1) { interactionDao.deleteByParent("sub") }
         coVerify(exactly = 1) { messageDao.deleteBySession("root") }
         coVerify(exactly = 1) { messageDao.deleteBySession("sub") }
         coVerify(exactly = 1) { chatDao.deleteByWorkspace("/ws/a") }
+    }
+
+    @Test
+    fun deleteParentCleansOwnedJournalIncludingDeletedChildHistory() = runTest {
+        val chatDao = mockk<ChatSessionDao>(relaxed = true)
+        val messageDao = mockk<AgentMessageDao>(relaxed = true)
+        val interactionDao = mockk<SubAgentInteractionDao>(relaxed = true)
+        coEvery { chatDao.getSubSessionsByParentOnce("root") } returns listOf(session("sub", "/ws", "root"))
+        val useCase = SessionUseCase(chatDao, messageDao, interactionDao)
+
+        assertEquals(listOf("root", "sub"), useCase.deleteSession("root"))
+
+        coVerify(exactly = 1) { interactionDao.deleteByParent("root") }
+        coVerify(exactly = 1) { interactionDao.deleteByParent("sub") }
+        coVerify(exactly = 0) { interactionDao.deleteAll() }
+        coVerify(exactly = 1) { chatDao.delete("root") }
+        coVerify(exactly = 1) { chatDao.delete("sub") }
+    }
+
+    @Test
+    fun deleteChildDoesNotClearParentAudit() = runTest {
+        val chatDao = mockk<ChatSessionDao>(relaxed = true)
+        val messageDao = mockk<AgentMessageDao>(relaxed = true)
+        val interactionDao = mockk<SubAgentInteractionDao>(relaxed = true)
+        coEvery { chatDao.getSubSessionsByParentOnce("sub") } returns emptyList()
+        val useCase = SessionUseCase(chatDao, messageDao, interactionDao)
+
+        assertEquals(listOf("sub"), useCase.deleteSession("sub"))
+
+        coVerify(exactly = 1) { interactionDao.deleteByParent("sub") }
+        coVerify(exactly = 0) { interactionDao.deleteByParent("root") }
+        coVerify(exactly = 0) { interactionDao.deleteAll() }
+        coVerify(exactly = 1) { messageDao.deleteBySession("sub") }
+        coVerify(exactly = 1) { chatDao.delete("sub") }
     }
 
     @Test
@@ -46,10 +84,12 @@ class SessionUseCaseWorkspaceDeletionTest {
         val messageDao = mockk<AgentMessageDao>(relaxed = true)
         coEvery { chatDao.getAllSessionsByWorkspaceOnce("/ws/empty") } returns emptyList()
 
-        val useCase = SessionUseCase(chatDao, messageDao)
+        val interactionDao = mockk<SubAgentInteractionDao>(relaxed = true)
+        val useCase = SessionUseCase(chatDao, messageDao, interactionDao)
         val deleted = useCase.deleteSessionsByWorkspace("/ws/empty")
 
         assertEquals(0, deleted)
+        coVerify(exactly = 0) { interactionDao.deleteByParent(any()) }
         coVerify(exactly = 0) { messageDao.deleteBySession(any()) }
         coVerify(exactly = 0) { chatDao.deleteByWorkspace(any()) }
     }

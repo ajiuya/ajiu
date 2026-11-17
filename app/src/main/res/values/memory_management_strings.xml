@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="memory_management_title">记忆管理</string>
+    <string name="memory_management_add">新增记忆</string>
+    <string name="memory_management_refresh">刷新记忆</string>
+    <string name="memory_management_global">全局记忆</string>
+    <string name="memory_management_project">当前项目记忆</string>
+    <string name="memory_management_project_named">当前项目 · %1$s</string>
+    <string name="memory_management_no_workspace">尚未选择工作区，项目记忆暂不可用；仍可查看和新增全局记忆。</string>
+    <string name="memory_management_empty">此作用域暂无记忆</string>
+    <string name="memory_management_name">名称</string>
+    <string name="memory_management_name_hint">使用字母、数字、连字符或下划线，与记忆工具使用相同名称。</string>
+    <string name="memory_management_description">摘要</string>
+    <string name="memory_management_no_description">暂无摘要</string>
+    <string name="memory_management_body">正文（Markdown）</string>
+    <string name="memory_management_scope">作用域</string>
+    <string name="memory_management_file">文件</string>
+    <string name="memory_management_copy_body">复制正文</string>
+    <string name="memory_management_create">创建</string>
+    <string name="memory_management_creating">正在创建…</string>
+    <string name="memory_management_delete_title">删除记忆</string>
+    <string name="memory_management_delete_message">确定删除“%1$s”（%2$s）吗？删除后无法恢复，其他作用域的同名记忆不受影响。</string>
+    <string name="memory_management_target_changed">工作区或执行环境已切换。为避免操作错误目标，本页已停止读写，请重新加载。</string>
+    <string name="memory_management_reload">加载当前环境</string>
+    <string name="memory_management_invalid_name">名称不合法，请使用字母、数字、连字符或下划线，不要包含路径或控制字符。</string>
+    <string name="memory_management_name_conflict">此作用域已存在同名记忆，请更换名称；已有内容未被覆盖。</string>
+    <string name="memory_management_not_found">记忆文件已不存在，请返回列表并刷新。</string>
+    <string name="memory_management_changed">记忆已被其他操作更新，本次未删除。请刷新并查看最新内容后重新确认。</string>
+    <string name="memory_management_unsafe_path">记忆目录或文件包含符号链接或不安全路径，无法操作。请检查存储位置。</string>
+    <string name="memory_management_io_failed">无法读写记忆，请检查目录访问权限后重试。</string>
+</resources>

@@ -27,7 +27,7 @@ class AgentDefinitionRepository @Inject constructor(
      * 这部分维持原有的「新会话才刷新」行为。
      */
     @Volatile private var definitionsVersionField: Long = 0
-    val definitionsVersion: Long get() = definitionsVersionField
+    val definitionsVersion: Long get() = definitionsVersionField + BuiltinAgentPublication.revision.value
 
     private fun bumpVersion() {
         definitionsVersionField++
@@ -100,7 +100,6 @@ class AgentDefinitionRepository @Inject constructor(
             providerId = form.providerId,
             model = form.model,
             reasoningEffort = form.reasoningEffort,
-            mode = form.mode,
             allowedTools = form.allowedTools,
             disallowedTools = form.disallowedTools,
             inject = form.inject,

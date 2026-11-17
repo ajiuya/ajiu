@@ -80,14 +80,8 @@ data class PendingToolPermission(
     val summary: String,
     val details: String,
     val argsPreview: String,
-    /**
-     * 「始终允许」会记忆的模式列表（shell 命令为命令前缀：子命令分发器记 `git pull` 这类带子命令的
-     * 前缀，普通程序记 `cat`/`ls`；非 shell 工具为 `*`）。
-     * 为空表示该调用不可记忆（命令不可静态判定），UI 应禁用「始终允许」、只留单次放行。
-     * 由 [com.aicode.feature.agent.domain.permission.ToolPermissionPolicyEngine] 评估后填入。
-     */
-    val rememberablePatterns: List<String> = emptyList(),
-    val rememberDisabledReason: String? = null,
+    val approvalNote: String? = null,
+    val sessionGrant: String? = null,
     /** 发起该授权请求的会话 id。多会话并行时用于在 UI 上区分弹窗归属、点亮侧边栏等待授权指示。 */
     val sessionId: String = ""
 )
@@ -124,8 +118,7 @@ abstract class AgentTool {
     }
 
     /**
-     * 生成符合 JSON Schema 的参数描述，用于真正传给大模型的 function-calling 接口
-     * （OpenAI 的 function.parameters / Anthropic 的 input_schema）。
+     * 生成工具业务参数的 JSON Schema；模型调用边界使用 [toModelJsonSchema]。
      *
      * 设为 open：MCP 等外部工具携带的是任意原始 inputSchema，无法用受限的 [ParameterType]
      * 枚举表达，需要覆写本方法直接透传服务端 schema。
@@ -149,6 +142,31 @@ abstract class AgentTool {
             "properties" to properties,
             "required" to required
         )
+    }
+
+    fun toModelJsonSchema(): Map<String, Any> {
+        val schema = toJsonSchema()
+        if (!hasModelActionTitle(schema)) return schema
+        val properties = LinkedHashMap<String, Any>()
+        properties[TOOL_TITLE_PARAM] = mapOf(
+            "type" to "string",
+            "description" to "简短描述这一次调用的具体动作，用于向用户展示，不超过48个字符。先写此字段，再写真实参数；不要写工具名、原始命令或敏感信息。"
+        )
+        @Suppress("UNCHECKED_CAST")
+        (schema["properties"] as? Map<String, Any>)?.let { properties.putAll(it) }
+        return LinkedHashMap(schema).apply {
+            put("properties", properties)
+            put("required", listOf(TOOL_TITLE_PARAM) + (schema["required"] as? List<*>).orEmpty())
+        }
+    }
+
+    internal fun hasModelActionTitle(schema: Map<String, Any> = toJsonSchema()): Boolean =
+        !name.startsWith("mcp__") && ToolCapability.EXTERNAL_TOOL !in capabilities &&
+            TOOL_TITLE_PARAM !in parameters &&
+            (schema["properties"] as? Map<*, *>)?.containsKey(TOOL_TITLE_PARAM) != true
+
+    companion object {
+        const val TOOL_TITLE_PARAM = "tool_title"
     }
 }
 

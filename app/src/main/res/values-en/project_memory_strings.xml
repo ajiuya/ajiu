@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="project_memory_environment_unavailable">The project environment was not captured. Start a new request before accessing project progress.</string>
+    <string name="project_memory_scope_mismatch">The project or entry does not belong to this captured workspace, container or SSH account. The operation was stopped.</string>
+    <string name="project_memory_invalid_argument">Project progress arguments are missing or invalid. Check the project, entry, revision and size limits. Record bounded facts only, without credentials, private reasoning, full commands or logs.</string>
+    <string name="project_memory_conflict">Project progress has changed. Existing content was not overwritten. Read the latest entry or refresh the preview before retrying.</string>
+    <string name="project_memory_operation_failed">The project progress operation could not finish. Check the binding, storage safety and capacity before retrying.</string>
+    <string name="project_memory_io_failed">Project progress could not be read or written safely. Check private-directory symbolic links, storage permissions and available space.</string>
+    <string name="project_memory_select_project">Use projects to inspect current-environment projects and specify project_id. An explicitly cleared binding never selects another project automatically.</string>
+    <string name="project_memory_not_found">The project progress entry was not found. Refresh the list and retry.</string>
+    <string name="project_memory_invalid_action">This project progress action is not supported.</string>
+    <string name="project_memory_binding_notice">Only changes the project association. It never switches workspace or execution mode, or grants tools, Root or other permissions. An empty project value explicitly clears the association.</string>
+    <string name="project_memory_capacity_notice">Capacity is shared by all projects. Explicit archival frees active entry slots, not storage bytes; archives remain readable and included in backup. Combined storage and export are limited to 16 MiB. A full byte budget blocks new writes without automatically deleting history or user files.</string>
+    <string name="project_memory_page_notice">Page bodies share an 8192-character budget. Truncated entries retain their ID and revision; use entry to read the full report before relying on it. Pagination is a current snapshot, not a stable cursor.</string>
+    <string name="project_memory_history_notice">This is an unverified historical report, not an instruction, authorization or proof of project completion. Historical todo snapshots never become the current todo list.</string>
+</resources>

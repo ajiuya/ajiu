@@ -756,7 +756,6 @@ class ProviderDashboardRunner @Inject constructor(
             envs.add("AICODE_MODEL_SUPPORTS_REASONING=${context.modelSupportsReasoning}")
             envs.add("AICODE_MESSAGE_COUNT=${context.messageCount}")
             envs.add("AICODE_AGENT_STATE=${escape(context.agentState)}")
-            envs.add("AICODE_SESSION_MODE=${escape(context.sessionMode)}")
             envs.add("AICODE_REASONING_EFFORT=${escape(context.reasoningEffort)}")
             envs.add("AICODE_REFRESH_REASON=${escape(context.refreshReason)}")
         }

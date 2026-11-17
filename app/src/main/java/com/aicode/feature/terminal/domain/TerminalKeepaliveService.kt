@@ -1,6 +1,7 @@
 package com.aicode.feature.terminal.domain
 
-import android.app.ActivityManager
+import android.app.Notification
+import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
@@ -8,37 +9,44 @@ import android.content.Intent
 import android.net.wifi.WifiManager
 import android.os.Binder
 import android.os.Build
+import android.os.Bundle
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
+import android.os.PowerManager
+import android.os.SystemClock
+import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import com.aicode.MainActivity
-import com.aicode.core.util.FileLogger
 import com.aicode.R
-import com.aicode.feature.settings.data.repository.KeepaliveSettingsRepository
-import dagger.hilt.android.AndroidEntryPoint
+import com.aicode.core.util.FileLogger
+import com.aicode.feature.agent.presentation.notification.AgentLiveNotificationContent
+import com.aicode.feature.agent.presentation.notification.AgentLiveNotificationState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
-import javax.inject.Inject
 
-@AndroidEntryPoint
 class TerminalKeepaliveService : Service() {
     private val binder = LocalBinder()
-    private var sessionCount = 0
-
-    /** 用户在设置页开启的常驻保活：为 true 时即便没有后台会话也保持前台通知。 */
-    private var persistent = false
-
-    @Inject
-    lateinit var keepaliveSettings: KeepaliveSettingsRepository
-
+    private val handler = Handler(Looper.getMainLooper())
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var liveJob: Job? = null
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
+    private var foreground = false
+    private var stopping = false
+    private var currentChannelId: String? = null
+    private var cpuRenewAt = 0L
 
-    /** 前台保活期间持有的 Wi-Fi 锁：避免切后台/息屏后 Wi-Fi 进入省电使长连接被回收。 */
-    private val wifiLocks = mutableListOf<WifiManager.WifiLock>()
-    private var wifiLocksInitialized = false
+    private val renewCpuLock = Runnable {
+        if (!stopping && foreground) reconcileTasks()
+    }
 
     inner class LocalBinder : Binder() {
         fun getService(): TerminalKeepaliveService = this@TerminalKeepaliveService
@@ -46,197 +54,351 @@ class TerminalKeepaliveService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        FileLogger.i(TAG, "Service created")
-        // 进程被系统回收后 START_STICKY 重建：persistent 是内存态会丢失。
-        // 从持久化开关恢复常驻前台，否则服务空转后 stopSelf，保活形同虚设。
-        serviceScope.launch {
-            if (keepaliveSettings.isEnabled()) {
-                persistent = true
-                ensureForeground()
-                FileLogger.i(TAG, "Restored persistent keepalive after restart")
-            }
+        if (ensureForeground()) {
+            TaskKeepaliveController.attach(this)
+            reconcileTasks()
+            startLiveObserver()
         }
-    }
-
-    override fun onDestroy() {
-        serviceScope.cancel()
-        releaseWifiLocks()
-        super.onDestroy()
-    }
-
-    override fun onTaskRemoved(rootIntent: Intent?) {
-        super.onTaskRemoved(rootIntent)
-        // 用户从最近任务划掉 app = 明确不要后台运行：停掉前台服务并取消 WorkManager 周期兜底，
-        // 否则进程被杀后服务会被 START_STICKY 或 KeepaliveWorker 重新拉起并弹通知。
-        // 开关本身保持不变，下次打开 app 时由 MainActivity / AIEditorApp 自动恢复。
-        KeepaliveWorker.cancel(this)
-        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
-        stopSelf()
-        FileLogger.i(TAG, "Task removed, keepalive stopped")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_START_SESSION -> {
-                sessionCount++
-                ensureForeground()
-                FileLogger.i(TAG, "Session started, count=$sessionCount")
-            }
-            ACTION_STOP_SESSION -> {
-                sessionCount = (sessionCount - 1).coerceAtLeast(0)
-                if (sessionCount == 0 && !persistent) {
-                    stopSelf(startId)
-                    FileLogger.i(TAG, "All sessions ended, stopping service")
-                } else {
-                    ensureForeground()
-                    FileLogger.i(TAG, "Session ended, count=$sessionCount, persistent=$persistent")
-                }
-            }
-            ACTION_ENABLE_PERSISTENT -> {
-                persistent = true
-                ensureForeground()
-                FileLogger.i(TAG, "Persistent keepalive enabled")
-            }
-            ACTION_DISABLE_PERSISTENT -> {
-                persistent = false
-                if (sessionCount == 0) {
-                    stopSelf(startId)
-                    FileLogger.i(TAG, "Persistent keepalive disabled, no sessions, stopping service")
-                } else {
-                    ensureForeground()
-                    FileLogger.i(TAG, "Persistent keepalive disabled, sessions still running count=$sessionCount")
-                }
+        // A new start can arrive after stopSelf but before destruction of this same instance.
+        if (stopping && TaskKeepaliveController.snapshot().serviceRequired) {
+            stopping = false
+            if (ensureForeground()) {
+                TaskKeepaliveController.attach(this)
+                startLiveObserver()
             }
         }
-        return START_STICKY
+        if (!stopping) reconcileTasks()
+        return START_NOT_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder = binder
 
-    /**
-     * 进入前台并刷新通知；文案随「常驻保活 / 后台会话」组合变化。
-     *
-     * startForeground 在 Android 12+ 从后台启动前台服务时可能抛
-     * ForegroundServiceStartNotAllowedException，此处捕获仅记录——常驻通知本次未能展示，
-     * 不应让进程崩溃（设置页的开关仍是开启态，下次前台时由 [com.aicode.MainActivity] 恢复）。
-     */
-    private fun ensureForeground() {
-        val text = when {
-            sessionCount > 0 && persistent ->
-                getString(R.string.notification_keepalive_persistent_sessions, sessionCount)
-            sessionCount > 0 ->
-                getString(R.string.notification_keepalive_running_sessions, sessionCount)
-            else -> getString(R.string.notification_keepalive_enabled)
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        TaskKeepaliveController.onTaskRemoved(this)
+        runCatching { KeepaliveWorker.cancel(this) }
+            .onFailure { FileLogger.w(TAG, "Cancel keepalive worker failed", it) }
+        stopProtection()
+    }
+
+    override fun onDestroy() {
+        handler.removeCallbacksAndMessages(null)
+        serviceScope.cancel()
+        cancelTaskListNotification()
+        releaseCpuLock()
+        releaseWifiLock()
+        foreground = false
+        currentChannelId = null
+        cpuRenewAt = 0L
+        TaskKeepaliveController.detach(this)
+        super.onDestroy()
+    }
+
+    internal fun reconcileTasks() {
+        if (stopping) return
+        val snapshot = TaskKeepaliveController.snapshot()
+        if (!snapshot.serviceRequired) {
+            stopProtection()
+            return
         }
-        val openAppIntent = PendingIntent.getActivity(
-            this,
-            0,
-            Intent(this, MainActivity::class.java).apply {
-                flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
-            },
-            PendingIntent.FLAG_IMMUTABLE
-        )
-        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.ic_menu_info_details)
+        if (!ensureForeground()) return
+        if (snapshot.cpuRequired) {
+            if (wakeLock?.isHeld != true || SystemClock.elapsedRealtime() >= cpuRenewAt) {
+                acquireCpuLock()
+                cpuRenewAt = SystemClock.elapsedRealtime() + CPU_RENEW_MS
+                handler.removeCallbacks(renewCpuLock)
+                handler.postDelayed(renewCpuLock, CPU_RENEW_MS)
+            }
+        } else {
+            handler.removeCallbacks(renewCpuLock)
+            cpuRenewAt = 0L
+            releaseCpuLock()
+        }
+        if (snapshot.wifiRequired) acquireWifiLock() else releaseWifiLock()
+    }
+
+    private fun ensureForeground(): Boolean {
+        val state = AgentLiveNotificationState.state.value
+        val channelId = if (state.active) AGENT_CHANNEL_ID else CHANNEL_ID
+        if (!foreground || currentChannelId != channelId) {
+            try {
+                postForegroundNotification(state) { startForeground(NOTIFICATION_ID, it) }
+                currentChannelId = channelId
+                foreground = true
+            } catch (error: Exception) {
+                foreground = false
+                TaskKeepaliveController.foregroundFailed(this, error)
+                stopProtection()
+                return false
+            }
+        } else {
+            runCatching {
+                postForegroundNotification(state) {
+                    getSystemService(NotificationManager::class.java)?.notify(NOTIFICATION_ID, it)
+                }
+            }.onFailure { FileLogger.w(TAG, "Update foreground notification failed", it) }
+        }
+        updateTaskListNotification(state)
+        return true
+    }
+
+    private inline fun postForegroundNotification(
+        state: AgentLiveNotificationState.Snapshot,
+        post: (Notification) -> Unit
+    ) {
+        val notification = buildForegroundNotification(state)
+        try {
+            post(notification)
+        } catch (error: Exception) {
+            if (!notification.extras.getBoolean(EXTRA_REQUEST_PROMOTED_ONGOING)) throw error
+            FileLogger.w(TAG, "Post native live update failed; retrying ordinary notification", error)
+            post(buildAgentNotification(state, allowPromoted = false))
+        }
+    }
+
+    private fun startLiveObserver() {
+        if (liveJob?.isActive == true || stopping) return
+        liveJob = serviceScope.launch {
+            combine(AgentLiveNotificationState.state, KeepaliveNotificationState.state) { live, _ -> live }
+                .collect { if (foreground && !stopping) ensureForeground() }
+        }
+    }
+
+    private fun buildForegroundNotification(state: AgentLiveNotificationState.Snapshot): Notification =
+        if (state.active) buildAgentNotification(state) else buildTerminalNotification()
+
+    private fun publicNotification(channelId: String): Notification =
+        NotificationCompat.Builder(this, channelId)
+            .setSmallIcon(R.drawable.ic_keepalive_task)
             .setContentTitle(getString(R.string.app_name))
-            .setContentText(text)
-            .setContentIntent(openAppIntent)
+            .setContentText(getString(R.string.keepalive_task_public_body))
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setOngoing(true)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_DEFERRED)
+            .setSilent(true)
             .build()
 
-        runCatching { startForeground(NOTIFICATION_ID, notification) }
-            .onSuccess { acquireWifiLocks() }
-            .onFailure { FileLogger.e(TAG, "startForeground failed", it) }
+    private fun taskLabels() = KeepaliveNotificationContent.Labels(
+        summary = getString(R.string.keepalive_task_summary),
+        terminalRow = getString(R.string.keepalive_task_terminal_row),
+        agentRow = getString(R.string.keepalive_task_agent_row),
+        local = getString(R.string.keepalive_task_local),
+        ssh = getString(R.string.keepalive_task_ssh),
+        running = getString(R.string.keepalive_task_command_running),
+        idle = getString(R.string.keepalive_task_terminal_idle)
+    )
+
+    private fun buildTerminalNotification(): Notification {
+        val state = KeepaliveNotificationState.state.value
+        val labels = taskLabels()
+        val persistent = TaskKeepaliveController.snapshot().persistent
+        val text = if (state.terminalCount == 0 && state.agents.isEmpty() && persistent) {
+            getString(R.string.notification_keepalive_enabled)
+        } else KeepaliveNotificationContent.summary(state, labels)
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_keepalive_task)
+            .setContentTitle(getString(R.string.app_name))
+            .setContentText(text)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(KeepaliveNotificationContent.expanded(state, labels)))
+            .setContentIntent(openAppIntent())
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+            .setPublicVersion(publicNotification(CHANNEL_ID))
+            .setOngoing(true)
+            .setSilent(true)
+            .setOnlyAlertOnce(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
+            .build()
     }
 
-    /**
-     * 获取 Wi-Fi 锁，尽量保持 Wi-Fi 不休眠。延后到首次进入前台时惰性创建：只有真正保活期间
-     * 才需要，避免无谓占用。API 29+ 同时持低延迟锁（前台亮屏时生效）与兼容锁（后台/息屏时生效）。
-     */
-    private fun acquireWifiLocks() {
+    private fun updateTaskListNotification(live: AgentLiveNotificationState.Snapshot) {
         runCatching {
-            if (!wifiLocksInitialized) {
-                val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager ?: return
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    wifiLocks += wm.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "AiCode:Keepalive:low-latency")
-                }
-                @Suppress("DEPRECATION")
-                wifiLocks += wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "AiCode:Keepalive")
-                wifiLocks.forEach { it.setReferenceCounted(false) }
-                wifiLocksInitialized = true
-            }
-            wifiLocks.forEach { lock -> if (!lock.isHeld) lock.acquire() }
-        }.onFailure { FileLogger.w(TAG, "acquireWifiLock failed", it) }
+            val manager = getSystemService(NotificationManager::class.java) ?: return
+            if (KeepaliveNotificationContent.companionRequired(live, KeepaliveNotificationState.state.value)) {
+                manager.notify(TASK_LIST_NOTIFICATION_ID, buildTerminalNotification())
+            } else manager.cancel(TASK_LIST_NOTIFICATION_ID)
+        }.onFailure { FileLogger.w(TAG, "Update task-list notification failed", it) }
     }
 
-    private fun releaseWifiLocks() {
-        wifiLocks.forEach { lock ->
-            runCatching { if (lock.isHeld) lock.release() }
+    private fun cancelTaskListNotification() {
+        runCatching { getSystemService(NotificationManager::class.java)?.cancel(TASK_LIST_NOTIFICATION_ID) }
+            .onFailure { FileLogger.w(TAG, "Cancel task-list notification failed", it) }
+    }
+
+    private fun buildAgentNotification(
+        state: AgentLiveNotificationState.Snapshot,
+        allowPromoted: Boolean = true
+    ): Notification {
+        val clock = AgentLiveNotificationContent.clock(state, SystemClock.elapsedRealtime(), System.currentTimeMillis())
+        val title = when {
+            state.completed && state.failed -> getString(R.string.keepalive_task_failed_title)
+            state.completed && !state.completionVerified -> getString(R.string.keepalive_task_ended_title)
+            state.completed -> getString(R.string.keepalive_task_completed_title)
+            else -> AgentLiveNotificationContent.title(
+                state, getString(R.string.keepalive_task_agent_running), getString(R.string.notification_agent_live_title_multi)
+            )
         }
+        val body = when {
+            state.completed && state.failed -> getString(R.string.keepalive_task_failed_body)
+            state.completed && !state.completionVerified -> getString(R.string.keepalive_task_ended_body)
+            state.completed -> getString(R.string.keepalive_task_completed_body)
+            else -> AgentLiveNotificationContent.body(
+                state, getString(R.string.keepalive_task_agent_running), getString(R.string.keepalive_task_agent_row)
+            )
+        }
+        val icon = when {
+            state.completed && state.failed -> R.drawable.ic_keepalive_task_failed
+            state.completed && state.completionVerified -> R.drawable.ic_keepalive_task_completed
+            else -> R.drawable.ic_keepalive_task
+        }
+        val shortText = AgentLiveNotificationContent.shortText(
+            state,
+            runningFallback = getString(R.string.keepalive_task_action_running),
+            completedText = getString(R.string.keepalive_task_completed_title),
+            failedText = getString(R.string.keepalive_task_failed_title),
+            thinkingText = getString(R.string.keepalive_task_action_thinking),
+            endedText = getString(R.string.keepalive_task_ended_title)
+        )
+        if (allowPromoted && Build.VERSION.SDK_INT >= Build.VERSION_CODES.BAKLAVA && promotedNotificationsAvailable()) {
+            runCatching { buildPromotedAgentNotification(state, title, body, shortText, icon, clock) }
+                .onSuccess { return it }
+                .onFailure { FileLogger.w(TAG, "Native live update unavailable; using ordinary notification", it) }
+        }
+        return NotificationCompat.Builder(this, AGENT_CHANNEL_ID)
+            .setSmallIcon(icon)
+            .setContentTitle(title)
+            .setContentText(body)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+            .setContentIntent(openAppIntent())
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+            .setPublicVersion(publicNotification(AGENT_CHANNEL_ID))
+            .setOngoing(true)
+            .setSilent(true)
+            .setOnlyAlertOnce(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setShowWhen(true)
+            .setWhen(clock.whenMs)
+            .setUsesChronometer(clock.usesChronometer)
+            .setChronometerCountDown(false)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
+            .build()
+    }
+
+    @RequiresApi(Build.VERSION_CODES.BAKLAVA)
+    private fun promotedNotificationsAvailable(): Boolean = runCatching {
+        getSystemService(NotificationManager::class.java)?.canPostPromotedNotifications() == true
+    }.getOrDefault(false)
+
+    @RequiresApi(Build.VERSION_CODES.BAKLAVA)
+    private fun buildPromotedAgentNotification(
+        state: AgentLiveNotificationState.Snapshot,
+        title: String,
+        body: String,
+        shortText: String,
+        icon: Int,
+        clock: AgentLiveNotificationContent.Clock
+    ): Notification {
+        val progressStyle = Notification.ProgressStyle()
+            .addProgressSegment(Notification.ProgressStyle.Segment(100))
+            .setStyledByProgress(false)
+            .setProgressTrackerIcon(null)
+            .setProgressIndeterminate(!state.completed)
+            .setProgress(if (state.completed && state.completionVerified && !state.failed) 100 else 0)
+        return Notification.Builder(this, AGENT_CHANNEL_ID)
+            .setSmallIcon(icon)
+            .setContentTitle(title)
+            .setContentText(body)
+            .setStyle(progressStyle)
+            .setContentIntent(openAppIntent())
+            .setVisibility(Notification.VISIBILITY_PRIVATE)
+            .setPublicVersion(publicNotification(AGENT_CHANNEL_ID))
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setCategory(Notification.CATEGORY_SERVICE)
+            .setShowWhen(false)
+            .setWhen(clock.whenMs)
+            .setUsesChronometer(false)
+            .setColorized(false)
+            .setShortCriticalText(shortText)
+            .addExtras(Bundle().apply { putBoolean(EXTRA_REQUEST_PROMOTED_ONGOING, true) })
+            .build()
+    }
+
+    private fun openAppIntent(): PendingIntent = PendingIntent.getActivity(
+        this, 0,
+        Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+        },
+        PendingIntent.FLAG_IMMUTABLE
+    )
+
+    private fun stopProtection() {
+        stopping = true
+        handler.removeCallbacksAndMessages(null)
+        liveJob?.cancel()
+        liveJob = null
+        cancelTaskListNotification()
+        releaseCpuLock()
+        releaseWifiLock()
+        foreground = false
+        currentChannelId = null
+        cpuRenewAt = 0L
+        TaskKeepaliveController.detach(this)
+        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    private fun acquireCpuLock() {
+        runCatching {
+            val lock = wakeLock ?: getSystemService(PowerManager::class.java)
+                .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AiCode:ActiveTasks")
+                .apply { setReferenceCounted(false) }
+                .also { wakeLock = it }
+            lock.acquire(CPU_TIMEOUT_MS)
+        }.onFailure { FileLogger.e(TAG, "CPU wake lock unavailable", it) }
+    }
+
+    private fun releaseCpuLock() {
+        runCatching { wakeLock?.let { if (it.isHeld) it.release() } }
+            .onFailure { FileLogger.w(TAG, "CPU wake lock release failed", it) }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun acquireWifiLock() {
+        runCatching {
+            val manager = applicationContext.getSystemService(WifiManager::class.java) ?: return
+            val lock = wifiLock ?: manager.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "AiCode:ActiveTasks")
+                .apply { setReferenceCounted(false) }
+                .also { wifiLock = it }
+            if (!lock.isHeld) lock.acquire()
+        }.onFailure { FileLogger.w(TAG, "Wi-Fi lock unavailable", it) }
+    }
+
+    private fun releaseWifiLock() {
+        runCatching { wifiLock?.let { if (it.isHeld) it.release() } }
+            .onFailure { FileLogger.w(TAG, "Wi-Fi lock release failed", it) }
     }
 
     companion object {
         private const val TAG = "TerminalKeepaliveService"
         private const val NOTIFICATION_ID = 1
+        private const val TASK_LIST_NOTIFICATION_ID = 2
         private const val CHANNEL_ID = "terminal_service"
-        const val ACTION_START_SESSION = "com.aicode.action.START_SESSION"
-        const val ACTION_STOP_SESSION = "com.aicode.action.STOP_SESSION"
-        const val ACTION_ENABLE_PERSISTENT = "com.aicode.action.ENABLE_PERSISTENT"
-        const val ACTION_DISABLE_PERSISTENT = "com.aicode.action.DISABLE_PERSISTENT"
+        private const val AGENT_CHANNEL_ID = "agent_live"
+        private const val CPU_TIMEOUT_MS = 10 * 60 * 1000L
+        private const val CPU_RENEW_MS = 5 * 60 * 1000L
+        private const val EXTRA_REQUEST_PROMOTED_ONGOING = "android.requestPromotedOngoing"
 
-        /** 开启常驻保活（幂等）。 */
-        fun enablePersistent(context: Context) {
-            val intent = Intent(context, TerminalKeepaliveService::class.java).apply {
-                action = ACTION_ENABLE_PERSISTENT
-            }
-            runCatching { context.startService(intent) }
-                .onFailure {
-                    // 后台冷启动时系统拒绝 startService（Android 8+ 后台执行限制），属预期场景，
-                    // 保活会在 App 回到前台或 WorkManager 兜底时恢复，不必刷全栈吓人日志。
-                    if (it.message?.contains("app is in background") == true) {
-                        FileLogger.i(TAG, "enablePersistent skipped: app in background, keepalive deferred")
-                    } else {
-                        FileLogger.e(TAG, "enablePersistent startService failed", it)
-                    }
-                }
-        }
+        fun enablePersistent(context: Context): Boolean = TaskKeepaliveController.retryPersistent(context)
 
-        /** 关闭常驻保活（幂等）。仅在确曾开启过时调用，避免为关闭而凭空拉起 Service。 */
         fun disablePersistent(context: Context) {
-            val intent = Intent(context, TerminalKeepaliveService::class.java).apply {
-                action = ACTION_DISABLE_PERSISTENT
-            }
-            runCatching { context.startService(intent) }
-                .onFailure { FileLogger.e(TAG, "disablePersistent startService failed", it) }
+            TaskKeepaliveController.setPersistent(context, false)
         }
 
-        /** 登记一个后台会话（不改变用户常驻开关）。由调用方按状态迁移保证不重复计数。 */
-        fun startSession(context: Context) {
-            val intent = Intent(context, TerminalKeepaliveService::class.java).apply {
-                action = ACTION_START_SESSION
-            }
-            runCatching { context.startService(intent) }
-                .onFailure { FileLogger.e(TAG, "startSession startService failed", it) }
-        }
-
-        /** 结束一个后台会话。 */
-        fun stopSession(context: Context) {
-            val intent = Intent(context, TerminalKeepaliveService::class.java).apply {
-                action = ACTION_STOP_SESSION
-            }
-            runCatching { context.startService(intent) }
-                .onFailure { FileLogger.e(TAG, "stopSession startService failed", it) }
-        }
-
-        /** 判断保活服务当前是否在运行。WorkManager 兜底拉起前先探测，避免反复 startService。 */
-        @Suppress("DEPRECATION")
-        fun isRunning(context: Context): Boolean {
-            val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-            val serviceName = TerminalKeepaliveService::class.java.name
-            return am.getRunningServices(Int.MAX_VALUE)
-                .any { it.service.packageName == context.packageName && it.service.className == serviceName }
-        }
+        fun isRunning(@Suppress("UNUSED_PARAMETER") context: Context): Boolean = TaskKeepaliveController.isProtected()
     }
 }

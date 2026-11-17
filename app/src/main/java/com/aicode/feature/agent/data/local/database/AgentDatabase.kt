@@ -2,17 +2,26 @@ package com.aicode.feature.agent.data.local.database
 
 import androidx.room.Database
 import androidx.room.RoomDatabase
+import com.aicode.feature.agent.data.local.dao.AgentNotificationDao
+import com.aicode.feature.agent.data.local.entity.AgentNotificationEntity
 import com.aicode.feature.agent.data.local.dao.AgentMessageDao
+import com.aicode.feature.agent.data.local.dao.AgentRecoveryDao
 import com.aicode.feature.agent.data.local.dao.ChatSessionDao
 import com.aicode.feature.agent.data.local.dao.CheckpointDao
 import com.aicode.feature.agent.data.local.dao.LlmCallRecordDao
 import com.aicode.feature.agent.data.local.dao.TodoItemDao
+import com.aicode.feature.agent.data.local.dao.SubAgentInteractionDao
 import com.aicode.feature.agent.data.local.entity.AgentMessageEntity
 import com.aicode.feature.agent.data.local.entity.ChatSessionEntity
 import com.aicode.feature.agent.data.local.entity.CheckpointEntity
 import com.aicode.feature.agent.data.local.entity.CheckpointFileSnapshotEntity
 import com.aicode.feature.agent.data.local.entity.LlmCallRecordEntity
 import com.aicode.feature.agent.data.local.entity.TodoItemEntity
+import com.aicode.feature.agent.data.local.entity.SubAgentInteractionEntity
+import com.aicode.feature.agent.data.local.entity.RecoveryRequestEntity
+import com.aicode.feature.agent.data.local.entity.RecoveryRunEntity
+import com.aicode.feature.agent.data.local.entity.RecoveryToolEntity
+import com.aicode.feature.agent.data.local.entity.RecoveryDraftEntity
 import com.aicode.feature.backup.data.local.dao.BackupTargetDao
 import com.aicode.feature.backup.data.local.entity.BackupTargetEntity
 import com.aicode.feature.settings.data.local.dao.AIProviderDao
@@ -22,7 +31,7 @@ import com.aicode.feature.workspace.data.local.entity.RemoteConnectionEntity
 import com.aicode.feature.workspace.data.local.entity.RemoteMountEntity
 
 @Database(
-    entities = [AgentMessageEntity::class, ChatSessionEntity::class, AIProviderEntity::class, RemoteConnectionEntity::class, RemoteMountEntity::class, TodoItemEntity::class, CheckpointEntity::class, CheckpointFileSnapshotEntity::class, LlmCallRecordEntity::class, BackupTargetEntity::class],
+    entities = [AgentMessageEntity::class, ChatSessionEntity::class, AIProviderEntity::class, RemoteConnectionEntity::class, RemoteMountEntity::class, TodoItemEntity::class, CheckpointEntity::class, CheckpointFileSnapshotEntity::class, LlmCallRecordEntity::class, BackupTargetEntity::class, SubAgentInteractionEntity::class, RecoveryRequestEntity::class, RecoveryRunEntity::class, RecoveryToolEntity::class, RecoveryDraftEntity::class, AgentNotificationEntity::class],
     version = AgentDatabase.SCHEMA_VERSION,
     exportSchema = true
 )
@@ -35,9 +44,12 @@ abstract class AgentDatabase : RoomDatabase() {
     abstract fun checkpointDao(): CheckpointDao
     abstract fun llmCallRecordDao(): LlmCallRecordDao
     abstract fun backupTargetDao(): BackupTargetDao
+    abstract fun subAgentInteractionDao(): SubAgentInteractionDao
+    abstract fun agentRecoveryDao(): AgentRecoveryDao
+    abstract fun agentNotificationDao(): AgentNotificationDao
 
     companion object {
-        const val SCHEMA_VERSION = 63
+        const val SCHEMA_VERSION = 71
 
         /** 数据库文件名（落在 `databases/` 下，另有 Room 默认 WAL 模式产生的 `-wal`/`-shm`）。 */
         const val DATABASE_NAME = "aicode_agent_db"

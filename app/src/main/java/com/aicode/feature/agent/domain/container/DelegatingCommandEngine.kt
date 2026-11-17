@@ -2,8 +2,12 @@ package com.aicode.feature.agent.domain.container
 
 import com.aicode.feature.settings.data.repository.ExecutionMode
 import com.aicode.feature.settings.data.repository.ExecutionModeHolder
+import com.aicode.feature.workspace.domain.WorkspaceExecutionContext
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.emitAll
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOn
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -21,9 +25,12 @@ class DelegatingCommandEngine @Inject constructor(
     private val remoteEngine: RemoteSshEngine
 ) : CommandEngine {
 
-    private fun delegate(): CommandEngine =
-        if (modeHolder.currentMode() == ExecutionMode.REMOTE_SSH) remoteEngine
-        else localEngine
+    private fun delegate(): CommandEngine {
+        val execution = WorkspaceExecutionContext.current()
+        execution?.checkCurrent()
+        val mode = execution?.mode ?: modeHolder.currentMode()
+        return if (mode == ExecutionMode.REMOTE_SSH) remoteEngine else localEngine
+    }
 
     override val initProgress: StateFlow<ContainerInitState>
         get() = delegate().initProgress
@@ -32,7 +39,15 @@ class DelegatingCommandEngine @Inject constructor(
         command: String,
         projectPath: String?,
         timeoutMs: Long
-    ): Flow<CommandEvent> = delegate().runCommandStream(command, projectPath, timeoutMs)
+    ): Flow<CommandEvent> {
+        val execution = WorkspaceExecutionContext.current()
+        val backend = delegate()
+        if (execution == null) return backend.runCommandStream(command, projectPath, timeoutMs)
+        return flow {
+            execution.checkCurrent()
+            emitAll(backend.runCommandStream(command, projectPath, timeoutMs))
+        }.flowOn(execution)
+    }
 
     override suspend fun runCommandSync(
         command: String,

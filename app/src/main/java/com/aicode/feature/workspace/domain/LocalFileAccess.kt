@@ -30,8 +30,13 @@ class LocalFileAccess @Inject constructor(
     private val pathMapper: WorkspacePathMapper
 ) : FileAccessProvider {
 
-    private fun resolve(path: String, followFinalLink: Boolean = true): File =
-        pathMapper.resolveFile(path, followFinalLink)
+    internal fun captureExecutionMapping(): WorkspacePathMapper.ExecutionMapping = pathMapper.captureExecutionMapping()
+
+    private fun resolve(path: String, followFinalLink: Boolean = true): File {
+        val execution = WorkspaceExecutionContext.current()
+        execution?.requireMode(com.aicode.feature.settings.data.repository.ExecutionMode.LOCAL_PROOT)
+        return pathMapper.resolveFile(path, followFinalLink).also { execution?.checkCurrent() }
+    }
 
     private fun resolveEntry(file: File): File = try {
         pathMapper.resolveHostFile(file)
@@ -60,6 +65,21 @@ class LocalFileAccess @Inject constructor(
         })
     }
 
+    override fun cacheIdentity(): String {
+        WorkspaceExecutionContext.current()?.let {
+            it.requireMode(com.aicode.feature.settings.data.repository.ExecutionMode.LOCAL_PROOT)
+            return it.fileCacheIdentity
+        }
+        return listOf("~/workspace", "/", "~/").map { resolve(it).canonicalPath }
+            .joinToString(separator = "", prefix = "local:") { "${it.length}:$it" }
+    }
+
+    override fun openRead(path: String): InputStream {
+        val execution = WorkspaceExecutionContext.current()
+        val input = resolve(path).inputStream()
+        return execution?.protectRead(input) ?: input
+    }
+
     override fun readFile(path: String): String {
         val file = resolve(path)
         if (!file.exists()) throw NoSuchFileException(file)
@@ -71,7 +91,12 @@ class LocalFileAccess @Inject constructor(
         if (!file.exists()) throw NoSuchFileException(file)
         // 惰性 Sequence：每次迭代才读下一行，大文件不整份载入；迭代结束后随 use 关闭 reader。
         // 单行封顶 64K 字符，避免单个超长行把内存顶爆。
-        return boundedLines { file.bufferedReader() }
+        val execution = WorkspaceExecutionContext.current()
+        return boundedLines {
+            execution?.checkCurrent()
+            val input = file.inputStream()
+            (execution?.protectRead(input) ?: input).bufferedReader()
+        }
     }
 
     override fun writeFile(path: String, content: String, overwrite: Boolean, encoding: Charset) {
@@ -171,6 +196,8 @@ class LocalFileAccess @Inject constructor(
      * 临时文件必须与目标**同目录**（同一文件系统）才能原子替换；放系统临时目录会退化成跨设备复制。
      */
     private fun writeAtomically(file: File, bytes: ByteArray, displayPath: String) {
+        val execution = WorkspaceExecutionContext.current()
+        execution?.checkCurrent()
         val parent = file.parentFile
         parent?.mkdirs()
 
@@ -187,6 +214,7 @@ class LocalFileAccess @Inject constructor(
             if (actual != bytes.size.toLong()) {
                 throw IOException("write verification failed: ${file.absolutePath} expected ${bytes.size} bytes, found $actual")
             }
+            execution?.checkCurrent()
             replaceTarget(tmp, file)
             FileLogger.i(TAG, "写入: '$displayPath' -> ${file.absolutePath} (${bytes.size} 字节)")
         } finally {
@@ -224,6 +252,7 @@ class LocalFileAccess @Inject constructor(
         if (file.exists() && !overwrite) throw FileAlreadyExistsException(file)
         file.parentFile?.mkdirs()
         return try {
+            WorkspaceExecutionContext.current()?.checkCurrent()
             FileOutputStream(file).use { out -> input.copyTo(out) }
         } catch (e: Exception) {
             // 写入中途失败（如源流读取出错、空间不足）会留下半截文件，清掉再抛出
@@ -321,6 +350,8 @@ class LocalFileAccess @Inject constructor(
     override fun toDisplayPath(path: String): String {
         return pathMapper.toContainerPath(pathMapper.toHostFile(path).absolutePath)
     }
+
+    internal fun toDisplayPath(file: File): String = pathMapper.toContainerPath(file.absolutePath)
 
     private companion object {
         const val TAG = "LocalFileAccess"

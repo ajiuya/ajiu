@@ -1,7 +1,9 @@
 package com.aicode.feature.settings.data.repository
 
 import android.content.Context
+import android.graphics.BitmapFactory
 import android.net.Uri
+import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
@@ -9,11 +11,15 @@ import androidx.datastore.preferences.preferencesDataStore
 import com.aicode.core.datastore.preferencesCorruptionHandler
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.IOException
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -36,8 +42,18 @@ class BackgroundSettingsRepository @Inject constructor(
         const val MAX_ALPHA = 0.2f
         /** 最小透明度：0 表示完全透明（背景不可见）。 */
         const val MIN_ALPHA = 0f
+        const val DEFAULT_CHAT_ALPHA = 0.2f
+        const val MIN_CHAT_ALPHA = 0f
+        const val MAX_CHAT_ALPHA = 1f
+        private const val MAX_IMAGE_BYTES = 32L * 1024 * 1024
+        private const val MAX_DECODE_DIMENSION = 2048
         private val IMAGE_PATH_KEY = stringPreferencesKey("background_image_path")
         private val ALPHA_KEY = floatPreferencesKey("background_alpha")
+        private val CHAT_IMAGE_PATH_KEY = stringPreferencesKey("chat_background_image_path")
+        private val CHAT_ALPHA_KEY = floatPreferencesKey("chat_background_alpha")
+
+        internal fun clampChatAlpha(alpha: Float): Float =
+            if (alpha.isNaN()) DEFAULT_CHAT_ALPHA else alpha.coerceIn(MIN_CHAT_ALPHA, MAX_CHAT_ALPHA)
 
         /** 把 UI 百分比（0~100）线性映射为实际透明度（0~MAX_ALPHA）。 */
         fun sliderToAlpha(percent: Float): Float =
@@ -48,47 +64,133 @@ class BackgroundSettingsRepository @Inject constructor(
             (alpha / MAX_ALPHA).coerceIn(0f, 1f) * 100f
     }
 
+    private val imageMutex = Mutex()
+
     /** 当前背景图文件绝对路径；null 表示未设置。 */
     val imagePathFlow: Flow<String?> = context.backgroundDataStore.data.map { it[IMAGE_PATH_KEY] }
 
-    /** 背景图不透明度（0.05~0.2，顶层水印保证文字可读）。 */
+    /** 背景图不透明度（0~0.2，顶层水印保证文字可读）。 */
     val alphaFlow: Flow<Float> = context.backgroundDataStore.data.map {
         (it[ALPHA_KEY] ?: DEFAULT_ALPHA).coerceIn(MIN_ALPHA, MAX_ALPHA)
     }
 
-    /**
-     * 选择新背景图：把 [uri] 拷贝到私有目录 backgrounds/ 后替换旧图。
-     * 先写新文件成功再更新 DataStore，失败时旧背景保持不变。
-     */
-    suspend fun setBackgroundImage(uri: Uri) {
-        val extension = extensionFor(uri)
-        val target = File(context.filesDir, "backgrounds/bg_${System.currentTimeMillis()}.$extension")
-        target.parentFile?.mkdirs()
-        val copied = withContext(Dispatchers.IO) {
-            runCatching {
-                context.contentResolver.openInputStream(uri)?.use { input ->
-                    target.outputStream().use { output -> input.copyTo(output) }
-                }
-                target.length() > 0
-            }.getOrDefault(false)
-        }
-        if (!copied) return
-        val oldPath = context.backgroundDataStore.data.first()[IMAGE_PATH_KEY]
-        context.backgroundDataStore.edit { it[IMAGE_PATH_KEY] = target.absolutePath }
-        oldPath?.let { runCatching { File(it).delete() } }
+    val chatImagePathFlow: Flow<String?> = context.backgroundDataStore.data.map { it[CHAT_IMAGE_PATH_KEY] }
+
+    val chatAlphaFlow: Flow<Float> = context.backgroundDataStore.data.map {
+        clampChatAlpha(it[CHAT_ALPHA_KEY] ?: DEFAULT_CHAT_ALPHA)
     }
 
-    /** 移除背景：删图片文件并清路径。 */
-    suspend fun clearBackground() {
-        val oldPath = context.backgroundDataStore.data.first()[IMAGE_PATH_KEY]
-        context.backgroundDataStore.edit { it.remove(IMAGE_PATH_KEY) }
-        oldPath?.let { runCatching { File(it).delete() } }
+    suspend fun setBackgroundImage(uri: Uri) {
+        replaceImage(uri, IMAGE_PATH_KEY)
     }
+
+    suspend fun clearBackground() {
+        clearImage(IMAGE_PATH_KEY)
+    }
+
+    suspend fun setChatBackgroundImage(uri: Uri) {
+        replaceImage(uri, CHAT_IMAGE_PATH_KEY)
+    }
+
+    suspend fun clearChatBackground() {
+        clearImage(CHAT_IMAGE_PATH_KEY)
+    }
+
+    suspend fun setChatBackgroundAlpha(alpha: Float) {
+        context.backgroundDataStore.edit { it[CHAT_ALPHA_KEY] = clampChatAlpha(alpha) }
+    }
+
+    suspend fun chatAlphaSnapshot(): Float = chatAlphaFlow.first()
 
     suspend fun setBackgroundAlpha(alpha: Float) {
         context.backgroundDataStore.edit {
             it[ALPHA_KEY] = alpha.coerceIn(MIN_ALPHA, MAX_ALPHA)
         }
+    }
+
+    private suspend fun replaceImage(uri: Uri, key: Preferences.Key<String>) = withContext(Dispatchers.IO) {
+        imageMutex.withLock {
+            val target = copyImage(uri) ?: return@withLock
+            // 路径切换与文件清理不能被取消拆开，否则可能留下指向已删除文件的设置。
+            withContext(NonCancellable) {
+                var saved = false
+                try {
+                    var oldPath: String? = null
+                    context.backgroundDataStore.edit {
+                        oldPath = it[key]
+                        it[key] = target.absolutePath
+                    }
+                    saved = true
+                    deleteImage(oldPath)
+                } finally {
+                    if (!saved) deleteImage(target.absolutePath)
+                }
+            }
+        }
+    }
+
+    private suspend fun clearImage(key: Preferences.Key<String>) = withContext(Dispatchers.IO) {
+        imageMutex.withLock {
+            withContext(NonCancellable) {
+                var oldPath: String? = null
+                context.backgroundDataStore.edit {
+                    oldPath = it[key]
+                    it.remove(key)
+                }
+                deleteImage(oldPath)
+            }
+        }
+    }
+
+    private fun copyImage(uri: Uri): File? {
+        var target: File? = null
+        return runCatching {
+            val directory = File(context.filesDir, "backgrounds").apply { mkdirs() }
+            val file = File.createTempFile("bg_", ".${extensionFor(uri)}", directory)
+            target = file
+            val input = context.contentResolver.openInputStream(uri)
+                ?: throw IOException("Cannot open background image")
+            input.use {
+                file.outputStream().use { output ->
+                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                    var totalBytes = 0L
+                    while (true) {
+                        val count = it.read(buffer)
+                        if (count < 0) break
+                        totalBytes += count
+                        if (totalBytes > MAX_IMAGE_BYTES) throw IOException("Background image is too large")
+                        output.write(buffer, 0, count)
+                    }
+                }
+            }
+            if (!isDecodableImage(file)) throw IOException("Invalid background image")
+            file
+        }.getOrElse {
+            deleteImage(target?.absolutePath)
+            null
+        }
+    }
+
+    private fun isDecodableImage(file: File): Boolean {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(file.absolutePath, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0 || bounds.outMimeType?.startsWith("image/") != true) {
+            return false
+        }
+        var sampleSize = 1
+        while (bounds.outWidth / sampleSize > MAX_DECODE_DIMENSION ||
+            bounds.outHeight / sampleSize > MAX_DECODE_DIMENSION
+        ) {
+            sampleSize *= 2
+        }
+        val options = BitmapFactory.Options().apply { inSampleSize = sampleSize }
+        val bitmap = BitmapFactory.decodeFile(file.absolutePath, options) ?: return false
+        bitmap.recycle()
+        return true
+    }
+
+    private fun deleteImage(path: String?) {
+        path?.let { runCatching { File(it).delete() } }
     }
 
     private fun extensionFor(uri: Uri): String = when (context.contentResolver.getType(uri)) {

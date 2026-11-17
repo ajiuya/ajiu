@@ -1,8 +1,11 @@
 package com.aicode.feature.workspace.domain
 
 import java.io.File
+import java.io.IOException
 import java.io.InputStream
 import java.nio.charset.Charset
+import java.util.concurrent.CancellationException
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** 目录条目信息，供 [FileAccessProvider.listFiles] 返回。 */
 data class FileEntry(
@@ -33,6 +36,19 @@ data class FileEntry(
  * [copyToLocal] 拿到本地临时文件再处理——远程模式下会 SFTP 下载到临时目录。
  */
 interface FileAccessProvider {
+
+    fun cacheIdentity(): String = "${javaClass.name}@${System.identityHashCode(this)}"
+
+    /** 调用方负责关闭；真实后端必须流式读取，默认实现供内存后端使用。 */
+    fun openRead(path: String): InputStream = readBytes(path).inputStream()
+
+    fun openRead(path: String, expectedCacheIdentity: String): InputStream {
+        fun checkSource() {
+            if (cacheIdentity() != expectedCacheIdentity) throw CancellationException("File source changed")
+        }
+        checkSource()
+        return identityCheckedRead(openRead(path), ::checkSource)
+    }
 
     /**
      * 读取文件全文文本。文件不存在时抛 [NoSuchFileException]。
@@ -163,6 +179,48 @@ interface FileAccessProvider {
 
     /** 把内部真实路径还原为 AI 视角的容器路径（回显用）。 */
     fun toDisplayPath(path: String): String
+}
+
+internal fun identityCheckedRead(input: InputStream, check: () -> Unit): InputStream {
+    try {
+        check()
+    } catch (failure: Throwable) {
+        runCatching { input.close() }.exceptionOrNull()?.let(failure::addSuppressed)
+        throw failure
+    }
+    return object : InputStream() {
+        private val closed = AtomicBoolean()
+        private var exhausted = false
+        private val single = ByteArray(1)
+
+        override fun read(): Int = if (read(single, 0, 1) < 0) -1 else single[0].toInt() and 0xff
+
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            if (off < 0 || len < 0 || off > b.size - len) throw IndexOutOfBoundsException()
+            if (len == 0) return 0
+            if (exhausted) return -1
+            if (closed.get()) throw IOException("Stream closed")
+            try {
+                check()
+                val count = input.read(b, off, len)
+                if (closed.get()) throw IOException("Stream closed")
+                check()
+                if (count < 0) { exhausted = true; close() }
+                return count
+            } catch (failure: Throwable) {
+                val changed = try { check(); failure } catch (sourceFailure: Throwable) {
+                    if (sourceFailure !== failure) sourceFailure.addSuppressed(failure)
+                    sourceFailure
+                }
+                runCatching { close() }.exceptionOrNull()?.let(changed::addSuppressed)
+                throw changed
+            }
+        }
+
+        override fun close() {
+            if (closed.compareAndSet(false, true)) input.close()
+        }
+    }
 }
 
 /**

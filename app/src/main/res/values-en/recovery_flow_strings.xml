@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="recovery_continue_request">Continue the interrupted task</string>
+    <string name="recovery_continue_failed">This request could not be continued. Check the current project, execution environment and model settings, then try again.</string>
+    <string name="recovery_continuation_limit">The automatic continuation budget for this request has been reached. Existing results were saved. Review them before deciding what to do next.</string>
+    <string name="recovery_request_not_saved">The request was not saved and execution did not start. Check available storage and try again.</string>
+</resources>

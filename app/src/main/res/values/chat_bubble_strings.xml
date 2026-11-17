@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="chat_bubble_settings_title">聊天气泡</string>
+    <string name="chat_bubble_settings_hint">用户与 AI 可独立选择样式，仅影响消息正文。</string>
+    <string name="chat_bubble_user_title">用户气泡</string>
+    <string name="chat_bubble_assistant_title">AI 气泡</string>
+    <string name="chat_bubble_user_sheet_title">选择用户气泡</string>
+    <string name="chat_bubble_assistant_sheet_title">选择 AI 气泡</string>
+    <string name="chat_bubble_user_sheet_hint">右侧显示你的消息，选择后立即保存。</string>
+    <string name="chat_bubble_assistant_sheet_hint">左侧显示 AI 正文，保留 Markdown、代码与表格。</string>
+    <string name="chat_bubble_preview_label">效果预览</string>
+    <string name="chat_bubble_preview_user">帮我整理一下今天的计划。</string>
+    <string name="chat_bubble_preview_assistant">可以，先列出 **重点任务**，再依次安排时间。</string>
+    <string name="chat_bubble_preview_sample">气泡样式</string>
+    <string name="chat_bubble_style_classic">经典白描边</string>
+    <string name="chat_bubble_style_shadow">柔和投影</string>
+    <string name="chat_bubble_style_minimal">极简纯白</string>
+    <string name="chat_bubble_style_dark">暗夜黑</string>
+    <string name="chat_bubble_style_square">漫画方格</string>
+    <string name="chat_bubble_style_green">清新绿</string>
+    <string name="chat_bubble_style_valentine">心动时刻</string>
+    <string name="chat_bubble_style_original">原版</string>
+    <string name="chat_bubble_style_document">文档流</string>
+    <string name="chat_bubble_document_hint">正文直接显示在聊天背景上。</string>
+</resources>

@@ -5,8 +5,6 @@ import android.content.Context
 import android.content.Intent
 import com.aicode.feature.agent.domain.permission.PermissionChoice
 import com.aicode.feature.agent.domain.tool.ToolPermissionManager
-import com.aicode.feature.agent.domain.tool.mode.PlanApprovalChoice
-import com.aicode.feature.agent.domain.tool.mode.PlanApprovalManager
 import com.aicode.feature.agent.presentation.notification.AgentApprovalNotificationManager.ApprovalKind
 import dagger.hilt.android.AndroidEntryPoint
 import javax.inject.Inject
@@ -22,9 +20,6 @@ class AgentApprovalActionReceiver : BroadcastReceiver() {
     @Inject
     lateinit var toolPermissionManager: ToolPermissionManager
 
-    @Inject
-    lateinit var planApprovalManager: PlanApprovalManager
-
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != ACTION) return
         val kind = intent.getStringExtra(EXTRA_KIND)?.let { value -> ApprovalKind.entries.find { it.name == value } } ?: return
@@ -36,11 +31,7 @@ class AgentApprovalActionReceiver : BroadcastReceiver() {
                 if (permissionChoice != PermissionChoice.ONCE && permissionChoice != PermissionChoice.REJECT) return
                 toolPermissionManager.resolve(requestId, permissionChoice)
             }
-            ApprovalKind.PLAN -> {
-                val planChoice = PlanApprovalChoice.entries.find { it.name == choice } ?: return
-                planApprovalManager.resolve(requestId, planChoice)
-            }
-            ApprovalKind.QUESTION -> Unit
+            ApprovalKind.QUESTION, ApprovalKind.PLAN -> Unit
         }
     }
 

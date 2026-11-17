@@ -19,7 +19,11 @@ import androidx.compose.ui.unit.dp
 import com.aicode.R
 import com.aicode.core.ui.LocalImageViewer
 import com.aicode.core.ui.MARKDOWN_MAX_EDGE
-import com.aicode.core.ui.decodeSampledBitmap
+import com.aicode.core.ui.ImageDecodeSpec
+import com.aicode.feature.agent.presentation.preview.UiWorkEffect
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import kotlinx.coroutines.CancellationException
 import com.aicode.core.util.FileLogger
 import com.aicode.feature.workspace.domain.FileAccessProvider
 import com.mikepenz.markdown.model.ImageData
@@ -55,8 +59,9 @@ internal class MarkdownImageTransformer(
     @Composable
     override fun transform(link: String): ImageData? {
         if (!isLocalPath(link)) return null
-        val painter by produceState<Painter?>(initialValue = null, key1 = link) {
-            value = withContext(Dispatchers.IO) { decode(link) }
+        var painter by remember(this, link) { mutableStateOf<Painter?>(null) }
+        UiWorkEffect(this, link) {
+            painter = decode(link)
         }
         val p = painter ?: return null
         val viewer = LocalImageViewer.current
@@ -73,11 +78,11 @@ internal class MarkdownImageTransformer(
         return ImageData(painter = p, modifier = modifier, contentScale = ContentScale.Fit)
     }
 
-    private fun decode(url: String): Painter? {
+    private suspend fun decode(url: String): Painter? {
         return try {
-            val file = fileAccess.copyToLocal(url)
-            if (!file.isFile || file.length() <= 0L) return null
-            decodeSampledBitmap(file.absolutePath, MARKDOWN_MAX_EDGE)?.let { BitmapPainter(it) }
+            ChatImageFiles.load(fileAccess, url, ImageDecodeSpec(MARKDOWN_MAX_EDGE, Long.MAX_VALUE))?.let { BitmapPainter(it) }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             FileLogger.w(TAG, "markdown 本地图片解码失败: $url", e)
             null

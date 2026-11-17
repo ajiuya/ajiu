@@ -7,6 +7,7 @@ import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.aicode.core.datastore.preferencesCorruptionHandler
+import com.aicode.feature.agent.domain.model.SpeedTier
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
@@ -42,41 +43,61 @@ enum class StartupSessionMode {
 class GeneralSettingsRepository @Inject constructor(
     @param:ApplicationContext private val context: Context
 ) {
-    private companion object {
-        val AUTO_REMOVE_STALE_MODELS_KEY = booleanPreferencesKey("auto_remove_stale_models")
-        val STARTUP_SESSION_MODE_KEY = stringPreferencesKey("startup_session_mode")
-        val FIRST_BYTE_TIMEOUT_SEC_KEY = intPreferencesKey("first_byte_timeout_sec")
-        val STREAM_IDLE_TIMEOUT_SEC_KEY = intPreferencesKey("stream_idle_timeout_sec")
-        val MAX_NETWORK_RETRIES_KEY = intPreferencesKey("max_network_retries")
-        val ENTER_TO_SEND_KEY = booleanPreferencesKey("enter_to_send")
-        val COMPACTION_THRESHOLD_PERCENT_KEY = intPreferencesKey("compaction_threshold_percent")
-        val SENDFILE_MAX_SIZE_MB_KEY = intPreferencesKey("sendfile_max_size_mb")
-        val GOAL_MAX_TURNS_KEY = intPreferencesKey("goal_max_turns")
-        val GOAL_MAX_TOKENS_KEY = intPreferencesKey("goal_max_tokens")
-        val DELETE_EXTERNAL_WORKSPACE_SESSIONS_KEY = booleanPreferencesKey("delete_external_workspace_sessions")
+    companion object {
+        const val DEFAULT_TYPEWRITER_CHARS_PER_SECOND = 30
+        const val MIN_TYPEWRITER_CHARS_PER_SECOND = 10
+        const val MAX_TYPEWRITER_CHARS_PER_SECOND = 120
+        private val TYPEWRITER_CHARS_PER_SECOND_KEY = intPreferencesKey("typewriter_chars_per_second")
+        private val SPEED_TIER_KEY = stringPreferencesKey("speed_tier")
+        private val AUTO_REMOVE_STALE_MODELS_KEY = booleanPreferencesKey("auto_remove_stale_models")
+        private val STARTUP_SESSION_MODE_KEY = stringPreferencesKey("startup_session_mode")
+        private val FIRST_BYTE_TIMEOUT_SEC_KEY = intPreferencesKey("first_byte_timeout_sec")
+        private val STREAM_IDLE_TIMEOUT_SEC_KEY = intPreferencesKey("stream_idle_timeout_sec")
+        private val MAX_NETWORK_RETRIES_KEY = intPreferencesKey("max_network_retries")
+        private val ENTER_TO_SEND_KEY = booleanPreferencesKey("enter_to_send")
+        private val COMPACTION_THRESHOLD_PERCENT_KEY = intPreferencesKey("compaction_threshold_percent")
+        private val SENDFILE_MAX_SIZE_MB_KEY = intPreferencesKey("sendfile_max_size_mb")
+        private val GOAL_MAX_TURNS_KEY = intPreferencesKey("goal_max_turns")
+        private val GOAL_MAX_TOKENS_KEY = intPreferencesKey("goal_max_tokens")
+        private val DELETE_EXTERNAL_WORKSPACE_SESSIONS_KEY = booleanPreferencesKey("delete_external_workspace_sessions")
         /** 「提示词」页使用说明公告已展示内容的哈希；无值或与当前内容哈希不一致时重新弹出。 */
-        val PROMPTS_ANNOUNCEMENT_SHOWN_HASH_KEY = stringPreferencesKey("prompts_announcement_shown_hash")
+        private val PROMPTS_ANNOUNCEMENT_SHOWN_HASH_KEY = stringPreferencesKey("prompts_announcement_shown_hash")
 
         /** 首字超时默认 5 分钟，与原硬编码值一致。 */
-        const val DEFAULT_FIRST_BYTE_TIMEOUT_SEC = 300
+        private const val DEFAULT_FIRST_BYTE_TIMEOUT_SEC = 300
 
         /** 数据块间隔超时默认 5 分钟：服务端静默时能自行断开并重试，避免本轮永久停在「执行中」。 */
-        const val DEFAULT_STREAM_IDLE_TIMEOUT_SEC = 300
+        private const val DEFAULT_STREAM_IDLE_TIMEOUT_SEC = 300
 
         /** 网络重试次数默认 6，与原硬编码值一致。 */
-        const val DEFAULT_MAX_NETWORK_RETRIES = 6
+        private const val DEFAULT_MAX_NETWORK_RETRIES = 6
 
         /** 自动压缩阈值默认 85%。 */
-        const val DEFAULT_COMPACTION_THRESHOLD_PERCENT = 85
+        private const val DEFAULT_COMPACTION_THRESHOLD_PERCENT = 85
 
         /** sendFile 单个文件大小上限默认 100MB，与原硬编码值一致。 */
-        const val DEFAULT_SENDFILE_MAX_SIZE_MB = 100
+        private const val DEFAULT_SENDFILE_MAX_SIZE_MB = 100
 
         /** goal 自主循环最大续跑轮数默认 50。 */
-        const val DEFAULT_GOAL_MAX_TURNS = 50
+        private const val DEFAULT_GOAL_MAX_TURNS = 50
 
         /** goal 自主循环 token 预算默认 500k（按输入+输出累计）。 */
-        const val DEFAULT_GOAL_MAX_TOKENS = 500_000
+        private const val DEFAULT_GOAL_MAX_TOKENS = 500_000
+    }
+
+    val typewriterCharsPerSecondFlow: Flow<Int> = context.generalDataStore.data.map {
+        (it[TYPEWRITER_CHARS_PER_SECOND_KEY] ?: DEFAULT_TYPEWRITER_CHARS_PER_SECOND)
+            .coerceIn(MIN_TYPEWRITER_CHARS_PER_SECOND, MAX_TYPEWRITER_CHARS_PER_SECOND)
+    }
+
+    suspend fun typewriterCharsPerSecond(): Int = typewriterCharsPerSecondFlow.first()
+
+    suspend fun setTypewriterCharsPerSecond(value: Int) {
+        context.generalDataStore.edit {
+            it[TYPEWRITER_CHARS_PER_SECOND_KEY] = value.coerceIn(
+                MIN_TYPEWRITER_CHARS_PER_SECOND, MAX_TYPEWRITER_CHARS_PER_SECOND
+            )
+        }
     }
 
     /** 拉取模型后自动对齐本地列表的开关流；未设置时回退到 true（默认开启）。 */
@@ -262,4 +283,14 @@ class GeneralSettingsRepository @Inject constructor(
     suspend fun deleteExternalWorkspaceSessionsSnapshot(): Boolean = deleteExternalWorkspaceSessionsFlow.first()
 
     suspend fun restoreDeleteExternalWorkspaceSessions(enabled: Boolean) = setDeleteExternalWorkspaceSessions(enabled)
+
+    val speedTierFlow: Flow<SpeedTier> = context.generalDataStore.data.map {
+        SpeedTier.fromStorageValue(it.asMap()[SPEED_TIER_KEY] as? String)
+    }
+
+    suspend fun setSpeedTier(tier: SpeedTier) {
+        context.generalDataStore.edit { it[SPEED_TIER_KEY] = tier.storageValue }
+    }
+
+    suspend fun speedTier(): SpeedTier = speedTierFlow.first()
 }

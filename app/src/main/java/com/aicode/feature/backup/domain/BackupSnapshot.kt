@@ -47,7 +47,14 @@ data class BackupSnapshot(
     val visionModel: String = "",
     val compactionProviderId: String = "",
     val compactionModel: String = "",
-    val syncSettings: SyncSettingsSnapshot? = null
+    val syncSettings: SyncSettingsSnapshot? = null,
+    val chatTextScale: Float? = null,
+    val chatBackgroundAlpha: Float? = null,
+    val typewriterCharsPerSecond: Int? = null,
+    val userChatBubbleStyleId: String? = null,
+    val assistantChatBubbleStyleId: String? = null,
+    val subAgentInteractions: List<SubAgentInteractionDto> = emptyList(),
+    val projectJournalHistoryJson: String? = null
 )
 
 /**
@@ -88,7 +95,12 @@ data class BackupMetadata(
     val compactionModel: String = "",
     val syncSettings: SyncSettingsSnapshot? = null,
     val workspaces: List<WorkspaceBackupMeta> = emptyList(),
-    val includesAppSettings: Boolean = themeMode != null
+    val includesAppSettings: Boolean = themeMode != null,
+    val chatTextScale: Float? = null,
+    val chatBackgroundAlpha: Float? = null,
+    val typewriterCharsPerSecond: Int? = null,
+    val userChatBubbleStyleId: String? = null,
+    val assistantChatBubbleStyleId: String? = null
 )
 
 /** 备份元数据中的一个工作区段：名称 + 备份的文件数（用于导入摘要）。 */
@@ -129,7 +141,12 @@ fun BackupSnapshot.toMetadata() = BackupMetadata(
     visionModel = visionModel,
     compactionProviderId = compactionProviderId,
     compactionModel = compactionModel,
-    syncSettings = syncSettings
+    syncSettings = syncSettings,
+    chatTextScale = chatTextScale,
+    chatBackgroundAlpha = chatBackgroundAlpha,
+    typewriterCharsPerSecond = typewriterCharsPerSecond,
+    userChatBubbleStyleId = userChatBubbleStyleId,
+    assistantChatBubbleStyleId = assistantChatBubbleStyleId
 )
 
 @Serializable
@@ -200,8 +217,6 @@ data class ChatSessionDto(
     val createdAt: Long,
     val updatedAt: Long,
     val workspacePath: String = "",
-    val mode: String = "BUILD",
-    val modeBeforePlan: String? = null,
     val reasoningEffort: String = "MEDIUM",
     val providerId: String? = null,
     val model: String? = null,
@@ -232,7 +247,38 @@ data class AgentMessageDto(
     /** Anthropic thinking / redacted_thinking 内容块的原样快照（JSON 数组文本）。 */
     val thinkingBlocksJson: String? = null,
     val isContextExcluded: Boolean = false,
-    val compactedBySummaryId: String? = null
+    val compactedBySummaryId: String? = null,
+    val contextInputTokens: Int? = null,
+    val contextInputBudget: Int? = null,
+    val contextEstimated: Boolean = true,
+    val contextBreakdownJson: String? = null,
+    val toolActionTitle: String? = null,
+    val toolStartedAtMs: Long? = null,
+    val toolDurationMs: Long? = null,
+    val turnDurationMs: Long? = null,
+    val modelInputSnapshotJson: String? = null,
+    val continuationOfMessageId: String? = null,
+    val continuationDraft: String? = null
+)
+
+@Serializable
+data class SubAgentInteractionDto(
+    val id: String,
+    val parentSessionId: String,
+    val subSessionId: String,
+    val kind: String,
+    val content: String,
+    val timestamp: Long,
+    val origin: String = when (kind) {
+        "SPAWNED", "MESSAGE_FROM_PARENT" -> "PARENT"
+        "MESSAGE_FROM_SUB", "COMPLETED", "FAILED" -> "SUB"
+        else -> "SYSTEM"
+    },
+    val sourceMessageId: String? = null,
+    val title: String? = null,
+    val model: String? = null,
+    val instructionId: String? = null,
+    val agentName: String? = null
 )
 
 @Serializable

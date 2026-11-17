@@ -16,6 +16,7 @@ import io.mockk.unmockkObject
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.Json
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -32,6 +33,7 @@ class PermissionRulesRepositoryTest {
     val tmp = TemporaryFolder()
 
     private lateinit var repository: PermissionRulesRepository
+    private lateinit var globalFile: File
     private lateinit var target: File
     private lateinit var link: File
 
@@ -47,6 +49,7 @@ class PermissionRulesRepositoryTest {
         val projectRoot: ProjectAicodeRoot = mockk()
         val changes: FileChangeHub = mockk()
         val filesDir = tmp.newFolder("files")
+        globalFile = File(filesDir, "aicode/permissions.json")
         val workspaceDir = tmp.newFolder("workspace")
         target = File(workspaceDir, "project/.aicode").apply { mkdirs() }
         link = File(workspaceDir, ".aicode")
@@ -82,13 +85,69 @@ class PermissionRulesRepositoryTest {
     }
 
     @Test
-    fun addRule_absoluteProjectLink_createsFileAndPreservesLink() = runBlocking {
-        val rule = PermissionRule("readFile", "*")
-        repository.add(PermissionScope.PROJECT, rule)
-        val saved = File(target, "permissions.json")
-        assertTrue(saved.isFile)
-        assertTrue(saved.readText().contains("readFile"))
+    fun setGlobalRules_preservesAllowAndDenyDataForBackup() = runBlocking {
+        val rules = listOf(
+            PermissionRule("Bash", "git pull", PermissionDecision.ALLOW),
+            PermissionRule("writeFile", "*", PermissionDecision.DENY)
+        )
+
+        repository.setGlobalRules(rules)
+
+        assertEquals(rules, repository.getGlobalRulesOnce())
+        assertEquals(rules, Json.decodeFromString(PermissionFile.serializer(), globalFile.readText()).toRuleList())
+        assertEquals(rules, repository.loadEffectiveForCurrentProject())
+    }
+
+    @Test
+    fun removeGlobalRule_cleansLegacyAllowWithoutDroppingDenyRules() = runBlocking {
+        val legacyAllow = PermissionRule("readFile", "*", PermissionDecision.ALLOW)
+        val deny = PermissionRule("Bash", "git push", PermissionDecision.DENY)
+        repository.setGlobalRules(listOf(legacyAllow, deny))
+
+        repository.removeGlobalRule(legacyAllow)
+
+        assertEquals(listOf(deny), repository.getGlobalRulesOnce())
+        assertEquals(listOf(deny), Json.decodeFromString(PermissionFile.serializer(), globalFile.readText()).toRuleList())
+        repository.removeGlobalRule(deny)
+        assertTrue(repository.getGlobalRulesOnce().isEmpty())
+        assertEquals(PermissionFile.EMPTY, Json.decodeFromString(PermissionFile.serializer(), globalFile.readText()))
+    }
+
+    @Test
+    fun removeProjectRule_absoluteProjectLink_writesTargetAndPreservesLink() = runBlocking {
+        val projectFile = File(target, "permissions.json")
+        projectFile.writeText("""{"permissions":{"allow":["readFile"],"deny":["writeFile"]}}""")
+
+        repository.removeProjectRule("project", PermissionRule("readFile", "*"))
+
+        val remaining = listOf(PermissionRule("writeFile", "*", PermissionDecision.DENY))
+        assertEquals(remaining, repository.loadEffectiveForCurrentProject())
+        assertEquals(remaining, Json.decodeFromString(PermissionFile.serializer(), projectFile.readText()).toRuleList())
         assertTrue(Files.isSymbolicLink(link.toPath()))
-        assertEquals(listOf(rule), repository.loadEffectiveForCurrentProject())
+        assertEquals("/root/workspace/project/.aicode", Files.readSymbolicLink(link.toPath()).toString())
+    }
+
+    @Test
+    fun promoteToGlobal_preservesDecisionAndAvoidsDuplicateRules() = runBlocking {
+        File(target, "permissions.json").writeText(
+            """{"permissions":{"allow":["writeFile"],"deny":["Bash(git push)"]}}"""
+        )
+        val existing = PermissionRule("readFile", "*", PermissionDecision.ALLOW)
+        val promoted = PermissionRule("Bash", "git push", PermissionDecision.DENY)
+        repository.setGlobalRules(listOf(existing))
+
+        repository.promoteToGlobal("project", promoted)
+        repository.promoteToGlobal("project", promoted)
+
+        assertEquals(listOf(existing, promoted), repository.getGlobalRulesOnce())
+        assertEquals(
+            listOf(PermissionRule("writeFile", "*"), existing, promoted),
+            repository.loadEffectiveForCurrentProject()
+        )
+        assertEquals(
+            listOf(PermissionRule("writeFile", "*")),
+            Json.decodeFromString(PermissionFile.serializer(), File(target, "permissions.json").readText()).toRuleList()
+        )
+        assertTrue(Files.isSymbolicLink(link.toPath()))
     }
 }

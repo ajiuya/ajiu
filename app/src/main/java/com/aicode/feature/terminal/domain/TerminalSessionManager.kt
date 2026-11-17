@@ -1,11 +1,12 @@
 package com.aicode.feature.terminal.domain
 
 import android.content.Context
-import android.content.Intent
 import com.aicode.core.util.FileLogger
 import com.aicode.feature.agent.domain.container.LinuxContainerEngine
+import com.aicode.feature.settings.data.repository.ExecutionMode
 import com.aicode.feature.terminal.presentation.component.AppTerminalSessionClient
 import com.aicode.feature.workspace.data.repository.WorkspaceRepository
+import com.aicode.feature.workspace.domain.WorkspaceExecutionContext
 import com.termux.terminal.TerminalSession
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CoroutineScope
@@ -14,6 +15,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -57,8 +59,6 @@ class TerminalSessionManager @Inject constructor(
         /** 完成兜底监控轮询屏幕缓冲的间隔（毫秒）。旧值 200ms 每轮都会构建 2000 行 transcript 字符串，
          *  长命令（构建/安装）期间持续占 CPU；间隔放宽到 1s 并配合「输出无增长跳过扫描」后开销可忽略。 */
         const val EXIT_MARKER_POLL_MS = 1_000L
-        /** 匹配命令退出标记 `[command exited: N]` 的定位前缀（配合手工解析退出码，免全量正则扫描）。 */
-        const val EXIT_MARKER_PREFIX = "[command exited: "
         /** 交互标签创建后多久仍无任何输出就 dump 容器诊断（proot 没起来/卡住时的主动取证）。 */
         const val SILENT_DIAGNOSTIC_DELAY_MS = 10_000L
     }
@@ -156,9 +156,11 @@ class TerminalSessionManager @Inject constructor(
     private fun scheduleSilentSessionDiagnostic(tabId: String) {
         monitorScope.launch {
             delay(SILENT_DIAGNOSTIC_DELAY_MS)
-            val tab = tab(tabId) ?: return@launch
-            if (tab.runState !is RunState.Running) return@launch
-            if (!getTabOutput(tabId).isNullOrBlank()) return@launch
+            val silent = withContext(Dispatchers.Main.immediate) {
+                val tab = tab(tabId) ?: return@withContext false
+                tab.runState is RunState.Running && getTabOutput(tabId).isNullOrBlank()
+            }
+            if (!silent) return@launch
             FileLogger.w(TAG, "终端标签 $tabId 启动 ${SILENT_DIAGNOSTIC_DELAY_MS}ms 后仍无任何输出，dump 容器状态")
             containerEngine.logContainerDiagnostics("终端标签 $tabId 静默")
         }
@@ -199,15 +201,15 @@ class TerminalSessionManager @Inject constructor(
                 notifyOnExit = notify,
                 sourceSessionId = sourceSessionId,
                 client = client,
-                runState = RunState.Running
+                runState = RunState.Running,
+                sourceMode = ExecutionMode.LOCAL_PROOT.name,
+                channelGeneration = null
             )
         )
         // 后台命令不抢占当前标签焦点：仅当没有活动标签时才设为当前。
         if (_activeTabId.value == null) _activeTabId.value = id
 
-        if (notify) monitorBackgroundExit(id)
-
-        startKeepaliveService()
+        monitorBackgroundExit(id)
         FileLogger.i(TAG, "后台命令标签 $id: $command")
         return id
     }
@@ -236,20 +238,19 @@ class TerminalSessionManager @Inject constructor(
     override fun writeBytesToTab(id: String, vararg bytes: Int): Boolean {
         val tab = runningTab(id) ?: return false
         val arr = ByteArray(bytes.size) { bytes[it].toByte() }
+        if (arr.isNotEmpty()) protectInput(tab)
         tab.session.write(arr, 0, arr.size)
         return true
     }
 
     /** 向当前活动标签写入文本（额外按键行：方向键/Tab 等）。 */
     fun writeToActive(text: String) {
-        activeTab?.let { writeToSession(it.session, text) }
+        _activeTabId.value?.let { writeToTab(it, text) }
     }
 
     /** 向当前活动标签写入原始字节（控制字符，如 Ctrl-C=0x03）。 */
     fun writeBytesToActive(vararg bytes: Int) {
-        val tab = activeTab ?: return
-        val arr = ByteArray(bytes.size) { bytes[it].toByte() }
-        tab.session.write(arr, 0, arr.size)
+        _activeTabId.value?.let { writeBytesToTab(it, *bytes) }
     }
 
     /**
@@ -258,9 +259,7 @@ class TerminalSessionManager @Inject constructor(
      */
     override fun getTabOutput(id: String): String? {
         val tab = tab(id) ?: return null
-        return runCatching {
-            tab.session.emulator?.screen?.transcriptText?.trimEnd('\n')
-        }.getOrNull() ?: ""
+        return runCatching { tab.readOutput() }.getOrDefault("")
     }
 
     /** 列出全部标签的摘要（id/标题/是否后台/运行状态/命令），供 AI 选目标。 */
@@ -282,6 +281,8 @@ class TerminalSessionManager @Inject constructor(
     /** 关闭并销毁标签（用户主动关 / AI close）。从列表移除并杀会话。 */
     override fun closeTab(id: String): Boolean {
         val tab = tab(id) ?: return false
+        releaseKeepalive(id)
+        tab.onUserInput = {}
         runCatching { tab.session.finishIfRunning() }
         tab.view = null
         val remaining = _tabs.value.filterNot { it.id == id }
@@ -291,7 +292,6 @@ class TerminalSessionManager @Inject constructor(
         }
         bumpRevision()
 
-        if (tab.isBackground) maybeStopKeepalive(tab)
         FileLogger.i(TAG, "关闭终端标签 $id")
         return true
     }
@@ -322,53 +322,33 @@ class TerminalSessionManager @Inject constructor(
      */
     /** 在输出文本的末尾行中定位退出标记 `[command exited: N]` 并解析退出码；未找到返回 null。
      *  要求退出标记必须作为独立行出现（以换行开头或位于文本起始），且从末尾向后定位，避免 PTY 命令行回显误判。 */
-    private fun extractExitCode(output: String): Int? {
-        val tail = output.takeLast(1000)
-        val idx = tail.lastIndexOf(EXIT_MARKER_PREFIX)
-        if (idx < 0) return null
-        if (idx > 0 && tail[idx - 1] != '\n' && tail[idx - 1] != '\r') return null
-        var end = idx + EXIT_MARKER_PREFIX.length
-        if (end >= tail.length || !tail[end].isDigit()) return null
-        var code = 0
-        while (end < tail.length && tail[end].isDigit()) {
-            code = code * 10 + (tail[end] - '0')
-            end++
-        }
-        return if (end < tail.length && tail[end] == ']') code else null
-    }
+    private fun extractExitCode(output: String): Int? = commandExitCode(output)
 
     private fun monitorBackgroundExit(tabId: String) {
-        monitorScope.launch {
-            var seenMarker = false
-            var lastOutputLen = -1
+        monitorScope.launch(Dispatchers.Main.immediate) {
+            var seenExitCode: Int? = null
+            var lastRevision = -1L
             while (true) {
                 val tab = tab(tabId) ?: return@launch
                 if (tab.runState !is RunState.Running) return@launch
-                val output = getTabOutput(tabId) ?: return@launch
-                if (!seenMarker) {
-                    // 输出无增长时跳过扫描：仅比较长度，省去每轮全量定位退出标记。
-                    if (output.length != lastOutputLen) {
-                        lastOutputLen = output.length
-                        if (extractExitCode(output) != null) seenMarker = true
+                if (seenExitCode == null) {
+                    if (tab.outputRevision != lastRevision) {
+                        val output = getTabOutput(tabId) ?: return@launch
+                        lastRevision = tab.outputRevision
+                        seenExitCode = extractExitCode(output)
+                        tab.markerExitCode = seenExitCode
                     }
                 } else {
                     delay(EXIT_MARKER_GRACE_MS)
                     // 缓冲后再查：正常 onFinished 回调若已触发，状态不再 Running，此处直接退出。
                     val current = tab(tabId) ?: return@launch
                     if (current.runState is RunState.Running) {
-                        val exitCode = extractExitCode(getTabOutput(tabId) ?: "") ?: 0
-                        current.runState = RunState.Finished(exitCode)
-                        bumpRevision()
-                        FileLogger.i(TAG, "兜底：标签 $tabId 检测到退出标记，强制收尾 exit=$exitCode")
-                        if (current.isBackground) maybeStopKeepalive(current)
-                        if (current.notifyOnExit && !current.finishedNotified) {
-                            current.finishedNotified = true
-                            _tabFinishedEvents.tryEmit(
-                                TabFinishedEvent(
-                                    current.id, current.title, current.command, exitCode, current.sourceSessionId,
-                                    tailOutput = getTabOutput(current.id)?.takeTailLines(TAIL_LINES)
-                                )
-                            )
+                        current.commandFinished = true
+                        if (current.notifyOnExit) {
+                            finishTab(current, seenExitCode)
+                        } else {
+                            TaskKeepaliveController.acquire(appContext, keepaliveOwner(tabId), cpu = false, network = false)
+                            bumpRevision()
                         }
                     }
                     return@launch
@@ -378,18 +358,45 @@ class TerminalSessionManager @Inject constructor(
         }
     }
 
+    private fun finishTab(tab: TerminalTab, exitCode: Int) {
+        if (!tab.finish(exitCode)) return
+        val completedExitCode = (tab.runState as RunState.Finished).exitCode
+        releaseKeepalive(tab.id)
+        bumpRevision()
+        if (tab.notifyOnExit && !tab.finishedNotified) {
+            tab.finishedNotified = true
+            _tabFinishedEvents.tryEmit(
+                TabFinishedEvent(
+                    tab.id, tab.title, tab.command, completedExitCode, tab.sourceSessionId,
+                    tailOutput = getTabOutput(tab.id)?.takeTailLines(TAIL_LINES),
+                    sourceMode = tab.sourceMode,
+                    channelGeneration = tab.channelGeneration
+                )
+            )
+        }
+    }
+
     private fun addTab(tab: TerminalTab) {
         _tabs.value = _tabs.value + tab
+        tab.onUserInput = { runningTab(tab.id)?.let { protectInput(it) } }
+        TaskKeepaliveController.acquire(appContext, keepaliveOwner(tab.id), cpu = tab.isBackground, network = tab.isBackground)
         bumpRevision()
     }
 
     private fun writeToSession(session: TerminalSession, text: String) {
+        if (text.isNotEmpty()) _tabs.value.firstOrNull { it.session === session }?.let { protectInput(it) }
         val bytes = text.toByteArray(Charsets.UTF_8)
         session.write(bytes, 0, bytes.size)
     }
 
     private fun bumpRevision() {
         _revision.value = _revision.value + 1
+        KeepaliveNotificationState.updateTerminals(
+            TerminalNotificationSource.LOCAL,
+            _tabs.value.filter { it.runState is RunState.Running }.map {
+                TerminalNotificationSession(it.id, it.isBackground && !it.commandFinished)
+            }
+        )
     }
 
     /**
@@ -399,7 +406,9 @@ class TerminalSessionManager @Inject constructor(
      * 故无需把 tab 引用提前注入 client（避免「构造 client 时 tab 还不存在」的先有鸡先有蛋）。
      */
     private fun buildSession(shellCommand: String): Pair<TerminalSession, AppTerminalSessionClient> {
-        val workspace = workspaceRepository.currentPath()
+        val execution = WorkspaceExecutionContext.current()
+        execution?.requireMode(ExecutionMode.LOCAL_PROOT)
+        val workspace = execution?.localMapping?.workspaceRoot?.absolutePath ?: workspaceRepository.currentPath()
         val invocation = containerEngine.buildProotInvocation(shellCommand, workspace)
         FileLogger.i(
             TAG,
@@ -413,54 +422,49 @@ class TerminalSessionManager @Inject constructor(
             viewProvider = { _tabs.value.firstOrNull { it.session === session }?.view },
             onFinished = { finished ->
                 _tabs.value.firstOrNull { it.session === finished }?.let { target ->
-                    target.runState = RunState.Finished(finished.exitStatus)
-                    bumpRevision()
-                    FileLogger.i(TAG, "终端标签 ${target.id} 会话结束 exit=${finished.exitStatus}")
-                    if (target.isBackground) maybeStopKeepalive(target)
-                    if (target.notifyOnExit && !target.finishedNotified) {
-                        target.finishedNotified = true
-                        _tabFinishedEvents.tryEmit(
-                            TabFinishedEvent(
-                                target.id, target.title, target.command, finished.exitStatus, target.sourceSessionId,
-                                tailOutput = getTabOutput(target.id)?.takeTailLines(TAIL_LINES)
-                            )
-                        )
-                    }
+                    val exitCode = if (target.isBackground && target.notifyOnExit) {
+                        target.markerExitCode ?: extractExitCode(getTabOutput(target.id).orEmpty()) ?: finished.exitStatus
+                    } else finished.exitStatus
+                    finishTab(target, exitCode)
                 }
             }
         )
+        val inputTrackingClient = object : com.termux.terminal.TerminalSessionClient by client {
+            override fun onTextChanged(changedSession: TerminalSession) {
+                _tabs.value.firstOrNull { it.session === changedSession }?.outputState?.changed()
+                client.onTextChanged(changedSession)
+            }
+
+            override fun onPasteTextFromClipboard(target: TerminalSession?) {
+                val clipboard = appContext.getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+                val text = clipboard?.primaryClip?.getItemAt(0)?.coerceToText(appContext)?.toString() ?: return
+                if (text.isNotEmpty() && target != null) writeToSession(target, text)
+            }
+        }
+        execution?.checkCurrent()
         session = TerminalSession(
             invocation.executable,
             appContext.filesDir.absolutePath,
             invocation.argv.toTypedArray(),
             invocation.ptyEnvArray,
             TRANSCRIPT_ROWS,
-            client
+            inputTrackingClient
         )
         session.updateSize(DEFAULT_COLUMNS, DEFAULT_ROWS)
         FileLogger.i(TAG, "PTY 会话已创建：pid=${session.pid} 运行中=${session.isRunning}")
         return session to client
     }
 
-    private fun startKeepaliveService() {
-        val intent = Intent(appContext, TerminalKeepaliveService::class.java).apply {
-            action = TerminalKeepaliveService.ACTION_START_SESSION
+    private fun keepaliveOwner(id: String): String = "local:$id"
+
+    private fun protectInput(tab: TerminalTab) {
+        if (tab.runState is RunState.Running) {
+            TaskKeepaliveController.acquireForInput(appContext, "${keepaliveOwner(tab.id)}:input")
         }
-        appContext.startService(intent)
-        FileLogger.i(TAG, "后台保活 Service 已启动")
     }
 
-    private fun stopKeepaliveService() {
-        val intent = Intent(appContext, TerminalKeepaliveService::class.java).apply {
-            action = TerminalKeepaliveService.ACTION_STOP_SESSION
-        }
-        appContext.startService(intent)
-        FileLogger.i(TAG, "后台保活 Service 已停止")
-    }
-
-    private fun maybeStopKeepalive(closingTab: TerminalTab) {
-        if (closingTab.isBackground && _tabs.value.none { it.isBackground && it.runState is RunState.Running }) {
-            stopKeepaliveService()
-        }
+    private fun releaseKeepalive(id: String) {
+        TaskKeepaliveController.release(appContext, keepaliveOwner(id))
+        TaskKeepaliveController.release(appContext, "${keepaliveOwner(id)}:input")
     }
 }

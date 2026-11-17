@@ -51,6 +51,10 @@ object SubAgentDigester {
         )
     }
 
+    fun digestRun(messages: List<AgentMessageEntity>, sourceMessageId: String?, runMessageIds: Set<String>): SubAgentDigest =
+        digest(messages.filter { it.id in runMessageIds &&
+            (it.role != MessageRole.ASSISTANT.name || it.id == sourceMessageId) })
+
     private fun lastAssistantText(messages: List<AgentMessageEntity>): String? =
         messages.lastOrNull {
             // 压缩产生的内部摘要行也是 ASSISTANT 角色，但它不是子代理的最终答复，必须排除。

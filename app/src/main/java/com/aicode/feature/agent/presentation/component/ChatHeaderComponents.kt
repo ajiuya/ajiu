@@ -22,6 +22,8 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -29,18 +31,25 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.aicode.R
 import com.aicode.core.theme.Radius
 import com.aicode.core.theme.Spacing
-import com.aicode.feature.agent.domain.model.AgentMode
+import com.aicode.feature.agent.domain.model.SpeedTier
+import com.aicode.feature.settings.domain.model.AIProviderConfig
 import com.aicode.feature.onboarding.domain.OnboardingStep
 import com.aicode.feature.onboarding.presentation.onboardingTarget
 import com.aicode.feature.settings.presentation.component.ModelLogoIcon
@@ -48,7 +57,9 @@ import compose.icons.FeatherIcons
 import compose.icons.feathericons.GitBranch
 import compose.icons.feathericons.Globe
 import compose.icons.feathericons.Menu
+import compose.icons.feathericons.MoreVertical
 import compose.icons.feathericons.Plus
+import compose.icons.feathericons.Server
 import compose.icons.feathericons.Terminal
 
 @Composable
@@ -62,14 +73,19 @@ internal fun ChatHeader(
     onNavigateToTerminal: () -> Unit,
     onNavigateToGit: () -> Unit,
     onNavigateToBrowser: () -> Unit = {},
-    currentMode: AgentMode,
-    onToggleMode: (AgentMode) -> Unit,
     connectionState: com.aicode.feature.agent.domain.container.ConnectionState? = null,
     showMenuButton: Boolean = true,
     terminalActive: Boolean = false,
     gitActive: Boolean = false,
-    browserActive: Boolean = false
+    browserActive: Boolean = false,
+    providerName: String? = null,
+    chosenSpeedTier: SpeedTier = SpeedTier.STANDARD,
+    onSpeedTierChange: (SpeedTier) -> Unit = {},
+    providerConfig: AIProviderConfig? = null,
+    onOpenMcp: () -> Unit = {}
 ) {
+    var moreActionsExpanded by remember { mutableStateOf(false) }
+    var speedTierMenuExpanded by remember { mutableStateOf(false) }
     Surface(
         color = MaterialTheme.colorScheme.background
     ) {
@@ -84,62 +100,131 @@ internal fun ChatHeader(
                     .padding(horizontal = Spacing.sm, vertical = Spacing.sm),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                // 大屏常驻侧栏时隐掉汉堡键：侧栏已经摆在左边，再给个开关反而困惑。
-                if (showMenuButton) {
-                    IconButton(
-                        onClick = onOpenDrawer,
-                        modifier = Modifier.onboardingTarget(OnboardingStep.OPEN_SIDEBAR)
-                    ) {
-                        Icon(
-                            FeatherIcons.Menu,
-                            contentDescription = stringResource(R.string.chat_open_sidebar),
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                Box(
+                    modifier = Modifier.size(48.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    if (showMenuButton) {
+                        IconButton(
+                            onClick = onOpenDrawer,
+                            modifier = Modifier.onboardingTarget(OnboardingStep.OPEN_SIDEBAR)
+                        ) {
+                            Icon(
+                                FeatherIcons.Menu,
+                                contentDescription = stringResource(R.string.chat_open_sidebar),
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
                     }
-                } else {
-                    Spacer(modifier = Modifier.width(Spacing.sm))
                 }
-                Column(modifier = Modifier.weight(1f)) {
+                Column(
+                    modifier = Modifier.weight(1f),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
                     Text(
                         text = sessionTitle,
                         style = MaterialTheme.typography.titleMedium,
                         color = MaterialTheme.colorScheme.onBackground,
                         maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
+                        overflow = TextOverflow.Ellipsis,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.fillMaxWidth()
                     )
                     Row(
+                        modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(Spacing.xs)
+                        horizontalArrangement = Arrangement.spacedBy(Spacing.xs, Alignment.CenterHorizontally)
                     ) {
                         if (!modelName.isNullOrBlank()) {
                             ModelLogoIcon(modelName = modelName, size = 14.dp)
                         }
+                        val modelLabel = when {
+                            modelName.isNullOrBlank() -> stringResource(R.string.chat_no_model_selected)
+                            providerName.isNullOrBlank() -> modelName
+                            else -> stringResource(R.string.chat_model_with_provider, modelName, providerName)
+                        }
                         Text(
-                            text = modelName?.takeIf { it.isNotBlank() } ?: stringResource(R.string.chat_no_model_selected),
+                            text = modelLabel,
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
+                            overflow = TextOverflow.Ellipsis,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.weight(1f, fill = false)
                         )
                     }
                 }
-                IconButton(onClick = onNewChat) {
-                    Icon(
-                        FeatherIcons.Plus,
-                        contentDescription = stringResource(R.string.chat_new_session),
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                Box(modifier = Modifier.size(48.dp), contentAlignment = Alignment.Center) {
+                    IconButton(onClick = {
+                        speedTierMenuExpanded = false
+                        moreActionsExpanded = true
+                    }) {
+                        Icon(
+                            FeatherIcons.MoreVertical,
+                            contentDescription = stringResource(R.string.chat_more_actions),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    DropdownMenu(
+                        expanded = moreActionsExpanded,
+                        onDismissRequest = {
+                            moreActionsExpanded = false
+                            speedTierMenuExpanded = false
+                        }
+                    ) {
+                        if (speedTierMenuExpanded) {
+                            SpeedTierMenu(
+                                chosenSpeedTier = chosenSpeedTier,
+                                onSpeedTierChange = {
+                                    moreActionsExpanded = false
+                                    speedTierMenuExpanded = false
+                                    onSpeedTierChange(it)
+                                },
+                                providerConfig = providerConfig,
+                                onBack = { speedTierMenuExpanded = false }
+                            )
+                        } else {
+                            ChatHeaderMenuItem(
+                                icon = FeatherIcons.Plus,
+                                label = stringResource(R.string.chat_new_session),
+                                onClick = {
+                                    moreActionsExpanded = false
+                                    onNewChat()
+                                }
+                            )
+                            ChatHeaderMenuItem(
+                                icon = FeatherIcons.GitBranch,
+                                label = stringResource(R.string.chat_open_git),
+                                active = gitActive,
+                                onClick = {
+                                    moreActionsExpanded = false
+                                    onNavigateToGit()
+                                }
+                            )
+                            ChatHeaderMenuItem(
+                                icon = FeatherIcons.Terminal,
+                                label = stringResource(R.string.chat_open_terminal),
+                                active = terminalActive,
+                                onClick = {
+                                    moreActionsExpanded = false
+                                    onNavigateToTerminal()
+                                }
+                            )
+                            SpeedTierMenuEntry(
+                                chosenSpeedTier = chosenSpeedTier,
+                                onClick = { speedTierMenuExpanded = true }
+                            )
+                            ChatHeaderMenuItem(
+                                icon = FeatherIcons.Server,
+                                label = stringResource(R.string.speed_tier_open_mcp),
+                                onClick = {
+                                    moreActionsExpanded = false
+                                    onOpenMcp()
+                                }
+                            )
+                        }
+                    }
                 }
-                WorkbenchIconButton(
-                    icon = FeatherIcons.GitBranch,
-                    contentDescription = stringResource(R.string.chat_open_git),
-                    active = gitActive,
-                    onClick = onNavigateToGit
-                )
-                WorkbenchIconButton(
-                    icon = FeatherIcons.Terminal,
-                    contentDescription = stringResource(R.string.chat_open_terminal),
-                    active = terminalActive,
-                    onClick = onNavigateToTerminal
-                )
             }
             // 远程模式：左边 SSH 连接状态，右边 token 累计统计
             if (connectionState != null) {
@@ -161,40 +246,26 @@ internal fun ChatHeader(
     }
 }
 
-/** 顶栏工作台入口按钮：大屏右栏开着对应内容时高亮，否则看不出点一下是开还是关。 */
 @Composable
-private fun WorkbenchIconButton(
+private fun ChatHeaderMenuItem(
     icon: ImageVector,
-    contentDescription: String,
-    active: Boolean,
+    label: String,
+    active: Boolean = false,
     onClick: () -> Unit
 ) {
-    IconButton(onClick = onClick) {
-        Box(
-            modifier = Modifier
-                .size(32.dp)
-                .then(
-                    if (active) {
-                        Modifier
-                            .clip(RoundedCornerShape(Radius.sm))
-                            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f))
-                    } else {
-                        Modifier
-                    }
-                ),
-            contentAlignment = Alignment.Center
-        ) {
-            Icon(
-                icon,
-                contentDescription = contentDescription,
-                tint = if (active) {
-                    MaterialTheme.colorScheme.primary
-                } else {
-                    MaterialTheme.colorScheme.onSurfaceVariant
-                }
+    val tint = if (active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+    DropdownMenuItem(
+        text = { Text(text = label, color = tint) },
+        leadingIcon = { Icon(icon, contentDescription = null, tint = tint) },
+        modifier = Modifier
+            .clip(RoundedCornerShape(Radius.sm))
+            .then(
+                if (active) Modifier.background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f))
+                else Modifier
             )
-        }
-    }
+            .semantics { selected = active },
+        onClick = onClick
+    )
 }
 
 @Composable

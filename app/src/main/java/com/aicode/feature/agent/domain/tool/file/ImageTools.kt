@@ -336,6 +336,7 @@ class ViewImageTool @Inject constructor(
             ProviderType.GEMINI -> GeminiAdapter(geminiApi)
             else -> OpenAIAdapter(openAIApi).also {
                 it.chatCacheKeyEnabled = config.openaiChatCacheKey
+                it.speedTierSource = generalSettingsRepository::speedTier
             }
         }
         provider.apiKey = config.apiKey

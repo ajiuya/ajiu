@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="task_operation_create">Dispatch task</string>
+    <string name="task_operation_send">Send instruction</string>
+    <string name="task_operation_read">Read progress</string>
+    <string name="task_operation_stop">Stop task</string>
+    <string name="task_operation_delete">Delete task</string>
+    <string name="task_operation_list">List subagents</string>
+    <string name="task_operation_unknown">Subagent operation</string>
+    <string name="task_operation_running">Running</string>
+    <string name="task_operation_completed">Completed</string>
+    <string name="task_operation_queued">Queued</string>
+    <string name="task_operation_delivered">Instruction delivered</string>
+    <string name="task_operation_stopping">Stopping</string>
+    <string name="task_operation_stopped">Stopped</string>
+    <string name="task_operation_deleted">Deleted</string>
+    <string name="task_operation_failed">Failed</string>
+    <string name="task_operation_interrupted">Interrupted</string>
+    <string name="task_operation_awaiting_confirmation">Awaiting user confirmation</string>
+    <string name="task_operation_recorded">Record read</string>
+    <string name="task_operation_status_unknown">Unknown state</string>
+    <string name="task_operation_route">%1$s → %2$s</string>
+    <string name="task_operation_task_title">Task: %1$s</string>
+    <string name="task_operation_generic_agent">Subagent</string>
+    <string name="task_operation_unnamed">Unnamed subagent</string>
+    <string name="task_operation_assignment">Assignment</string>
+    <string name="task_operation_supplement">Additional instruction</string>
+    <string name="task_operation_latest_output">Output captured by this call</string>
+    <string name="task_operation_delivered_hint">Delivery means the instruction was received, not that the subagent task has completed.</string>
+    <string name="task_operation_empty">No subagent records</string>
+    <string name="task_operation_partial">Partial results are available. Review warnings or errors.</string>
+    <string name="task_operation_history_instruction_missing">The full instruction was not saved in history and cannot be recovered from a task summary.</string>
+    <string name="task_operation_preparing">Waiting for subagent operation information.</string>
+    <string name="task_operation_unparsed">This operation could not be parsed. Safe details remain available.</string>
+    <string name="task_operation_show_technical">Show safe details</string>
+    <string name="task_operation_hide_technical">Hide safe details</string>
+    <string name="task_operation_safe_args">Safe arguments</string>
+    <string name="task_operation_safe_result">Safe result</string>
+</resources>

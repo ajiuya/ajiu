@@ -3,20 +3,30 @@ package com.aicode.feature.agent.domain.session
 import com.aicode.core.util.FileLogger
 import com.aicode.feature.agent.data.local.dao.AgentMessageDao
 import com.aicode.feature.agent.data.local.dao.ChatSessionDao
+import com.aicode.feature.agent.data.local.dao.SubAgentInteractionDao
 import com.aicode.feature.agent.data.local.entity.ChatSessionEntity
-import com.aicode.feature.agent.domain.model.AgentMode
 import com.aicode.feature.agent.domain.model.GoalStatus
 import com.aicode.feature.agent.domain.model.ReasoningEffort
+import com.aicode.feature.agent.domain.recovery.RecoveryRepository
 import com.aicode.feature.agent.presentation.MessageRole
+import kotlinx.coroutines.CompletableDeferred
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.inject.Inject
 import javax.inject.Singleton
 
 @Singleton
 class SessionUseCase @Inject constructor(
     private val chatSessionDao: ChatSessionDao,
-    private val agentMessageDao: AgentMessageDao
+    private val agentMessageDao: AgentMessageDao,
+    private val subAgentInteractionDao: SubAgentInteractionDao,
+    private val recoveryRepository: RecoveryRepository? = null,
+    private val subAgentJournal: com.aicode.feature.agent.domain.subagent.SubAgentInteractionJournal? = null,
+    private val notificationRecovery: com.aicode.feature.agent.domain.recovery.RecoveryNotificationCoordinator? = null
 ) {
+    private val coldStartCleanupStarted = AtomicBoolean(false)
+    private val coldStartCleanupComplete = CompletableDeferred<Unit>()
+
     companion object {
         private const val TAG = "SessionUseCase"
         const val TITLE_MAX = 20
@@ -31,7 +41,14 @@ class SessionUseCase @Inject constructor(
 
     /** 冷启动收尾：上次进程被杀时若有工具正在执行，其占位行会永久显示「执行中」。 */
     suspend fun initColdStartCleanup() {
-        runCatching {
+        if (!coldStartCleanupStarted.compareAndSet(false, true)) {
+            coldStartCleanupComplete.await()
+            return
+        }
+        try {
+            recoveryRepository?.initialize()
+            subAgentJournal?.recoverInterrupted()
+            notificationRecovery?.prepareConfirmationRequests()
             val n = listOf(PENDING_TOOL_MARKER, LEGACY_PENDING_TOOL_MARKER).sumOf { marker ->
                 agentMessageDao.markPendingToolsInterrupted(
                     toolRole = MessageRole.TOOL.name,
@@ -40,7 +57,12 @@ class SessionUseCase @Inject constructor(
                 )
             }
             if (n > 0) FileLogger.i(TAG, "冷启动收尾 $n 条残留「执行中」工具行为已中断")
-        }.onFailure { FileLogger.e(TAG, "回收残留执行中工具行失败", it) }
+            coldStartCleanupComplete.complete(Unit)
+        } catch (error: Throwable) {
+            coldStartCleanupComplete.completeExceptionally(error)
+            FileLogger.e(TAG, "回收残留执行中工具行失败", error)
+            throw error
+        }
     }
 
     fun newSessionEntity(
@@ -70,23 +92,33 @@ class SessionUseCase @Inject constructor(
 
     /** 删除会话及其全部子代理会话（消息 + 会话记录一并删除）。返回被删除的会话 id 列表。 */
     suspend fun deleteSession(id: String): List<String> {
-        val deleted = mutableListOf(id)
-        // 递归收集子会话（v1 仅一层，循环即可）
-        chatSessionDao.getSubSessionsByParentOnce(id).forEach { child ->
-            agentMessageDao.deleteBySession(child.id)
-            chatSessionDao.delete(child.id)
-            deleted.add(child.id)
+        val deleted = linkedSetOf(id)
+        var descendants = listOf(id)
+        while (descendants.isNotEmpty()) {
+            descendants = descendants.flatMap { parentId ->
+                recoveryRepository?.deleteSession(parentId, "session_deleted")
+                chatSessionDao.getSubSessionsByParentOnce(parentId).map { it.id }
+            }.filter { deleted.add(it) }
         }
-        agentMessageDao.deleteBySession(id)
-        chatSessionDao.delete(id)
-        return deleted
+        deleted.toList().asReversed().forEach { sessionId ->
+            subAgentInteractionDao.deleteByParent(sessionId)
+            agentMessageDao.deleteBySession(sessionId)
+            chatSessionDao.delete(sessionId)
+        }
+        return deleted.toList()
     }
 
     /** 删除某工作区下的全部会话（含子代理会话）及其消息，返回删除的会话数。 */
     suspend fun deleteSessionsByWorkspace(workspacePath: String): Int {
         val sessions = chatSessionDao.getAllSessionsByWorkspaceOnce(workspacePath)
         if (sessions.isEmpty()) return 0
-        sessions.forEach { session -> agentMessageDao.deleteBySession(session.id) }
+        sessions.forEach { session ->
+            recoveryRepository?.deleteSession(session.id, "session_deleted")
+        }
+        sessions.forEach { session ->
+            subAgentInteractionDao.deleteByParent(session.id)
+            agentMessageDao.deleteBySession(session.id)
+        }
         chatSessionDao.deleteByWorkspace(workspacePath)
         return sessions.size
     }
@@ -109,7 +141,7 @@ class SessionUseCase @Inject constructor(
     suspend fun recycleEmptySessions(workspacePath: String, keepId: String? = null): Int {
         var count = 0
         chatSessionDao.getRootSessionsByWorkspaceOnce(workspacePath).forEach { session ->
-            if (session.id != keepId && !agentMessageDao.hasMessages(session.id)) {
+            if (session.id != keepId && isSessionEmpty(session.id)) {
                 deleteSession(session.id)
                 count++
             }
@@ -125,7 +157,6 @@ class SessionUseCase @Inject constructor(
      * @param providerId 覆盖 provider；null 表示继承父会话
      * @param model 覆盖模型；null 表示继承父会话
      * @param reasoningEffort 覆盖思考强度；null 表示继承父会话
-     * @param mode 覆盖运行模式；null 表示继承父会话（只能往更严的方向收，不能放大，见 [resolveChildMode]）
      */
     fun newSubSessionEntity(
         title: String,
@@ -134,8 +165,7 @@ class SessionUseCase @Inject constructor(
         subagentType: String,
         providerId: String? = null,
         model: String? = null,
-        reasoningEffort: String? = null,
-        mode: AgentMode? = null
+        reasoningEffort: String? = null
     ): ChatSessionEntity {
         val now = System.currentTimeMillis()
         return ChatSessionEntity(
@@ -144,26 +174,12 @@ class SessionUseCase @Inject constructor(
             workspacePath = parent.workspacePath,
             createdAt = now,
             updatedAt = now,
-            // 默认继承父会话 mode：权限引擎按会话 mode 判定写拦截，默认 BUILD 会让 PLAN
-            // 模式下派出的子代理绕过只读限制，反过来 AUTO 模式的子代理又会弹授权窗打扰用户。
-            mode = resolveChildMode(mode, parent.mode),
             providerId = providerId ?: parent.providerId,
             model = model ?: parent.model,
             reasoningEffort = reasoningEffort ?: parent.reasoningEffort,
             parentId = parentId,
             subagentType = subagentType
         )
-    }
-
-    /**
-     * 子会话实际生效的模式：默认继承父会话；自定义子代理的定义可覆盖，但只能更严、不能更宽。
-     *
-     * 若允许放大，PLAN 下派一个 `mode: build` 的子代理就能直接改文件——这正是业界把
-     * 「子代理不继承父权限」列为安全漏洞的原因。父会话 mode 值异常时按继承处理。
-     */
-    internal fun resolveChildMode(requested: AgentMode?, parentMode: String): String {
-        val parent = runCatching { AgentMode.valueOf(parentMode) }.getOrNull() ?: return parentMode
-        return (requested ?: parent).limitedBy(parent).name
     }
 
     suspend fun upsertSession(entity: ChatSessionEntity) {
@@ -184,19 +200,6 @@ class SessionUseCase @Inject constructor(
 
     suspend fun getSessionById(id: String): ChatSessionEntity? {
         return chatSessionDao.getById(id)
-    }
-
-    suspend fun updateMode(sessionId: String, mode: String) {
-        val s = chatSessionDao.getById(sessionId) ?: return
-        val newMode = runCatching { AgentMode.valueOf(mode) }.getOrNull() ?: return
-        val currentMode = runCatching { AgentMode.valueOf(s.mode) }.getOrNull()
-        // 用户手动进入 PLAN 时同样记下进入前的模式，退出 PLAN 时恢复（与 AI 自切保持同一套语义）。
-        val modeBeforePlan = when {
-            newMode == AgentMode.PLAN && currentMode != AgentMode.PLAN -> currentMode?.name
-            newMode == AgentMode.PLAN -> s.modeBeforePlan
-            else -> null
-        }
-        chatSessionDao.upsert(s.copy(mode = newMode.name, modeBeforePlan = modeBeforePlan))
     }
 
     suspend fun updateProviderModel(sessionId: String, providerId: String?, model: String?) {
@@ -229,6 +232,8 @@ class SessionUseCase @Inject constructor(
     }
 
     suspend fun isSessionEmpty(sessionId: String): Boolean {
-        return !agentMessageDao.hasMessages(sessionId)
+        return !agentMessageDao.hasMessages(sessionId) &&
+            !chatSessionDao.hasPendingRecovery(sessionId) &&
+            chatSessionDao.getRecoveryGate(sessionId)?.autoDispatchBlockedReason == null
     }
 }

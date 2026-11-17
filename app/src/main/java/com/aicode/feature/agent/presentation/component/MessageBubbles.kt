@@ -4,12 +4,15 @@ import android.content.ClipData
 import androidx.compose.animation.core.LinearOutSlowInEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -42,20 +45,29 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.aicode.R
 import com.aicode.core.theme.Brand
+import com.aicode.core.theme.Radius
 import com.aicode.core.theme.Spacing
 import com.aicode.core.theme.semanticColors
 import com.aicode.core.ui.ChevronRotationStyle
@@ -74,6 +86,7 @@ import compose.icons.feathericons.Copy
 import compose.icons.feathericons.Database
 import compose.icons.feathericons.MoreHorizontal
 import compose.icons.feathericons.RotateCcw
+import compose.icons.feathericons.Tool
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
@@ -108,9 +121,22 @@ internal data class TurnUsage(
  * 上下文压缩插入的锚点/摘要落在轮内（压缩发生在请求前），若参与划分会把轮起点算到压缩
  * 时刻上，故先剔除。
  */
-private fun splitTurns(messages: List<AgentUIMessage>, lastTurnFinished: Boolean): List<AgentTurn> {
+private fun splitTurns(
+    messages: List<AgentUIMessage>,
+    lastTurnFinished: Boolean,
+    allowMeasuredLeading: Boolean = false
+): List<AgentTurn> {
+    var inputOwner: String? = null
     val turnMessages = messages.filter {
-        !it.isCompactionMarker && !it.isContextSummary && !it.isCompactionFailure
+        !it.isCompactionMarker && !it.isContextSummary && !it.isCompactionFailure && !it.isBackgroundNotification
+    }.filter { message ->
+        if (message.role != MessageRole.USER) true
+        else {
+            val continuation = message.continuationOfMessageId
+            val continuesCurrent = continuation != null && continuation == inputOwner
+            inputOwner = continuation ?: message.id
+            !continuesCurrent
+        }
     }
     if (turnMessages.isEmpty()) return emptyList()
     val turns = mutableListOf<AgentTurn>()
@@ -123,7 +149,7 @@ private fun splitTurns(messages: List<AgentUIMessage>, lastTurnFinished: Boolean
                 assistants = mutableListOf()
             }
             MessageRole.ASSISTANT -> {
-                val start = turnStart ?: return@forEachIndexed
+                val start = turnStart ?: message.timestamp.takeIf { allowMeasuredLeading && message.turnDurationMs != null } ?: return@forEachIndexed
                 assistants += message
                 val isTurnEnd = if (index == turnMessages.lastIndex) {
                     lastTurnFinished
@@ -142,16 +168,14 @@ private fun splitTurns(messages: List<AgentUIMessage>, lastTurnFinished: Boolean
 }
 
 /**
- * 每轮任务的总耗时（毫秒）：轮末助手消息落库时刻 − 该轮用户消息发出时刻，即用户按下发送
- * 到本轮 AI 收工的挂钟时间（含工具执行与等待用户授权的时间）。返回「消息 id → 耗时」，
- * 只有轮末的那条助手消息才有条目。
+ * 本轮单调时钟实测总耗时；旧数据缺少快照时不从排序时间推算。
  */
 internal fun computeTaskDurations(
     messages: List<AgentUIMessage>,
     lastTurnFinished: Boolean
-): Map<String, Long> = splitTurns(messages, lastTurnFinished)
-    .filter { it.endMessage.timestamp > it.startMillis }
-    .associate { it.endMessage.id to (it.endMessage.timestamp - it.startMillis) }
+): Map<String, Long> = splitTurns(messages, lastTurnFinished, allowMeasuredLeading = true)
+    .mapNotNull { turn -> turn.endMessage.turnDurationMs?.takeIf { it >= 0L }?.let { turn.endMessage.id to it } }
+    .toMap()
 
 /**
  * 每轮任务的 token 合计：轮内**所有步骤**的输入/输出/缓存命中求和，返回「消息 id → [TurnUsage]」，
@@ -195,13 +219,49 @@ internal fun formatCacheHitRate(inputTokens: Int, cachedInputTokens: Int): Strin
     return "${rate.roundToInt()}%"
 }
 
+internal enum class MessageContextUsageLevel { LOW, MODERATE, HIGH }
+
+internal data class MessageContextUsage(
+    val fraction: Double,
+    val percentage: Long,
+    val estimated: Boolean
+) {
+    val ringProgress: Float get() = fraction.coerceIn(0.0, 1.0).toFloat()
+    val level: MessageContextUsageLevel
+        get() = when {
+            fraction < 0.5 -> MessageContextUsageLevel.LOW
+            fraction < 0.85 -> MessageContextUsageLevel.MODERATE
+            else -> MessageContextUsageLevel.HIGH
+        }
+}
+
+internal fun messageContextUsage(message: AgentUIMessage): MessageContextUsage? {
+    val inputTokens = message.contextInputTokens ?: return null
+    val inputBudget = message.contextInputBudget ?: return null
+    if (inputTokens < 0 || inputBudget <= 0) return null
+    return MessageContextUsage(
+        fraction = inputTokens.toDouble() / inputBudget,
+        percentage = inputTokens.toLong() * 100 / inputBudget,
+        estimated = message.contextEstimated
+    )
+}
+
+internal fun messageCompletionVisible(
+    message: AgentUIMessage,
+    playbackSettled: Boolean,
+    content: String,
+    renderedContent: String?,
+): Boolean = message.role != MessageRole.ASSISTANT ||
+    (playbackSettled && (!message.content.hasVisibleContent() || renderedContent == content))
+
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 internal fun AgentMessageItem(
     message: AgentUIMessage,
-    /** 是否为整段会话最新的一条消息（只有它挂「复制 / 更多」）。用户消息不受此限：每条都常驻
-     *  这一排按钮，随时能复制或回退自己发的话；助手消息只挂最新一条，避免历史回复下面吊满
-     *  重复按钮把聊天记录割碎。时间戳与用量、耗时属于信息，不受它控制。 */
+    /** 是否为已结束轮次的最终回复（挂「复制 / 更多」）。用户消息不受此限：每条都常驻
+     *  这一排按钮，随时能复制或回退自己发的话。时间戳与用量、耗时属于信息，不受它控制。 */
     showActions: Boolean = false,
+    playbackSettled: Boolean = true,
     liveOutput: String? = null,
     markdownCache: MarkdownRenderCache? = null,
     onRewindClick: ((String) -> Unit)? = null,
@@ -213,8 +273,6 @@ internal fun AgentMessageItem(
     onToolExpandedChange: ((Boolean) -> Unit)? = null,
     reasoningExpandedOverride: Boolean? = null,
     onReasoningExpandedChange: ((Boolean) -> Unit)? = null,
-    /** 本 item 内容的外层内边距：工具调用分组展开时由 [AIChatPanel] 传入缩进，用于区分层级。 */
-    contentPadding: PaddingValues = PaddingValues(0.dp),
     /** 本轮任务总耗时（ms）：仅轮末助手消息非空，见 [computeTaskDurations]。 */
     taskDurationMs: Long? = null,
     /** 本轮任务的 token 合计（1 轮 n 步求和）：仅轮末助手消息非空，见 [computeTurnUsage]。 */
@@ -232,6 +290,10 @@ internal fun AgentMessageItem(
     reasoningDurationMs: Long? = null,
     /** 是否为分块的末块（渲染操作行、底部圆角、与下一条列表 item 的间距）；非分块消息恒为 true。 */
     isChunkFooter: Boolean = true,
+    onCompactContext: (() -> Unit)? = null,
+    contextCompactionEnabled: Boolean = true,
+    toolDurationMs: Long? = null,
+    onToolPreview: (() -> Unit)? = null,
 ) {
     if (message.isCompactionMarker) {
         // 压缩内部锚点不再渲染分隔线：摘要卡片已提供压缩反馈，避免与卡片重复。
@@ -252,6 +314,33 @@ internal fun AgentMessageItem(
         BackgroundNotificationBar(message)
         return
     }
+    if (message.continuationOfMessageId != null) {
+        var expanded by rememberSaveable(message.id) { mutableStateOf(false) }
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(vertical = Spacing.xs),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(Spacing.xs)
+        ) {
+            Text(stringResource(R.string.session_recovery_continuation),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+            message.continuationDraft?.takeIf { it.isNotBlank() }?.let { draft ->
+                Text(stringResource(R.string.session_recovery_draft_label),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.semanticColors.warning)
+                SelectionContainer {
+                    Text(draft, style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = if (expanded) Int.MAX_VALUE else 3,
+                        overflow = TextOverflow.Ellipsis)
+                }
+                Text(stringResource(if (expanded) R.string.common_collapse_action else R.string.common_expand),
+                    modifier = Modifier.clickable { expanded = !expanded }.padding(Spacing.sm),
+                    style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+            }
+        }
+        return
+    }
 
     val hasReasoning = message.role == MessageRole.ASSISTANT && !message.reasoning.isNullOrEmpty()
     val hasContent = message.content.hasVisibleContent()
@@ -260,8 +349,9 @@ internal fun AgentMessageItem(
     if (message.role == MessageRole.ASSISTANT && !hasContent && !hasReasoning && !hasAttachments) return
 
     val isUser = message.role == MessageRole.USER
-    // 分块消息：块间只留一个段落间距，视觉上仍是连续的一段正文（DSH 扁平文档流下不再有描边接缝）。
-    val chunked = contentSlice != null
+    val displayedContent = contentSlice ?: message.content
+    var renderedContent by remember(message.id) { mutableStateOf<String?>(null) }
+    val completionVisible = messageCompletionVisible(message, playbackSettled, displayedContent, renderedContent)
     val screenWidthDp = LocalConfiguration.current.screenWidthDp
     // 用户气泡随文字撑开，最大撑到与 AI 气泡同宽（消息列宽 - 列表两侧 padding）。
     // 大屏下消息列已限宽居中，气泡上限跟着收窄，不能再拿整个屏宽算。
@@ -269,6 +359,15 @@ internal fun AgentMessageItem(
         minOf(screenWidthDp.dp, ContentWidth.readable) - Spacing.lg * 2
     }
     var copied by remember { mutableStateOf(false) }
+    var contextDetailsVisible by remember(message.id) { mutableStateOf(false) }
+    if (contextDetailsVisible) {
+        ContextUsageSheet(
+            message = message,
+            onDismissRequest = { contextDetailsVisible = false },
+            onCompactContext = onCompactContext,
+            contextCompactionEnabled = contextCompactionEnabled
+        )
+    }
     val clipboard = LocalClipboard.current
     val copyScope = rememberCoroutineScope()
 
@@ -296,9 +395,6 @@ internal fun AgentMessageItem(
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            // 分组成员的层级缩进（见 contentPadding 注释）：加在最外层，卡片自带的分隔细线与
-            // 「指令 / 结果」面板都跟着内缩，不会出现分组头与成员行起始位置齐平的观感。
-            .padding(contentPadding)
             // LazyColumn 不再统一 spacedBy：末块（或非分块消息）自带与下一条 item 的间距，
             // 相邻分块之间零间距无缝衔接，整段长回复在外观上仍是连续的一整段。
             // 扁平文档流下正文之间没有气泡边框兜底，紧凑排布分清「轮次」。
@@ -326,7 +422,7 @@ internal fun AgentMessageItem(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         if (message.role == MessageRole.TOOL) {
-                            // 工具行自带 1px 细线与状态图标；这里只负责入场动画（只改 draw 层，不动布局）
+                            // 入场动画只改 draw 层，避免高度变化干扰贴底。
                             Box(
                                 modifier = Modifier
                                     .fillMaxWidth()
@@ -340,50 +436,24 @@ internal fun AgentMessageItem(
                                     liveOutput = liveOutput,
                                     expandedOverride = toolExpandedOverride,
                                     onExpandedChange = onToolExpandedChange,
-                                    onToggle = onToolToggle
+                                    onToggle = onToolToggle,
+                                    durationMs = toolDurationMs,
+                                    onOpenPreview = onToolPreview
                                 )
                             }
                         } else if (isUser) {
-                            // 用户消息：右对齐浅色药丸 + 深色文字（不再整块主题色反白）。
-                            Surface(
-                                shape = RoundedCornerShape(ChatStyle.bubbleCorner),
-                                color = chatUserBubbleColor(),
-                                modifier = Modifier.widthIn(max = maxUserBubbleWidth)
-                            ) {
-                                SelectionContainer {
-                                    CompositionLocalProvider(
-                                        LocalTextSelectionColors provides TextSelectionColors(
-                                            handleColor = MaterialTheme.colorScheme.onPrimaryContainer,
-                                            backgroundColor = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.24f),
-                                        )
-                                    ) {
-                                        Text(
-                                            text = message.content,
-                                            color = chatUserBubbleTextColor(),
-                                            style = MaterialTheme.typography.bodyMedium.copy(lineHeight = 20.sp),
-                                            modifier = Modifier.padding(horizontal = Spacing.md, vertical = Spacing.sm)
-                                        )
-                                    }
-                                }
-                            }
+                            UserMessageBubble(
+                                text = message.content,
+                                maxWidth = maxUserBubbleWidth
+                            )
                         } else {
-                            // 助手正文：不套容器，直接铺在页面底色上（文档流）。分块之间只留一个段落间距，
-                            // 整条消息看起来仍是连续的一段正文。
-                            SelectionContainer {
-                                CompositionLocalProvider(
-                                    LocalTextSelectionColors provides TextSelectionColors(
-                                        handleColor = MaterialTheme.colorScheme.primary,
-                                        backgroundColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.32f),
-                                    )
-                                ) {
-                                    MarkdownContent(
-                                        text = contentSlice ?: message.content,
-                                        color = MaterialTheme.colorScheme.onSurface,
-                                        modifier = Modifier.fillMaxWidth(),
-                                        cache = markdownCache,
-                                    )
-                                }
-                            }
+                            AssistantMessageBubble(
+                                text = displayedContent,
+                                cache = markdownCache,
+                                isChunkHeader = isChunkHeader,
+                                isChunkFooter = isChunkFooter,
+                                onRendered = { renderedContent = it },
+                            )
                         }
                     }
                 }
@@ -391,8 +461,8 @@ internal fun AgentMessageItem(
                     MessageAttachmentList(attachments = message.attachments)
                 }
                 // 气泡下方的元信息行（工具消息不显示）：用户消息每条都常驻「时间 + 复制/回退/更多」，
-                // 助手消息只挂整段会话最新的一条，避免每条回复下面都吊一排按钮把聊天记录割碎。
-                // 排列固定为「统计（用量/缓存/耗时）→ 复制 → 更多选项」：信息在前，操作入口收在行尾。
+                // 助手消息只挂已结束轮次的最终回复。
+                // 排列固定为「统计（用量/缓存/耗时）→ 复制 → 上下文 → 更多选项」：上下文读取本条消息的快照。
                 //
                 // 用量与耗时按**本轮合计**（1 轮 n 步的所有调用求和）挂在轮末那条助手消息上：
                 // 逐步显示会把一次任务的开销拆成碎片，中间步骤的数字对用户也没有意义。
@@ -407,20 +477,22 @@ internal fun AgentMessageItem(
                     formatCacheHitRate(it.inputTokens, it.cachedInputTokens)
                 }
                 val durationText = taskDurationMs?.let { formatTaskDuration(it) }
-                val hasMeta = isUser || tokenStats != null || cacheHitRate != null || durationText != null
+                val contextUsageVisible = message.role == MessageRole.ASSISTANT &&
+                    (turnUsage != null || taskDurationMs != null || showActions)
+                val hasMeta = isUser || tokenStats != null || cacheHitRate != null || durationText != null || contextUsageVisible
                 val actionsVisible = isUser || showActions
                 if ((hasContent || hasAttachments) && message.role != MessageRole.TOOL && isChunkFooter &&
-                    (actionsVisible || hasMeta)
+                    completionVisible && (actionsVisible || hasMeta)
                 ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
+                    FlowRow(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(
+                            Spacing.sm,
+                            if (isUser) Alignment.End else Alignment.Start
+                        ),
+                        verticalArrangement = Arrangement.spacedBy(Spacing.xs)
+                    ) {
                         val iconTint = MaterialTheme.colorScheme.onSurfaceVariant
-                        // 排过内容才补间隔，否则本行首个元素会被凭空缩进一格
-                        var emitted = false
-                        // 用户消息：时间戳排在复制按钮之前（对齐参考图里气泡下方的「17:55 ⧉」）
-                        if (isUser) {
-                            ChatMetaText(text = formatClockTime(message.timestamp))
-                            emitted = true
-                        }
                         val copyButton: @Composable () -> Unit = {
                             MessageActionIconButton(
                                 icon = if (copied) FeatherIcons.Check else FeatherIcons.Copy,
@@ -436,65 +508,86 @@ internal fun AgentMessageItem(
                                 }
                             )
                         }
-                        // 用户消息：复制紧跟时间戳，回退按钮在其后（保持原顺序）
-                        if (isUser && actionsVisible) {
-                            if (emitted) Spacer(Modifier.width(Spacing.xs))
-                            if (hasContent) copyButton()
-                            if (onRewindClick != null) {
-                                MessageActionIconButton(
-                                    icon = FeatherIcons.RotateCcw,
-                                    contentDescription = stringResource(R.string.checkpoint_rewind_title),
-                                    tint = iconTint,
-                                    onClick = { onRewindClick(message.id) }
-                                )
+                        if (isUser) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                ChatMetaText(text = formatClockTime(message.timestamp))
+                                if (actionsVisible) {
+                                    Spacer(Modifier.width(Spacing.xs))
+                                    if (hasContent) copyButton()
+                                    if (onRewindClick != null) {
+                                        MessageActionIconButton(
+                                            icon = FeatherIcons.RotateCcw,
+                                            contentDescription = stringResource(R.string.checkpoint_rewind_title),
+                                            tint = iconTint,
+                                            onClick = { onRewindClick(message.id) }
+                                        )
+                                    }
+                                    if (onMoreClick != null) {
+                                        Spacer(Modifier.width(Spacing.xs))
+                                        MessageActionIconButton(
+                                            icon = FeatherIcons.MoreHorizontal,
+                                            contentDescription = stringResource(R.string.chat_more_options),
+                                            tint = iconTint,
+                                            onClick = { onMoreClick(message) }
+                                        )
+                                    }
+                                }
                             }
-                            emitted = true
                         }
                         if (tokenStats != null) {
-                            if (emitted) Spacer(Modifier.width(Spacing.sm))
-                            ChatMetaText(text = tokenStats)
-                            emitted = true
+                            ChatMetaText(text = tokenStats, modifier = Modifier.align(Alignment.CenterVertically))
                         }
                         if (cacheHitRate != null) {
-                            if (emitted) Spacer(Modifier.width(Spacing.sm))
-                            Icon(
-                                FeatherIcons.Database,
-                                contentDescription = stringResource(R.string.chat_cache_hit_rate, cacheHitRate),
-                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.size(12.dp)
-                            )
-                            Spacer(Modifier.width(2.dp))
-                            ChatMetaText(text = cacheHitRate)
-                            emitted = true
+                            Row(
+                                modifier = Modifier.align(Alignment.CenterVertically),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    FeatherIcons.Database,
+                                    contentDescription = stringResource(R.string.chat_cache_hit_rate, cacheHitRate),
+                                    tint = iconTint,
+                                    modifier = Modifier.size(12.dp)
+                                )
+                                Spacer(Modifier.width(2.dp))
+                                ChatMetaText(text = cacheHitRate)
+                            }
                         }
                         if (durationText != null) {
-                            if (emitted) Spacer(Modifier.width(Spacing.sm))
-                            Icon(
-                                FeatherIcons.Clock,
-                                contentDescription = stringResource(R.string.chat_task_duration, durationText),
-                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.size(13.dp)
-                            )
-                            Spacer(Modifier.width(2.dp))
-                            ChatMetaText(text = durationText)
-                            emitted = true
+                            Row(
+                                modifier = Modifier.align(Alignment.CenterVertically),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    FeatherIcons.Clock,
+                                    contentDescription = stringResource(R.string.chat_task_duration, durationText),
+                                    tint = iconTint,
+                                    modifier = Modifier.size(13.dp)
+                                )
+                                Spacer(Modifier.width(2.dp))
+                                ChatMetaText(text = durationText)
+                            }
                         }
-                        // 助手消息的复制按钮排在「更多选项」左边（统计信息之后）
-                        if (!isUser && actionsVisible && hasContent) {
-                            if (emitted) Spacer(Modifier.width(Spacing.xs))
-                            copyButton()
-                            emitted = true
-                        }
-                        // 「更多选项」排在这一行的**最后**：助手消息里它跟在复制按钮后面（先给信息，
-                        // 再给操作入口）；用户消息没有统计项，它自然接着回退按钮，间距与按钮组一致。
-                        if (actionsVisible && onMoreClick != null) {
-                            if (emitted) Spacer(Modifier.width(Spacing.xs))
-                            MessageActionIconButton(
-                                icon = FeatherIcons.MoreHorizontal,
-                                contentDescription = stringResource(R.string.chat_more_options),
-                                tint = iconTint,
-                                onClick = { onMoreClick(message) }
-                            )
+                        if (!isUser && (actionsVisible || contextUsageVisible)) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(Spacing.xs)
+                            ) {
+                                if (actionsVisible && hasContent) copyButton()
+                                if (contextUsageVisible) {
+                                    MessageContextUsageIndicator(
+                                        message = message,
+                                        onClick = { contextDetailsVisible = true }
+                                    )
+                                }
+                                if (actionsVisible && onMoreClick != null) {
+                                    MessageActionIconButton(
+                                        icon = FeatherIcons.MoreHorizontal,
+                                        contentDescription = stringResource(R.string.chat_more_options),
+                                        tint = iconTint,
+                                        onClick = { onMoreClick(message) }
+                                    )
+                                }
+                            }
                         }
                     }
                     // 复制成功 1.5s 后恢复图标
@@ -510,44 +603,117 @@ internal fun AgentMessageItem(
     }
 }
 
-/**
- * 整轮任务折叠头（最外层）：一行「执行中 / 已完成 Xs + 箭头」，点一下展开/收起整轮过程。
- *
- * 收起态用右箭头（ChevronRight），展开态用下箭头（ChevronDown）——与参考图一致；
- * 运行中（[running]）只显示「执行中」，完成后显示本轮耗时。风格对齐 [ToolCallGroupHeader]。
- */
+@Composable
+private fun MessageContextUsageIndicator(
+    message: AgentUIMessage,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val usage = messageContextUsage(message)
+    val description = when {
+        usage == null -> stringResource(R.string.chat_context_usage_unknown)
+        usage.estimated -> stringResource(R.string.chat_context_usage_estimated, usage.percentage)
+        else -> stringResource(R.string.chat_context_usage, usage.percentage)
+    }
+    val tint = when (usage?.level) {
+        MessageContextUsageLevel.LOW -> MaterialTheme.semanticColors.success
+        MessageContextUsageLevel.MODERATE -> MaterialTheme.semanticColors.warning
+        MessageContextUsageLevel.HIGH -> MaterialTheme.colorScheme.error
+        null -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    val trackColor = MaterialTheme.colorScheme.outlineVariant
+    Row(
+        modifier = modifier
+            .clip(RoundedCornerShape(ChatStyle.panelCorner))
+            .clickable(
+                role = Role.Button,
+                onClickLabel = stringResource(R.string.chat_context_details),
+                onClick = onClick
+            )
+            .clearAndSetSemantics { contentDescription = description }
+            .padding(vertical = Spacing.xs),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(Spacing.xs)
+    ) {
+        Canvas(modifier = Modifier.size(ChatStyle.rowIconSize)) {
+            val strokeWidth = 2.dp.toPx()
+            val diameter = size.minDimension - strokeWidth
+            drawCircle(
+                color = trackColor,
+                radius = diameter / 2f,
+                style = Stroke(width = strokeWidth)
+            )
+            if (usage != null) {
+                drawArc(
+                    color = tint,
+                    startAngle = -90f,
+                    sweepAngle = 360f * usage.ringProgress,
+                    useCenter = false,
+                    topLeft = Offset(strokeWidth / 2f, strokeWidth / 2f),
+                    size = Size(diameter, diameter),
+                    style = Stroke(width = strokeWidth, cap = StrokeCap.Round)
+                )
+            }
+        }
+        Text(
+            text = if (usage == null) "—%" else "${if (usage.estimated) "≈" else ""}${usage.percentage}%",
+            style = MaterialTheme.typography.labelSmall,
+            color = tint,
+            maxLines = 1
+        )
+    }
+}
+
+
 @Composable
 internal fun TurnCollapseHeader(
     running: Boolean,
     durationMs: Long?,
     expanded: Boolean,
     onToggle: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    summary: String? = null
 ) {
     Row(
         modifier = modifier
             .fillMaxWidth()
-            .heightIn(min = ChatStyle.toolRowMinHeight)
-            .clip(RoundedCornerShape(ChatStyle.panelCorner))
+            .padding(horizontal = Spacing.xs)
+            .heightIn(min = Spacing.xl * 2)
+            .clip(RoundedCornerShape(Radius.pill))
+            .background(chatMutedSurfaceColor())
+            .border(ChatStyle.hairline, MaterialTheme.semanticColors.subtleBorder, RoundedCornerShape(Radius.pill))
             .clickable(
                 onClickLabel = stringResource(
                     if (expanded) R.string.common_collapse_action else R.string.common_expand
                 ),
                 onClick = onToggle
-            ),
-        verticalAlignment = Alignment.CenterVertically
+            )
+            .padding(horizontal = Spacing.md, vertical = Spacing.sm),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.Center
     ) {
+        if (summary != null) {
+            Icon(
+                imageVector = FeatherIcons.Tool,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(ChatStyle.rowIconSize)
+            )
+            Spacer(Modifier.width(Spacing.sm))
+        }
         Text(
-            text = when {
+            text = summary ?: when {
                 running -> stringResource(R.string.chat_turn_running)
                 durationMs != null -> stringResource(R.string.chat_turn_completed, formatTaskDuration(durationMs))
                 // 拿不到耗时（被窗口截断的半轮、消息缺时间戳）时只说「已完成」，不留空档
                 else -> stringResource(R.string.chat_turn_completed_plain)
             },
+            modifier = Modifier.weight(1f, fill = false),
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             style = MaterialTheme.typography.labelMedium,
             fontWeight = FontWeight.Medium,
-            maxLines = 1,
+            textAlign = TextAlign.Center,
+            maxLines = 2,
             overflow = TextOverflow.Ellipsis
         )
         Spacer(Modifier.width(Spacing.xs))
@@ -583,7 +749,10 @@ private fun MessageActionIconButton(
  */
 @Composable
 private fun BackgroundNotificationBar(message: AgentUIMessage) {
-    val content = message.content
+    val notices = parseSubAgentNotificationMetadata(message.content)
+    val remaining = unrepresentedSubAgentNotifications(notices, LocalRepresentedSubAgentIds.current)
+    if (remaining.isEmpty()) return
+    val content = remaining.joinToString("\n") { it.raw }
     val statuses = Regex("<status>(.*?)</status>")
         .findAll(content).map { it.groupValues.getOrNull(1)?.trim()?.lowercase() }.filterNotNull().toList()
     val summaries = Regex("<summary>(.*?)</summary>")
@@ -626,7 +795,7 @@ private fun BackgroundNotificationBar(message: AgentUIMessage) {
             Text(
                 text = label,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-                style = MaterialTheme.typography.bodySmall,
+                style = MaterialTheme.typography.bodySmall.scaledForChat(LocalChatTextScale.current),
                 maxLines = 2,
                 overflow = TextOverflow.Ellipsis
             )
@@ -723,7 +892,7 @@ private fun CompactionFailureCard(message: AgentUIMessage) {
                     Text(
                         text = reason.replace("\n", " ").trim(),
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        style = MaterialTheme.typography.bodySmall,
+                        style = MaterialTheme.typography.bodySmall.scaledForChat(LocalChatTextScale.current),
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f)
@@ -745,6 +914,7 @@ private fun CompactionFailureCard(message: AgentUIMessage) {
                         text = reason,
                         color = MaterialTheme.colorScheme.onSurface,
                         style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace)
+                            .scaledForChat(LocalChatTextScale.current)
                     )
                 }
             }

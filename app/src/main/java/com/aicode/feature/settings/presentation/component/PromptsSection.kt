@@ -86,7 +86,8 @@ internal fun PromptsSection(
     onDeleteFragment: (Int) -> Unit,
     onReorder: (List<PromptFragment>) -> Unit,
     onToggleBuiltinDisabled: (Boolean) -> Unit,
-    onBatchDeleteFragments: (List<Int>) -> Unit
+    onBatchDeleteFragments: (List<Int>) -> Unit,
+    onToggleFragment: (Int, Boolean) -> Unit = { _, _ -> }
 ) {
     var showBatchDeleteConfirm by remember { mutableStateOf(false) }
     // 内置来源的片段删不了，也就不参与多选：勾选框置灰、全选也不会选中它们。
@@ -117,6 +118,13 @@ internal fun PromptsSection(
                 }
             )
         }
+
+        Text(
+            text = stringResource(R.string.prompts_fragment_toggle_hint),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = Spacing.lg, vertical = Spacing.sm)
+        )
 
         if (selection.isActive) {
             SelectionActionBar(
@@ -152,6 +160,7 @@ internal fun PromptsSection(
                 onOpenFragment = onOpenFragment,
                 onDeleteFragment = onDeleteFragment,
                 onReorder = onReorder,
+                onToggleFragment = onToggleFragment,
                 modifier = Modifier.weight(1f)
             )
         }
@@ -183,6 +192,7 @@ private fun PromptList(
     onOpenFragment: (PromptFragment) -> Unit,
     onDeleteFragment: (Int) -> Unit,
     onReorder: (List<PromptFragment>) -> Unit,
+    onToggleFragment: (Int, Boolean) -> Unit,
     modifier: Modifier = Modifier
 ) {
     var localFragments by remember { mutableStateOf(fragments) }
@@ -237,6 +247,7 @@ private fun PromptList(
                         fragment = fragment,
                         onClick = { onOpenFragment(fragment) },
                         onDelete = { onDeleteFragment(fragment.number) },
+                        onToggle = { onToggleFragment(fragment.number, it) },
                         deleteEnabled = fragment.editable,
                         selectionMode = selection.isActive,
                         selected = selection.isSelected(fragment.number.toString()),
@@ -273,6 +284,7 @@ private fun PromptRow(
     fragment: PromptFragment,
     onClick: () -> Unit,
     onDelete: () -> Unit,
+    onToggle: (Boolean) -> Unit,
     deleteEnabled: Boolean,
     dragModifier: Modifier,
     selectionMode: Boolean = false,
@@ -280,6 +292,7 @@ private fun PromptRow(
     onToggleSelect: () -> Unit = {}
 ) {
     val sortDescription = stringResource(R.string.prompts_sort_long_press)
+    val toggleDescription = stringResource(R.string.prompts_fragment_enabled)
     val row: @Composable () -> Unit = {
         Row(
             modifier = Modifier
@@ -325,11 +338,25 @@ private fun PromptRow(
                             overflow = TextOverflow.Ellipsis
                         )
                     }
+                    if (!fragment.enabled) {
+                        Text(
+                            text = stringResource(R.string.prompts_fragment_disabled),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.semanticColors.subtleText
+                        )
+                    }
                 }
             }
 
             Spacer(modifier = Modifier.width(Spacing.sm))
             SourceBadge(fragment.source)
+            Spacer(modifier = Modifier.width(Spacing.sm))
+            AppSwitch(
+                checked = fragment.enabled,
+                onCheckedChange = onToggle,
+                enabled = !selectionMode,
+                modifier = Modifier.semantics { contentDescription = toggleDescription }
+            )
             Spacer(modifier = Modifier.width(Spacing.xs))
             Icon(
                 imageVector = FeatherIcons.ChevronRight,

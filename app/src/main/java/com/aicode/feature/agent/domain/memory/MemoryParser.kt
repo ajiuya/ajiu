@@ -12,11 +12,17 @@ object MemoryParser {
         val text = try {
             if (!file.isFile || !file.canRead()) return null
             file.readText()
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
         } catch (e: Exception) {
             FileLogger.w(TAG, "读取 Memory 文件失败: ${file.absolutePath}", e)
             return null
         }
 
+        return parseText(text, file, scope)
+    }
+
+    internal fun parseText(text: String, file: File, scope: MemoryScope): Memory {
         val (frontmatter, body) = splitAndParseFrontmatter(text)
 
         val name = frontmatter["name"]?.toString()?.takeIf { it.isNotBlank() } ?: file.nameWithoutExtension
@@ -64,6 +70,8 @@ object MemoryParser {
             val yaml = Yaml()
             val loaded = yaml.load<Map<String, Any>>(block)
             loaded ?: emptyMap()
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
         } catch (e: Exception) {
             FileLogger.w(TAG, "解析 YAML 失败", e)
             emptyMap()

@@ -105,7 +105,6 @@ import compose.icons.feathericons.Download
 import compose.icons.feathericons.FileText
 import compose.icons.feathericons.Globe
 import compose.icons.feathericons.HardDrive
-import compose.icons.feathericons.Image
 import compose.icons.feathericons.Info
 import compose.icons.feathericons.Lock
 import compose.icons.feathericons.Moon
@@ -147,11 +146,14 @@ private val SettingsTwoPaneMinWidth = 840.dp
 internal enum class SettingsSection(@param:StringRes val titleRes: Int) {
     Menu(R.string.settings_title),
     General(R.string.settings_general),
+    Appearance(R.string.settings_appearance_title),
     Providers(R.string.settings_providers),
     ProviderEditor(R.string.settings_provider_editor),
     DefaultModels(R.string.settings_default_models),
     Mcp(R.string.settings_mcp),
     Skills(R.string.settings_skills),
+    Memory(R.string.memory_management_title),
+    ProjectProgress(R.string.project_progress_title),
     Prompts(R.string.prompts_title),
     PromptDetail(R.string.prompts_title),
     PromptEditor(R.string.prompts_title),
@@ -205,7 +207,9 @@ fun SettingsScreen(
     onRerunOnboarding: () -> Unit = {},
     onboardingStep: OnboardingStep? = null,
     onOnboardingModelAdded: (() -> Unit)? = null,
-    onOnboardingDismissFetchDialog: (() -> Unit)? = null
+    onOnboardingDismissFetchDialog: (() -> Unit)? = null,
+    openMcpOnEntry: Boolean = false,
+    currentSessionId: String? = null
 ) {
     val providers by viewModel.providers.collectAsStateWithLifecycle()
     val logLevel by viewModel.logLevel.collectAsStateWithLifecycle()
@@ -225,7 +229,6 @@ fun SettingsScreen(
     val globalRules by viewModel.globalRules.collectAsStateWithLifecycle()
     val projectRules by viewModel.projectRules.collectAsStateWithLifecycle()
     val currentProjectName by viewModel.currentProjectName.collectAsStateWithLifecycle()
-    val disableSafetyInterception by viewModel.disableSafetyInterception.collectAsStateWithLifecycle()
     val keepaliveEnabled by viewModel.keepaliveEnabled.collectAsStateWithLifecycle()
     val screenOnEnabled by viewModel.screenOnEnabled.collectAsStateWithLifecycle()
     val agentSoundEnabled by viewModel.agentSoundEnabled.collectAsStateWithLifecycle()
@@ -237,6 +240,10 @@ fun SettingsScreen(
     val streamIdleTimeoutSec by viewModel.streamIdleTimeoutSec.collectAsStateWithLifecycle()
     val maxNetworkRetries by viewModel.maxNetworkRetries.collectAsStateWithLifecycle()
     val enterToSend by viewModel.enterToSend.collectAsStateWithLifecycle()
+    val typewriterCharsPerSecond by viewModel.typewriterCharsPerSecond.collectAsStateWithLifecycle()
+    val rootAccessState by viewModel.rootAccessState.collectAsStateWithLifecycle()
+    val rootAccessChanging by viewModel.rootAccessChanging.collectAsStateWithLifecycle()
+    val rootAccessError by viewModel.rootAccessError.collectAsStateWithLifecycle()
     val compactionThresholdPercent by viewModel.compactionThresholdPercent.collectAsStateWithLifecycle()
     val sendFileMaxSizeMb by viewModel.sendFileMaxSizeMb.collectAsStateWithLifecycle()
     val goalMaxTurns by viewModel.goalMaxTurns.collectAsStateWithLifecycle()
@@ -247,6 +254,11 @@ fun SettingsScreen(
     val dynamicColorEnabled by viewModel.dynamicColorEnabled.collectAsStateWithLifecycle()
     val backgroundImagePath by viewModel.backgroundImagePath.collectAsStateWithLifecycle()
     val backgroundAlpha by viewModel.backgroundAlpha.collectAsStateWithLifecycle()
+    val chatBackgroundImagePath by viewModel.chatBackgroundImagePath.collectAsStateWithLifecycle()
+    val chatBackgroundAlpha by viewModel.chatBackgroundAlpha.collectAsStateWithLifecycle()
+    val chatTextScale by viewModel.chatTextScale.collectAsStateWithLifecycle()
+    val userChatBubbleStyle by viewModel.userChatBubbleStyle.collectAsStateWithLifecycle()
+    val assistantChatBubbleStyle by viewModel.assistantChatBubbleStyle.collectAsStateWithLifecycle()
     val languageTag by viewModel.languageTag.collectAsStateWithLifecycle()
     val visionProviderId by viewModel.visionProviderId.collectAsStateWithLifecycle()
     val visionModel by viewModel.visionModel.collectAsStateWithLifecycle()
@@ -293,7 +305,7 @@ fun SettingsScreen(
     }
 
 
-    var section by remember { mutableStateOf(SettingsSection.Menu) }
+    var section by remember(openMcpOnEntry) { mutableStateOf(if (openMcpOnEntry) SettingsSection.Mcp else SettingsSection.Menu) }
     var logReturnSection by remember { mutableStateOf(SettingsSection.Menu) }
     // 各列表页的多选状态：顶栏「多选」开关在本页 Scaffold 里，所以状态必须提到这里统一持有。
     // 用普通 map（非 snapshot）新建容器，避免在组合期写快照状态；Compose 状态在 ListSelectionState 内部。
@@ -396,8 +408,8 @@ fun SettingsScreen(
     var showContainerAddSheet by remember { mutableStateOf(false) }
     var showContainerAnnouncement by remember { mutableStateOf(false) }
     var showImageSourceSheet by remember { mutableStateOf(false) }
-    var showThemeSheet by remember { mutableStateOf(false) }
     var showBackgroundSheet by remember { mutableStateOf(false) }
+    var showChatBackgroundSheet by remember { mutableStateOf(false) }
     var showLanguageSheet by remember { mutableStateOf(false) }
     var showResetTokenStats by remember { mutableStateOf(false) }
 
@@ -409,6 +421,8 @@ fun SettingsScreen(
     // 返回键与顶栏返回箭头共用这一份判定，不再各写一套（之前两处不一致，镜像下载页返回会直接跳回菜单）。
     val parentSection: SettingsSection? = when (section) {
         SettingsSection.Menu -> null
+        SettingsSection.Mcp -> if (openMcpOnEntry) null else if (expanded) null else SettingsSection.Menu
+        SettingsSection.ProjectProgress -> SettingsSection.Memory
         SettingsSection.ProviderEditor -> SettingsSection.Providers
         SettingsSection.Log -> logReturnSection.takeUnless { expanded && it == SettingsSection.Menu }
         SettingsSection.SkillDetail -> SettingsSection.Skills
@@ -481,11 +495,7 @@ fun SettingsScreen(
             dynamicColorEnabled = dynamicColorEnabled,
             terminalSettings = terminalSettings,
             currentLanguageDisplayName = currentLanguageDisplayName,
-            backgroundImagePath = backgroundImagePath,
-            backgroundAlpha = backgroundAlpha,
-            onOpenThemeSheet = { showThemeSheet = true },
             onOpenTerminalSettingsSheet = { showTerminalSettingsSheet = true },
-            onOpenBackgroundSheet = { showBackgroundSheet = true },
             onOpenLanguageSheet = { showLanguageSheet = true },
             onOpenManual = {
                 context.startActivity(
@@ -563,6 +573,18 @@ fun SettingsScreen(
                 onSave = { provider ->
                     viewModel.saveProvider(provider)
                 }
+            )
+
+            current == SettingsSection.Memory -> MemorySettingsRoute(
+                viewModel = androidx.hilt.navigation.compose.hiltViewModel(),
+                showBack = !expanded,
+                onNavigateBack = { section = SettingsSection.Menu },
+                onOpenProjectProgress = { section = SettingsSection.ProjectProgress }
+            )
+
+            current == SettingsSection.ProjectProgress -> ProjectProgressSettingsRoute(
+                sessionId = currentSessionId,
+                onBack = { section = SettingsSection.Memory }
             )
 
             current == SettingsSection.SkillEditor -> SkillEditorScreen(
@@ -929,6 +951,8 @@ fun SettingsScreen(
                     onSetMaxNetworkRetries = { viewModel.setMaxNetworkRetries(it) },
                     enterToSend = enterToSend,
                     onToggleEnterToSend = { viewModel.setEnterToSend(it) },
+                    typewriterCharsPerSecond = typewriterCharsPerSecond,
+                    onSetTypewriterCharsPerSecond = viewModel::setTypewriterCharsPerSecond,
                     compactionThresholdPercent = compactionThresholdPercent,
                     onSetCompactionThresholdPercent = { viewModel.setCompactionThresholdPercent(it) },
                     sendFileMaxSizeMb = sendFileMaxSizeMb,
@@ -939,6 +963,26 @@ fun SettingsScreen(
                     onSetGoalMaxTokens = { viewModel.setGoalMaxTokens(it) },
                     deleteExternalWorkspaceSessions = deleteExternalWorkspaceSessions,
                     onToggleDeleteExternalWorkspaceSessions = { viewModel.setDeleteExternalWorkspaceSessions(it) }
+                )
+                SettingsSection.Appearance -> AppearanceSection(
+                    themeMode = themeMode,
+                    themePresetId = themePresetId,
+                    dynamicColorEnabled = dynamicColorEnabled,
+                    onThemeModeSelected = { viewModel.setThemeMode(it) },
+                    onThemePresetSelected = { viewModel.setThemePreset(it) },
+                    onDynamicColorChanged = { viewModel.setDynamicColorEnabled(it) },
+                    backgroundImagePath = backgroundImagePath,
+                    backgroundAlpha = backgroundAlpha,
+                    chatBackgroundImagePath = chatBackgroundImagePath,
+                    chatBackgroundAlpha = chatBackgroundAlpha,
+                    chatTextScale = chatTextScale,
+                    onChatTextScaleChanged = { viewModel.setChatTextScale(it) },
+                    userChatBubbleStyle = userChatBubbleStyle,
+                    assistantChatBubbleStyle = assistantChatBubbleStyle,
+                    onUserChatBubbleStyleChanged = viewModel::setUserChatBubbleStyle,
+                    onAssistantChatBubbleStyleChanged = viewModel::setAssistantChatBubbleStyle,
+                    onOpenGlobalBackground = { showBackgroundSheet = true },
+                    onOpenChatBackground = { showChatBackgroundSheet = true }
                 )
                 SettingsSection.Providers -> ProvidersSection(
                     providers = providers,
@@ -1017,6 +1061,11 @@ fun SettingsScreen(
                         androidx.hilt.navigation.compose.hiltViewModel()
                     val promptsState by promptsViewModel.state.collectAsStateWithLifecycle()
                     LaunchedEffect(Unit) { promptsViewModel.refresh() }
+                    LaunchedEffect(promptsViewModel) {
+                        promptsViewModel.errors.collect { resource ->
+                            android.widget.Toast.makeText(context, resource, android.widget.Toast.LENGTH_LONG).show()
+                        }
+                    }
                     PromptsSection(
                         state = promptsState,
                         selection = selectionFor(SettingsSection.Prompts),
@@ -1028,7 +1077,8 @@ fun SettingsScreen(
                         onDeleteFragment = promptsViewModel::deleteFragment,
                         onReorder = promptsViewModel::reorderFragments,
                         onToggleBuiltinDisabled = promptsViewModel::setBuiltinDisabled,
-                        onBatchDeleteFragments = promptsViewModel::deleteFragments
+                        onBatchDeleteFragments = promptsViewModel::deleteFragments,
+                        onToggleFragment = promptsViewModel::setFragmentEnabled
                     )
                     if (showResetPrompts) {
                         AlertDialog(
@@ -1164,8 +1214,6 @@ fun SettingsScreen(
                     projectName = currentProjectName,
                     projectRules = projectRules,
                     globalRules = globalRules,
-                    disableSafetyInterception = disableSafetyInterception,
-                    onToggleSafetyInterception = { viewModel.setDisableSafetyInterception(it) },
                     onDeleteProject = { viewModel.deleteProjectRule(it) },
                     onPromote = { viewModel.promoteRuleToGlobal(it) },
                     onDeleteGlobal = { viewModel.deleteGlobalRule(it) }
@@ -1178,7 +1226,11 @@ fun SettingsScreen(
                         shizukuState = shizukuState,
                         onRequestShizukuPermission = { shizukuViewModel.requestPermission() },
                         onOpenShizuku = { shizukuViewModel.openShizukuApp() },
-                        onRefreshShizuku = { shizukuViewModel.refresh() }
+                        onRefreshShizuku = { shizukuViewModel.refresh() },
+                        rootEnabled = rootAccessState.enabled,
+                        rootChanging = rootAccessChanging,
+                        rootError = rootAccessError,
+                        onSetRootEnabled = viewModel::setRootAccessEnabled
                     )
                 }
                 SettingsSection.BackgroundRun -> BackgroundRunSection(
@@ -1204,6 +1256,7 @@ fun SettingsScreen(
                     onClearFilters = { viewModel.clearTokenStatsFilters() }
                 )
                 SettingsSection.Storage -> storageViewModel?.let { StorageSectionHost(viewModel = it) }
+                SettingsSection.Memory, SettingsSection.ProjectProgress -> Unit
                 SettingsSection.ProviderEditor -> {} // 已在上方 early return 处理
                 SettingsSection.SkillEditor -> {} // 已在上方 early return 处理
                 SettingsSection.SubAgentEditor -> {} // 已在上方 early return 处理
@@ -1338,18 +1391,6 @@ fun SettingsScreen(
         )
     }
 
-    if (showThemeSheet) {
-        ThemeSelectionSheet(
-            selected = themeMode,
-            selectedPresetId = themePresetId,
-            dynamicColorEnabled = dynamicColorEnabled,
-            onSelected = { viewModel.setThemeMode(it) },
-            onPresetSelected = { viewModel.setThemePreset(it) },
-            onDynamicColorChanged = { viewModel.setDynamicColorEnabled(it) },
-            onDismiss = { showThemeSheet = false }
-        )
-    }
-
     if (showTerminalSettingsSheet) {
         TerminalSettingsSheet(
             settings = terminalSettings,
@@ -1368,7 +1409,22 @@ fun SettingsScreen(
             onPickImage = { viewModel.setBackgroundImage(it) },
             onAlphaChange = { viewModel.setBackgroundAlpha(it) },
             onRemove = { viewModel.clearBackgroundImage() },
-            onDismiss = { showBackgroundSheet = false }
+            onDismiss = { showBackgroundSheet = false },
+            titleRes = R.string.settings_global_background
+        )
+    }
+
+    if (showChatBackgroundSheet) {
+        BackgroundImageSheet(
+            imagePath = chatBackgroundImagePath,
+            alpha = chatBackgroundAlpha,
+            onPickImage = { viewModel.setChatBackgroundImage(it) },
+            onAlphaChange = { viewModel.setChatBackgroundAlpha(it) },
+            onRemove = { viewModel.clearChatBackground() },
+            onDismiss = { showChatBackgroundSheet = false },
+            titleRes = R.string.settings_chat_background,
+            alphaMax = BackgroundSettingsRepository.MAX_CHAT_ALPHA,
+            hintRes = R.string.settings_chat_background_hint
         )
     }
 
@@ -1631,11 +1687,7 @@ internal fun SettingsMenu(
     dynamicColorEnabled: Boolean,
     terminalSettings: TerminalSettings,
     currentLanguageDisplayName: String,
-    backgroundImagePath: String?,
-    backgroundAlpha: Float,
-    onOpenThemeSheet: () -> Unit,
     onOpenTerminalSettingsSheet: () -> Unit,
-    onOpenBackgroundSheet: () -> Unit,
     onOpenLanguageSheet: () -> Unit,
     onOpenManual: () -> Unit,
     onRerunOnboarding: () -> Unit,
@@ -1660,8 +1712,8 @@ internal fun SettingsMenu(
             SettingsDivider()
             SettingsRow(
                 icon = FeatherIcons.Moon,
-                title = stringResource(R.string.settings_theme_title),
-                onClick = onOpenThemeSheet,
+                title = stringResource(SettingsSection.Appearance.titleRes),
+                onClick = { onOpen(SettingsSection.Appearance) },
                 trailing = {
                     val colorLabel = if (dynamicColorEnabled && isDynamicColorSupported) {
                         stringResource(R.string.theme_dynamic_color)
@@ -1683,20 +1735,6 @@ internal fun SettingsMenu(
                 trailing = {
                     Text(
                         text = stringResource(terminalSettings.theme.nameRes),
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.semanticColors.subtleText
-                    )
-                }
-            )
-            SettingsDivider()
-            SettingsRow(
-                icon = FeatherIcons.Image,
-                title = stringResource(R.string.settings_background_image),
-                onClick = onOpenBackgroundSheet,
-                trailing = {
-                    Text(
-                        text = if (backgroundImagePath != null) "${BackgroundSettingsRepository.alphaToSlider(backgroundAlpha).toInt()}%"
-                        else stringResource(R.string.settings_background_image_none),
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.semanticColors.subtleText
                     )
@@ -1743,6 +1781,12 @@ internal fun SettingsMenu(
                 icon = FeatherIcons.Book,
                 title = stringResource(SettingsSection.Skills.titleRes),
                 onClick = { onOpen(SettingsSection.Skills) }
+            )
+            SettingsDivider()
+            SettingsRow(
+                icon = FeatherIcons.BookOpen,
+                title = stringResource(SettingsSection.Memory.titleRes),
+                onClick = { onOpen(SettingsSection.Memory) }
             )
             SettingsDivider()
             SettingsRow(

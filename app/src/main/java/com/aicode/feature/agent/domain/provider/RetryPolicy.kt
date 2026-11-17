@@ -46,7 +46,8 @@ private const val NETWORK_WAIT_TIMEOUT_MS = 30_000L
  */
 const val FIRST_BYTE_TIMEOUT_MS = 300_000L
 
-class FirstContentGuard {
+class FirstContentGuard(private val nanoTime: () -> Long = System::nanoTime) {
+    private var requestStartedAtNanos: Long? = null
     @Volatile private var close: (() -> Unit)? = null
     @Volatile private var cancelCall: (() -> Unit)? = null
     private var received = false
@@ -62,8 +63,11 @@ class FirstContentGuard {
     suspend fun awaitBody(call: retrofit2.Call<okhttp3.ResponseBody>): okhttp3.ResponseBody {
         cancelCall = { call.cancel() }
         if (closed) call.cancel()
+        requestStartedAtNanos = nanoTime()
         return call.await()
     }
+
+    fun requestDurationMillis(): Long? = requestStartedAtNanos?.let { (nanoTime() - it) / 1_000_000L }
 
     fun receivedContent() {
         synchronized(this) {

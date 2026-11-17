@@ -167,6 +167,8 @@ internal class ResponsesStreamAccumulator {
     private val budget = StreamBudget()
     private var thinkingBlocksSnapshotJson: String? = null
     private val calls = LinkedHashMap<String, CallAcc>()
+    private val callAliases = mutableMapOf<String, String>()
+    private val previews = ToolArgumentsPreview()
     /** 流中 output_item.done 里到达的图片，按 item id 去重。 */
     private val images = LinkedHashMap<String, AgentImage>()
     /** 终止事件里兜底解析出的图片（流中 delta 事件缺失时的补齐来源）。 */
@@ -279,6 +281,17 @@ internal class ResponsesStreamAccumulator {
         return null
     }
 
+    fun argumentPreviews(force: Boolean = false): List<AIStreamChunk.ToolCallArgumentsDelta> = buildList {
+        calls.values.forEach { acc ->
+            previews.update(acc.callId, acc.name, acc.args, force)?.let { add(it) }
+        }
+        if (terminated) finalCalls.forEach { call ->
+            if (calls.values.none { it.callId == call.id && it.name.isNotBlank() && it.args.isNotEmpty() }) {
+                previews.update(call.id, call.name, kotlinx.serialization.json.JsonObject(call.arguments).toString(), force)?.let { add(it) }
+            }
+        }
+    }
+
     fun toResponse(): AIResponse {
         val streamed = calls.values
             .filter { it.callId.isNotEmpty() || it.name.isNotEmpty() }
@@ -317,8 +330,15 @@ internal class ResponsesStreamAccumulator {
         finalImages.addAll(parsed.images)
     }
 
-    private fun JsonObject.callKey(): String =
-        str("output_index") ?: str("item_id") ?: "0"
+    private fun JsonObject.callKey(): String {
+        val keys = buildList {
+            str("output_index")?.let { add("index:$it") }
+            (str("item_id") ?: obj("item")?.str("id"))?.let { add("item:$it") }
+        }
+        val key = keys.firstNotNullOfOrNull { callAliases[it] } ?: keys.firstOrNull() ?: "index:0"
+        keys.forEach { callAliases[it] = key }
+        return key
+    }
 }
 
 private fun JsonObject.str(name: String): String? =

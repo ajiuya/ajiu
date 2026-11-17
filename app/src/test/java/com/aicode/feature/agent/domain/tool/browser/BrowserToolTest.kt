@@ -48,6 +48,20 @@ class BrowserToolTest {
     }
 
     @Test
+    fun modelSchemaDecoratesBrowserOverrideWithoutLosingActionsOrParameters() {
+        val original = tool.toJsonSchema()
+        val model = tool.toModelJsonSchema()
+        val originalProperties = original["properties"] as Map<*, *>
+        val properties = model["properties"] as Map<*, *>
+
+        assertEquals(listOf("tool_title") + originalProperties.keys, properties.keys.toList())
+        assertEquals(listOf("tool_title", "action"), model["required"])
+        assertSame(originalProperties["action"], properties["action"])
+        assertEquals(originalProperties, properties - "tool_title")
+        assertEquals(listOf("action"), original["required"])
+    }
+
+    @Test
     fun execute_timeout_returnsTimeout() = runTest {
         coEvery { browserManager.evaluateJavaScript("1 + 1", null) } coAnswers {
             withTimeout(1L) { awaitCancellation() }

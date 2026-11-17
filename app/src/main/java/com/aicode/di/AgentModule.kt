@@ -6,10 +6,12 @@ import androidx.room.Room
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 import com.aicode.feature.agent.data.local.dao.AgentMessageDao
+import com.aicode.feature.agent.data.local.dao.AgentRecoveryDao
 import com.aicode.feature.agent.data.local.dao.ChatSessionDao
 import com.aicode.feature.agent.data.local.dao.CheckpointDao
 import com.aicode.feature.agent.data.local.dao.LlmCallRecordDao
 import com.aicode.feature.agent.data.local.dao.TodoItemDao
+import com.aicode.feature.agent.data.local.dao.SubAgentInteractionDao
 import com.aicode.feature.backup.data.local.dao.BackupTargetDao
 import com.aicode.feature.settings.data.local.dao.AIProviderDao
 import com.aicode.feature.settings.domain.repository.AIProviderRepository
@@ -40,8 +42,13 @@ import com.aicode.feature.agent.domain.tool.container.TerminalSessionTool
 import com.aicode.feature.agent.domain.tool.explorer.ListFilesTool
 import com.aicode.feature.agent.domain.tool.explorer.SearchCodeTool
 import com.aicode.feature.agent.domain.tool.shizuku.ShizukuTool
+import com.aicode.feature.agent.domain.tool.root.RootTool
+import com.aicode.feature.agent.domain.root.RootCommandManager
+import com.aicode.feature.agent.domain.root.RootProcessFactory
+import com.aicode.feature.agent.domain.root.HostRootProcessFactory
 import com.aicode.feature.agent.domain.tool.skill.LoadSkillTool
 import com.aicode.feature.agent.domain.tool.question.AskUserQuestionTool
+import com.aicode.feature.agent.domain.tool.plan.SubmitPlanTool
 import com.aicode.feature.agent.domain.tool.todo.TodoTool
 import com.aicode.feature.agent.domain.tool.subagent.TaskTool
 import com.aicode.feature.agent.domain.tool.subagent.MessageParentTool
@@ -89,8 +96,6 @@ import com.aicode.feature.agent.domain.session.MessagePersistenceUseCase
 import com.aicode.feature.agent.domain.session.SessionUseCase
 import com.aicode.feature.agent.domain.tool.mcp.ManageMcpTool
 import com.aicode.feature.agent.domain.tool.memory.MemoryTool
-import com.aicode.feature.agent.domain.tool.mode.PlanApprovalManager
-import com.aicode.feature.agent.domain.tool.mode.PlanModeTool
 import com.aicode.feature.agent.domain.tool.goal.GoalStatusTool
 import com.aicode.feature.agent.domain.tool.search.WebFetchTool
 import com.aicode.feature.agent.domain.tool.search.WebSearchTool
@@ -134,6 +139,18 @@ object AgentModule {
 
     @Provides
     @Singleton
+    fun provideAgentRecoveryDao(database: AgentDatabase): AgentRecoveryDao {
+        return database.agentRecoveryDao()
+    }
+
+    @Provides
+    @Singleton
+    fun provideAgentNotificationDao(database: AgentDatabase): com.aicode.feature.agent.data.local.dao.AgentNotificationDao {
+        return database.agentNotificationDao()
+    }
+
+    @Provides
+    @Singleton
     fun provideChatSessionDao(database: AgentDatabase): ChatSessionDao {
         return database.chatSessionDao()
     }
@@ -166,6 +183,12 @@ object AgentModule {
     @Singleton
     fun provideBackupTargetDao(database: AgentDatabase): BackupTargetDao {
         return database.backupTargetDao()
+    }
+
+    @Provides
+    @Singleton
+    fun provideSubAgentInteractionDao(database: AgentDatabase): SubAgentInteractionDao {
+        return database.subAgentInteractionDao()
     }
 
     @Provides
@@ -353,6 +376,10 @@ object AgentModule {
 
     @Provides
     @Singleton
+    fun provideRootProcessFactory(impl: HostRootProcessFactory): RootProcessFactory = impl
+
+    @Provides
+    @Singleton
     fun provideToolRegistry(
         readFileTool: ReadFileTool,
         sendFileTool: SendFileTool,
@@ -362,15 +389,16 @@ object AgentModule {
         generateImageTool: GenerateImageTool,
         executeCommandTool: ExecuteCommandTool,
         shizukuTool: ShizukuTool,
+        rootTool: RootTool,
         terminalSessionTool: TerminalSessionTool,
         listFilesTool: ListFilesTool,
         searchCodeTool: SearchCodeTool,
         loadSkillTool: LoadSkillTool,
         askUserQuestionTool: AskUserQuestionTool,
+        submitPlanTool: SubmitPlanTool,
         manageMcpTool: ManageMcpTool,
         webSearchTool: WebSearchTool,
         webFetchTool: WebFetchTool,
-        planModeTool: PlanModeTool,
         goalStatusTool: GoalStatusTool,
         todoTool: TodoTool,
         memoryTool: MemoryTool,
@@ -387,15 +415,16 @@ object AgentModule {
             register("generateImage", generateImageTool)
             register("Bash", executeCommandTool)
             register("Shizuku", shizukuTool)
+            register("Root", rootTool)
             register("terminal", terminalSessionTool)
             register("list", listFilesTool)
             register("search", searchCodeTool)
             register("loadSkill", loadSkillTool)
             register("askUserQuestion", askUserQuestionTool)
+            register(SubmitPlanTool.NAME, submitPlanTool)
             register("manageMcp", manageMcpTool)
             register("websearch", webSearchTool)
             register("webfetch", webFetchTool)
-            register("planMode", planModeTool)
             register("goalStatus", goalStatusTool)
             register("todo", todoTool)
             register("memory", memoryTool)
@@ -421,7 +450,6 @@ object AgentModule {
         permissionManager: ToolPermissionManager,
         policyEngine: ToolPermissionPolicyEngine,
         contextCompactor: ContextCompactor,
-        planApprovalManager: PlanApprovalManager,
         toolOutputStore: ToolOutputStore,
         modelMetadataService: ModelMetadataService,
         compactionModelSettingsRepository: CompactionModelSettingsRepository,
@@ -436,7 +464,10 @@ object AgentModule {
         agentNotificationCenter: AgentNotificationCenter,
         eventInjector: AgentEventInjector,
         fileAccess: FileAccessProvider,
-        @ApplicationContext context: Context
+        @ApplicationContext context: Context,
+        rootCommandManager: RootCommandManager,
+        recoveryRepository: com.aicode.feature.agent.domain.recovery.RecoveryRepository,
+        workspaceExecutionContextFactory: com.aicode.feature.workspace.domain.WorkspaceExecutionContextFactory
     ): AgentWorkflow {
         return StatefulAgentWorkflow(
             toolRegistry,
@@ -448,7 +479,6 @@ object AgentModule {
             permissionManager,
             policyEngine,
             contextCompactor,
-            planApprovalManager,
             toolOutputStore,
             modelMetadataService,
             compactionModelSettingsRepository,
@@ -463,7 +493,10 @@ object AgentModule {
             agentNotificationCenter,
             eventInjector,
             fileAccess,
-            context
+            context,
+            rootCommandManager,
+            recoveryRepository,
+            workspaceExecutionContextFactory
         )
     }
 }

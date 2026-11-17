@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="keepalive_task_public_body">后台活动保护中，打开应用查看</string>
+    <string name="keepalive_task_summary">命令 %1$d · AI %2$d · 终端 %3$d</string>
+    <string name="keepalive_task_terminal_row">%1$s终端 %2$d · %3$s</string>
+    <string name="keepalive_task_agent_row">AI 会话 %1$d · %2$s</string>
+    <string name="keepalive_task_local">本地</string>
+    <string name="keepalive_task_ssh">SSH </string>
+    <string name="keepalive_task_command_running">命令运行中</string>
+    <string name="keepalive_task_terminal_idle">终端已连接</string>
+    <string name="keepalive_task_agent_running">AI 正在运行</string>
+    <string name="keepalive_task_completed_title">已完成</string>
+    <string name="keepalive_task_completed_body">本轮已完成，打开应用查看结果</string>
+    <string name="keepalive_task_failed_title">任务失败</string>
+    <string name="keepalive_task_failed_body">本轮有任务失败，打开应用查看详情</string>
+    <string name="keepalive_task_ended_title">已结束</string>
+    <string name="keepalive_task_ended_body">本轮已结束，结果尚未确认，请打开应用查看</string>
+    <string name="keepalive_task_action_running">运行中</string>
+    <string name="keepalive_task_action_thinking">思考中</string>
+    <string name="keepalive_task_action_editing">修改文件</string>
+    <string name="keepalive_task_action_reading">读取文件</string>
+    <string name="keepalive_task_action_image">查看图片</string>
+    <string name="keepalive_task_action_search">搜索中</string>
+    <string name="keepalive_task_action_browser">浏览网页</string>
+    <string name="keepalive_task_action_command">执行命令</string>
+    <string name="keepalive_task_action_question">等待回答</string>
+    <string name="keepalive_task_action_generate">生成图片</string>
+    <string name="keepalive_task_action_todo">更新待办</string>
+    <string name="keepalive_task_action_subagent">子任务</string>
+    <string name="keepalive_task_action_memory">读取记忆</string>
+    <string name="keepalive_task_action_tool">调用工具</string>
+    <string name="keepalive_task_action_context">压缩上下文</string>
+    <string name="keepalive_task_action_approval">等待审批</string>
+</resources>

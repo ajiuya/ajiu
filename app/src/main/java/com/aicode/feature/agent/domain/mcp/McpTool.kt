@@ -67,7 +67,6 @@ class McpTool(
         descriptor.description ?: "MCP 工具 ${descriptor.name}（来自 ${client.serverName}）"
     override val capabilities = setOf(ToolCapability.EXTERNAL_TOOL)
 
-    // 所有 MCP 工具统一走工具权限：默认需审核，可「始终允许」记忆（见 ToolPermissionPolicyEngine）。
     override val permissionPolicy = ToolPermissionPolicy.ASK
 
     // MCP 工具直接用原始 schema，不走 parameters 这条路；保留空 map 满足基类契约。

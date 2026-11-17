@@ -4,6 +4,7 @@ import android.content.Context
 import com.aicode.R
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.aicode.core.datastore.preferencesCorruptionHandler
@@ -34,11 +35,18 @@ enum class AppThemeMode(val labelRes: Int) {
 class ThemeSettingsRepository @Inject constructor(
     @param:ApplicationContext private val context: Context
 ) {
-    private companion object {
-        val THEME_MODE_KEY = stringPreferencesKey("theme_mode")
-        val DARK_THEME_KEY = booleanPreferencesKey("dark_theme_enabled")
-        val THEME_PRESET_KEY = stringPreferencesKey("theme_preset_id")
-        val DYNAMIC_COLOR_KEY = booleanPreferencesKey("dynamic_color_enabled")
+    companion object {
+        const val DEFAULT_CHAT_TEXT_SCALE = 1f
+        const val MIN_CHAT_TEXT_SCALE = 0.8f
+        const val MAX_CHAT_TEXT_SCALE = 1.4f
+        private val THEME_MODE_KEY = stringPreferencesKey("theme_mode")
+        private val DARK_THEME_KEY = booleanPreferencesKey("dark_theme_enabled")
+        private val THEME_PRESET_KEY = stringPreferencesKey("theme_preset_id")
+        private val DYNAMIC_COLOR_KEY = booleanPreferencesKey("dynamic_color_enabled")
+        private val CHAT_TEXT_SCALE_KEY = floatPreferencesKey("chat_text_scale")
+
+        internal fun clampChatTextScale(value: Float): Float =
+            if (value.isNaN()) DEFAULT_CHAT_TEXT_SCALE else value.coerceIn(MIN_CHAT_TEXT_SCALE, MAX_CHAT_TEXT_SCALE)
     }
 
     val themeModeFlow: Flow<AppThemeMode> = context.themeDataStore.data.map { prefs ->
@@ -53,6 +61,16 @@ class ThemeSettingsRepository @Inject constructor(
     /** 是否启用系统莫奈取色。开启后配色主题的选择不再生效。 */
     val dynamicColorFlow: Flow<Boolean> =
         context.themeDataStore.data.map { it[DYNAMIC_COLOR_KEY] == true }
+
+    val chatTextScaleFlow: Flow<Float> = context.themeDataStore.data.map {
+        clampChatTextScale(it[CHAT_TEXT_SCALE_KEY] ?: DEFAULT_CHAT_TEXT_SCALE)
+    }
+
+    suspend fun setChatTextScale(value: Float) {
+        context.themeDataStore.edit { it[CHAT_TEXT_SCALE_KEY] = clampChatTextScale(value) }
+    }
+
+    suspend fun chatTextScaleSnapshot(): Float = chatTextScaleFlow.first()
 
     suspend fun setThemeMode(mode: AppThemeMode) {
         context.themeDataStore.edit { it[THEME_MODE_KEY] = mode.name }

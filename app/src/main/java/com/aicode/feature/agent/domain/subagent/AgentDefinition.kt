@@ -1,7 +1,5 @@
 package com.aicode.feature.agent.domain.subagent
 
-import com.aicode.feature.agent.domain.model.AgentMode
-
 /** 子代理定义的来源作用域：全局（跨项目共享）或项目级（仅当前工作区生效，可 git 追踪）。 */
 enum class AgentDefinitionScope { GLOBAL, PROJECT }
 
@@ -50,7 +48,6 @@ enum class InjectPart(val token: String) {
  * @param providerId 绑定的 provider id；null 表示继承父会话
  * @param model 绑定的模型名；null 表示继承父会话
  * @param reasoningEffort 思考强度（low/medium/high）；null 表示继承父会话
- * @param mode 运行模式（build/plan/auto）；null 表示继承父会话
  * @param allowedTools 工具白名单；空表示继承全量工具
  * @param disallowedTools 工具黑名单，先于白名单生效
  * @param inject 要注入的提示词片段
@@ -63,7 +60,6 @@ data class AgentDefinition(
     val providerId: String? = null,
     val model: String? = null,
     val reasoningEffort: String? = null,
-    val mode: AgentMode? = null,
     val allowedTools: List<String> = emptyList(),
     val disallowedTools: List<String> = emptyList(),
     val inject: Set<InjectPart> = DEFAULT_INJECT,
@@ -92,39 +88,11 @@ data class AgentDefinition(
     private fun isDenied(toolName: String): Boolean =
         disallowedTools.any { matches(it, toolName) }
 
-    /**
-     * 该定义派出的子代理实际生效的运行模式（与 SessionUseCase.resolveChildMode 同规则）：
-     * 默认继承父会话；定义自带 [mode] 时只能往更严的方向收、不能放大。
-     * 返回 null 表示两边都没给出（极罕见的无模式上下文）。
-     */
-    fun effectiveMode(parentMode: AgentMode?): AgentMode? = when {
-        mode != null && parentMode != null -> mode.limitedBy(parentMode)
-        else -> mode ?: parentMode
+    /** 派发前给主代理看的能力摘要（读 / 写 / 命令三个维度）。 */
+    fun capabilitySummary(): String {
+        fun flag(group: Set<String>): String = if (group.any { allowsTool(it) }) "是" else "否"
+        return "文件读取 ${flag(READ_TOOLS)} · 文件修改 ${flag(WRITE_TOOLS)} · 执行命令 ${flag(EXEC_TOOLS)}"
     }
-
-    /**
-     * 派发前给主代理看的能力摘要（读 / 写 / 命令三个维度）。
-     *
-     * 主代理看不到子代理的工具集，容易把修改任务派给只读子代理、让没有 Shell 的子代理跑验证命令，
-     * 白跑一整轮才发现。摘要随「可用子代理」清单注入，判定与 [filterToolNames] 同源。
-     *
-     * @param parentMode 父会话模式。判定用 [effectiveMode]：不仅父会话是 PLAN 时写与命令显示
-     *   「否（PLAN 只读）」，定义钉死 `mode: plan`（即便父会话是 BUILD）同样如此——子代理
-     *   实际跑在只读边界，定义里配了写工具也会被策略引擎拦截，不提前说清就会派错活。
-     */
-    fun capabilitySummary(parentMode: AgentMode? = null): String {
-        val planReadOnly = effectiveMode(parentMode) == AgentMode.PLAN
-        fun flag(group: Set<String>, blockedByMode: Boolean = false): String = when {
-            blockedByMode && planReadOnly -> "否（PLAN 只读）"
-            group.any { allowsTool(it) } -> "是"
-            else -> "否"
-        }
-        return "文件读取 ${flag(READ_TOOLS)} · 文件修改 ${flag(WRITE_TOOLS, blockedByMode = true)}" +
-            " · 执行命令 ${flag(EXEC_TOOLS, blockedByMode = true)}"
-    }
-
-    /** 该定义（不叠加模式约束）是否具备写文件或执行命令的能力。 */
-    fun canModifyOrExecute(): Boolean = (WRITE_TOOLS + EXEC_TOOLS).any { allowsTool(it) }
 
     private fun matches(pattern: String, toolName: String): Boolean {
         val p = pattern.trim()
@@ -150,7 +118,7 @@ data class AgentDefinition(
 
         /**
          * [capabilitySummary] 的能力分组：新增同类工具时补进对应组，摘要才不会漏判。
-         * browser 归入写组：浏览器自动化（点击/填表）在 PLAN 下同样被拦截。
+         * browser 归入写组：浏览器自动化会修改页面状态。
          * MCP 动态工具（`mcp__*`）性质未知，不归组——定义绑定 MCP 时以描述文本为准。
          */
         private val READ_TOOLS = setOf("readFile", "list", "search", "viewImage")
@@ -172,7 +140,6 @@ data class AgentDefinitionForm(
     val providerId: String? = null,
     val model: String? = null,
     val reasoningEffort: String? = null,
-    val mode: AgentMode? = null,
     val allowedTools: List<String> = emptyList(),
     val disallowedTools: List<String> = emptyList(),
     val inject: Set<InjectPart> = AgentDefinition.DEFAULT_INJECT,

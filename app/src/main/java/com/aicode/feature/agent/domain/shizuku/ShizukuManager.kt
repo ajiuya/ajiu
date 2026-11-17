@@ -9,6 +9,7 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.IBinder
+import com.aicode.R
 import com.aicode.core.util.FileLogger
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CompletableDeferred
@@ -34,6 +35,8 @@ enum class ShizukuState {
 
     /** 服务运行中，但本应用尚未获得授权。 */
     PERMISSION_DENIED,
+
+    SHELL_REQUIRED,
 
     /** 就绪，可执行命令。 */
     READY
@@ -170,6 +173,7 @@ class ShizukuManager @Inject constructor(
         if (runCatching { Shizuku.pingBinder() }.getOrDefault(false)) {
             // pre-v11 无 UserService，等同不可用。
             if (runCatching { Shizuku.isPreV11() }.getOrDefault(false)) return ShizukuState.NOT_RUNNING
+            if (runCatching { Shizuku.getUid() }.getOrNull() != 2000) return ShizukuState.SHELL_REQUIRED
             val granted = runCatching {
                 Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
             }.getOrDefault(false)
@@ -227,7 +231,13 @@ class ShizukuManager @Inject constructor(
         val service = ensureBound()
         val timeout = timeoutMs.coerceIn(1_000L, MAX_TIMEOUT_MS).toInt()
         return withContext(Dispatchers.IO) {
+            requireShellIdentity()
             val bundle = service.exec(command, timeout)
+            if (bundle.getInt(ShizukuShellService.KEY_EXIT_CODE) == ShizukuShellService.EXIT_SHELL_REQUIRED) {
+                shellService = null
+                _state.value = ShizukuState.SHELL_REQUIRED
+                throw IllegalStateException(context.getString(R.string.shizuku_shell_required))
+            }
             ShizukuCommandResult(
                 output = bundle.getString(ShizukuShellService.KEY_OUTPUT).orEmpty(),
                 exitCode = bundle.getInt(ShizukuShellService.KEY_EXIT_CODE, ShizukuShellService.EXIT_FAILURE)
@@ -235,10 +245,20 @@ class ShizukuManager @Inject constructor(
         }
     }
 
+    private fun requireShellIdentity() {
+        if (runCatching { Shizuku.getUid() }.getOrNull() != 2000) {
+            shellService = null
+            refreshState()
+            throw IllegalStateException(context.getString(R.string.shizuku_shell_required))
+        }
+    }
+
     /** 幂等绑定 UserService，返回可用的 AIDL 代理。 */
     private suspend fun ensureBound(): IShizukuShellService {
+        requireShellIdentity()
         shellService?.let { return it }
         return bindMutex.withLock {
+            requireShellIdentity()
             shellService?.let { return@withLock it }
             if (computeState() != ShizukuState.READY) {
                 throw IllegalStateException("Shizuku 未就绪（${_state.value}）")

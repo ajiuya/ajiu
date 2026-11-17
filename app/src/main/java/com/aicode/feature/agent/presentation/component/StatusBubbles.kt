@@ -63,6 +63,7 @@ import androidx.compose.ui.unit.dp
 import com.aicode.R
 import com.aicode.core.theme.Brand
 import com.aicode.core.theme.Spacing
+import com.aicode.feature.agent.presentation.preview.UiWorkEffect
 import com.aicode.feature.agent.domain.provider.RetryErrorInfo
 import com.aicode.feature.agent.domain.provider.RetryErrorKind
 import compose.icons.FeatherIcons
@@ -71,6 +72,7 @@ import com.aicode.core.ui.ExpandableChevronIcon
 import compose.icons.feathericons.Clock
 import compose.icons.feathericons.Key
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 
 /** 涟漪高光一个来回的周期（ms）。 */
 private const val RIPPLE_PERIOD_MS = 1600
@@ -104,6 +106,7 @@ internal fun Modifier.rippleHighlight(
     bandRatio: Float = RIPPLE_BAND_RATIO,
     periodMs: Int = RIPPLE_PERIOD_MS
 ): Modifier {
+    if (!chatUiWorkActive()) return this
     val transition = rememberInfiniteTransition(label = "ripple-highlight")
     val progress by transition.animateFloat(
         initialValue = 0f,
@@ -212,9 +215,9 @@ internal fun ThinkingBubble(label: String) {
 
 /** 上下文压缩期间的临时状态行，不落库。 */
 @Composable
-internal fun CompactionProgressBubble() {
+internal fun CompactionProgressBubble(percent: Int) {
     AgentBusyIndicator(
-        label = stringResource(R.string.chat_compressing_context),
+        label = stringResource(R.string.chat_compressing_context_progress, percent),
         modifier = Modifier
             .fillMaxWidth()
             .heightIn(min = ChatStyle.toolRowMinHeight),
@@ -326,68 +329,63 @@ private const val STREAMING_RENDER_DEBOUNCE_MS = 120L
 @Composable
 private fun rememberThrottledStreamingText(text: String): String {
     var renderText by remember { mutableStateOf(text) }
-    LaunchedEffect(text) {
-        if (renderText == text) return@LaunchedEffect
+    UiWorkEffect(text) {
+        if (renderText == text) return@UiWorkEffect
         delay(STREAMING_RENDER_DEBOUNCE_MS)
         if (renderText != text) renderText = text
     }
     return renderText
 }
 
-/** 打字机最低显示速率（字符/秒）：上游停顿时仍匀速追赶，保证能看到结尾。 */
-private const val TYPEWRITER_MIN_RATE = 30f
-
-/** 常规显示速率上限（字符/秒）：滞后在 [TYPEWRITER_LAG_TARGET] 以内时的天花板。 */
-private const val TYPEWRITER_MAX_RATE = 220f
-
-/** 滞后超标后的应急速率上限（字符/秒）：允许突破常规上限，把积压迅速吃掉。 */
-private const val TYPEWRITER_BURST_RATE = 1600f
-
-/** 显示速率 = 上游速率 × 该系数：略小于 1，保留「始终慢半拍」的滞后感。 */
-private const val TYPEWRITER_FOLLOW_RATIO = 0.95f
-
-/**
- * 允许的滞后（字符）：显示最多落在上游这么多字之后。
- *
- * 超过它就不再受 [TYPEWRITER_MAX_RATE] 约束。这条上限是「结束瞬间别抽搐」的关键——
- * 上游结束时要补的永远是最后这一小段，而不是攒了几百字的整段。
- */
-private const val TYPEWRITER_LAG_TARGET = 12f
-
-/** 追赶时间常数（秒）：滞后按该节奏收敛，越小追得越紧。 */
-private const val TYPEWRITER_SETTLE_SECONDS = 0.06f
-
-/**
- * 上游结束后把剩余文字打完的目标时长（秒）。
- *
- * 结束后不再一帧补全（那正是「突然跳到结尾」的来源），而是按「剩余 ÷ 该时长」匀速打完：
- * 既不会瞬移，也不会拖到用户以为卡住。常见剩余量（十几字）约 0.2 秒打完。
- */
-private const val TYPEWRITER_DRAIN_SECONDS = 0.2f
-
-/** 收尾阶段的显示速率上限（字符/秒）：剩余很多时也不至于一闪而过。 */
-private const val TYPEWRITER_DRAIN_MAX_RATE = 400f
-
-/** 收尾硬上限（ms）：极端情况（文本被整体替换、渲染跟不上）也必须在这之内追平。 */
-private const val TYPEWRITER_DRAIN_HARD_MS = 600L
-
-/** 上游吐字速率估算的滑动窗口时长（ms）。 */
-private const val TYPEWRITER_RATE_WINDOW_MS = 500L
-
-/** 打字机渲染节流间隔（ms）：~40fps 高频平滑快照，彻底消除低速模型的顿挫感。 */
 private const val TYPEWRITER_RENDER_INTERVAL_MS = 24L
 
-/** 按码点数量截断字符串，避免把 emoji 等代理对截成孤立的半个字符。 */
-private fun truncateToCodePoints(text: String, codePoints: Int): String {
+internal fun typewriterCodePointCount(text: String): Int {
+    val end = text.length - if (text.lastOrNull()?.isHighSurrogate() == true) 1 else 0
+    return text.codePointCount(0, end)
+}
+
+internal fun truncateToCodePoints(text: String, codePoints: Int): String {
     if (codePoints <= 0) return ""
-    if (codePoints >= text.codePointCount(0, text.length)) return text
-    var index = 0
-    var count = 0
-    while (index < text.length && count < codePoints) {
-        index += Character.charCount(text.codePointAt(index))
-        count++
+    val count = minOf(codePoints, typewriterCodePointCount(text))
+    return text.substring(0, text.offsetByCodePoints(0, count))
+}
+
+internal class TypewriterCursor(initialText: String) {
+    private var source = initialText
+    private var availableEnd = source.length - if (source.lastOrNull()?.isHighSurrogate() == true) 1 else 0
+    var availableCodePoints = source.codePointCount(0, availableEnd)
+        private set
+    private var renderedCodePoints = availableCodePoints
+    private var renderedEnd = availableEnd
+    private var snapshot = if (availableEnd == source.length) source else source.substring(0, availableEnd)
+
+    fun update(text: String): Boolean {
+        if (text === source) return false
+        val continues = text.startsWith(source)
+        val end = text.length - if (text.lastOrNull()?.isHighSurrogate() == true) 1 else 0
+        if (continues) {
+            availableCodePoints += text.codePointCount(availableEnd, end)
+        } else {
+            availableCodePoints = text.codePointCount(0, end)
+            renderedCodePoints = 0
+            renderedEnd = 0
+            snapshot = ""
+        }
+        source = text
+        availableEnd = end
+        return !continues
     }
-    return text.substring(0, index)
+
+    fun render(codePoints: Int): String {
+        val target = codePoints.coerceIn(0, availableCodePoints)
+        if (target == renderedCodePoints) return snapshot
+        val start = if (target < renderedCodePoints) 0 else renderedEnd
+        val count = if (target < renderedCodePoints) target else target - renderedCodePoints
+        renderedEnd = source.offsetByCodePoints(start, count)
+        renderedCodePoints = target
+        snapshot = if (renderedEnd == source.length) source else source.substring(0, renderedEnd)
+        return snapshot
+    }
 }
 
 /** 延续判据的前缀采样上限（字符）：只存指纹不存全文，避免大段流式文本进 saveable。 */
@@ -409,176 +407,106 @@ internal fun isStreamContinuation(text: String, seenChars: Int, seenHead: Int): 
     return text.take(minOf(seenChars, CONTINUITY_HEAD_CHARS)).hashCode() == seenHead
 }
 
-/**
- * 打字机单帧显示速率（码点/秒）。[lag] = 上游已到字数 − 已显示字数，[arrivalRate] 为滑窗估算的
- * 上游吐字速率，[drainRate] 非空表示上游已结束的收尾阶段（按该恒定速率匀速打完剩余）。
- *
- * 播出阶段取两者较大值：
- * - 跟随项 = 上游速率 × [TYPEWRITER_FOLLOW_RATIO]（略慢于上游，保留「慢半拍」的观感）；
- * - 追赶项 = 滞后 ÷ [TYPEWRITER_SETTLE_SECONDS]（滞后越大追得越快）。
- *
- * 常规上限 [TYPEWRITER_MAX_RATE] 只在滞后未超标时生效：滞后一旦超过 [TYPEWRITER_LAG_TARGET]
- * 就放宽到 [TYPEWRITER_BURST_RATE]。这条规则是「结束时别抽搐」的关键——旧实现把速率死封在
- * 200 字符/秒，模型吐得快或爆发式吐字时滞后只增不减（稳态约 1.8×上游速率，动辄上百字），
- * 上游一结束整段一次跳出，看起来就是突然抽搐一下。现在滞后被压在十几字以内，
- * 收尾阶段再按 [TYPEWRITER_DRAIN_SECONDS] 匀速把这一小段打完，不会瞬移。
- */
-internal fun typewriterRate(lag: Float, arrivalRate: Float, drainRate: Float? = null): Float {
-    if (lag <= 0f) return 0f
-    if (drainRate != null) {
-        return drainRate.coerceIn(TYPEWRITER_MIN_RATE, TYPEWRITER_BURST_RATE)
-    }
-    val followRate = arrivalRate * TYPEWRITER_FOLLOW_RATIO
-    val catchUpRate = lag / TYPEWRITER_SETTLE_SECONDS
-    val ceiling = if (lag > TYPEWRITER_LAG_TARGET) TYPEWRITER_BURST_RATE else TYPEWRITER_MAX_RATE
-    return maxOf(followRate, catchUpRate).coerceIn(TYPEWRITER_MIN_RATE, ceiling)
-}
+internal fun typewriterRate(lag: Float, charsPerSecond: Int = 30): Float =
+    if (lag <= 0f) 0f else charsPerSecond.coerceIn(10, 120).toFloat()
 
-/**
- * 收尾速率（码点/秒）：把 [lag] 个剩余码点在 [TYPEWRITER_DRAIN_SECONDS] 内匀速打完。
- *
- * 取「按剩余量摊到目标时长」而不是「固定倍数追赶」，保证收尾时间是常数级（约 0.2 秒）：
- * 剩余十几字看得清是打字，剩余几百字也不会一格一格磨到用户以为卡住。
- */
-internal fun typewriterDrainRate(lag: Float): Float =
-    (lag / TYPEWRITER_DRAIN_SECONDS).coerceIn(TYPEWRITER_MIN_RATE, TYPEWRITER_DRAIN_MAX_RATE)
+internal fun typewriterDrainRate(lag: Float, charsPerSecond: Int = 30): Float =
+    typewriterRate(lag, charsPerSecond)
+
+internal fun advanceTypewriter(
+    shownCodePoints: Double,
+    availableCodePoints: Int,
+    elapsedNanos: Long,
+    charsPerSecond: Int = 30,
+): Double {
+    val rate = typewriterRate((availableCodePoints - shownCodePoints).toFloat(), charsPerSecond)
+    return (shownCodePoints + rate.toDouble() * elapsedNanos.coerceAtLeast(0L) / 1_000_000_000.0)
+        .coerceAtMost(availableCodePoints.toDouble())
+}
 
 /** 打字机当前渲染结果：[text] 为应渲染文本（上游全文的前缀），[settled] 表示是否已追平全文。 */
 internal data class TypewriterText(val text: String, val settled: Boolean)
 
 /**
- * 速率自适应打字机：显示文本滞后于上游累积文本，打字速度跟随模型吐字速度。
- *
- * 上游每个 delta 都携带完整累积文本，到达节奏即模型吐字节奏。此处维护两个进度：
- * 到达进度（[text] 的码点数）与显示进度（已展示的码点数）。显示进度由动画帧驱动，速率见
- * [typewriterRate]：滞后被压在 [TYPEWRITER_LAG_TARGET] 附近，不会越积越多。
- *
- * 渲染文本每 [TYPEWRITER_RENDER_INTERVAL_MS] 快照一次（throttle 而非 debounce，
- * 保证打字期间渲染持续可见增长），把 md 解析频率压在 ~10fps；text 突变（换会话 /
- * 新一轮 / 重试）时补全为当前全文，之后继续跟着 delta 打字。
- *
- * 上游结束（[active] 变 false）**不再一帧补全**：剩余那一小段按 [typewriterDrainRate] 匀速
- * 打完（约 0.2 秒，硬上限 [TYPEWRITER_DRAIN_HARD_MS] 兜底），期间 [TypewriterText.settled]
- * 保持 false，调用方据此把这段文字的渲染交棒给刚落库的助手消息（见 AIChatPanel），
- * 打完后再让落库消息完全接管——用户看不到「整段突然跳出」，也看不到同一段文字重复两份。
- *
- * 调用方应在 LazyColumn 之外持有本状态，避免尾巴 item 滚出视口被 dispose 后
- * 重新组合导致打字进度丢失。切页（chat 整棵子树离开 NavHost 组合）无法靠持有位置规避，
- * 由内部 saveable 进度承接。
+ * 按码点限速的 UI 播放；上游结束不改变速率。调用方在 LazyColumn 外持有，落库后继续以
+ * [TypewriterText.settled] 判定交棒。saveable 只存长度与指纹，不保存整段正文。
  */
 @Composable
 internal fun rememberTypewriterStreamingText(
     text: String,
     active: Boolean,
-    /**
-     * 文本所属会话。切到另一个正在输出的会话时，它已产出的部分是既成事实，必须直接补全显示——
-     * 本函数的状态挂在调用点上，会话切换并不会让它重建，不显式区分就会被下面的「换轮」
-     * 判定当成新一轮，把那段内容当着用户的面再逐字打一遍。
-     */
-    sessionKey: String? = null
+    sessionKey: String? = null,
+    charsPerSecond: Int = 30,
+    initialText: String = text,
+    revealImmediately: Boolean = false,
+    workActive: Boolean = chatUiWorkActive(),
 ): TypewriterText {
-    // 已渲染文本的长度与前缀指纹进 saveable：切页返回后据此延续打字进度，避免已输出的
-    // 正文从头重打。校验不通过（期间换过轮或换过会话）时补全为当前全文而不是从头打字：
-    // 挂载这一刻才第一次看到的文本对用户就是历史，重打一遍只会让人以为模型在重复输出。
-    var shownChars by rememberSaveable { mutableStateOf(0) }
-    var shownHead by rememberSaveable { mutableStateOf(0) }
-    val restored = remember {
-        if (isStreamContinuation(text, shownChars, shownHead)) text.substring(0, shownChars) else text
-    }
-    var shownCodePoints by remember {
-        mutableStateOf(restored.codePointCount(0, restored.length).toFloat())
-    }
-    var renderText by remember { mutableStateOf(restored) }
-    // 上游到达事件窗口：(帧时间戳, 累计码点数)，用于估算吐字速率
-    val arrivals = remember { ArrayDeque<Pair<Long, Int>>() }
-    var lastArrivalNanos by remember { mutableStateOf(0L) }
-    var lastText by remember { mutableStateOf(restored) }
-    var lastSessionKey by remember { mutableStateOf(sessionKey) }
-    // 渲染文本与其 saveable 指纹必须同步更新，否则恢复时会拿指纹去校验另一段文本
-    val commitRender: (String) -> Unit = { snapshot ->
-        renderText = snapshot
-        shownChars = snapshot.length
-        shownHead = streamHeadFingerprint(snapshot)
-    }
-
-    LaunchedEffect(text, active, sessionKey) {
-        // 文本不是当前进度的延续（换会话 / 新一轮 / 重试）：补全到当前全文，再跟着后续 delta 打字。
-        // 不能归零重打——切到另一个正在输出的会话时，它已产出的几百字会当着用户的面再来一遍。
-        // 换会话必须单独判：currentSessionId 与 streamingText 未必同一帧到达，只靠前缀判定
-        // 会漏掉先到的那一帧（那一帧文本还是旧会话的，看不出突变）。
-        // 新一轮开头也走这条路径，但那时 text 只有第一个 delta 的几个字，补全与重打视觉上无差别。
-        val sessionChanged = sessionKey != lastSessionKey
-        lastSessionKey = sessionKey
-        if (sessionChanged || (lastText.isNotEmpty() && !text.startsWith(lastText))) {
-            shownCodePoints = text.codePointCount(0, text.length).toFloat()
-            commitRender(text)
-            arrivals.clear()
-            lastArrivalNanos = 0L
-        }
-        lastText = text
-
-        // 上游结束进入收尾阶段：不再一帧补全（那正是「结束瞬间抽搐一下」的来源），
-        // 剩余那点字按恒定速率匀速打完。此时 text 不会再变，收尾期间本协程不会被打断。
-        val draining = !active
-        val now = System.nanoTime()
-        val codePoints = text.codePointCount(0, text.length)
-        // 收尾速率按「进入收尾时的剩余量」定，保证收尾时长恒定、且能精确打完（不残留小数）
-        val drainRate = if (draining) {
-            typewriterDrainRate((codePoints - shownCodePoints).coerceAtLeast(0f))
+    var shownChars by rememberSaveable(sessionKey) { mutableStateOf(initialText.length) }
+    var shownHead by rememberSaveable(sessionKey) { mutableStateOf(streamHeadFingerprint(initialText)) }
+    val restored = remember(sessionKey) {
+        val prefix = if (isStreamContinuation(text, shownChars, shownHead)) {
+            text.substring(0, shownChars)
         } else {
-            null
+            initialText.takeIf { text.startsWith(it) }.orEmpty()
         }
-        val drainDeadlineNanos = now + TYPEWRITER_DRAIN_HARD_MS * 1_000_000L
-        if (!draining) {
-            // 记录本次到达事件，裁剪速率窗口（保留最近 WINDOW 内至少 2 条）
-            if (lastArrivalNanos != 0L) {
-                arrivals.addLast(now to codePoints)
-                val windowNanos = TYPEWRITER_RATE_WINDOW_MS * 1_000_000L
-                while (arrivals.size > 2 && now - arrivals.first().first > windowNanos) {
-                    arrivals.removeFirst()
-                }
-            }
-            lastArrivalNanos = now
-        }
+        truncateToCodePoints(prefix, typewriterCodePointCount(prefix))
+    }
+    var renderText by remember(sessionKey) { mutableStateOf(restored) }
+    val latestInput by rememberUpdatedState(TypewriterInput(text, active, charsPerSecond, revealImmediately, workActive))
 
-        // 帧驱动推进显示进度，追平本次文本即退出（text 再变化时本协程被取消重启）
-        var lastRenderNanos = 0L
+    LaunchedEffect(sessionKey) {
+        val cursor = TypewriterCursor(restored)
+        var shownCodePoints = cursor.availableCodePoints.toDouble()
         var lastFrameNanos = 0L
-        while (shownCodePoints < codePoints) {
+        var lastRenderNanos = 0L
+        fun commitRender(snapshot: String) {
+            if (snapshot === renderText) return
+            renderText = snapshot
+            shownChars = snapshot.length
+            shownHead = streamHeadFingerprint(snapshot)
+        }
+        while (true) {
+            val input = latestInput
+            if (!input.workActive) {
+                val resumed = androidx.compose.runtime.snapshotFlow { latestInput }.first { it.workActive }
+                cursor.update(resumed.text)
+                shownCodePoints = cursor.availableCodePoints.toDouble()
+                commitRender(cursor.render(cursor.availableCodePoints))
+                lastFrameNanos = 0L
+                lastRenderNanos = 0L
+                continue
+            }
+            if (cursor.update(input.text)) {
+                shownCodePoints = 0.0
+                lastFrameNanos = 0L
+                lastRenderNanos = 0L
+                commitRender("")
+            }
+            val available = cursor.availableCodePoints
+            if (input.revealImmediately) shownCodePoints = available.toDouble()
+            if (shownCodePoints >= available) {
+                commitRender(cursor.render(available))
+                // 追平期间不积攒时间额度，后来的突发文本不能花掉空闲时间瞬间显示。
+                androidx.compose.runtime.snapshotFlow { latestInput }.first { it != input }
+                lastFrameNanos = 0L
+                continue
+            }
             withFrameNanos { frameNanos ->
+                if (!latestInput.workActive) {
+                    lastFrameNanos = 0L
+                    lastRenderNanos = 0L
+                    return@withFrameNanos
+                }
                 if (lastFrameNanos != 0L) {
-                    val dtSec = (frameNanos - lastFrameNanos) / 1_000_000_000f
-                    // 播出阶段才需要估算上游速率：收尾阶段上游已经不动了
-                    var arrivalRate = 0f
-                    if (!draining) {
-                        val oldest = arrivals.firstOrNull()
-                        if (arrivals.size >= 2 && oldest != null) {
-                            val spanSec = (frameNanos - oldest.first) / 1_000_000_000f
-                            if (spanSec > 0f) {
-                                arrivalRate = (arrivals.last().second - oldest.second) / spanSec
-                            }
-                        }
-                    }
-                    val rate = typewriterRate(
-                        lag = codePoints - shownCodePoints,
-                        arrivalRate = arrivalRate,
-                        drainRate = drainRate
+                    shownCodePoints = advanceTypewriter(
+                        shownCodePoints, available, frameNanos - lastFrameNanos, latestInput.charsPerSecond
                     )
-                    shownCodePoints = (shownCodePoints + rate * dtSec)
-                        .coerceAtMost(codePoints.toFloat())
                 }
                 lastFrameNanos = frameNanos
-
-                // 收尾硬上限：极端情况（文本被整体替换、渲染跟不上）也必须在这之内追平，
-                // 否则尾巴会一直挂在未追平状态，落库消息永远等不到交棒。
-                if (draining && frameNanos >= drainDeadlineNanos) {
-                    shownCodePoints = codePoints.toFloat()
-                }
-
-                // 渲染节流：到间隔就快照当前显示进度；追平瞬间强制渲染完整文本
-                val intervalNanos = TYPEWRITER_RENDER_INTERVAL_MS * 1_000_000L
-                if (frameNanos - lastRenderNanos >= intervalNanos || shownCodePoints >= codePoints) {
-                    val snapshot = truncateToCodePoints(text, shownCodePoints.toInt())
+                if (frameNanos - lastRenderNanos >= TYPEWRITER_RENDER_INTERVAL_MS * 1_000_000L ||
+                    shownCodePoints >= available
+                ) {
+                    val snapshot = cursor.render(shownCodePoints.toInt())
                     if (snapshot != renderText) {
                         lastRenderNanos = frameNanos
                         commitRender(snapshot)
@@ -586,35 +514,32 @@ internal fun rememberTypewriterStreamingText(
                 }
             }
         }
-        // 追平后确保渲染完整文本（while 退出时 shownCodePoints 已到 available）
-        if (renderText != text) commitRender(text)
     }
-    // settled 直接由「渲染文本是否已等于上游全文」给出：收尾期间调用方据此决定渲染归属
     return TypewriterText(text = renderText, settled = renderText == text)
 }
+
+private data class TypewriterInput(
+    val text: String,
+    val active: Boolean,
+    val charsPerSecond: Int,
+    val revealImmediately: Boolean,
+    val workActive: Boolean,
+)
 
 /**
  * 模型流式吐字时的实时气泡：左对齐、与助手气泡同款。
  * 尾部带三个跳动的点表示仍在生成。本轮结束后由落库的助手气泡接管。
  *
  * 流式阶段以打字机效果渲染（打字进度由调用方经
- * [rememberTypewriterStreamingText] 驱动，见 [AIChatPanel]），打字速度随模型吐字
- * 速度自适应，上游结束时自动补全为完整文本，与落库消息无缝接力。
+ * [rememberTypewriterStreamingText] 驱动，见 [AIChatPanel]），落库后继续按所选速率播放尾文。
  */
 @Composable
 internal fun StreamingBubble(
     text: String,
     cache: MarkdownRenderCache? = null
 ) {
-    val renderText = text
-    // 与落库助手正文同构：不套容器，直接铺在页面底色上，底部挂「生成中」的点
     Column(modifier = Modifier.fillMaxWidth()) {
-        MarkdownContent(
-            text = renderText,
-            color = MaterialTheme.colorScheme.onSurface,
-            modifier = Modifier.fillMaxWidth(),
-            cache = cache
-        )
+        AssistantMessageBubble(text = text, cache = cache)
         Spacer(Modifier.height(Spacing.xs))
         TypingDots(color = MaterialTheme.colorScheme.primary, dotSize = 5.dp)
     }
@@ -691,8 +616,8 @@ internal fun ReasoningBubble(
     var timerSeenHead by rememberSaveable { mutableStateOf(0) }
     var elapsedMillis by remember { mutableStateOf(0L) }
     val latestText by rememberUpdatedState(text)
-    LaunchedEffect(showTimer, live, sessionKey, timerStartMs) {
-        if (!showTimer || !live) return@LaunchedEffect
+    UiWorkEffect(showTimer, live, sessionKey, timerStartMs) {
+        if (!showTimer || !live) return@UiWorkEffect
         if (timerStartMs != null) {
             timerStartMillis = timerStartMs
         } else if (!isStreamContinuation(latestText, timerSeenChars, timerSeenHead)) {
@@ -793,7 +718,8 @@ internal fun TypingDots(
     /** 是否单独给读屏播报「正在生成」：嵌在 [AgentBusyIndicator] 里时由外层状态行统一播报。 */
     announce: Boolean = true
 ) {
-    val transition = rememberInfiniteTransition(label = "typing-dots")
+    val animate = chatUiWorkActive()
+    val transition = if (animate) rememberInfiniteTransition(label = "typing-dots") else null
     val label = stringResource(R.string.chat_status_generating)
     Row(
         verticalAlignment = Alignment.CenterVertically,
@@ -805,7 +731,7 @@ internal fun TypingDots(
             )
     ) {
         repeat(3) { index ->
-            val offsetY by transition.animateFloat(
+            val offsetY = transition?.animateFloat(
                 initialValue = 0f,
                 targetValue = 0f,
                 animationSpec = infiniteRepeatable(
@@ -823,7 +749,7 @@ internal fun TypingDots(
             )
             Box(
                 modifier = Modifier
-                    .graphicsLayer { translationY = offsetY }
+                    .graphicsLayer { translationY = offsetY?.value ?: 0f }
                     .size(dotSize)
                     .clip(CircleShape)
                     .background(color)

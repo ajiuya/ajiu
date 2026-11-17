@@ -29,7 +29,6 @@ import com.aicode.feature.agent.domain.mcp.McpServerEntry
 import com.aicode.feature.agent.domain.mcp.McpServerStatus
 import com.aicode.feature.agent.domain.mcp.McpToolDescriptor
 import com.aicode.feature.agent.domain.mcp.auth.McpOAuthCancelledException
-import com.aicode.feature.agent.domain.model.AgentMode
 import com.aicode.feature.agent.domain.permission.PermissionRule
 import com.aicode.feature.agent.domain.permission.PermissionRulesRepository
 import com.aicode.feature.agent.domain.skill.SkillConfigRepository
@@ -86,8 +85,9 @@ import com.aicode.feature.settings.data.repository.ProxySettingsRepository
 import com.aicode.feature.settings.data.repository.ScreenOnSettingsRepository
 import com.aicode.feature.settings.data.repository.StartupSessionMode
 import com.aicode.feature.settings.data.repository.ThemeSettingsRepository
-import com.aicode.feature.settings.data.repository.ToolSafetySettingsRepository
 import com.aicode.feature.settings.data.repository.BackgroundSettingsRepository
+import com.aicode.feature.settings.data.repository.ChatBubbleSettingsRepository
+import com.aicode.feature.settings.data.repository.ChatBubbleStyle
 import com.aicode.feature.settings.data.repository.ImageGenModelSettingsRepository
 import com.aicode.feature.settings.data.repository.VisionModelSettingsRepository
 import com.aicode.feature.workspace.domain.model.RemoteConnection
@@ -103,6 +103,9 @@ import com.aicode.feature.settings.domain.service.ProviderDashboardRunner
 import com.aicode.feature.settings.domain.model.ProviderType
 import com.aicode.feature.settings.domain.model.ProxyType
 import com.aicode.R
+import com.aicode.feature.agent.domain.root.RootCommandManager
+import com.aicode.feature.agent.domain.tool.ToolPermissionManager
+import com.aicode.feature.settings.data.repository.RootAccessSettingsRepository
 import com.aicode.feature.settings.domain.repository.AIProviderRepository
 import com.aicode.feature.terminal.data.repository.TerminalSettings
 import com.aicode.feature.terminal.data.repository.TerminalSettingsRepository
@@ -118,6 +121,7 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -294,7 +298,6 @@ data class SubAgentUiEntry(
     val providerId: String?,
     val model: String?,
     val reasoningEffort: String?,
-    val mode: AgentMode?,
     val allowedTools: List<String>,
     val disallowedTools: List<String>,
     val inject: Set<InjectPart>,
@@ -360,6 +363,7 @@ class SettingsViewModel @Inject constructor(
     private val modelMetadataService: ModelMetadataService,
     private val logSettingsRepository: LogSettingsRepository,
     private val themeSettingsRepository: ThemeSettingsRepository,
+    private val chatBubbleSettingsRepository: ChatBubbleSettingsRepository,
     private val backgroundSettingsRepository: BackgroundSettingsRepository,
     private val keepaliveSettingsRepository: KeepaliveSettingsRepository,
     private val screenOnSettingsRepository: ScreenOnSettingsRepository,
@@ -367,11 +371,13 @@ class SettingsViewModel @Inject constructor(
     private val liveNotificationSettingsRepository: LiveNotificationSettingsRepository,
     private val approvalNotificationSettingsRepository: ApprovalNotificationSettingsRepository,
     private val generalSettingsRepository: GeneralSettingsRepository,
+    private val rootAccessSettingsRepository: RootAccessSettingsRepository,
+    private val rootCommandManager: RootCommandManager,
+    private val toolPermissionManager: ToolPermissionManager,
     private val languageSettingsRepository: LanguageSettingsRepository,
     private val mcpConfigRepository: McpConfigRepository,
     private val mcpManager: McpManager,
     private val permissionRulesRepository: PermissionRulesRepository,
-    private val toolSafetySettingsRepository: ToolSafetySettingsRepository,
     private val skillRepository: SkillRepository,
     private val agentDefinitionRepository: AgentDefinitionRepository,
     private val agentDefinitionConfigRepository: AgentDefinitionConfigRepository,
@@ -587,6 +593,13 @@ class SettingsViewModel @Inject constructor(
 
     private val _enterToSend = MutableStateFlow(false)
     val enterToSend: StateFlow<Boolean> = _enterToSend.asStateFlow()
+    val typewriterCharsPerSecond: StateFlow<Int> = generalSettingsRepository.typewriterCharsPerSecondFlow
+        .stateIn(viewModelScope, SharingStarted.Eagerly, GeneralSettingsRepository.DEFAULT_TYPEWRITER_CHARS_PER_SECOND)
+    val rootAccessState = rootAccessSettingsRepository.state
+    private val _rootAccessChanging = MutableStateFlow(false)
+    val rootAccessChanging: StateFlow<Boolean> = _rootAccessChanging.asStateFlow()
+    private val _rootAccessError = MutableStateFlow<String?>(null)
+    val rootAccessError: StateFlow<String?> = _rootAccessError.asStateFlow()
 
     private val _compactionThresholdPercent = MutableStateFlow(85)
     val compactionThresholdPercent: StateFlow<Int> = _compactionThresholdPercent.asStateFlow()
@@ -622,6 +635,23 @@ class SettingsViewModel @Inject constructor(
 
     /** 透明度落盘的节流 job，见 [setBackgroundAlpha]。 */
     private var backgroundAlphaWriteJob: Job? = null
+
+    val chatBackgroundImagePath: StateFlow<String?> = backgroundSettingsRepository.chatImagePathFlow
+        .stateIn(viewModelScope, SharingStarted.Eagerly, null)
+
+    val chatBackgroundAlpha: StateFlow<Float> = backgroundSettingsRepository.chatAlphaFlow
+        .stateIn(viewModelScope, SharingStarted.Eagerly, BackgroundSettingsRepository.DEFAULT_CHAT_ALPHA)
+
+    val chatTextScale: StateFlow<Float> = themeSettingsRepository.chatTextScaleFlow
+        .stateIn(viewModelScope, SharingStarted.Eagerly, ThemeSettingsRepository.DEFAULT_CHAT_TEXT_SCALE)
+
+    val userChatBubbleStyle: StateFlow<ChatBubbleStyle> = chatBubbleSettingsRepository.userStyleFlow
+        .stateIn(viewModelScope, SharingStarted.Eagerly, ChatBubbleStyle.ORIGINAL)
+
+    val assistantChatBubbleStyle: StateFlow<ChatBubbleStyle> = chatBubbleSettingsRepository.assistantStyleFlow
+        .stateIn(viewModelScope, SharingStarted.Eagerly, ChatBubbleStyle.DOCUMENT)
+
+    private var chatBackgroundAlphaWriteJob: Job? = null
 
     /** 用户选择的应用语言 tag（null 表示跟随系统）。 */
     private val _languageTag = MutableStateFlow<String?>(null)
@@ -698,9 +728,6 @@ class SettingsViewModel @Inject constructor(
 
     val currentProjectName: StateFlow<String?> = permissionRulesRepository.currentProjectNameFlow
         .stateIn(viewModelScope, SharingStarted.Eagerly, null)
-
-    private val _disableSafetyInterception = MutableStateFlow(false)
-    val disableSafetyInterception: StateFlow<Boolean> = _disableSafetyInterception.asStateFlow()
 
     private val _activeProfileId = MutableStateFlow(ContainerProfile.BUILTIN_ID)
     val activeProfileId: StateFlow<String> = _activeProfileId.asStateFlow()
@@ -1138,12 +1165,6 @@ class SettingsViewModel @Inject constructor(
             launch {
                 permissionRulesRepository.currentProjectRulesFlow.collectLatest {
                     _projectRules.value = it
-                }
-            }
-
-            launch {
-                toolSafetySettingsRepository.disableSafetyInterceptionFlow.collectLatest {
-                    _disableSafetyInterception.value = it
                 }
             }
 
@@ -1669,7 +1690,6 @@ class SettingsViewModel @Inject constructor(
                         providerId = entry.definition.providerId,
                         model = entry.definition.model,
                         reasoningEffort = entry.definition.reasoningEffort,
-                        mode = entry.definition.mode,
                         allowedTools = entry.definition.allowedTools,
                         disallowedTools = entry.definition.disallowedTools,
                         inject = entry.definition.inject,
@@ -2144,6 +2164,28 @@ class SettingsViewModel @Inject constructor(
         }
     }
 
+    fun setTypewriterCharsPerSecond(value: Int) {
+        viewModelScope.launch { generalSettingsRepository.setTypewriterCharsPerSecond(value) }
+    }
+
+    fun setRootAccessEnabled(enabled: Boolean) {
+        if (_rootAccessChanging.value) return
+        _rootAccessChanging.value = true
+        _rootAccessError.value = null
+        if (!enabled) toolPermissionManager.rejectForTool("Root")
+        viewModelScope.launch {
+            try {
+                rootCommandManager.setEnabled(enabled)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                _rootAccessError.value = context.getString(R.string.root_access_update_failed)
+            } finally {
+                _rootAccessChanging.value = false
+            }
+        }
+    }
+
     /** 回车键是否直接发送消息。 */
     fun setEnterToSend(enabled: Boolean) {
         viewModelScope.launch {
@@ -2230,6 +2272,40 @@ class SettingsViewModel @Inject constructor(
             delay(BACKGROUND_ALPHA_WRITE_DEBOUNCE_MS)
             backgroundSettingsRepository.setBackgroundAlpha(alpha)
         }
+    }
+
+    fun setChatBackgroundImage(uri: Uri) {
+        viewModelScope.launch {
+            backgroundSettingsRepository.setChatBackgroundImage(uri)
+        }
+    }
+
+    fun clearChatBackground() {
+        viewModelScope.launch {
+            backgroundSettingsRepository.clearChatBackground()
+        }
+    }
+
+    fun setChatBackgroundAlpha(alpha: Float) {
+        chatBackgroundAlphaWriteJob?.cancel()
+        chatBackgroundAlphaWriteJob = viewModelScope.launch {
+            delay(BACKGROUND_ALPHA_WRITE_DEBOUNCE_MS)
+            backgroundSettingsRepository.setChatBackgroundAlpha(alpha)
+        }
+    }
+
+    fun setChatTextScale(value: Float) {
+        viewModelScope.launch {
+            themeSettingsRepository.setChatTextScale(value)
+        }
+    }
+
+    fun setUserChatBubbleStyle(style: ChatBubbleStyle) {
+        viewModelScope.launch { chatBubbleSettingsRepository.setUserStyle(style) }
+    }
+
+    fun setAssistantChatBubbleStyle(style: ChatBubbleStyle) {
+        viewModelScope.launch { chatBubbleSettingsRepository.setAssistantStyle(style) }
     }
 
     /** 设置应用语言；tag 为空字符串或 null 表示跟随系统。 */
@@ -2933,10 +3009,6 @@ class SettingsViewModel @Inject constructor(
     fun promoteRuleToGlobal(rule: PermissionRule) {
         val name = currentProjectName.value ?: return
         viewModelScope.launch { permissionRulesRepository.promoteToGlobal(name, rule) }
-    }
-
-    fun setDisableSafetyInterception(disabled: Boolean) {
-        viewModelScope.launch { toolSafetySettingsRepository.setDisableSafetyInterception(disabled) }
     }
 }
 

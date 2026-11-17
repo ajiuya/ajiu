@@ -11,14 +11,13 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
@@ -56,13 +55,21 @@ import com.mikepenz.markdown.m3.markdownTypography
 import com.mikepenz.markdown.model.markdownAnimations
 import com.mikepenz.markdown.model.markdownDimens
 import com.mikepenz.markdown.model.markdownPadding
-import com.mikepenz.markdown.model.rememberMarkdownState
 import com.mikepenz.markdown.model.State as MarkdownParseState
 import dev.snipme.highlights.Highlights
 import dev.snipme.highlights.model.BoldHighlight
 import dev.snipme.highlights.model.ColorHighlight
 import dev.snipme.highlights.model.SyntaxLanguage
 import dev.snipme.highlights.model.SyntaxThemes
+import dev.snipme.highlights.model.SyntaxTheme
+import com.aicode.core.ui.KeyedDeferredCache
+import com.aicode.feature.agent.presentation.preview.UiWorkEffect
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import androidx.compose.runtime.rememberUpdatedState
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -70,55 +77,52 @@ import kotlinx.coroutines.withContext
 // 内置 JetBrains Mono NL 经资源加载可走系统 fallback，能显示 ₀-₉ 等下标/上标字符。
 private val CodeFontFamily = FontFamily(Font(R.font.jetbrains_mono_nl))
 
-internal class MarkdownRenderCache(
-    private val maxEntries: Int = 80
-) {
-    private val parsedStates = object : LinkedHashMap<String, MarkdownParseState.Success>(
-        maxEntries,
-        0.75f,
-        true
-    ) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, MarkdownParseState.Success>?): Boolean {
-            return size > maxEntries
-        }
-    }
-
-    fun get(text: String): MarkdownParseState.Success? =
-        parsedStates[text] ?: parsedStates[text.trim()]
-
-    /**
-     * 在缓存中寻找是 [text] 前缀的最长解析态。
-     * 流式转落库交接瞬间，全文可能比上一帧打字机内容多出尾部字符，直接拿最长前缀 AST 兜底，
-     * 确保首帧以排版好的 Markdown 呈现，彻底消灭裸纯文本（- **xxx**）闪现。
-     */
-    fun getBestPrefix(text: String): MarkdownParseState.Success? {
-        val exact = get(text)
-        if (exact != null) return exact
-        var bestMatch: MarkdownParseState.Success? = null
-        var bestLength = 0
-        for ((key, value) in parsedStates) {
-            if (key.length in (bestLength + 1)..text.length && text.startsWith(key)) {
-                bestMatch = value
-                bestLength = key.length
-            }
-        }
-        return bestMatch
-    }
-
-    fun put(state: MarkdownParseState.Success) {
-        parsedStates[state.content] = state
-        val trimmed = state.content.trim()
-        if (trimmed != state.content) {
-            parsedStates[trimmed] = state
-        }
-    }
-}
-
 internal fun formatTokenCount(tokens: Long): String = when {
     tokens >= 1_000_000_000L -> "%.1fB".format(tokens / 1_000_000_000.0)
     tokens >= 1_000_000L -> "%.1fM".format(tokens / 1_000_000.0)
     tokens >= 1_000L -> "%.1fk".format(tokens / 1_000.0)
     else -> tokens.toString()
+}
+
+internal data class MarkdownPreparation(val content: PreparedMarkdown? = null, val failed: Boolean = false)
+
+@Composable
+internal fun rememberMarkdownPreparation(
+    text: String,
+    cache: MarkdownRenderCache,
+    textSizePx: Float,
+    colorArgb: Int,
+    dispatcher: CoroutineDispatcher = Dispatchers.Default,
+    prepare: suspend (String, PreparedMarkdown?) -> MarkdownPreparation = { raw, previous ->
+        val processed = MarkdownPreprocessor.resolve(raw)
+        when (val parsed = cache.resolve(processed)) {
+            is MarkdownParseState.Success -> {
+                val resources = LatexCache.prepare(parsed.content, textSizePx, colorArgb, previous)
+                MarkdownPreparation(PreparedMarkdown(raw, parsed, resources.layouts, resources.bitmaps, textSizePx, colorArgb))
+            }
+            else -> MarkdownPreparation(failed = parsed is MarkdownParseState.Error)
+        }
+    },
+): MarkdownPreparation {
+    val latestText by rememberUpdatedState(text)
+    val latestPrepare by rememberUpdatedState(prepare)
+    var result by remember(cache, textSizePx, colorArgb) {
+        mutableStateOf(MarkdownPreparation(cache.displayedPrefix(text, textSizePx, colorArgb)))
+    }
+    UiWorkEffect(cache, textSizePx, colorArgb, dispatcher) {
+        // 允许在途前缀完成；逐字取消会让慢排版在持续流中无法发布。
+        snapshotFlow { latestText }.collect { raw ->
+            val previous = result.content?.takeIf { raw.startsWith(it.raw) }
+            val prepareInput = latestPrepare
+            val prepared = withContext(dispatcher) { prepareInput(raw, previous) }
+            currentCoroutineContext().ensureActive()
+            if (latestText.startsWith(raw)) {
+                prepared.content?.let(cache::rememberDisplayed)
+                result = prepared.copy(content = prepared.content ?: previous)
+            }
+        }
+    }
+    return result.copy(content = result.content?.takeIf { text.startsWith(it.raw) })
 }
 
 @Composable
@@ -128,11 +132,12 @@ internal fun MarkdownContent(
     modifier: Modifier = Modifier,
     cache: MarkdownRenderCache? = null,
     compact: Boolean = false,
-    /** 解析未完成（Loading）时显示的内容；为 null 时回退显示原文纯文本（聊天流式场景）。 */
+    /** 首版排版准备期间的占位；更新期间继续显示上一版完整 Markdown。 */
     loading: (@Composable () -> Unit)? = null,
     /** 长文本虚拟化渲染：正文改用 LazyColumn 逐块渲染（调用方需配合 heightIn 等有限高度约束
      *  才能触发懒加载），避免超大 md 一次性全量组合/测量造成的卡顿。 */
-    lazyScroll: Boolean = false
+    lazyScroll: Boolean = false,
+    onRendered: ((String) -> Unit)? = null,
 ) {
     val isDark = MaterialTheme.colorScheme.background.luminance() < 0.5f
     val semantic = MaterialTheme.semanticColors
@@ -150,22 +155,23 @@ internal fun MarkdownContent(
 
     val typography = MaterialTheme.typography
     // compact：正文、列表用 bodySmall，标题降一档，用于思考气泡等次要文本区域
-    val body = if (compact) typography.bodySmall else typography.bodyMedium
-    val bodyLineHeight = if (compact) 18.sp else 20.sp
-    val codeSize = if (compact) 12.sp else 13.sp
+    val scale = LocalChatTextScale.current
+    val body = (if (compact) typography.bodySmall else typography.bodyMedium).scaledForChat(scale)
+    val bodyLineHeight = (if (compact) 18.sp else 20.sp) * scale
+    val codeSize = (if (compact) 12.sp else 13.sp) * scale
     val mdTypography = markdownTypography(
-        h1 = (if (compact) typography.titleMedium else typography.headlineSmall).copy(fontWeight = FontWeight.Bold, color = color),
-        h2 = (if (compact) typography.titleSmall else typography.titleLarge).copy(fontWeight = FontWeight.Bold, color = color),
-        h3 = (if (compact) typography.bodyLarge else typography.titleMedium).copy(fontWeight = FontWeight.SemiBold, color = color),
-        h4 = (if (compact) typography.bodyMedium else typography.titleSmall).copy(fontWeight = FontWeight.SemiBold, color = color),
-        h5 = (if (compact) typography.bodySmall else typography.bodyLarge).copy(fontWeight = FontWeight.Medium, color = color),
-        h6 = (if (compact) typography.bodySmall else typography.bodyMedium).copy(fontWeight = FontWeight.Medium, color = color),
+        h1 = (if (compact) typography.titleMedium else typography.headlineSmall).scaledForChat(scale).copy(fontWeight = FontWeight.Bold, color = color),
+        h2 = (if (compact) typography.titleSmall else typography.titleLarge).scaledForChat(scale).copy(fontWeight = FontWeight.Bold, color = color),
+        h3 = (if (compact) typography.bodyLarge else typography.titleMedium).scaledForChat(scale).copy(fontWeight = FontWeight.SemiBold, color = color),
+        h4 = (if (compact) typography.bodyMedium else typography.titleSmall).scaledForChat(scale).copy(fontWeight = FontWeight.SemiBold, color = color),
+        h5 = (if (compact) typography.bodySmall else typography.bodyLarge).scaledForChat(scale).copy(fontWeight = FontWeight.Medium, color = color),
+        h6 = (if (compact) typography.bodySmall else typography.bodyMedium).scaledForChat(scale).copy(fontWeight = FontWeight.Medium, color = color),
         paragraph = body.copy(color = color, lineHeight = bodyLineHeight),
         code = TextStyle(fontFamily = CodeFontFamily, fontSize = codeSize, color = MaterialTheme.colorScheme.onSurface),
-        inlineCode = TextStyle(fontFamily = CodeFontFamily, color = MaterialTheme.colorScheme.onSurface),
+        inlineCode = TextStyle(fontFamily = CodeFontFamily, fontSize = body.fontSize, color = MaterialTheme.colorScheme.onSurface),
         ordered = body.copy(color = color, lineHeight = bodyLineHeight),
         bullet = body.copy(color = color, lineHeight = bodyLineHeight),
-        table = typography.bodySmall.copy(color = color),
+        table = typography.bodySmall.scaledForChat(scale).copy(color = color),
     )
 
     val mdPadding = markdownPadding(
@@ -182,67 +188,26 @@ internal fun MarkdownContent(
         tableCornerSize = 6.dp,
     )
 
-    val highlightsBuilder = remember(isDark) {
-        Highlights.Builder().theme(SyntaxThemes.atom(darkMode = isDark))
-    }
-
-    val processed = remember(text) { MarkdownPreprocessor.process(text) }
+    val highlightTheme = remember(isDark) { SyntaxThemes.atom(darkMode = isDark) }
+    val renderCache = cache ?: remember { MarkdownRenderCache() }
     val baseTransformer = LocalMarkdownImageTransformer.current
-    val mathTransformer = remember(baseTransformer, body.fontSize.value) {
-        MathImageTransformer(baseTransformer, body.fontSize.value)
-    }
-
-    // 后台预热本条消息里的所有 LaTeX 公式：在 item 首次组合时就把 measure+render 摆到后台算好
-    // 写缓存，等快速 fling 掠过时主线程 getOrMeasure 直接命中、不再同步 build drawable（实测单
-    // 次高达 113ms，是 fling 抽搐的直接根因）。
     val density = LocalDensity.current
     val textSizePx = with(density) { body.fontSize.toPx() }
     val colorArgb = color.toArgb()
-    LaunchedEffect(processed, textSizePx, colorArgb) {
-        if (!processed.contains("aicode-math-")) return@LaunchedEffect
-        withContext(Dispatchers.Default) {
-            MathImageTransformer.prewarm(processed, textSizePx, colorArgb)
-        }
+    val preparation = rememberMarkdownPreparation(text, renderCache, textSizePx, colorArgb)
+    val prepared = preparation.content
+    val parseFailed = preparation.failed
+    val mathTransformer = remember(baseTransformer, prepared) {
+        MathImageTransformer(baseTransformer, prepared?.layouts.orEmpty(), prepared?.bitmaps.orEmpty())
     }
 
     androidx.compose.runtime.CompositionLocalProvider(
         androidx.compose.material3.LocalContentColor provides color
     ) {
-        // rememberMarkdownState 必须无条件参与组合：若缓存命中就走 if 分支跳过它，其内部
-        // remember 状态会被 dispose；下一帧文本变化（流式增长/停顿后恢复）缓存 miss 重建时
-        // 初始状态是 Loading，会闪现原始 md 文本（解析/未解析反复横跳的根因）。
-        // 缓存只作为渲染加速：解析结果与当前文本一致时直接用；不一致但缓存命中当前文本时
-        // 用缓存；否则进入 Loading。注意：本库 rememberMarkdownState 在文本变化时会把
-        // state 无条件置为 Loading（retainState 参数在此版本不生效），Loading 分支若回退
-        // 显示原文纯文本，流式场景下每次文本变化都会闪现「最新文本的裸文本」（底部字在闪）。
-        // 因此 Loading 期间优先渲染最近一次成功解析的结果（旧文本的完整 md 排版），解析
-        // 完成后再平滑切到新文本，内容只增不跳。
-        val mdState = rememberMarkdownState(content = processed, retainState = true)
-        val parseState by mdState.state.collectAsState()
-        val cachedState = cache?.get(processed)
-        val prefixFallback = cache?.getBestPrefix(processed)
-        // 委托属性不能智能转换，先取局部快照再判断
-        val currentState = parseState
-        val parsedState: MarkdownParseState = when {
-            currentState is MarkdownParseState.Success && currentState.content == processed -> currentState
-            cachedState != null -> cachedState
-            else -> currentState
-        }
-
-        // 最近一次成功解析的结果：Loading 期间的渲染兜底（初始首帧即用前缀缓存，杜绝纯文本裸奔）
-        var lastSuccessState by remember { mutableStateOf<MarkdownParseState.Success?>(prefixFallback) }
-        if (parsedState is MarkdownParseState.Success) {
-            lastSuccessState = parsedState
-            // 同步写入缓存：让同轮次接力的落库消息首帧即可命中，避免 LaunchedEffect 异步延迟导致的裸纯文本闪烁
-            cache?.put(parsedState)
-        }
-
-        // Success 渲染当前结果；Loading 优先渲染本组件或前缀缓存的成功结果（杜绝裸纯文本闪现）；Error 回退原文
-        val renderState: MarkdownParseState.Success? = when (parsedState) {
-            is MarkdownParseState.Success -> parsedState
-            is MarkdownParseState.Loading -> lastSuccessState ?: prefixFallback
-            is MarkdownParseState.Error -> null
-        }
+        val renderState = prepared?.state
+        // 打字进度追平时，异步排版仍可能展示上一版前缀。
+        val renderedSource = prepared?.raw ?: text.takeIf { loading == null && parseFailed }
+        SideEffect { renderedSource?.let { onRendered?.invoke(it) } }
 
         if (renderState != null) {
             // 长文本用 LazyColumn 逐块渲染时，animations（文本尺寸动画等）不适用，属预期。
@@ -284,7 +249,7 @@ internal fun MarkdownContent(
                         content = it.content,
                         node = it.node,
                     ) { code, language, style ->
-                        SafeMarkdownHighlightedCode(code, language, style, highlightsBuilder, showHeader = true)
+                        SafeMarkdownHighlightedCode(code, language, style, highlightTheme, showHeader = true)
                     }
                 },
                 codeBlock = {
@@ -292,7 +257,7 @@ internal fun MarkdownContent(
                         content = it.content,
                         node = it.node,
                     ) { code, language, style ->
-                        SafeMarkdownHighlightedCode(code, language, style, highlightsBuilder, showHeader = true)
+                        SafeMarkdownHighlightedCode(code, language, style, highlightTheme, showHeader = true)
                     }
                 },
                 // 库默认 maxLines=1 + Ellipsis，单元格长文会被截断；这里放开为完整多行显示。
@@ -340,7 +305,7 @@ internal fun MarkdownContent(
             )
         } else if (loading != null) {
             loading()
-        } else {
+        } else if (parseFailed) {
             PlainMarkdownText(
                 text = text,
                 color = color,
@@ -364,20 +329,20 @@ internal fun MarkdownContent(
  * 高亮文本）。fling 快速滚过大量代码块时这会挤满 Default 线程并制造密集重组。命中缓存
  * 时直接同步拿到结果作为 produceState 初值，既不重算也不闪纯文本。key 含 isDark（主题影响颜色）。
  */
-private object CodeHighlightCache {
+internal object CodeHighlightCache {
     private data class Key(val code: String, val language: String?, val dark: Boolean)
 
-    private const val MAX = 128
-    private val cache = object : LinkedHashMap<Key, AnnotatedString>(MAX, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Key, AnnotatedString>?): Boolean = size > MAX
-    }
+    private val cache = KeyedDeferredCache<Key, AnnotatedString>(
+        CoroutineScope(SupervisorJob() + Dispatchers.Default), 128,
+        maxWeight = MarkdownCacheBudget.HIGHLIGHT,
+        weigh = { key, value -> MarkdownCacheBudget.textPair(key.code, value.text) +
+            2L * (key.language?.length ?: 0) + 192L * value.spanStyles.size },
+    )
 
-    fun get(code: String, language: String?, dark: Boolean): AnnotatedString? =
-        synchronized(cache) { cache[Key(code, language, dark)] }
-
-    fun put(code: String, language: String?, dark: Boolean, value: AnnotatedString) {
-        synchronized(cache) { cache[Key(code, language, dark)] = value }
-    }
+    fun get(code: String, language: String?, dark: Boolean): AnnotatedString? = cache.peek(Key(code, language, dark))
+    suspend fun resolve(code: String, language: String?, dark: Boolean, theme: SyntaxTheme): AnnotatedString =
+        cache.get(Key(code, language, dark)) { buildHighlightedText(code, language, theme) }
+    fun stats() = cache.stats()
 }
 
 @Composable
@@ -385,21 +350,14 @@ private fun SafeMarkdownHighlightedCode(
     code: String,
     language: String?,
     style: TextStyle,
-    highlightsBuilder: Highlights.Builder,
+    highlightTheme: SyntaxTheme,
     showHeader: Boolean,
 ) {
     val isDark = MaterialTheme.colorScheme.background.luminance() < 0.5f
     val cached = CodeHighlightCache.get(code, language, isDark)
-    val highlighted: AnnotatedString by produceState(
-        initialValue = cached ?: AnnotatedString(code),
-        code,
-        language,
-        isDark,
-    ) {
-        if (CodeHighlightCache.get(code, language, isDark) != null) return@produceState
-        value = withContext(Dispatchers.Default) {
-            buildHighlightedText(code, language, highlightsBuilder)
-        }.also { CodeHighlightCache.put(code, language, isDark, it) }
+    var highlighted by remember(code, language, isDark) { mutableStateOf(cached ?: AnnotatedString(code)) }
+    UiWorkEffect(code, language, isDark) {
+        highlighted = CodeHighlightCache.resolve(code, language, isDark, highlightTheme)
     }
 
     MarkdownCodeBackground(
@@ -423,13 +381,13 @@ private fun SafeMarkdownHighlightedCode(
 private fun buildHighlightedText(
     code: String,
     language: String?,
-    highlightsBuilder: Highlights.Builder,
+    highlightTheme: SyntaxTheme,
 ): AnnotatedString {
     // 高亮引擎本身也可能抛错（语言解析等），失败时退回纯文本，不让它影响消息渲染。
     val highlights = runCatching {
-        val syntaxLanguage = language?.let { SyntaxLanguage.getByName(it) }
-        highlightsBuilder.code(code)
-            .let { if (syntaxLanguage != null) it.language(syntaxLanguage) else it }
+        val syntaxLanguage = language?.let { SyntaxLanguage.getByName(it) } ?: SyntaxLanguage.DEFAULT
+        Highlights.Builder().theme(highlightTheme).code(code)
+            .language(syntaxLanguage)
             .build()
             .getHighlights()
     }.getOrDefault(emptyList())
@@ -459,5 +417,6 @@ private fun PlainMarkdownText(
         text = text,
         modifier = modifier,
         style = MaterialTheme.typography.bodyMedium.copy(color = color, lineHeight = 20.sp)
+            .scaledForChat(LocalChatTextScale.current)
     )
 }

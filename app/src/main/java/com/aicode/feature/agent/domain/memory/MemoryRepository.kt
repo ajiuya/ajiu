@@ -17,6 +17,57 @@ class MemoryRepository @Inject constructor(
     private fun projectSource(projectRoot: String) =
         ProjectMemorySource(projectRoot, executionModeHolder, containerInstaller, projectAicodeRoot)
 
+    fun captureStorageTarget(projectRoot: String?): MemoryStorageTarget = MemoryStorageTarget(
+        globalRoot = globalMemorySource.rootDirectory.absoluteFile,
+        projectRoot = projectRoot?.takeIf { it.isNotBlank() }?.let { projectSource(it).rootDirectory.absoluteFile }
+    )
+
+    fun listEntries(target: MemoryStorageTarget): MemoryManagementResult<List<MemoryEntry>> = managementOperation {
+        MemoryFileStore(target.globalRoot, MemoryScope.GLOBAL).entries() +
+            (target.projectRoot?.let { MemoryFileStore(it, MemoryScope.PROJECT).entries() } ?: emptyList())
+    }
+
+    fun readEntry(target: MemoryStorageTarget, entry: MemoryEntry): MemoryManagementResult<MemoryDocument> = managementOperation {
+        managementSource(target, entry.scope).read(entry.fileName)
+            ?: throw MemoryStorageException(MemoryManagementError.NOT_FOUND)
+    }
+
+    fun createOnly(
+        target: MemoryStorageTarget,
+        scope: MemoryScope,
+        name: String,
+        description: String,
+        content: String
+    ): MemoryManagementResult<Unit> = managementOperation {
+        managementSource(target, scope).createOnly(name, description, content)
+    }
+
+    fun deleteEntry(target: MemoryStorageTarget, entry: MemoryEntry): MemoryManagementResult<Unit> = managementOperation {
+        managementSource(target, entry.scope).deleteEntry(entry)
+    }
+
+    private fun managementSource(target: MemoryStorageTarget, scope: MemoryScope): MemoryFileStore = MemoryFileStore(
+        when (scope) {
+            MemoryScope.GLOBAL -> target.globalRoot
+            MemoryScope.PROJECT -> target.projectRoot ?: throw MemoryStorageException(MemoryManagementError.NO_WORKSPACE)
+        },
+        scope
+    )
+
+    private fun <T> managementOperation(action: () -> T): MemoryManagementResult<T> = synchronized(MemorySource.storageLock) {
+        try {
+            MemoryManagementResult.Success(action())
+        } catch (e: MemoryStorageException) {
+            MemoryManagementResult.Failure(e.error)
+        } catch (_: java.nio.file.NoSuchFileException) {
+            MemoryManagementResult.Failure(MemoryManagementError.NOT_FOUND)
+        } catch (_: java.io.IOException) {
+            MemoryManagementResult.Failure(MemoryManagementError.IO_FAILED)
+        } catch (_: SecurityException) {
+            MemoryManagementResult.Failure(MemoryManagementError.IO_FAILED)
+        }
+    }
+
     /** 扫描并聚合全局和项目级的 memory。同名 memory 项目级优先。 */
     fun listMemories(projectRoot: String?): List<Memory> {
         val allMemories = mutableListOf<Memory>()

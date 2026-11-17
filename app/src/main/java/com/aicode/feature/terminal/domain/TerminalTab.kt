@@ -29,7 +29,9 @@ data class TabFinishedEvent(
     /** 发起该后台命令的会话 id；回调据此路由回原会话，而非用户当前所在会话。 */
     val sourceSessionId: String?,
     /** 结束时终端 transcript 的最后 [TAIL_LINES] 行快照。事件可能被缓存到会话空闲才合并发送，期间标签可能已关闭，故在 emit 处提前截取。 */
-    val tailOutput: String? = null
+    val tailOutput: String? = null,
+    val sourceMode: String? = null,
+    val channelGeneration: String? = null
 )
 
 /**
@@ -51,7 +53,9 @@ class TerminalTab(
     /** 发起该后台命令的会话 id；交互标签为 null。回调据此路由回原会话。 */
     val sourceSessionId: String? = null,
     val client: com.termux.terminal.TerminalSessionClient? = null,
-    runState: RunState
+    runState: RunState,
+    val sourceMode: String? = null,
+    val channelGeneration: String? = null
 ) {
     var title: String = title
         internal set
@@ -60,6 +64,38 @@ class TerminalTab(
     var view: TerminalView? = null
 
     var runState: RunState = runState
+        internal set
+
+    internal var commandFinished: Boolean = false
+    internal val outputState = TerminalOutputState()
+    internal var markerExitCode: Int? = null
+
+    internal val outputRevision: Long
+        get() {
+            val emulator = session.emulator
+            return outputState.observe(emulator?.screen, emulator?.mColumns ?: 0, emulator?.mRows ?: 0)
+        }
+
+    internal fun readOutput(): String {
+        val emulator = session.emulator
+        val screen = emulator?.screen
+        return outputState.read(screen, emulator?.mColumns ?: 0, emulator?.mRows ?: 0) {
+            screen?.transcriptText?.trimEnd('\n') ?: ""
+        }
+    }
+
+    internal fun finish(exitCode: Int): Boolean {
+        if (runState !is RunState.Running) return false
+        val completedCommand = isBackground && notifyOnExit
+        runState = RunState.Finished(if (completedCommand) markerExitCode ?: exitCode else exitCode)
+        commandFinished = true
+        onUserInput = {}
+        // backend 关闭可能同步回调；先冻结逻辑结果，不能让强杀状态覆盖命令退出码。
+        if (completedCommand) runCatching { session.finishIfRunning() }
+        return true
+    }
+
+    var onUserInput: () -> Unit = {}
         internal set
 
     /**

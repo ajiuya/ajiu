@@ -16,10 +16,9 @@ import kotlinx.serialization.json.put
  *
  * 两种形态共用同一份措辞与 XML 结构，保证 AI 无论从哪条路径收到通知，理解方式一致。
  *
- * 支持五类通知：后台任务完成（`task-notification`）、子代理完成（`subagent-notification`）、
- * 代理间消息（`agent-message`，主会话与子代理双向）、模式切换（`mode-change`）、
- * 用户插话（`user-message`，用户在工作期间插入的消息，属用户输入而非系统事件）。
- * 消息的 `<status>` 取 `message`、模式切换取 `changed`，UI 提示条据此按非失败渲染。
+ * 支持四类通知：后台任务完成（`task-notification`）、子代理完成（`subagent-notification`）、
+ * 代理间消息（`agent-message`，主会话与子代理双向）、用户插话（`user-message`，属用户输入而非系统事件）。
+ * 消息的 `<status>` 取 `message`，UI 提示条据此按非失败渲染。
  */
 object AgentNotificationFormatter {
 
@@ -36,7 +35,7 @@ object AgentNotificationFormatter {
         }
         return buildString {
             appendLine(BACKGROUND_NOTIFICATION_PREFIX)
-            // 固定的来源/类型标注：与用户消息、模式提醒保持同一套边界写法，便于一眼分辨消息来历。
+            // 固定的来源/类型标注，便于与用户消息区分。
             appendLine("[来源：AiCode] [类型：系统事件]")
             appendLine("应用通知（${items.size} 条）。")
             if (items.any { it.kind == AgentNotificationKind.USER_MESSAGE }) {
@@ -72,7 +71,6 @@ object AgentNotificationFormatter {
             AgentNotificationKind.BACKGROUND_TASK -> "task-notification"
             AgentNotificationKind.SUBAGENT -> "subagent-notification"
             AgentNotificationKind.AGENT_MESSAGE -> "agent-message"
-            AgentNotificationKind.MODE_CHANGE -> "mode-change"
             AgentNotificationKind.USER_MESSAGE -> "user-message"
         }
         appendLine("<$tag>")
@@ -98,9 +96,6 @@ object AgentNotificationFormatter {
                 appendLine("  <from-title>$title</from-title>")
                 message?.takeIf { it.isNotBlank() }?.let { appendLine("  <message>${escapeXml(it)}</message>") }
             }
-            AgentNotificationKind.MODE_CHANGE -> {
-                appendLine("  <new-mode>${newMode?.name ?: "UNKNOWN"}</new-mode>")
-            }
             AgentNotificationKind.USER_MESSAGE -> {
                 message?.takeIf { it.isNotBlank() }?.let { appendLine("  <message>${escapeXml(it)}</message>") }
             }
@@ -118,7 +113,6 @@ object AgentNotificationFormatter {
             AgentNotificationKind.BACKGROUND_TASK -> "background_task"
             AgentNotificationKind.SUBAGENT -> "subagent"
             AgentNotificationKind.AGENT_MESSAGE -> "agent_message"
-            AgentNotificationKind.MODE_CHANGE -> "mode_change"
             AgentNotificationKind.USER_MESSAGE -> "user_message"
         })
         put("notice", if (kind == AgentNotificationKind.USER_MESSAGE) USER_MESSAGE_NOTICE else NOTICE)
@@ -142,9 +136,6 @@ object AgentNotificationFormatter {
                 put("from_title", title)
                 message?.takeIf { it.isNotBlank() }?.let { put("message", JsonPrimitive(it)) }
             }
-            AgentNotificationKind.MODE_CHANGE -> {
-                put("new_mode", newMode?.name ?: "UNKNOWN")
-            }
             AgentNotificationKind.USER_MESSAGE -> {
                 message?.takeIf { it.isNotBlank() }?.let { put("message", JsonPrimitive(it)) }
             }
@@ -158,7 +149,6 @@ object AgentNotificationFormatter {
 
     private fun PendingNotification.statusText(): String = when (kind) {
         AgentNotificationKind.AGENT_MESSAGE -> "message"
-        AgentNotificationKind.MODE_CHANGE -> "changed"
         AgentNotificationKind.USER_MESSAGE -> "message"
         else -> when (outcome) {
             NotificationOutcome.COMPLETED -> "completed"
@@ -177,8 +167,6 @@ object AgentNotificationFormatter {
         }
         AgentNotificationKind.AGENT_MESSAGE ->
             if (fromParent) "主会话发来一条消息" else "子代理「$title」发来一条消息"
-        AgentNotificationKind.MODE_CHANGE ->
-            "用户已将模式切换为 ${newMode?.name ?: "UNKNOWN"}"
         AgentNotificationKind.USER_MESSAGE ->
             "用户在工作期间插入了一条消息"
     }
@@ -202,8 +190,6 @@ object AgentNotificationFormatter {
             } else {
                 "可用 task(action=\"send\", id=\"$sourceId\", message=\"...\") 回复该子代理；若无需回复可忽略。"
             }
-        AgentNotificationKind.MODE_CHANGE ->
-            "后续操作按新模式权限执行，任务范围保持不变。"
         AgentNotificationKind.USER_MESSAGE ->
             "按用户补充的输入调整当前任务。"
     }
@@ -212,7 +198,6 @@ object AgentNotificationFormatter {
         val tasks = items.filter { it.kind == AgentNotificationKind.BACKGROUND_TASK }
         val subAgents = items.filter { it.kind == AgentNotificationKind.SUBAGENT }
         val messages = items.filter { it.kind == AgentNotificationKind.AGENT_MESSAGE }
-        val modeChanges = items.filter { it.kind == AgentNotificationKind.MODE_CHANGE }
         val userMessages = items.filter { it.kind == AgentNotificationKind.USER_MESSAGE }
         val lines = mutableListOf<String>()
         when (tasks.size) {
@@ -234,9 +219,6 @@ object AgentNotificationFormatter {
         }
         if (userMessages.isNotEmpty()) {
             lines.add("以上 user-message 是用户补充的输入，请据此调整任务。")
-        }
-        if (modeChanges.isNotEmpty()) {
-            lines.add(modeChanges.last().singleHint())
         }
         return lines.joinToString("\n")
     }

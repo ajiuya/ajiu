@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="file_preview_title">File preview</string>
+    <string name="file_preview_loading">Loading file…</string>
+    <string name="file_preview_error">This file cannot be previewed. It may be unavailable, unsupported, or exceed the preview limits.</string>
+    <string name="file_preview_environment_changed">The file environment has changed. Close the preview and reopen it in the correct workspace or connection.</string>
+    <string name="file_preview_page">Page %1$d of %2$d</string>
+    <string name="file_preview_truncated">Only part of the content is shown. You can still share, save, or open the complete file externally.</string>
+    <string name="file_preview_cached">Viewing an attachment cache. Related files are unavailable. Confirm the current environment before reloading.</string>
+    <string name="file_preview_reload">Read from current environment</string>
+    <string name="file_preview_reload_title">Confirm file environment</string>
+    <string name="file_preview_reload_message">Older attachments do not record the full server and container identity. “%1$s” will be read from the current workspace or connection. Confirm that it is the correct environment.</string>
+    <string name="file_preview_open_external">Open externally</string>
+    <string name="file_preview_share">Share</string>
+    <string name="file_preview_save_as">Save as</string>
+    <string name="file_preview_action_failed">The operation failed. Check that the file is still accessible.</string>
+    <string name="file_preview_saved">File saved</string>
+    <string name="file_preview_open_web_title">Open external web page?</string>
+    <string name="file_preview_open_web_message">This link will open in an external browser:
+%1$s</string>
+    <string name="file_preview_open_web">Open web page</string>
+    <string name="file_preview_local_only">Web previews only load resources in the authorized folder. External network resources are not loaded automatically.</string>
+    <string name="file_preview_archive_notice">Archives show entries only. Files are not extracted or executed automatically.</string>
+    <string name="file_preview_archive_empty">The archive is empty</string>
+    <string name="file_preview_table_empty">No data to display</string>
+    <string name="file_preview_file_name">File name</string>
+    <string name="file_preview_file_path">File location</string>
+    <string name="file_preview_file_size">File size</string>
+    <string name="file_preview_file_type">File type</string>
+    <string name="file_preview_package_name">Package name</string>
+    <string name="file_preview_package_version">App version</string>
+    <string name="file_preview_package_sdk">Minimum Android SDK</string>
+    <string name="file_preview_install">Install app</string>
+    <string name="file_preview_office_notice">Save this document or share it with an app that supports its format.</string>
+    <string name="file_preview_binary_notice">File information is available for this format. Save, share, or open it with another app.</string>
+    <string name="file_preview_image_unavailable">The image cannot be decoded</string>
+    <string name="file_preview_close">Close preview</string>
+    <string name="file_preview_play">Use built-in player</string>
+</resources>

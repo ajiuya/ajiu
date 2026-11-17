@@ -535,6 +535,38 @@ class OpenAIAdapterTest {
     }
 
     @Test
+    fun streamChatArgumentPreviewsKeepIdsIsolatedAndPreserveWireTitle() = runTest {
+        val api = api()
+        fun delta(index: Int, id: String? = null, name: String? = null, arguments: String): String {
+            val call = com.google.gson.JsonObject().apply {
+                addProperty("index", index)
+                id?.let { addProperty("id", it) }
+                add("function", com.google.gson.JsonObject().apply {
+                    name?.let { addProperty("name", it) }
+                    addProperty("arguments", arguments)
+                })
+            }
+            return "data: {\"choices\":[{\"delta\":{\"tool_calls\":[$call]}}]}"
+        }
+        val prefix = """{"tool_title":"Write a","content":""""
+        every { api.streamChatCompletion(any(), any(), any(), any()) } returns sseCall(
+            delta(0, "one", "writeFile", prefix),
+            delta(1, "two", "writeFile", """{"tool_title":"Write b","content":"other"}"""),
+            delta(0, arguments = "body\"}"),
+            "data: [DONE]"
+        )
+        val chunks = adapter(api).completeStream("", emptyList()).toList()
+        val previews = chunks.filterIsInstance<AIStreamChunk.ToolCallArgumentsDelta>()
+        assertEquals(prefix, previews.first { it.id == "one" }.accumulated)
+        assertEquals(listOf("one", "two"), previews.map { it.id }.distinct())
+        assertEquals("${prefix}body\"}", previews.last { it.id == "one" }.accumulated)
+        val calls = (chunks.last() as AIStreamChunk.Final).response.toolCalls
+        assertEquals(JsonPrimitive("Write a"), calls[0].arguments["tool_title"])
+        assertEquals(JsonPrimitive("body"), calls[0].arguments["content"])
+        assertEquals(JsonPrimitive("other"), calls[1].arguments["content"])
+    }
+
+    @Test
     fun streamChat_accumulatesImagesFromDelta() = runTest {
         val api = api()
         every { api.streamChatCompletion(any(), any(), any(), any()) } returns sseCall(

@@ -25,7 +25,8 @@ class TaskDurationTest {
         role = MessageRole.ASSISTANT,
         content = "ok",
         timestamp = ts,
-        isContextSummary = summary
+        isContextSummary = summary,
+        turnDurationMs = mapOf("a1" to if (ts == 4_000L) 3_000L else 5_000L, "a2" to if (ts == 16_000L) 5_000L else 8_000L)[id]
     )
 
     private fun tool(id: String, ts: Long) = AgentUIMessage(
@@ -98,8 +99,27 @@ class TaskDurationTest {
     @Test
     fun assistant_without_a_preceding_user_message_is_skipped() {
         // 分页只加载到助手消息时，找不到本轮起点，不显示耗时
-        val messages = listOf(assistant("a1", 2_000))
+        val messages = listOf(assistant("a1", 2_000).copy(turnDurationMs = null))
         assertTrue(computeTaskDurations(messages, lastTurnFinished = true).isEmpty())
+    }
+
+    @Test
+    fun oldTimestampDifferenceIsNotUsedAsMeasuredTime() {
+        val messages = listOf(user("u1", 1_000), assistant("a1", 6_000).copy(turnDurationMs = null))
+        assertTrue(computeTaskDurations(messages, true).isEmpty())
+    }
+
+    @Test
+    fun backgroundNoticeDoesNotResetTheUserTurn() {
+        val notice = user("notice", 4_000).copy(isBackgroundNotification = true)
+        val messages = listOf(user("u1", 1_000), assistant("a1", 3_000), notice, assistant("a2", 9_000))
+        assertEquals(mapOf("a2" to 8_000L), computeTaskDurations(messages, true))
+    }
+
+    @Test
+    fun measuredDurationSurvivesPagedOutUserMessage() {
+        val messages = listOf(tool("t1", 1_000), assistant("a1", 2_000).copy(turnDurationMs = 12_345))
+        assertEquals(mapOf("a1" to 12_345L), computeTaskDurations(messages, true))
     }
 
     @Test

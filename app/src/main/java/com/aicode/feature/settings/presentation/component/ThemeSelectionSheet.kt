@@ -17,7 +17,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import com.aicode.core.ui.AdaptiveModalBottomSheet
@@ -29,7 +28,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
@@ -53,7 +51,7 @@ import compose.icons.feathericons.Check
  * @param selectedPresetId 当前配色方案 id，null 表示未选过（回退默认）。
  * @param dynamicColorEnabled 莫奈取色开关状态；开启时配色方案不可选。
  */
-@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun ThemeSelectionSheet(
     selected: AppThemeMode,
@@ -65,112 +63,113 @@ internal fun ThemeSelectionSheet(
     onDismiss: () -> Unit
 ) {
     val sheetState = rememberModalBottomSheetState()
-    val isDarkTheme = MaterialTheme.colorScheme.background.luminance() < 0.5f
-    val activePreset = AppThemePreset.findById(selectedPresetId)
 
     AdaptiveModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = sheetState,
         containerColor = MaterialTheme.colorScheme.surface
     ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(bottom = Spacing.xl)
-        ) {
-            SectionLabel(stringResource(R.string.theme_mode_section))
+        ThemeSelectionContent(
+            selected = selected,
+            selectedPresetId = selectedPresetId,
+            dynamicColorEnabled = dynamicColorEnabled,
+            onSelected = onSelected,
+            onPresetSelected = onPresetSelected,
+            onDynamicColorChanged = onDynamicColorChanged,
+            modifier = Modifier.padding(bottom = Spacing.xl)
+        )
+    }
+}
 
-            AppThemeMode.entries.forEach { mode ->
-                val isSelected = mode == selected
-                Surface(
-                    onClick = { onSelected(mode) },
-                    color = Color.Transparent
-                ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = Spacing.lg, vertical = Spacing.md),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = stringResource(mode.labelRes),
-                            style = MaterialTheme.typography.bodyLarge,
-                            color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
-                            fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
-                            modifier = Modifier.weight(1f)
-                        )
-                        if (isSelected) {
-                            Icon(
-                                imageVector = FeatherIcons.Check,
-                                contentDescription = null,
-                                modifier = Modifier.size(20.dp),
-                                tint = MaterialTheme.colorScheme.primary
-                            )
-                        }
-                    }
-                }
-            }
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+internal fun ThemeSelectionContent(
+    selected: AppThemeMode,
+    selectedPresetId: String?,
+    dynamicColorEnabled: Boolean,
+    onSelected: (AppThemeMode) -> Unit,
+    onPresetSelected: (String) -> Unit,
+    onDynamicColorChanged: (Boolean) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val isDarkTheme = MaterialTheme.colorScheme.background.luminance() < 0.5f
+    val activePreset = AppThemePreset.findById(selectedPresetId)
 
-            Spacer(Modifier.height(Spacing.sm))
-            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
-            Spacer(Modifier.height(Spacing.md))
+    Column(modifier = modifier.fillMaxWidth().padding(top = Spacing.md)) {
+        SectionLabel(stringResource(R.string.theme_mode_section))
 
-            SectionLabel(stringResource(R.string.theme_preset_section))
-
-            FlowRow(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = Spacing.lg)
-                    .alpha(if (dynamicColorEnabled) 0.4f else 1f),
-                horizontalArrangement = Arrangement.spacedBy(Spacing.sm),
-                verticalArrangement = Arrangement.spacedBy(Spacing.sm)
-            ) {
-                AppThemePreset.ALL_PRESETS.forEach { preset ->
-                    PresetChip(
-                        preset = preset,
-                        darkTheme = isDarkTheme,
-                        isSelected = preset.id == activePreset.id,
-                        enabled = !dynamicColorEnabled,
-                        onSelect = { onPresetSelected(preset.id) }
-                    )
-                }
-            }
-
-            Spacer(Modifier.height(Spacing.lg))
-            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
-
+        AppThemeMode.entries.forEach { mode ->
+            val isSelected = mode == selected
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .clickable { onSelected(mode) }
                     .padding(horizontal = Spacing.lg, vertical = Spacing.md),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = stringResource(R.string.theme_dynamic_color),
-                        style = MaterialTheme.typography.bodyLarge,
-                        color = MaterialTheme.colorScheme.onSurface
-                    )
-                    Text(
-                        text = stringResource(
-                            if (isDynamicColorSupported) {
-                                R.string.theme_dynamic_color_desc
-                            } else {
-                                R.string.theme_dynamic_color_unsupported
-                            }
-                        ),
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                Text(
+                    text = stringResource(mode.labelRes),
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                    fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
+                    modifier = Modifier.weight(1f)
+                )
+                if (isSelected) {
+                    Icon(
+                        imageVector = FeatherIcons.Check,
+                        contentDescription = null,
+                        modifier = Modifier.size(20.dp),
+                        tint = MaterialTheme.colorScheme.primary
                     )
                 }
-                Spacer(Modifier.width(Spacing.md))
+            }
+        }
+
+        Spacer(Modifier.height(Spacing.sm))
+        SettingsDivider()
+        Spacer(Modifier.height(Spacing.md))
+
+        SectionLabel(stringResource(R.string.theme_preset_section))
+
+        FlowRow(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = Spacing.lg)
+                .alpha(if (dynamicColorEnabled) 0.4f else 1f),
+            horizontalArrangement = Arrangement.spacedBy(Spacing.sm),
+            verticalArrangement = Arrangement.spacedBy(Spacing.sm)
+        ) {
+            AppThemePreset.ALL_PRESETS.forEach { preset ->
+                PresetChip(
+                    preset = preset,
+                    darkTheme = isDarkTheme,
+                    isSelected = preset.id == activePreset.id,
+                    enabled = !dynamicColorEnabled,
+                    onSelect = { onPresetSelected(preset.id) }
+                )
+            }
+        }
+
+        Spacer(Modifier.height(Spacing.lg))
+        SettingsDivider()
+
+        SettingsRow(
+            title = stringResource(R.string.theme_dynamic_color),
+            subtitle = stringResource(
+                if (isDynamicColorSupported) {
+                    R.string.theme_dynamic_color_desc
+                } else {
+                    R.string.theme_dynamic_color_unsupported
+                }
+            ),
+            trailing = {
                 AppSwitch(
                     checked = dynamicColorEnabled && isDynamicColorSupported,
                     onCheckedChange = onDynamicColorChanged,
                     enabled = isDynamicColorSupported
                 )
             }
-        }
+        )
     }
 }
 

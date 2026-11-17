@@ -1,6 +1,5 @@
 package com.aicode.feature.agent.domain.notification
 
-import com.aicode.feature.agent.domain.model.AgentMode
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -18,32 +17,33 @@ class AgentEventInjectorTest {
 
     private val injector = DefaultAgentEventInjector()
 
-    private val modeChange = PendingNotification(
-        kind = AgentNotificationKind.MODE_CHANGE,
-        sourceId = "user",
-        title = "PLAN",
+    private val notification = PendingNotification(
+        kind = AgentNotificationKind.BACKGROUND_TASK,
+        sourceId = "term-1",
+        title = "test",
         outcome = NotificationOutcome.COMPLETED,
-        newMode = AgentMode.PLAN
+        command = "pwd",
+        exitCode = 0
     )
 
     @Test
     fun inject_validJson_addsNotificationsFieldAndKeepsOriginal() {
         val raw = """{"success":true,"data":{"message":"ok"}}"""
 
-        val injected = injector.inject(raw, listOf(modeChange))
+        val injected = injector.inject(raw, listOf(notification))
         val obj = Json.parseToJsonElement(injected).jsonObject
 
         assertEquals("ok", (obj["data"] as JsonObject)["message"]!!.jsonPrimitive.content)
         val notifications = obj["notifications"] as JsonArray
         assertEquals(1, notifications.size)
-        assertEquals("mode_change", (notifications[0] as JsonObject)["kind"]!!.jsonPrimitive.content)
+        assertEquals("background_task", (notifications[0] as JsonObject)["kind"]!!.jsonPrimitive.content)
     }
 
     @Test
-    fun inject_modeChangeWithDetail_keepsDetailAndOriginalToolData() {
+    fun inject_notificationWithDetail_keepsDetailAndOriginalToolData() {
         val raw = """{"status":"success","data":"普通工具结果","images":[],"extra":{"request_id":"tool-1"}}"""
-        val detail = "已有切换说明。\n【模式切换】当前为 \"PLAN\" 模式，仅进行只读探索与规划。"
-        val event = modeChange.copy(detail = detail)
+        val detail = "后台任务完成"
+        val event = notification.copy(detail = detail)
 
         val injected = injector.inject(raw, listOf(event))
         val obj = Json.parseToJsonElement(injected).jsonObject
@@ -52,21 +52,20 @@ class AgentEventInjectorTest {
         assertEquals("普通工具结果", obj["data"]!!.jsonPrimitive.content)
         val notifications = obj["notifications"] as JsonArray
         assertEquals(1, notifications.size)
-        val notification = notifications[0].jsonObject
-        assertEquals("mode_change", notification["kind"]!!.jsonPrimitive.content)
-        assertEquals("PLAN", notification["new_mode"]!!.jsonPrimitive.content)
-        assertEquals(detail, notification["detail"]!!.jsonPrimitive.content)
+        val result = notifications[0].jsonObject
+        assertEquals("background_task", result["kind"]!!.jsonPrimitive.content)
+        assertEquals(detail, result["detail"]!!.jsonPrimitive.content)
     }
 
     @Test
     fun inject_nonJson_fallsBackToTextAppend() {
         val raw = "tool output is plain text"
 
-        val injected = injector.inject(raw, listOf(modeChange))
+        val injected = injector.inject(raw, listOf(notification))
 
         assertTrue(injected.startsWith(raw))
-        assertTrue(injected.contains("<mode-change>"))
-        assertTrue(injected.contains("<new-mode>PLAN</new-mode>"))
+        assertTrue(injected.contains("<task-notification>"))
+        assertTrue(injected.contains("<task-id>term-1</task-id>"))
     }
 
     @Test

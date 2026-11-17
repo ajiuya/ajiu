@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; media-src 'self' blob:; img-src 'self' data: blob:; worker-src 'self' blob:; base-uri 'none'; form-action 'self'; object-src 'none'">
+<title></title>
+<link rel="stylesheet" href="player.css">
+<script defer src="config.js"></script>
+<script defer src="bridge.js"></script>
+<script defer src="net-media.js"></script>
+<script defer src="app.js"></script>
+</head>
+<body data-mode="series">
+<header id="top">
+  <h1 id="workTitle" data-l10n="title"></h1>
+  <button id="btnVideo" type="button" data-l10n="search" aria-expanded="false"></button>
+  <button id="btnList" type="button" aria-expanded="false"><span data-l10n="playlist"></span> <span id="cnt">0</span></button>
+  <button id="moreBtn" type="button" data-l10n-label="more" aria-expanded="false">⋯</button>
+</header>
+<nav id="morePanel" hidden>
+  <button id="btnAdd" type="button" data-l10n="files"></button>
+  <button id="btnUrl" type="button" data-l10n="url"></button>
+  <button id="btnInfo" type="button" data-l10n="info"></button>
+  <button id="fullPage" type="button" data-l10n="full_page"></button>
+  <button id="vizBtn" type="button" data-l10n="spectrum"></button>
+</nav>
+<main id="main">
+  <section id="videoCatalog" hidden></section>
+  <section id="stage" data-l10n-label="title">
+    <canvas id="viz" aria-hidden="true"></canvas>
+    <video id="video" playsinline webkit-playsinline preload="metadata"></video>
+    <div id="cover"><div class="disc"></div><div id="ttl" class="ttl" data-l10n="choose_media"></div><div id="sub" class="sub" data-l10n="drop_hint"></div></div>
+    <div id="gate" hidden><button id="gateBtn" type="button" data-l10n="tap_play"></button></div>
+    <button id="snd" type="button" data-l10n="sound_on" hidden></button>
+    <output id="ajiuStatus" role="status" aria-live="polite"></output>
+    <div id="dragHint" data-l10n="drop_add" hidden></div>
+  </section>
+  <form id="urlbox" class="ajiu-tools" hidden>
+    <input id="urlinput" type="text" inputmode="url" autocomplete="off" spellcheck="false" maxlength="8192" data-l10n-label="url" data-l10n-placeholder="url_hint">
+    <button type="submit" data-l10n="add"></button><div id="presets"></div>
+  </form>
+  <section id="meta" hidden></section>
+  <section id="episodes">
+    <div id="videoLines" class="ajiu-tools" hidden><label for="lineSelect" data-l10n="lines"></label><select id="lineSelect"></select></div>
+    <h2 id="epsLab" data-l10n="episodes"></h2><nav id="episodePages" class="pager" data-l10n-label="episodes"></nav><div id="grid" class="episode-grid"></div>
+    <form id="catalogTools" class="ajiu-tools"><input id="apiInput" inputmode="url" maxlength="8192" data-l10n-label="api" data-l10n-placeholder="api"><input id="queryInput" maxlength="512" data-l10n-label="keyword" data-l10n-placeholder="keyword"><button type="submit" data-l10n="search_action"></button><output id="catalogOutput" role="status"></output></form>
+  </section>
+  <section id="list" hidden data-l10n-label="playlist">
+    <form id="libraryTools" class="ajiu-tools"><input id="rootInput" data-l10n-label="root" data-l10n-placeholder="root"><button id="scanBtn" type="submit" data-l10n="rescan"></button><output id="libraryOutput" role="status"></output></form>
+    <p id="dropzone" data-l10n="drop_hint"></p><p class="local-copy" data-l10n="local_copy"></p>
+    <button id="clearBtn" type="button" data-l10n="clear"></button><div id="items"></div><nav id="listPages" class="pager" data-l10n-label="playlist"></nav>
+  </section>
+</main>
+<footer id="bar">
+  <div class="seek-row"><span id="cur" class="time">0:00</span><input id="seek" type="range" min="0" max="1000" value="0" step="1" data-l10n-label="seek"><span id="dur" class="time">0:00</span></div>
+  <div class="transport"><button id="prev" type="button" data-l10n-label="previous">≪</button><button id="play" class="primary" type="button" data-l10n-label="play">▶</button><button id="next" type="button" data-l10n-label="next">≫</button><button id="mode" type="button" data-l10n="sequential" data-l10n-label="order"></button><button id="speedBtn" type="button" data-l10n-label="rate"><span id="spd">1×</span></button></div>
+  <div class="tools"><button id="muteBtn" type="button" data-l10n="mute"></button><input id="vol" type="range" min="0" max="100" value="100" data-l10n-label="volume"><button id="pipBtn" type="button" data-l10n="pip"></button><button id="fsBtn" type="button" data-l10n="fullscreen"></button></div>
+</footer>
+<input id="picker" type="file" multiple accept="audio/*,video/*,.flac,.opus,.m4a,.mkv,.webm,.ts,.aac,.ogg,.wav,.mp3,.m3u8,.mpd" hidden>
+</body>
+</html>

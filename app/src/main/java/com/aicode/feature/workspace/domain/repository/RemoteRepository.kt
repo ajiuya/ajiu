@@ -336,10 +336,13 @@ class RemoteRepository @Inject constructor(
                         .split(",").map { it.trim() }.filter { it.isNotEmpty() }.toSet(),
                     followGitignore = syncSettings.useGitIgnore.value
                 ),
-                fallbackPoll = false
+                fallbackPoll = true
             ).collect { batch ->
                 FileLogger.d(TAG, "同步监听收到变更: mount=$mountId count=${batch.changes.size} truncated=${batch.truncated}")
-                for (change in batch.changes) engine.enqueueLocalChange(change.hostPath)
+                if (batch.truncated) engine.requestReconcile()
+                for (change in batch.changes) {
+                    if (!syncIndexStore.ownsPath(change.hostPath)) engine.enqueueLocalChange(change.hostPath)
+                }
             }
         }
     }
@@ -395,7 +398,8 @@ class RemoteRepository @Inject constructor(
 
     /** 清除某挂载的同步指纹索引；下次上传将视为全部未同步（全量）。 */
     suspend fun clearSyncIndex(mountId: String) = withContext(Dispatchers.IO) {
-        syncIndexStore.clear(mountId)
+        val engine = activeEngines[mountId]
+        if (engine != null) engine.clearSyncIndex() else syncIndexStore.clear(mountId)
     }
 
     suspend fun forceDownloadMount(mountId: String): Result<Unit> = withContext(Dispatchers.IO) {

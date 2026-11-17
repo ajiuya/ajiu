@@ -1,5 +1,8 @@
 package com.aicode.feature.agent.domain.tool.shizuku
 
+import android.content.Context
+import com.aicode.R
+import dagger.hilt.android.qualifiers.ApplicationContext
 import com.aicode.core.util.FileLogger
 import com.aicode.feature.agent.domain.container.BoundedOutput
 import com.aicode.feature.agent.domain.shizuku.ShizukuManager
@@ -29,7 +32,8 @@ import javax.inject.Inject
  * UserService 的 AIDL 调用是同步、一次性的（无逐行回传），故不实现流式输出。
  */
 class ShizukuTool @Inject constructor(
-    private val shizukuManager: ShizukuManager
+    private val shizukuManager: ShizukuManager,
+    @param:ApplicationContext private val appContext: Context
 ) : AgentTool() {
     private companion object {
         const val TAG = "ShizukuTool"
@@ -42,7 +46,7 @@ class ShizukuTool @Inject constructor(
 
     override val description =
         "通过 Shizuku 在宿主 Android 系统上执行 pm/am/cmd 等命令，用于辅助调试。" +
-            "需已安装、运行并授权 Shizuku；默认每次调用需用户确认。"
+            "需已安装、运行并授权 Shizuku；默认需用户确认，可在审批弹窗选择本会话始终允许。不同会话不共享授权，显式禁止规则仍优先。"
 
     override val permissionPolicy = ToolPermissionPolicy.ASK
     override val capabilities = setOf(ToolCapability.EXECUTE_COMMANDS)
@@ -112,6 +116,7 @@ class ShizukuTool @Inject constructor(
         ShizukuState.NOT_INSTALLED -> "未安装 Shizuku，请先安装并启动 Shizuku 服务"
         ShizukuState.NOT_RUNNING -> "Shizuku 服务未运行，请在 Shizuku 应用中启动服务"
         ShizukuState.PERMISSION_DENIED -> "本应用尚未获得 Shizuku 授权，请在设置中授予"
+        ShizukuState.SHELL_REQUIRED -> appContext.getString(R.string.shizuku_shell_required)
         ShizukuState.READY -> ""
     }
 }

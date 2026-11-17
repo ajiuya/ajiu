@@ -6,10 +6,14 @@ import com.aicode.feature.agent.data.local.entity.AgentMessageEntity
 import com.aicode.feature.agent.domain.model.AgentMessage
 import com.aicode.feature.agent.domain.model.CONTEXT_COMPACTION_MARKER
 import com.aicode.feature.agent.domain.model.CONTEXT_SUMMARY_LEGACY_PREFIX
+import com.aicode.feature.agent.domain.model.ContextUsageBreakdown
 import com.aicode.feature.agent.domain.tool.ToolCall
 import com.aicode.feature.agent.presentation.AgentAttachment
 import com.aicode.feature.agent.presentation.MessageRole
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
@@ -21,14 +25,16 @@ import javax.inject.Singleton
 @Singleton
 class MessagePersistenceUseCase @Inject constructor(
     private val agentMessageDao: AgentMessageDao,
-    private val agentDatabase: AgentDatabase
+    private val agentDatabase: AgentDatabase,
+    private val recoveryRepository: com.aicode.feature.agent.domain.recovery.RecoveryRepository? = null
 ) {
     private val json = Json { ignoreUnknownKeys = true }
 
-    /** agent_messages 表变更版本号：任何写路径（含 rewind 删除、压缩标记、冷启动清理）触发递增，
-     *  作为 [buildHistory] 缓存的失效信号。InvalidationTracker 监听表级变更，覆盖所有 DAO 写入。 */
+    /** 消息表变更版本号，作为 [buildHistory] 缓存的失效信号。 */
     private val dbVersion = java.util.concurrent.atomic.AtomicLong(0)
-    private val historyCache = HashMap<String, HistoryEntry>()
+    private val historyCache = WeightedLruCache<String, HistoryEntry>(8, 32L * 1024 * 1024)
+    internal val cachedHistoryEntries: Int get() = synchronized(historyCache) { historyCache.size }
+    internal val cachedHistoryBytes: Long get() = synchronized(historyCache) { historyCache.bytes }
 
     private class HistoryEntry(
         val version: Long,
@@ -40,7 +46,9 @@ class MessagePersistenceUseCase @Inject constructor(
         agentDatabase.invalidationTracker.addObserver(
             object : androidx.room.InvalidationTracker.Observer(arrayOf("agent_messages")) {
                 override fun onInvalidated(tables: Set<String>) {
-                    dbVersion.incrementAndGet()
+                    synchronized(historyCache) {
+                        dbVersion.incrementAndGet()
+                    }
                 }
             }
         )
@@ -50,24 +58,16 @@ class MessagePersistenceUseCase @Inject constructor(
      *  每轮 LLM 调用都重读文件 + base64 编码。带条目与总字节双重上限。 */
     private class CachedImage(val mimeType: String, val base64: String)
 
-    private val imageBase64Cache = object : LinkedHashMap<String, CachedImage>(16, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CachedImage>?): Boolean =
-            size > MAX_IMAGE_CACHE_ENTRIES
-    }
-    private var imageCacheBytes = 0L
+    private val imageBase64Cache = WeightedLruCache<String, CachedImage>(MAX_IMAGE_CACHE_ENTRIES, MAX_IMAGE_CACHE_BYTES)
+    internal val cachedImageEntries: Int get() = synchronized(imageBase64Cache) { imageBase64Cache.size }
+    internal val cachedImageBytes: Long get() = synchronized(imageBase64Cache) { imageBase64Cache.bytes }
 
     private fun cachedImageBase64(key: String): CachedImage? = synchronized(imageBase64Cache) { imageBase64Cache[key] }
 
-    private fun cacheImageBase64(key: String, value: CachedImage) {
+    private fun cacheImageBase64(key: String, value: CachedImage, version: Long) {
         synchronized(imageBase64Cache) {
-            val old = imageBase64Cache.put(key, value)
-            imageCacheBytes += value.base64.length - (old?.base64?.length ?: 0)
-            while (imageCacheBytes > MAX_IMAGE_CACHE_BYTES && imageBase64Cache.isNotEmpty()) {
-                val it = imageBase64Cache.entries.iterator()
-                val eldest = it.next()
-                it.remove()
-                imageCacheBytes -= eldest.value.base64.length
-            }
+            if (dbVersion.get() != version) return
+            imageBase64Cache.put(key, value, 128L + (key.length.toLong() + value.mimeType.length + value.base64.length) * 2)
         }
     }
 
@@ -101,43 +101,123 @@ class MessagePersistenceUseCase @Inject constructor(
         outputTokens: Int = 0,
         cachedInputTokens: Int = 0,
         isCompacted: Boolean = false,
-        isContextExcluded: Boolean = false
+        isContextExcluded: Boolean = false,
+        contextInputTokens: Int? = null,
+        contextInputBudget: Int? = null,
+        contextEstimated: Boolean = true,
+        contextBreakdown: ContextUsageBreakdown? = null,
+        toolActionTitle: String? = null,
+        toolStartedAtMs: Long? = null,
+        toolDurationMs: Long? = null,
+        turnDurationMs: Long? = null,
+        requireSession: Boolean = false,
+        recoveryRunId: String? = null,
+        recoveryStep: com.aicode.feature.agent.domain.recovery.RecoveryStep? = null,
+        recoveryPlaceholder: Boolean = false,
+        recoverySupplemental: Boolean = false,
+        continuationOfMessageId: String? = null,
+        notificationSeqs: List<Long> = emptyList()
     ) {
-        agentMessageDao.insert(
-            AgentMessageEntity(
-                id = id,
-                sessionId = sessionId,
-                role = role.name,
-                content = sanitizeContent(content),
-                timestamp = nextTimestamp(),
-                toolCallsJson = if (toolCalls.isNotEmpty()) capBytes(json.encodeToString(toolCalls), MAX_SNAPSHOT_BYTES) else null,
-                toolCallId = toolCallId,
-                toolName = toolName,
-                toolArgs = toolArgs?.let { capBytes(it, MAX_TOOL_ARGS_BYTES) },
-                isError = isError,
-                reasoning = reasoning?.let { sanitizeContent(it) },
-                signature = signature?.let { capBytes(it, MAX_SNAPSHOT_BYTES) },
-                thinkingBlocksJson = thinkingBlocksJson?.let { capBytes(it, MAX_SNAPSHOT_BYTES) },
-                attachmentsJson = if (attachments.isNotEmpty()) capBytes(json.encodeToString(attachments), MAX_ATTACHMENTS_BYTES) else null,
-                inputTokens = inputTokens,
-                outputTokens = outputTokens,
-                cachedInputTokens = cachedInputTokens,
-                isCompacted = isCompacted,
-                isContextExcluded = isContextExcluded
-            )
+        val message = AgentMessageEntity(
+            id = id,
+            sessionId = sessionId,
+            role = role.name,
+            content = sanitizeContent(content),
+            timestamp = nextTimestamp(),
+            toolCallsJson = if (toolCalls.isNotEmpty()) capBytes(json.encodeToString(toolCalls), MAX_SNAPSHOT_BYTES) else null,
+            toolCallId = toolCallId,
+            toolName = toolName,
+            toolArgs = toolArgs?.let { capBytes(it, MAX_TOOL_ARGS_BYTES) },
+            isError = isError,
+            reasoning = reasoning?.let { sanitizeContent(it) },
+            signature = signature?.let { capBytes(it, MAX_SNAPSHOT_BYTES) },
+            thinkingBlocksJson = thinkingBlocksJson?.let { capBytes(it, MAX_SNAPSHOT_BYTES) },
+            attachmentsJson = if (attachments.isNotEmpty()) capBytes(json.encodeToString(attachments), MAX_ATTACHMENTS_BYTES) else null,
+            inputTokens = inputTokens,
+            outputTokens = outputTokens,
+            cachedInputTokens = cachedInputTokens,
+            isCompacted = isCompacted,
+            isContextExcluded = isContextExcluded,
+            contextInputTokens = contextInputTokens,
+            contextInputBudget = contextInputBudget,
+            contextEstimated = contextEstimated,
+            contextBreakdownJson = contextBreakdown?.let { json.encodeToString(it) },
+            toolActionTitle = toolActionTitle.takeIf { role == MessageRole.TOOL },
+            toolStartedAtMs = toolStartedAtMs.takeIf { role == MessageRole.TOOL },
+            toolDurationMs = toolDurationMs.takeIf { role == MessageRole.TOOL },
+            turnDurationMs = turnDurationMs.takeIf { role == MessageRole.ASSISTANT },
+            continuationOfMessageId = continuationOfMessageId
         )
+        if (recoveryRunId != null) {
+            val repository = checkNotNull(recoveryRepository)
+            val committed = when (role) {
+                MessageRole.USER -> if (recoverySupplemental) repository.commitSupplementalInput(recoveryRunId, message)
+                    else repository.commitInput(recoveryRunId, message, notificationSeqs)
+                MessageRole.ASSISTANT -> repository.commitAssistant(recoveryRunId, requireNotNull(recoveryStep), message)
+                MessageRole.TOOL -> if (recoveryPlaceholder) repository.commitToolPlaceholder(recoveryRunId, message)
+                    else repository.commitToolResult(recoveryRunId, message, notificationSeqs)
+            }
+            if (!committed) throw CancellationException("Recovery message owner is no longer current")
+            invalidateHistory(sessionId)
+            return
+        }
+        if (requireSession) {
+            agentMessageDao.insertMessageIfSessionExists(message)
+            return
+        }
+        if (role != MessageRole.TOOL) {
+            val existing = if (role == MessageRole.USER) agentMessageDao.getMessageById(message.id) else null
+            agentMessageDao.insert(if (existing?.sessionId == message.sessionId && existing.role == message.role)
+                message.copy(modelInputSnapshotJson = existing.modelInputSnapshotJson ?: message.modelInputSnapshotJson) else message)
+            return
+        }
+        agentMessageDao.insertToolMessagePreservingMetadata(message)
+    }
+
+    suspend fun loadAttachmentImages(attachments: List<AgentAttachment>): List<com.aicode.feature.agent.domain.model.AgentImage> =
+        withContext(Dispatchers.IO) { attachments.mapNotNull { it.toAgentImage(mutableMapOf()) } }
+
+    suspend fun prepareModelInput(context: com.aicode.feature.agent.domain.model.AgentContext, content: String): List<AgentMessage> {
+        val candidate = com.aicode.feature.agent.domain.model.ModelInputSnapshot.prepare(context, content)
+        val encoded = json.encodeToString(candidate)
+        require(encoded.toByteArray(Charsets.UTF_8).size <= MAX_SNAPSHOT_BYTES) { "Model input snapshot is too large" }
+        val canonical = if (context.recoveryRunId != null) {
+            checkNotNull(recoveryRepository).freezeInputSnapshot(context.recoveryRunId, encoded, context.inputMessageId)
+        } else agentMessageDao.freezeModelInputSnapshot(requireNotNull(context.sessionId), context.inputMessageId, encoded)
+        if (canonical == null) throw CancellationException("Model input owner is no longer available")
+        val snapshot = json.decodeFromString<com.aicode.feature.agent.domain.model.ModelInputSnapshot>(canonical)
+        check(snapshot.version == 1)
+        invalidateHistory(requireNotNull(context.sessionId))
+        return snapshot.messages(context.inputMessageId, context.inputImages, persisted = !context.transientInput)
+    }
+
+    suspend fun updateToolTiming(sessionId: String, callId: String, startedAtMs: Long?, durationMs: Long?) {
+        agentMessageDao.updateToolTiming(sessionId, callId, startedAtMs, durationMs)
+    }
+
+    suspend fun updateTurnDuration(sessionId: String, messageId: String, durationMs: Long) {
+        agentMessageDao.updateTurnDuration(sessionId, messageId, durationMs)
     }
 
     fun invalidateHistory(sessionId: String) {
-        dbVersion.incrementAndGet()
         synchronized(historyCache) {
+            dbVersion.incrementAndGet()
             historyCache.remove(sessionId)
         }
     }
 
-    suspend fun rewindConversation(sessionId: String, cutoff: Long) {
-        agentMessageDao.rewindConversation(sessionId, cutoff)
+    fun releaseSessionCache(sessionId: String) {
         invalidateHistory(sessionId)
+        synchronized(imageBase64Cache) { imageBase64Cache.clear() }
+    }
+
+    suspend fun rewindConversation(sessionId: String, cutoff: Long) {
+        releaseSessionCache(sessionId)
+        try {
+            agentMessageDao.rewindConversation(sessionId, cutoff)
+        } finally {
+            releaseSessionCache(sessionId)
+        }
     }
 
     suspend fun updateContent(messageId: String, newContent: String) {
@@ -227,54 +307,69 @@ class MessagePersistenceUseCase @Inject constructor(
      * 已被上下文压缩标记的消息（isCompacted=true）不参与回放。
      */
     suspend fun buildHistory(sessionId: String, pendingToolMarker: String): List<AgentMessage> {
-        // 版本化缓存：agent_messages 表无变更且 marker 相同时直接复用上次重建结果，
-        // 避免工具循环中每轮 LLM 调用都全量读库 + 多次遍历 + JSON 解码。
-        // InvalidationTracker 覆盖所有写路径（含 rewind 删除、压缩标记、冷启动清理），不会漏失效。
-        val version = dbVersion.get()
-        synchronized(historyCache) {
-            historyCache[sessionId]?.let { cached ->
-                if (cached.version == version && cached.pendingToolMarker == pendingToolMarker) {
-                    return cached.messages
+        val context = currentCoroutineContext()
+        while (true) {
+            val version = synchronized(historyCache) {
+                context.ensureActive()
+                val currentVersion = dbVersion.get()
+                historyCache[sessionId]?.let { cached ->
+                    if (cached.version == currentVersion && cached.pendingToolMarker == pendingToolMarker) {
+                        return cached.messages
+                    }
+                    historyCache.remove(sessionId)
+                }
+                currentVersion
+            }
+            val pendingImages = mutableMapOf<String, CachedImage>()
+            val messages = withContext(Dispatchers.IO) {
+                buildHistoryUncached(sessionId, pendingToolMarker, pendingImages)
+            }
+            val weight = 128L + sessionId.length * 2L + pendingToolMarker.length * 2L + messages.sumOf(::messageWeight)
+            synchronized(historyCache) {
+                context.ensureActive()
+                if (version == dbVersion.get()) {
+                    // 图片与历史一起发布，失败、取消或失效的重建不会填回旧图片。
+                    pendingImages.forEach { (key, image) -> cacheImageBase64(key, image, version) }
+                    historyCache.put(sessionId, HistoryEntry(version, pendingToolMarker, messages), weight)
+                    return messages
                 }
             }
         }
-        val messages = withContext(Dispatchers.IO) {
-            buildHistoryUncached(sessionId, pendingToolMarker)
-        }
-        synchronized(historyCache) {
-            historyCache[sessionId] = HistoryEntry(version, pendingToolMarker, messages)
-        }
-        return messages
     }
 
-    private suspend fun buildHistoryUncached(sessionId: String, pendingToolMarker: String): List<AgentMessage> {
-        val entities = agentMessageDao.getMessagesBySessionOnce(sessionId)
-            .filter { !it.isCompacted && !it.isContextExcluded }
+    private suspend fun buildHistoryUncached(
+        sessionId: String,
+        pendingToolMarker: String,
+        pendingImages: MutableMap<String, CachedImage>
+    ): List<AgentMessage> {
+        val storedEntities = agentMessageDao.getMessagesBySessionOnce(sessionId)
+        val positions = storedEntities.withIndex().associate { it.value.id to it.index }
+        val entities = storedEntities.filter { !it.isCompacted && !it.isContextExcluded }
             .let { orderHistoryEntities(it) }
 
-        // 第一遍：求 assistant 声明的 toolCallId 与 tool 结果 toolCallId 的交集。
-        val declaredIds = mutableSetOf<String>()
-        val resultIds = mutableSetOf<String>()
-        for (e in entities) {
-            when (MessageRole.valueOf(e.role)) {
-                MessageRole.ASSISTANT -> e.toolCallsJson?.let {
-                    runCatching { json.decodeFromString<List<ToolCall>>(it) }
-                        .getOrNull()?.forEach { tc -> declaredIds.add(tc.id) }
-                }
-                MessageRole.TOOL -> {
-                    // 只有真正完成的结果才计入配对；执行中占位行（完成事件未回来的孤儿）不算。
-                    if (!e.content.startsWith(pendingToolMarker) &&
-                        !e.content.startsWith(SessionUseCase.LEGACY_PENDING_TOOL_MARKER)
-                    ) {
-                        e.toolCallId?.let { resultIds.add(it) }
-                    }
-                }
-                else -> {}
-            }
+        val callsByMessage = storedEntities.filter { it.role == "ASSISTANT" }.associate { entity ->
+            entity.id to entity.toolCallsJson?.let {
+                runCatching { json.decodeFromString<List<ToolCall>>(it) }.getOrNull()
+            }.orEmpty()
         }
-        val validIds = declaredIds intersect resultIds
+        val declarationsById = storedEntities.flatMap { entity ->
+            callsByMessage[entity.id].orEmpty().map { it to entity }
+        }.groupBy { it.first.id }
+        val resultsById = storedEntities.filter {
+            it.role == "TOOL" && !it.toolCallId.isNullOrBlank() &&
+                !it.content.startsWith(pendingToolMarker) &&
+                !it.content.startsWith(SessionUseCase.LEGACY_PENDING_TOOL_MARKER)
+        }.groupBy { it.toolCallId }
+        val pairedResults = declarationsById.mapNotNull { (id, calls) ->
+            val (call, declaring) = calls.singleOrNull() ?: return@mapNotNull null
+            val completed = resultsById[id]?.singleOrNull() ?: return@mapNotNull null
+            if (id.isBlank() || declaring.isCompacted || declaring.isContextExcluded ||
+                completed.isCompacted || completed.isContextExcluded ||
+                completed.toolName != null && completed.toolName != call.name ||
+                positions.getValue(completed.id) <= positions.getValue(declaring.id)) null else id to completed
+        }.toMap()
 
-        // 第二遍：构建消息，过滤掉无法配对的工具调用 / 工具结果。
+        // 迟到的工具结果必须紧邻原声明回放，数据库里的审计顺序保持不变。
         val result = mutableListOf<AgentMessage>()
         for (e in entities) {
             when (MessageRole.valueOf(e.role)) {
@@ -302,20 +397,26 @@ class MessagePersistenceUseCase @Inject constructor(
                         rawContent
                     }
 
-                    val images = attachments.mapNotNull { it.toAgentImage() }
+                    val images = attachments.mapNotNull { it.toAgentImage(pendingImages) }
 
-                    result.add(
+                    val snapshot = e.modelInputSnapshotJson?.let {
+                        json.decodeFromString<com.aicode.feature.agent.domain.model.ModelInputSnapshot>(it).also { value ->
+                            check(value.version == 1) { "Unsupported model input snapshot version" }
+                        }
+                    }
+                    if (snapshot != null && !e.isCompactionMarker) {
+                        result.addAll(snapshot.messages(e.id, images, persisted = true))
+                    } else result.add(
                         AgentMessage.UserMessage(
                             id = e.id,
                             content = finalContent,
-                            images = images
+                            images = images,
+                            isCompactionMarker = e.isCompactionMarker
                         )
                     )
                 }
                 MessageRole.ASSISTANT -> {
-                    val toolCalls = e.toolCallsJson?.let {
-                        runCatching { json.decodeFromString<List<ToolCall>>(it) }.getOrNull()
-                    }?.filter { it.id in validIds } ?: emptyList()
+                    val toolCalls = callsByMessage[e.id].orEmpty().filter { it.id in pairedResults }
                     val imageAttachments = e.attachmentsJson?.let {
                         runCatching { json.decodeFromString<List<AgentAttachment>>(it) }.getOrNull()
                     }.orEmpty()
@@ -323,50 +424,54 @@ class MessagePersistenceUseCase @Inject constructor(
                         val previous = result.lastOrNull()
                         if (
                             e.isContextSummary &&
-                            !(previous is AgentMessage.UserMessage && previous.content == CONTEXT_COMPACTION_MARKER)
+                            !(previous is AgentMessage.UserMessage && previous.isCompactionMarker)
                         ) {
-                            result.add(AgentMessage.UserMessage(content = CONTEXT_COMPACTION_MARKER))
+                            result.add(AgentMessage.UserMessage(
+                                content = CONTEXT_COMPACTION_MARKER,
+                                isCompactionMarker = true,
+                                isTransient = true
+                            ))
                         }
                         result.add(
                             AgentMessage.AssistantMessage(
                                 id = e.id,
-                                content = e.content.removePrefix(CONTEXT_SUMMARY_LEGACY_PREFIX).trimStart(),
+                                content = if (e.isContextSummary) e.content.removePrefix(CONTEXT_SUMMARY_LEGACY_PREFIX).trimStart() else e.content,
+                                isContextSummary = e.isContextSummary,
                                 toolCalls = toolCalls,
                                 reasoning = e.reasoning ?: "",
                                 signature = e.signature ?: "",
                                 thinkingBlocksJson = e.thinkingBlocksJson ?: "",
                                 inputTokens = e.inputTokens,
                                 // 附件里的图片按路径重建 base64（带缓存），供下一轮上下文回放。
-                                images = imageAttachments.mapNotNull { it.toAgentImage() }
+                                images = imageAttachments.mapNotNull { it.toAgentImage(pendingImages) }
                             )
                         )
+                        for (call in toolCalls) {
+                            val completed = pairedResults.getValue(call.id)
+                            result.add(AgentMessage.ToolResultMessage(
+                                id = call.id,
+                                messageId = completed.id,
+                                toolName = completed.toolName ?: "unknown",
+                                result = completed.content
+                            ))
+                        }
                     }
                 }
-                MessageRole.TOOL -> {
-                    val tcId = e.toolCallId
-                    if (tcId != null && tcId in validIds) {
-                        result.add(
-                            AgentMessage.ToolResultMessage(
-                                id = tcId,
-                                messageId = e.id,
-                                toolName = e.toolName ?: "unknown",
-                                result = e.content
-                            )
-                        )
-                    }
-                }
+                MessageRole.TOOL -> Unit
             }
         }
         return result
     }
 
-    private fun AgentAttachment.toAgentImage(): com.aicode.feature.agent.domain.model.AgentImage? {
+    private fun AgentAttachment.toAgentImage(
+        pendingImages: MutableMap<String, CachedImage>
+    ): com.aicode.feature.agent.domain.model.AgentImage? {
         if (!isImage || localPath.isBlank()) return null
         val file = java.io.File(localPath)
         if (!file.exists() || !file.isFile || file.length() <= 0) return null
         // 按路径+大小+修改时间缓存 base64：文件未变时直接复用，省去每次 LLM 调用的重读+编码。
         val key = "$localPath:${file.length()}:${file.lastModified()}"
-        cachedImageBase64(key)?.let { cached ->
+        (pendingImages[key] ?: cachedImageBase64(key))?.let { cached ->
             return com.aicode.feature.agent.domain.model.AgentImage(
                 mimeType = cached.mimeType,
                 base64Data = cached.base64,
@@ -377,12 +482,14 @@ class MessagePersistenceUseCase @Inject constructor(
             val (mime, base64) = com.aicode.core.util.ImageDownscaler.downscaleToBase64(
                 file.readBytes(), mimeType.ifBlank { "image/jpeg" }
             )
-            cacheImageBase64(key, CachedImage(mime, base64))
+            pendingImages[key] = CachedImage(mime, base64)
             com.aicode.feature.agent.domain.model.AgentImage(
                 mimeType = mime,
                 base64Data = base64,
                 path = containerPath
             )
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             null
         }

@@ -25,7 +25,7 @@ internal fun buildResponsesTools(tools: List<AgentTool>): List<ResponsesToolDefi
         ResponsesToolDefinition(
             name = tool.name,
             description = tool.description,
-            parameters = tool.toJsonSchema()
+            parameters = tool.toModelJsonSchema()
         )
     }
 

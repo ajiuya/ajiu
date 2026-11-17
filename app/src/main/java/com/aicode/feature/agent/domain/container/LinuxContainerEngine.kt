@@ -5,6 +5,7 @@ import com.aicode.core.util.FileLogger
 import com.aicode.core.util.LINE_TRUNCATED_NOTE
 import com.aicode.R
 import com.aicode.feature.settings.data.repository.ExecutionMode
+import com.aicode.feature.workspace.domain.WorkspaceExecutionContext
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -119,6 +120,14 @@ class LinuxContainerEngine @Inject constructor(
         return profiles.firstOrNull { it.id == id }
             ?: profiles.firstOrNull()
             ?: ContainerProfile.BUILTIN_ALPINE
+    }
+
+    private fun executionProfile(): ContainerProfile {
+        val execution = WorkspaceExecutionContext.current() ?: return currentProfile
+        execution.requireMode(ExecutionMode.LOCAL_PROOT)
+        val captured = execution.localMapping?.profile ?: throw CancellationException("Local execution profile missing")
+        if (currentProfile != captured) throw CancellationException("Local command profile changed")
+        return captured
     }
 
     /**
@@ -317,7 +326,7 @@ class LinuxContainerEngine @Inject constructor(
         projectPath: String?,
         timeoutMs: Long
     ): CommandResult? {
-        if (!containerInstaller.isInstalledFor(currentProfile)) return null
+        if (!containerInstaller.isInstalledFor(executionProfile())) return null
         val result = execCaptured(command, projectPath, timeoutMs)
         return CommandResult(result.output, result.exitCode, result.truncated)
     }
@@ -452,11 +461,11 @@ class LinuxContainerEngine @Inject constructor(
      * 否则回退到 Android 原生 shell（rootfs 缺失时的兜底）。
      */
     private fun startContainerProcess(command: String, projectPath: String?): Process {
-        val profile = currentProfile
+        val profile = executionProfile()
         val useProot = containerInstaller.isInstalledFor(profile)
 
         val processBuilder = if (useProot) {
-            buildProcessBuilder(buildProotInvocation(command, projectPath))
+            buildProcessBuilder(buildProotInvocation(command, projectPath, profile))
         } else {
             FileLogger.w(TAG, "PRoot 未安装，回退到原生 shell")
             buildNativeProcess(command, projectPath)
@@ -465,17 +474,18 @@ class LinuxContainerEngine @Inject constructor(
         // Redirect stderr to stdout so we capture everything in one stream
         processBuilder.redirectErrorStream(true)
         processBuilder.redirectInput(STDIN_FROM_DEV_NULL)
+        WorkspaceExecutionContext.current()?.checkCurrent()
         return processBuilder.start()
     }
 
     /** 容器是否已安装就绪（按当前 profile）。 */
-    override fun isContainerInstalled(): Boolean = containerInstaller.isInstalledFor(currentProfile)
+    override fun isContainerInstalled(): Boolean = containerInstaller.isInstalledFor(executionProfile())
 
     /**
      * 基础包是否已配置完成（按当前 profile 的标记）。首次进入终端时由初始化菜单
      * （assets/aicode/provision.sh）引导安装，完成后脚本写标记；未完成时不影响进入 shell。
      */
-    override fun isProvisioned(): Boolean = isProvisionedFor(currentProfile)
+    override fun isProvisioned(): Boolean = isProvisionedFor(executionProfile())
 
     /** 按指定 profile 判断基础包配置是否完成（[defaultShell] 据此选 bash/sh）。 */
     fun isProvisionedFor(profile: ContainerProfile): Boolean {
@@ -487,7 +497,7 @@ class LinuxContainerEngine @Inject constructor(
      * 容器未就绪（rootfs 未解压）时返回引导文案，就绪返回 null。
      * 命令执行入口据此不自动初始化、直接失败并引导用户去终端页完成初始化。
      */
-    override fun notReadyHint(): String? = notReadyHintFor(currentProfile)
+    override fun notReadyHint(): String? = notReadyHintFor(executionProfile())
 
     /** 按指定 profile 判断容器是否就绪（MCP 按运行时容器启动前检查用）。 */
     fun notReadyHintFor(profile: ContainerProfile): String? {
@@ -499,10 +509,11 @@ class LinuxContainerEngine @Inject constructor(
      * 容器默认命令 shell：优先用 profile 指定的 [ContainerProfile.shellPath]；未指定时
      * 按 provision 状态选 `/bin/bash`（脚本已安装 bash）或 `/bin/sh`。
      */
-    override fun defaultShell(): String {
-        val profile = currentProfile
+    override fun defaultShell(): String = defaultShellFor(executionProfile())
+
+    private fun defaultShellFor(profile: ContainerProfile): String {
         profile.shellPath?.takeIf { it.isNotBlank() }?.let { return it }
-        return if (isProvisioned()) "/bin/bash" else "/bin/sh"
+        return if (isProvisionedFor(profile)) "/bin/bash" else "/bin/sh"
     }
 
     /**
@@ -517,7 +528,7 @@ class LinuxContainerEngine @Inject constructor(
      * 并抛异常（不静默置 Ready），让终端页进入失败态、可重试。
      */
     override suspend fun ensureInstalled() {
-        val profile = currentProfile
+        val profile = executionProfile()
         val startedAt = System.currentTimeMillis()
         FileLogger.i(
             TAG,
@@ -672,7 +683,7 @@ class LinuxContainerEngine @Inject constructor(
         programArgs: List<String>,
         projectPath: String?,
         extraEnv: Map<String, String> = emptyMap(),
-        profile: ContainerProfile = currentProfile
+        profile: ContainerProfile = executionProfile()
     ): Process {
         val invocation = buildStdioInvocation(program, programArgs, projectPath, extraEnv, profile)
         val pb = buildProcessBuilder(invocation)
@@ -705,13 +716,17 @@ class LinuxContainerEngine @Inject constructor(
      * 构造进入容器执行 [command] 的完整 PRoot 调用（argv + env）。
      * 暴露给终端会话：Termux TerminalSession 需要把可执行文件与参数分开传入。
      */
-    fun buildProotInvocation(command: String, projectPath: String?): ProotInvocation {
-        val argv = buildBaseProotArgv(projectPath, currentProfile)
-        // 用 [defaultShell]：bash 装好后 AI 命令与终端会话都走 bash；装机期间/失败回退 /bin/sh。
-        argv.add(defaultShell())
+    fun buildProotInvocation(command: String, projectPath: String?): ProotInvocation =
+        buildProotInvocation(command, projectPath, executionProfile())
+
+    private fun buildProotInvocation(command: String, projectPath: String?, profile: ContainerProfile): ProotInvocation {
+        val argv = buildBaseProotArgv(projectPath, profile)
+        argv.add(defaultShellFor(profile))
         argv.add("-c")
         argv.add(command)
-        return ProotInvocation(argv, buildContainerEnv(currentProfile) + currentProfile.env)
+        val invocation = ProotInvocation(argv, buildContainerEnv(profile) + profile.env)
+        WorkspaceExecutionContext.current()?.checkCurrent()
+        return invocation
     }
 
     /**
@@ -719,7 +734,9 @@ class LinuxContainerEngine @Inject constructor(
      * 但**不含**最终的客户机命令（由各调用方自行追加 `/bin/sh -c …` 或 `exec` 形式）。
      */
     private fun buildBaseProotArgv(projectPath: String?, profile: ContainerProfile): MutableList<String> {
-        val rootfs = containerInstaller.rootfsDirFor(profile).absolutePath
+        val execution = WorkspaceExecutionContext.current()
+        execution?.requireMode(ExecutionMode.LOCAL_PROOT)
+        val rootfs = execution?.localMapping?.rootfsRoot?.absolutePath ?: containerInstaller.rootfsDirFor(profile).absolutePath
         val prootBin = containerInstaller.prootBin.absolutePath
         if (!containerInstaller.prootBin.exists()) {
             // 不可能缺失除非打包配置回退：jniLibs sourceSet 或 packaging.jniLibs.useLegacyPackaging
@@ -739,7 +756,8 @@ class LinuxContainerEngine @Inject constructor(
         // 把当前工作区目录绑定到容器内 ~/workspace（即 /root/workspace），使命令与文件工具作用于同一目录
         if (projectPath != null) {
             argv.add("-b")
-            argv.add("$projectPath:/root/workspace")
+            val workspace = execution?.localMapping?.workspaceRoot?.absolutePath ?: projectPath
+            argv.add("$workspace:/root/workspace")
             argv.add("-w")
             argv.add("/root/workspace")
         }

@@ -1,19 +1,26 @@
 package com.aicode.feature.backup.data
 
 import android.content.Context
+import androidx.room.withTransaction
 import com.aicode.core.security.KeystoreCipher
 import com.aicode.core.util.FileLogger
 import com.aicode.core.util.GitIgnoreMatcher
 import com.aicode.feature.agent.data.local.dao.AgentMessageDao
 import com.aicode.feature.agent.data.local.dao.ChatSessionDao
+import com.aicode.feature.agent.data.local.dao.RecoverySessionGate
+import com.aicode.feature.agent.data.local.dao.SubAgentInteractionDao
 import com.aicode.feature.agent.data.local.dao.TodoItemDao
 import com.aicode.feature.agent.data.local.database.AgentDatabase
 import com.aicode.feature.agent.data.local.entity.AgentMessageEntity
 import com.aicode.feature.agent.data.local.entity.ChatSessionEntity
+import com.aicode.feature.agent.data.local.entity.SubAgentInteractionEntity
 import com.aicode.feature.agent.data.local.entity.TodoItemEntity
 import com.aicode.feature.agent.domain.mcp.McpConfigRepository
 import com.aicode.feature.agent.domain.mcp.McpManager
+import com.aicode.feature.agent.domain.memory.ProjectMemoryJournal
 import com.aicode.feature.agent.domain.permission.PermissionRulesRepository
+import com.aicode.feature.agent.domain.recovery.RecoveryRepository
+import com.aicode.feature.agent.domain.session.SessionUseCase
 import com.aicode.feature.backup.domain.AgentMessageDto
 import com.aicode.feature.backup.domain.BackupCrypto
 import com.aicode.feature.backup.domain.BackupDecryptionException
@@ -27,6 +34,7 @@ import com.aicode.feature.backup.domain.ProviderDto
 import com.aicode.feature.backup.domain.RemoteConnectionDto
 import com.aicode.feature.backup.domain.RemoteMountDto
 import com.aicode.feature.backup.domain.RestoreStats
+import com.aicode.feature.backup.domain.SubAgentInteractionDto
 import com.aicode.feature.backup.domain.TodoItemDto
 import com.aicode.feature.backup.domain.WorkspaceBackupMeta
 import com.aicode.feature.backup.domain.toMetadata
@@ -34,6 +42,8 @@ import com.aicode.feature.settings.data.local.dao.AIProviderDao
 import com.aicode.feature.settings.data.local.entity.AIProviderEntity
 import com.aicode.feature.settings.data.repository.CompactionModelSettingsRepository
 import com.aicode.feature.settings.data.repository.AgentSoundSettingsRepository
+import com.aicode.feature.settings.data.repository.BackgroundSettingsRepository
+import com.aicode.feature.settings.data.repository.ChatBubbleSettingsRepository
 import com.aicode.feature.settings.data.repository.GeneralSettingsRepository
 import com.aicode.feature.settings.data.repository.KeepaliveSettingsRepository
 import com.aicode.feature.settings.data.repository.LiveNotificationSettingsRepository
@@ -55,7 +65,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.KSerializer
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonObject
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
 import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream
@@ -94,7 +108,13 @@ class BackupManagerImpl @Inject constructor(
     private val visionModelSettingsRepository: VisionModelSettingsRepository,
     private val compactionModelSettingsRepository: CompactionModelSettingsRepository,
     private val syncSettingsRepository: SyncSettingsRepository,
-    private val workspaceRepository: WorkspaceRepository
+    private val workspaceRepository: WorkspaceRepository,
+    private val backgroundSettingsRepository: BackgroundSettingsRepository,
+    private val chatBubbleSettingsRepository: ChatBubbleSettingsRepository,
+    private val subAgentInteractionDao: SubAgentInteractionDao,
+    private val projectMemoryJournal: ProjectMemoryJournal,
+    private val recoveryRepository: RecoveryRepository,
+    private val agentDatabase: AgentDatabase
 ) : BackupManager {
 
     private val json = Json {
@@ -146,6 +166,7 @@ class BackupManagerImpl @Inject constructor(
     override suspend fun exportSession(sessionId: String, output: OutputStream) {
         withContext(Dispatchers.IO) {
             val session = chatSessionDao.getById(sessionId) ?: error("Session not found: $sessionId")
+            val sessions = listOf(session) + chatSessionDao.getSubSessionsByParentOnce(sessionId)
             val temp = createTempFile()
             try {
                 FileOutputStream(temp).use { fos ->
@@ -158,27 +179,42 @@ class BackupManagerImpl @Inject constructor(
                                 createdAt = System.currentTimeMillis()
                             ))
                             writeJsonlFileEntry(tar, FILE_SESSIONS) { writer ->
-                                writer.writeLine(json.encodeToString(ChatSessionDto.serializer(), session.toDto()))
+                                sessions.forEach { writer.writeLine(json.encodeToString(ChatSessionDto.serializer(), it.toDto())) }
                             }
                             writeJsonlFileEntry(tar, FILE_MESSAGES) { writer ->
-                                var lastTs = 0L
-                                var lastId = ""
-                                while (true) {
-                                    val batch = agentMessageDao.getPageBySessionAfter(sessionId, lastTs, lastId, PAGE_SIZE)
-                                    if (batch.isEmpty()) break
-                                    batch.forEach { writer.writeLine(json.encodeToString(AgentMessageDto.serializer(), it.toDto())) }
-                                    lastTs = batch.last().timestamp
-                                    lastId = batch.last().id
+                                sessions.forEach { included ->
+                                    var lastTs = 0L
+                                    var lastId = ""
+                                    while (true) {
+                                        val batch = agentMessageDao.getPageBySessionAfter(included.id, lastTs, lastId, PAGE_SIZE)
+                                        if (batch.isEmpty()) break
+                                        batch.forEach { writer.writeLine(json.encodeToString(AgentMessageDto.serializer(), it.toDto())) }
+                                        lastTs = batch.last().timestamp
+                                        lastId = batch.last().id
+                                    }
                                 }
                             }
                             writeJsonlFileEntry(tar, FILE_TODOS) { writer ->
+                                sessions.forEach { included ->
+                                    var lastTs = 0L
+                                    var lastId = ""
+                                    while (true) {
+                                        val batch = todoItemDao.getBySessionPageAfter(included.id, lastTs, lastId, PAGE_SIZE)
+                                        if (batch.isEmpty()) break
+                                        batch.forEach { writer.writeLine(json.encodeToString(TodoItemDto.serializer(), it.toDto())) }
+                                        lastTs = batch.last().createdAt
+                                        lastId = batch.last().id
+                                    }
+                                }
+                            }
+                            writeJsonlFileEntry(tar, FILE_INTERACTIONS) { writer ->
                                 var lastTs = 0L
                                 var lastId = ""
                                 while (true) {
-                                    val batch = todoItemDao.getBySessionPageAfter(sessionId, lastTs, lastId, PAGE_SIZE)
+                                    val batch = subAgentInteractionDao.getPageByParentAfter(sessionId, lastTs, lastId, PAGE_SIZE)
                                     if (batch.isEmpty()) break
-                                    batch.forEach { writer.writeLine(json.encodeToString(TodoItemDto.serializer(), it.toDto())) }
-                                    lastTs = batch.last().createdAt
+                                    batch.forEach { writer.writeLine(json.encodeToString(SubAgentInteractionDto.serializer(), it.toDto())) }
+                                    lastTs = batch.last().timestamp
                                     lastId = batch.last().id
                                 }
                             }
@@ -333,6 +369,18 @@ class BackupManagerImpl @Inject constructor(
                                 lastId = batch.last().id
                             }
                         }
+                        writeJsonlFileEntry(tar, FILE_INTERACTIONS) { writer ->
+                            var lastTs = 0L
+                            var lastId = ""
+                            while (true) {
+                                val batch = subAgentInteractionDao.getPageAfter(lastTs, lastId, PAGE_SIZE)
+                                if (batch.isEmpty()) break
+                                batch.forEach { writer.writeLine(json.encodeToString(SubAgentInteractionDto.serializer(), it.toDto())) }
+                                lastTs = batch.last().timestamp
+                                lastId = batch.last().id
+                            }
+                        }
+                        writeTarEntry(tar, FILE_PROJECT_JOURNAL_HISTORY, projectMemoryJournal.exportHistory().toByteArray(Charsets.UTF_8))
                     }
                 }
             }
@@ -372,7 +420,12 @@ class BackupManagerImpl @Inject constructor(
         compactionModel = if (options.appSettings) compactionModelSettingsRepository.getCompactionModel() else "",
         syncSettings = if (options.appSettings) syncSettingsRepository.snapshot() else null,
         workspaces = if (options.workspaceFiles) collectWorkspaceMetas() else emptyList(),
-        includesAppSettings = options.appSettings
+        includesAppSettings = options.appSettings,
+        chatTextScale = if (options.appSettings) themeSettingsRepository.chatTextScaleSnapshot() else null,
+        chatBackgroundAlpha = if (options.appSettings) backgroundSettingsRepository.chatAlphaSnapshot() else null,
+        typewriterCharsPerSecond = if (options.appSettings) generalSettingsRepository.typewriterCharsPerSecond() else null,
+        userChatBubbleStyleId = if (options.appSettings) chatBubbleSettingsRepository.userStyleSnapshot().id else null,
+        assistantChatBubbleStyleId = if (options.appSettings) chatBubbleSettingsRepository.assistantStyleSnapshot().id else null
     )
 
     private fun writeMetadataEntry(tar: TarArchiveOutputStream, metadata: BackupMetadata) {
@@ -485,71 +538,123 @@ class BackupManagerImpl @Inject constructor(
         val restoreMapping = mutableMapOf<String, Workspace>()
         var metadata: BackupMetadata? = null
         var stats = RestoreStats()
-        var entry = tar.nextEntry
-        while (entry != null) {
-            when (entry.name) {
-                FILE_LEGACY_SNAPSHOT -> {
-                    val plain = tar.readBytes()
-                    val snapshot = json.decodeFromString(BackupSnapshot.serializer(), String(plain, Charsets.UTF_8))
-                    checkVersion(snapshot.schemaVersion)
-                    return restoreLegacy(snapshot)
-                }
-                FILE_METADATA -> {
-                    val plain = tar.readBytes()
-                    metadata = json.decodeFromString(BackupMetadata.serializer(), String(plain, Charsets.UTF_8))
-                    checkVersion(metadata.schemaVersion)
-                }
-                FILE_SESSIONS -> {
-                    val count = restoreJsonl(tar, ChatSessionDto.serializer()) { dtos ->
-                        chatSessionDao.upsertAll(
-                            dtos.map { dto ->
-                                dto.copy(
-                                    workspacePath = resolveSessionWorkspace(dto.workspacePath, restoreMapping)
-                                ).toEntity()
+        val restoredSessionIds = mutableSetOf<String>()
+        val restoredSessionGates = mutableMapOf<String, RecoverySessionGate>()
+        var interactionsFile: File? = null
+        var projectHistory: Pair<String, String>? = null
+        try {
+            var entry = tar.nextEntry
+            while (entry != null) {
+                when (entry.name) {
+                    FILE_LEGACY_SNAPSHOT -> {
+                        val plain = tar.readBytes()
+                        val document = json.parseToJsonElement(String(plain, Charsets.UTF_8)).jsonObject
+                        val snapshot = json.decodeFromJsonElement(BackupSnapshot.serializer(), JsonObject(document - "subAgentInteractions"))
+                        checkVersion(snapshot.schemaVersion)
+                        val interactions = (document["subAgentInteractions"] as? JsonArray)?.mapNotNull { item ->
+                            try {
+                                json.decodeFromJsonElement(SubAgentInteractionDto.serializer(), item)
+                            } catch (_: SerializationException) {
+                                null
                             }
-                        )
+                        }.orEmpty()
+                        return restoreLegacy(snapshot.copy(subAgentInteractions = interactions))
                     }
-                    FileLogger.i(TAG, "恢复会话 $count 条")
-                    stats += RestoreStats(chatSessions = count)
-                }
-                FILE_MESSAGES -> {
-                    val count = restoreJsonl(tar, AgentMessageDto.serializer()) { dtos ->
-                        agentMessageDao.insertAll(dtos.map { it.toEntity() })
+                    FILE_METADATA -> {
+                        val plain = tar.readBytes()
+                        metadata = json.decodeFromString(BackupMetadata.serializer(), String(plain, Charsets.UTF_8))
+                        checkVersion(metadata.schemaVersion)
                     }
-                    FileLogger.i(TAG, "恢复消息 $count 条")
-                    stats += RestoreStats(agentMessages = count)
-                }
-                FILE_TODOS -> {
-                    val count = restoreJsonl(tar, TodoItemDto.serializer()) { dtos ->
-                        todoItemDao.upsertAll(dtos.map { it.toEntity() })
+                    FILE_SESSIONS -> {
+                        val count = restoreJsonl(tar, ChatSessionDto.serializer()) { dtos ->
+                            restoreSessions(dtos, restoreMapping, restoredSessionIds, restoredSessionGates)
+                        }
+                        FileLogger.i(TAG, "恢复会话 $count 条")
+                        stats += RestoreStats(chatSessions = count)
                     }
-                    FileLogger.i(TAG, "恢复待办 $count 条")
-                    stats += RestoreStats(todoItems = count)
+                    FILE_MESSAGES -> {
+                        val count = restoreJsonl(tar, AgentMessageDto.serializer()) { dtos ->
+                            agentDatabase.withTransaction {
+                                dtos.map { it.sessionId }.distinct().forEach { fenceSessionForRestore(it, restoredSessionGates) }
+                                agentMessageDao.insertAll(dtos.map { it.toEntity() })
+                            }
+                        }
+                        FileLogger.i(TAG, "恢复消息 $count 条")
+                        stats += RestoreStats(agentMessages = count)
+                    }
+                    FILE_TODOS -> {
+                        val count = restoreJsonl(tar, TodoItemDto.serializer()) { dtos ->
+                            agentDatabase.withTransaction {
+                                dtos.map { it.sessionId }.distinct().forEach { fenceSessionForRestore(it, restoredSessionGates) }
+                                todoItemDao.upsertAll(dtos.map { it.toEntity() })
+                            }
+                        }
+                        FileLogger.i(TAG, "恢复待办 $count 条")
+                        stats += RestoreStats(todoItems = count)
+                    }
+                    FILE_PROJECT_JOURNAL_HISTORY -> {
+                        require(projectHistory == null && entry.isFile && !entry.isSymbolicLink && !entry.isLink)
+                        require(entry.size in 0L..MAX_PROJECT_HISTORY_BYTES)
+                        val text = String(tar.readBytes(), Charsets.UTF_8)
+                        projectHistory = text to validateProjectHistoryImport(text)
+                    }
+                    FILE_INTERACTIONS -> {
+                        // tar 条目可乱序；先落临时文件，待所有会话恢复后再校验父归属。
+                        val pending = interactionsFile ?: createTempFile().also { interactionsFile = it }
+                        FileOutputStream(pending, true).use { output ->
+                            tar.copyTo(output)
+                            output.write('\n'.code)
+                        }
+                    }
+                    else -> {
+                        if (entry.name.startsWith(WORKSPACE_PREFIX)) {
+                            stats += restoreWorkspaceEntry(tar, entry.name, selectedWorkspaces, restoreMapping)
+                        }
+                    }
                 }
-                else -> {
-                    if (entry.name.startsWith(WORKSPACE_PREFIX)) {
-                        stats += restoreWorkspaceEntry(tar, entry.name, selectedWorkspaces, restoreMapping)
+                entry = tar.nextEntry
+            }
+            val meta = metadata ?: run {
+                FileLogger.e(TAG, "导入失败：tar 中缺少 metadata.json")
+                error("不是有效的 AiCode 备份文件：缺少 metadata.json")
+            }
+            interactionsFile?.let { pending ->
+                val childOwners = mutableMapOf<String, Set<String>>()
+                for (instructionReferencesOnly in listOf(false, true)) {
+                    FileInputStream(pending).buffered().use { input ->
+                        restoreJsonl(input, SubAgentInteractionDto.serializer(), skipInvalidLines = true) { dtos ->
+                            restoreInteractions(dtos.filter { (it.kind in INSTRUCTION_REFERENCE_KINDS) == instructionReferencesOnly }, restoredSessionIds, childOwners)
+                        }
                     }
                 }
             }
-            entry = tar.nextEntry
+            projectHistory?.let { (text, version) -> projectMemoryJournal.importHistory(text, version) }
+            FileLogger.i(TAG, "tar 解析完成，开始还原元数据段")
+            return stats + restoreMeta(meta)
+        } finally {
+            interactionsFile?.delete()
         }
-        val meta = metadata ?: run {
-            FileLogger.e(TAG, "导入失败：tar 中缺少 metadata.json")
-            error("不是有效的 AiCode 备份文件：缺少 metadata.json")
-        }
-        FileLogger.i(TAG, "tar 解析完成，开始还原元数据段")
-        return stats + restoreMeta(meta)
     }
 
     /** 逐行解析 jsonl 条目，每 [PAGE_SIZE] 条回调一次批量插入；返回该文件的总条数。 */
-    private suspend fun <T> restoreJsonl(tar: TarArchiveInputStream, serializer: KSerializer<T>, insert: suspend (List<T>) -> Unit): Int {
+    private suspend fun <T> restoreJsonl(
+        input: InputStream,
+        serializer: KSerializer<T>,
+        skipInvalidLines: Boolean = false,
+        insert: suspend (List<T>) -> Unit
+    ): Int {
         val buffer = ByteArray(64 * 1024)
         val line = ByteArrayOutputStream(16 * 1024)
         val batch = ArrayList<T>(PAGE_SIZE)
         var count = 0
+        fun decodeLine(): T? = try {
+            json.decodeFromString(serializer, String(line.toByteArray(), Charsets.UTF_8))
+        } catch (e: SerializationException) {
+            if (!skipInvalidLines) throw e
+            null
+        }
         while (true) {
-            val n = tar.read(buffer)
+            val n = input.read(buffer)
             if (n < 0) break
             var start = 0
             for (i in 0 until n) {
@@ -559,7 +664,7 @@ class BackupManagerImpl @Inject constructor(
                     if (line.size() > 0) {
                         // 注意：ByteArrayOutputStream.toString(Charset) 是 API 33 才有的方法，
                         // 在 Android 13 以下会抛 NoSuchMethodError，必须用 String(byte[], Charset) 构造器。
-                        batch.add(json.decodeFromString(serializer, String(line.toByteArray(), Charsets.UTF_8)))
+                        decodeLine()?.let { batch.add(it) }
                         line.reset()
                         if (batch.size >= PAGE_SIZE) {
                             count += batch.size
@@ -574,7 +679,7 @@ class BackupManagerImpl @Inject constructor(
             line.write(buffer, start, n - start)
         }
         if (line.size() > 0) {
-            batch.add(json.decodeFromString(serializer, String(line.toByteArray(), Charsets.UTF_8)))
+            decodeLine()?.let { batch.add(it) }
         }
         if (batch.isNotEmpty()) {
             count += batch.size
@@ -591,27 +696,134 @@ class BackupManagerImpl @Inject constructor(
 
     /** 旧格式（单文件 snapshot.json 完整快照）还原。 */
     private suspend fun restoreLegacy(snapshot: BackupSnapshot): RestoreStats {
-        var stats = restoreMeta(snapshot.toMetadata())
+        val projectHistoryVersion = snapshot.projectJournalHistoryJson?.let(::validateProjectHistoryImport)
+        val stats = restoreMeta(snapshot.toMetadata())
+        val restoredSessionIds = mutableSetOf<String>()
+        val restoredSessionGates = mutableMapOf<String, RecoverySessionGate>()
         if (snapshot.chatSessions.isNotEmpty()) {
             // 按备份中的工作区路径逐个解析到目标工作区（不存在则自动创建空工作区），不再全部塞进当前工作区。
             val restoreMapping = mutableMapOf<String, Workspace>()
-            chatSessionDao.upsertAll(
-                snapshot.chatSessions.map {
-                    it.copy(workspacePath = resolveSessionWorkspace(it.workspacePath, restoreMapping)).toEntity()
-                }
-            )
+            snapshot.chatSessions.chunked(PAGE_SIZE).forEach { dtos ->
+                restoreSessions(dtos, restoreMapping, restoredSessionIds, restoredSessionGates)
+            }
         }
-        if (snapshot.agentMessages.isNotEmpty()) {
-            agentMessageDao.insertAll(snapshot.agentMessages.map { it.toEntity() })
+        snapshot.agentMessages.chunked(PAGE_SIZE).forEach { dtos ->
+            agentDatabase.withTransaction {
+                dtos.map { it.sessionId }.distinct().forEach { fenceSessionForRestore(it, restoredSessionGates) }
+                agentMessageDao.insertAll(dtos.map { it.toEntity() })
+            }
         }
-        if (snapshot.todoItems.isNotEmpty()) {
-            todoItemDao.upsertAll(snapshot.todoItems.map { it.toEntity() })
+        snapshot.todoItems.chunked(PAGE_SIZE).forEach { dtos ->
+            agentDatabase.withTransaction {
+                dtos.map { it.sessionId }.distinct().forEach { fenceSessionForRestore(it, restoredSessionGates) }
+                todoItemDao.upsertAll(dtos.map { it.toEntity() })
+            }
         }
+        val childOwners = mutableMapOf<String, Set<String>>()
+        for (instructionReferencesOnly in listOf(false, true)) {
+            snapshot.subAgentInteractions.chunked(PAGE_SIZE).forEach { dtos ->
+                restoreInteractions(dtos.filter { (it.kind in INSTRUCTION_REFERENCE_KINDS) == instructionReferencesOnly }, restoredSessionIds, childOwners)
+            }
+        }
+        snapshot.projectJournalHistoryJson?.let { projectMemoryJournal.importHistory(it, projectHistoryVersion) }
         return stats + RestoreStats(
             chatSessions = snapshot.chatSessions.size,
             agentMessages = snapshot.agentMessages.size,
             todoItems = snapshot.todoItems.size
         )
+    }
+
+    private suspend fun restoreSessions(
+        dtos: List<ChatSessionDto>,
+        restoreMapping: MutableMap<String, Workspace>,
+        restoredSessionIds: MutableSet<String>,
+        restoredSessionGates: MutableMap<String, RecoverySessionGate>
+    ) {
+        val resolved = dtos.distinctBy { it.id }.map { dto ->
+            dto.copy(workspacePath = resolveSessionWorkspace(dto.workspacePath, restoreMapping))
+        }
+        agentDatabase.withTransaction {
+            val entities = resolved.mapNotNull { dto ->
+                val existing = chatSessionDao.getById(dto.id)
+                if (existing != null && existing.parentId != dto.parentId) return@mapNotNull null
+                val fenced = fenceSessionForRestore(dto.id, restoredSessionGates)
+                dto.toEntity().copy(
+                    executionGeneration = fenced?.executionGeneration ?: 0,
+                    autoDispatchBlockedReason = fenced?.autoDispatchBlockedReason
+                )
+            }
+            if (entities.isNotEmpty()) {
+                chatSessionDao.upsertAll(entities)
+                restoredSessionIds.addAll(entities.map { it.id })
+                entities.forEach {
+                    restoredSessionGates[it.id] = RecoverySessionGate(it.id, it.executionGeneration, it.autoDispatchBlockedReason)
+                }
+            }
+        }
+    }
+
+    private suspend fun fenceSessionForRestore(
+        sessionId: String,
+        restoredSessionGates: MutableMap<String, RecoverySessionGate>
+    ): ChatSessionEntity? {
+        val current = chatSessionDao.getById(sessionId)
+        restoredSessionGates[sessionId]?.let { gate ->
+            check(current != null && current.executionGeneration == gate.executionGeneration &&
+                current.autoDispatchBlockedReason == gate.autoDispatchBlockedReason && !chatSessionDao.hasPendingRecovery(sessionId)
+            ) { "Session changed during backup restore" }
+            return current
+        }
+        if (current == null) return null
+        check(recoveryRepository.invalidateSession(sessionId, "backup_restore", generationBump = true)) {
+            "Session deleted during backup restore"
+        }
+        return checkNotNull(chatSessionDao.getById(sessionId)) { "Session deleted during backup restore" }.also {
+            restoredSessionGates[sessionId] = RecoverySessionGate(it.id, it.executionGeneration, it.autoDispatchBlockedReason)
+        }
+    }
+
+    private fun validateProjectHistoryImport(text: String): String {
+        projectMemoryJournal.validateHistory(text)
+        return projectMemoryJournal.historyVersion().also { version ->
+            projectMemoryJournal.validateImportHistory(text, version)
+        }
+    }
+
+    private suspend fun restoreInteractions(
+        dtos: List<SubAgentInteractionDto>,
+        restoredSessionIds: Set<String>,
+        childOwners: MutableMap<String, Set<String>>
+    ) {
+        for (dto in dtos) {
+            if (dto.id.isBlank() || dto.parentSessionId.isBlank() || dto.subSessionId.isBlank() ||
+                dto.parentSessionId == dto.subSessionId || dto.timestamp < 0 ||
+                dto.kind !in INTERACTION_KINDS || dto.origin !in INTERACTION_ORIGINS ||
+                dto.sourceMessageId?.isBlank() == true || dto.instructionId?.isBlank() == true ||
+                (dto.instructionId != null && dto.kind !in INSTRUCTION_REFERENCE_KINDS) ||
+                (dto.kind == "INSTRUCTION_CANCELLED" && dto.instructionId == null) ||
+                (dto.kind in INSTRUCTION_REFERENCE_KINDS && dto.sourceMessageId != null) ||
+                dto.parentSessionId !in restoredSessionIds
+            ) continue
+            if (subAgentInteractionDao.getById(dto.id) != null) continue
+            val parent = chatSessionDao.getById(dto.parentSessionId) ?: continue
+            val child = chatSessionDao.getById(dto.subSessionId)
+            if (child != null && child.parentId != parent.id) continue
+            val knownOwners = childOwners[dto.subSessionId]
+                ?: subAgentInteractionDao.getParentIdsByChildOnce(dto.subSessionId).toSet().also {
+                    childOwners[dto.subSessionId] = it
+                }
+            if (knownOwners.any { it != parent.id }) continue
+            val source = dto.sourceMessageId?.let { agentMessageDao.getMessageById(it) }
+            if (source != null && source.sessionId != dto.subSessionId) continue
+            if (dto.instructionId != null) {
+                val instruction = subAgentInteractionDao.getById(dto.instructionId) ?: continue
+                if (instruction.parentSessionId != parent.id || instruction.subSessionId != dto.subSessionId ||
+                    instruction.kind != "MESSAGE_FROM_PARENT" || instruction.origin != "USER"
+                ) continue
+            }
+            subAgentInteractionDao.insertIgnore(dto.toEntity())
+            childOwners[dto.subSessionId] = setOf(parent.id)
+        }
     }
 
     /** 元数据段还原（小表 + 应用设置），新旧格式共用。 */
@@ -644,6 +856,12 @@ class BackupManagerImpl @Inject constructor(
         if (meta.includesAppSettings) {
             meta.themeMode?.let { themeSettingsRepository.restore(it) }
             themeSettingsRepository.restoreColors(meta.themePresetId, meta.dynamicColorEnabled)
+            meta.chatTextScale?.let { themeSettingsRepository.setChatTextScale(it) }
+            meta.chatBackgroundAlpha?.let { backgroundSettingsRepository.setChatBackgroundAlpha(it) }
+            meta.typewriterCharsPerSecond?.let { generalSettingsRepository.setTypewriterCharsPerSecond(it) }
+            if (meta.userChatBubbleStyleId != null || meta.assistantChatBubbleStyleId != null) {
+                chatBubbleSettingsRepository.restore(meta.userChatBubbleStyleId, meta.assistantChatBubbleStyleId)
+            }
             keepaliveSettingsRepository.restore(meta.keepaliveEnabled)
             liveNotificationSettingsRepository.restore(meta.liveNotificationEnabled)
             approvalNotificationSettingsRepository.restore(meta.approvalNotificationEnabled)
@@ -832,23 +1050,28 @@ class BackupManagerImpl @Inject constructor(
 
     private fun ChatSessionEntity.toDto() = ChatSessionDto(
         id = id, title = title, createdAt = createdAt, updatedAt = updatedAt, workspacePath = workspacePath,
-        mode = mode, modeBeforePlan = modeBeforePlan, reasoningEffort = reasoningEffort, providerId = providerId,
+        reasoningEffort = reasoningEffort, providerId = providerId,
         model = model, isPinned = isPinned, parentId = parentId, subagentType = subagentType
     )
 
     private fun ChatSessionDto.toEntity() = ChatSessionEntity(
         id = id, title = title, createdAt = createdAt, updatedAt = updatedAt, workspacePath = workspacePath,
-        mode = mode, modeBeforePlan = modeBeforePlan, reasoningEffort = reasoningEffort, providerId = providerId,
+        reasoningEffort = reasoningEffort, providerId = providerId,
         model = model, isPinned = isPinned, parentId = parentId, subagentType = subagentType
     )
 
     private fun AgentMessageEntity.toDto() = AgentMessageDto(
         id, sessionId, role, content, timestamp, toolCallsJson, toolCallId, toolName, toolArgs,
         isError, reasoning, signature, attachmentsJson, isCompacted, isContextSummary, isCompactionMarker,
-        thinkingBlocksJson, isContextExcluded, compactedBySummaryId
+        thinkingBlocksJson, isContextExcluded, compactedBySummaryId,
+        contextInputTokens, contextInputBudget, contextEstimated, contextBreakdownJson, toolActionTitle,
+        toolStartedAtMs, toolDurationMs, turnDurationMs, modelInputSnapshotJson, continuationOfMessageId, continuationDraft
     )
 
     private fun AgentMessageDto.toEntity(): AgentMessageEntity {
+        val interrupted = role == "TOOL" && (
+            content.startsWith(SessionUseCase.PENDING_TOOL_MARKER) || content.startsWith(SessionUseCase.LEGACY_PENDING_TOOL_MARKER)
+        )
         val summary = isContextSummary || (role == "ASSISTANT" && content.startsWith(
             com.aicode.feature.agent.domain.model.CONTEXT_SUMMARY_LEGACY_PREFIX
         ))
@@ -857,11 +1080,23 @@ class BackupManagerImpl @Inject constructor(
                 toolCallsJson == null && compactedBySummaryId == null && isLegacyUsageTable(content)
         )
         return AgentMessageEntity(
-            id, sessionId, role, content, timestamp, toolCallsJson, toolCallId, toolName, toolArgs,
-            isError, reasoning, signature, attachmentsJson, isCompacted && !excluded, summary, isCompactionMarker,
+            id, sessionId, role, if (interrupted) SessionUseCase.INTERRUPTED_TOOL_TEXT else content,
+            timestamp, toolCallsJson, toolCallId, toolName, toolArgs,
+            isError || interrupted, reasoning, signature, attachmentsJson, isCompacted && !excluded, summary, isCompactionMarker,
             thinkingBlocksJson = thinkingBlocksJson,
             isContextExcluded = excluded,
-            compactedBySummaryId = if (excluded) null else compactedBySummaryId
+            compactedBySummaryId = if (excluded) null else compactedBySummaryId,
+            contextInputTokens = contextInputTokens,
+            contextInputBudget = contextInputBudget,
+            contextEstimated = contextEstimated,
+            contextBreakdownJson = contextBreakdownJson,
+            toolActionTitle = toolActionTitle,
+            toolStartedAtMs = toolStartedAtMs,
+            toolDurationMs = toolDurationMs,
+            turnDurationMs = turnDurationMs,
+            modelInputSnapshotJson = modelInputSnapshotJson,
+            continuationOfMessageId = continuationOfMessageId,
+            continuationDraft = continuationDraft
         )
     }
 
@@ -881,16 +1116,36 @@ class BackupManagerImpl @Inject constructor(
         }
     }
 
+    private fun SubAgentInteractionEntity.toDto() = SubAgentInteractionDto(
+        id = id, parentSessionId = parentSessionId, subSessionId = subSessionId,
+        kind = kind, content = content, timestamp = timestamp, origin = origin,
+        sourceMessageId = sourceMessageId, title = title, model = model, instructionId = instructionId,
+        agentName = agentName
+    )
+
+    private fun SubAgentInteractionDto.toEntity() = SubAgentInteractionEntity(
+        id = id, parentSessionId = parentSessionId, subSessionId = subSessionId,
+        kind = kind, content = content, timestamp = timestamp, origin = origin,
+        sourceMessageId = sourceMessageId, title = title, model = model, instructionId = instructionId,
+        agentName = agentName
+    )
+
     private fun TodoItemEntity.toDto() = TodoItemDto(id, sessionId, subject, description, status, priority, order, createdAt, updatedAt)
     private fun TodoItemDto.toEntity() = TodoItemEntity(id, sessionId, subject, description, status, priority, order, createdAt, updatedAt)
 
     private companion object {
         const val TAG = "BackupManager"
+        val INTERACTION_KINDS = setOf("SPAWNED", "STARTED", "INSTRUCTION_CANCELLED", "MESSAGE_FROM_PARENT", "MESSAGE_FROM_SUB", "COMPLETED", "FAILED", "STOPPED", "INTERRUPTED", "DELETED")
+        val INSTRUCTION_REFERENCE_KINDS = setOf("STARTED", "INSTRUCTION_CANCELLED")
+        val INTERACTION_ORIGINS = setOf("PARENT", "SUB", "USER", "SYSTEM")
         const val PAGE_SIZE = 500
         const val FILE_METADATA = "metadata.json"
         const val FILE_SESSIONS = "chatSessions.jsonl"
         const val FILE_MESSAGES = "messages.jsonl"
         const val FILE_TODOS = "todoItems.jsonl"
+        const val FILE_INTERACTIONS = "subAgentInteractions.jsonl"
+        const val FILE_PROJECT_JOURNAL_HISTORY = "project_journal_history.json"
+        const val MAX_PROJECT_HISTORY_BYTES = 16L * 1024 * 1024
         const val FILE_LEGACY_SNAPSHOT = "snapshot.json"
         const val WORKSPACE_PREFIX = "workspaces/"
     }

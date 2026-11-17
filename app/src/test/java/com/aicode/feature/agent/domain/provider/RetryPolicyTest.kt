@@ -1,5 +1,7 @@
 package com.aicode.feature.agent.domain.provider
 
+import io.mockk.every
+import io.mockk.mockk
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
@@ -11,10 +13,13 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import okhttp3.ResponseBody
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
+import retrofit2.Call
+import retrofit2.Callback
 import retrofit2.HttpException
 import retrofit2.Response
 import java.io.IOException
@@ -28,6 +33,61 @@ import javax.net.ssl.SSLException
  * 触发重试的异常 → 用户可见错误摘要（[Throwable.toRetryErrorInfo]）的分类逻辑。
  */
 class RetryPolicyTest {
+
+    @Test
+    fun requestDurationIncludesHeadersAndContentButExcludesPreparation() = runTest {
+        var nowNanos = 1_000L
+        val guard = FirstContentGuard { nowNanos }
+        assertNull(guard.requestDurationMillis())
+        nowNanos += 80_000_000_000L
+        val call = mockk<Call<ResponseBody>>()
+        every { call.enqueue(any()) } answers {
+            nowNanos += 6_000_000_000L
+            firstArg<Callback<ResponseBody>>().onResponse(call, Response.success("body".toResponseBody(null)))
+        }
+        every { call.cancel() } returns Unit
+        every { call.isCanceled } returns false
+        guard.awaitBody(call).use {
+            assertEquals(6_000L, guard.requestDurationMillis())
+            nowNanos += 778_000_000L
+            guard.receivedContent()
+            nowNanos += 3_222_000_000L
+        }
+        assertEquals(10_000L, guard.requestDurationMillis())
+    }
+
+    @Test
+    fun successfulRequestDurationExcludesFailedAttemptAndRetryWaiting() = runTest {
+        var nowNanos = 0L
+        val failed = FirstContentGuard { nowNanos }
+        val failedCall = mockk<Call<ResponseBody>>()
+        every { failedCall.enqueue(any()) } answers {
+            nowNanos += 50_000_000_000L
+            firstArg<Callback<ResponseBody>>().onFailure(failedCall, IOException("disconnected"))
+        }
+        every { failedCall.cancel() } returns Unit
+        every { failedCall.isCanceled } returns false
+        try {
+            failed.awaitBody(failedCall)
+            org.junit.Assert.fail("Expected disconnected request")
+        } catch (_: IOException) {
+        }
+        val successful = FirstContentGuard { nowNanos }
+        nowNanos += 30_000_000_000L
+        val successfulCall = mockk<Call<ResponseBody>>()
+        every { successfulCall.enqueue(any()) } answers {
+            nowNanos += 1_000_000_000L
+            firstArg<Callback<ResponseBody>>().onResponse(successfulCall, Response.success("body".toResponseBody(null)))
+        }
+        every { successfulCall.cancel() } returns Unit
+        every { successfulCall.isCanceled } returns false
+        successful.awaitBody(successfulCall).use {
+            successful.receivedContent()
+            nowNanos += 1_000_000_000L
+        }
+        assertEquals(2_000L, successful.requestDurationMillis())
+        assertEquals(82_000_000_000L, nowNanos)
+    }
 
     @Test
     fun timeout_covers_waiting_for_headers() = runTest {

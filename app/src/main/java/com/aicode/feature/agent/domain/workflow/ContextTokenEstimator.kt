@@ -1,45 +1,65 @@
 package com.aicode.feature.agent.domain.workflow
 
 import com.aicode.feature.agent.domain.model.AgentMessage
+import com.aicode.feature.agent.domain.model.ContextUsageBreakdown
 import com.aicode.feature.agent.domain.tool.AgentTool
-import com.aicode.feature.agent.domain.tool.modelToolResultText
 import com.aicode.feature.settings.domain.model.ModelContextPolicy
-import com.google.gson.Gson
 
 object ContextTokenEstimator {
-    private val gson = Gson()
+    private val cache = ContextEstimateCache()
+
+    internal val cacheStats: ContextEstimateCache.Stats get() = cache.stats
 
     fun estimate(
         systemPrompt: String,
         messages: List<AgentMessage>,
         tools: List<AgentTool>,
         charsPerToken: Int = ModelContextPolicy.CHARS_PER_TOKEN
-    ): Int {
-        val total = ModelContextPolicy.estimateTextTokens(systemPrompt, charsPerToken).toLong() +
-            tools.sumOf { tool ->
-                ModelContextPolicy.estimateTextTokens(tool.name + tool.description + gson.toJson(tool.toJsonSchema()), charsPerToken).toLong() + 16
-            } + messages.sumOf { estimate(it, charsPerToken).toLong() }
-        return total.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+    ): Int = breakdown(systemPrompt, messages, tools, charsPerToken).estimatedTotal
+
+    fun breakdown(
+        systemPrompt: String,
+        messages: List<AgentMessage>,
+        tools: List<AgentTool>,
+        charsPerToken: Int = ModelContextPolicy.CHARS_PER_TOKEN
+    ): ContextUsageBreakdown {
+        val toolDefinitionTokens = tools.sumOf { tool ->
+            cache.schemaTextTokens(tool, charsPerToken).toLong() + 16
+        }
+        var chatTokens = 0L
+        var toolResultTokens = 0L
+        var imageTokens = 0L
+        messages.forEach { message ->
+            val images = when (message) {
+                is AgentMessage.UserMessage -> message.images
+                is AgentMessage.AssistantMessage -> message.images
+                is AgentMessage.ToolResultMessage -> message.images
+            }
+            val messageImageTokens = images.size * 4_096L
+            val textTokens = (estimate(message, charsPerToken).toLong() - messageImageTokens).coerceAtLeast(0L)
+            when (message) {
+                is AgentMessage.UserMessage, is AgentMessage.AssistantMessage -> chatTokens += textTokens
+                is AgentMessage.ToolResultMessage -> toolResultTokens += textTokens
+            }
+            imageTokens += messageImageTokens
+        }
+        return ContextUsageBreakdown(
+            systemTokens = ModelContextPolicy.estimateTextTokens(systemPrompt, charsPerToken),
+            toolDefinitionTokens = toolDefinitionTokens.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+            chatTokens = chatTokens.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+            toolResultTokens = toolResultTokens.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+            imageTokens = imageTokens.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+        )
     }
 
     fun estimate(message: AgentMessage, charsPerToken: Int = ModelContextPolicy.CHARS_PER_TOKEN): Int {
-        val text: String
-        val images: Int
-        when (message) {
-            is AgentMessage.UserMessage -> {
-                text = message.content
-                images = message.images.size
-            }
-            is AgentMessage.AssistantMessage -> {
-                text = message.content + message.reasoning + message.toolCalls.joinToString { it.name + gson.toJson(it.arguments) }
-                images = message.images.size
-            }
-            is AgentMessage.ToolResultMessage -> {
-                text = message.toolName + (message.modelResult ?: modelToolResultText(message.toolName, message.result) ?: message.result)
-                images = message.images.size
-            }
+        val textTokens = cache.messageTextTokens(message, charsPerToken)
+        val images = when (message) {
+            is AgentMessage.UserMessage -> message.images.size
+            is AgentMessage.AssistantMessage -> message.images.size
+            is AgentMessage.ToolResultMessage -> message.images.size
         }
-        return (ModelContextPolicy.estimateTextTokens(text, charsPerToken).toLong() + images * 4_096L + 12)
+        return (textTokens.toLong() + images * 4_096L + 12)
             .coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
     }
 

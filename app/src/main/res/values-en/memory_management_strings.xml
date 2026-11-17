@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="memory_management_title">Memory management</string>
+    <string name="memory_management_add">New memory</string>
+    <string name="memory_management_refresh">Refresh memories</string>
+    <string name="memory_management_global">Global memories</string>
+    <string name="memory_management_project">Current project memories</string>
+    <string name="memory_management_project_named">Current project · %1$s</string>
+    <string name="memory_management_no_workspace">No workspace selected. Project memories are unavailable; global memories can still be viewed and created.</string>
+    <string name="memory_management_empty">No memories in this scope</string>
+    <string name="memory_management_name">Name</string>
+    <string name="memory_management_name_hint">Use letters, numbers, hyphens or underscores, matching the memory tool namespace.</string>
+    <string name="memory_management_description">Summary</string>
+    <string name="memory_management_no_description">No summary</string>
+    <string name="memory_management_body">Body (Markdown)</string>
+    <string name="memory_management_scope">Scope</string>
+    <string name="memory_management_file">File</string>
+    <string name="memory_management_copy_body">Copy body</string>
+    <string name="memory_management_create">Create</string>
+    <string name="memory_management_creating">Creating…</string>
+    <string name="memory_management_delete_title">Delete memory</string>
+    <string name="memory_management_delete_message">Delete “%1$s” (%2$s)? This cannot be undone. Memories with the same name in other scopes are not affected.</string>
+    <string name="memory_management_target_changed">The workspace or execution environment changed. Reads and writes on this page have stopped to avoid using the wrong target. Reload to continue.</string>
+    <string name="memory_management_reload">Load current environment</string>
+    <string name="memory_management_invalid_name">Invalid name. Use letters, numbers, hyphens or underscores, without paths or control characters.</string>
+    <string name="memory_management_name_conflict">A memory with this name already exists in this scope. Choose another name; existing content was not overwritten.</string>
+    <string name="memory_management_not_found">This memory file no longer exists. Return to the list and refresh.</string>
+    <string name="memory_management_changed">Another operation updated this memory. Nothing was deleted. Refresh and review the latest content before confirming again.</string>
+    <string name="memory_management_unsafe_path">The memory directory or file contains a symbolic link or unsafe path. Check its storage location before continuing.</string>
+    <string name="memory_management_io_failed">Unable to read or write memories. Check directory access permissions and try again.</string>
+</resources>

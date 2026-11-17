@@ -5,6 +5,7 @@ import com.aicode.core.util.GitIgnoreMatcher
 import com.aicode.feature.workspace.domain.model.SyncConnectionState
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.async
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
@@ -13,8 +14,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.channels.BufferOverflow
-import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -33,7 +34,8 @@ class SyncEngine(
     private val useGitIgnore: Boolean,
     private val maxSyncBatchSize: Int,
     /** 同步指纹索引：未变文件据此跳过重传（见 [SyncDecision]）。 */
-    private val indexStore: SyncIndexStore
+    private val indexStore: SyncIndexStore,
+    private val dispatcher: CoroutineDispatcher = Dispatchers.IO
 ) {
     companion object {
         private const val TAG = "SyncEngine"
@@ -42,7 +44,7 @@ class SyncEngine(
         private const val RECONNECT_MAX_MS = 60_000L
         private const val FILE_SYNC_DELAY_MS = 50L
 
-        /** 待同步路径队列上限；超出时丢弃最旧项，防止大量改动时内存无界增长。 */
+        /** 待同步路径上限；溢出要求全量对账，不静默丢失同步状态。 */
         private const val MAX_PENDING_SYNC = 4096
 
         private val HEX = "0123456789abcdef".toCharArray()
@@ -52,6 +54,7 @@ class SyncEngine(
     private var gitIgnorePatterns = emptyList<String>()
 
     private fun isIgnored(path: String): Boolean {
+        if (indexStore.ownsPath(path)) return true
         // 统一转为「相对挂载根」的路径段再匹配：GitIgnoreMatcher 契约是相对路径段，
         // 直接传宿主/远程绝对路径会让前缀段参与匹配，可能误命中（如 gitignore 写了 `data` 而
         // 宿主路径恰好有 /data 前缀）。本地路径剥 localMountPath，远程路径剥 remotePath。
@@ -75,7 +78,8 @@ class SyncEngine(
 
     /** 相对挂载根的路径，作为索引 key（挂载本地路径改动后仍可复用）。 */
     private fun relativeKey(absolutePath: String): String =
-        absolutePath.removePrefix(mount.localMountPath).removePrefix("/")
+        File(mount.localMountPath).absoluteFile.toPath().normalize()
+            .relativize(File(absolutePath).absoluteFile.toPath().normalize()).toString()
 
     /** 计算文件内容 SHA-256（十六进制小写）；读盘失败返回 null（调用方据此保守上传）。 */
     private fun sha256Of(file: File): String? = runCatching {
@@ -95,11 +99,11 @@ class SyncEngine(
 
     /** 判定某文件是否需要上传；命中跳过时顺带刷新 mtime，避免下次重复算哈希。 */
     private fun shouldUpload(rel: String, file: File): Boolean {
-        val action = SyncDecision.decide(fingerprints[rel], file.length(), file.lastModified()) { sha256Of(file) }
+        val action = SyncDecision.decide(currentFingerprint(rel), file.length(), file.lastModified()) { sha256Of(file) }
         if (action == SyncDecision.Action.SKIP_UNCHANGED) {
-            fingerprints[rel]?.let { stored ->
+            currentFingerprint(rel)?.let { stored ->
                 if (stored.mtimeMs != file.lastModified()) {
-                    fingerprints[rel] = stored.copy(mtimeMs = file.lastModified())
+                    updateFingerprint(rel, stored.copy(mtimeMs = file.lastModified()))
                 }
             }
             return false
@@ -107,20 +111,54 @@ class SyncEngine(
         return true
     }
 
-    /** 上传成功后记录指纹；仅当与旧记录同尺寸（原地改写）才补算哈希，避免典型上传都全量读盘。 */
-    private fun recordUploaded(rel: String, file: File) {
-        val size = file.length()
-        val stored = fingerprints[rel]
-        val sha = if (stored != null && stored.size == size) sha256Of(file) else null
-        fingerprints[rel] = FileFingerprint(size, file.lastModified(), sha)
+    private suspend fun uploadAndRecord(rel: String, file: File, remotePath: String) {
+        val before = FileFingerprint(file.length(), file.lastModified(), sha256Of(file))
+        syncClient.uploadFile(file.absolutePath, remotePath)
+        val after = FileFingerprint(file.length(), file.lastModified(), sha256Of(file))
+        if (before.sha256 == null || before != after) {
+            requestReconcile()
+            return
+        }
+        updateFingerprint(rel, after)
     }
+
+    private fun matchesContent(rel: String, file: File): Boolean {
+        val stored = currentFingerprint(rel) ?: return false
+        return stored.size == file.length() && stored.sha256 != null && stored.sha256 == sha256Of(file)
+    }
+
+    private val operationMutex = Mutex()
+    private val pendingIndex = LinkedHashMap<String, FileFingerprint?>()
+    private val batchLimit = maxSyncBatchSize.coerceIn(1, MAX_PENDING_SYNC)
+
+    private fun currentFingerprint(path: String): FileFingerprint? =
+        if (pendingIndex.containsKey(path)) pendingIndex[path] else fingerprints[path]
+
+    private fun updateFingerprint(path: String, value: FileFingerprint?) {
+        if (currentFingerprint(path) == value && path !in observed) return
+        pendingIndex[path] = value
+        if (pendingIndex.size >= batchLimit) saveIndex()
+    }
+
+    private class IndexWriteFailure(cause: Exception) : java.io.IOException("Sync index checkpoint failed", cause)
 
     private fun saveIndex() {
-        if (fingerprints.isNotEmpty()) indexStore.save(mount.id, HashMap(fingerprints))
+        if (pendingIndex.isEmpty()) return
+        try {
+            indexStore.applyChanges(mount.id, pendingIndex)
+        } catch (failure: Exception) {
+            pendingIndex.clear()
+            requestReconcile()
+            throw IndexWriteFailure(failure)
+        }
+        pendingIndex.forEach { (key, value) ->
+            if (value == null) fingerprints.remove(key) else fingerprints[key] = value
+            observed.remove(key)
+        }
+        pendingIndex.clear()
     }
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val retryCounts = java.util.concurrent.ConcurrentHashMap<String, Int>()
+    private val scope = CoroutineScope(SupervisorJob() + dispatcher)
 
     /** 相对挂载根路径 → 上次成功同步的指纹；用于跳过未变文件。 */
     private val fingerprints = java.util.concurrent.ConcurrentHashMap<String, FileFingerprint>()
@@ -129,14 +167,16 @@ class SyncEngine(
     /** 连接健康度：探活失败进 RECONNECTING，重连成功回 CONNECTED，供 UI 展示。 */
     val connectionState: StateFlow<SyncConnectionState> = _connectionState.asStateFlow()
     
-    // 使用 Channel 做缓冲和防抖（上限内堆积，满则丢弃最旧项）
-    private val syncChannel = Channel<String>(
-        capacity = MAX_PENDING_SYNC,
-        onBufferOverflow = BufferOverflow.DROP_OLDEST
-    )
+    private val pending = SyncPendingQueue(MAX_PENDING_SYNC)
+    private val observed = LinkedHashMap<String, FileFingerprint>()
+    private var observationInitialized = false
 
     init {
         fingerprints.putAll(indexStore.load(mount.id))
+        val reconcileOnStart = indexStore.needsReconcile(mount.id) || fingerprints.isNotEmpty()
+        // A watcher cannot durably log its last event before process death; keep the lease dirty.
+        indexStore.requireReconcile(mount.id)
+        if (reconcileOnStart) requestReconcile()
         if (useGitIgnore) {
             val gitignore = File(mount.localMountPath, ".gitignore")
             if (gitignore.exists()) {
@@ -147,27 +187,42 @@ class SyncEngine(
         }
 
         scope.launch {
+            while (isActive && !observationInitialized) {
+                try {
+                    operationMutex.withLock { ensureObservationBaseline() }
+                } catch (failure: Exception) {
+                    if (failure is CancellationException) throw failure
+                    FileLogger.e(TAG, "无法建立同步观测基线，等待重试", failure)
+                    delay(1000)
+                }
+            }
+            var retryPaths = emptyList<String>()
             while (isActive) {
-                // 等待队列中的第一个事件
-                val firstItem = syncChannel.receive()
-                val batch = mutableSetOf(firstItem) // 使用 Set 去重，避免极短时间内同一文件多次触发上传
-
-                // 尝试收集更多就绪的事件，但不超过最大批处理数量
-                while (batch.size < maxSyncBatchSize) {
-                    val next = syncChannel.tryReceive().getOrNull() ?: break
-                    batch.add(next)
+                val batch = if (retryPaths.isNotEmpty()) SyncPendingQueue.Batch(retryPaths, reconcile = true)
+                else {
+                    pending.wakeup.receive()
+                    pending.take(batchLimit)
                 }
-
-                // 按顺序处理批次
-                for (localPath in batch) {
-                    handleLocalChange(localPath)
+                var completed = 0
+                try {
+                    operationMutex.withLock {
+                        if (batch.reconcile) reconcileWorkspace()
+                        for (localPath in batch.paths) {
+                            handleLocalChange(localPath, force = true)
+                            completed++
+                        }
+                        saveIndex()
+                    }
+                    retryPaths = emptyList()
+                } catch (failure: Exception) {
+                    if (failure is CancellationException) throw failure
+                    // Keep the bounded in-flight force batch even when the pending queue is full.
+                    retryPaths = batch.paths.drop(completed)
+                    FileLogger.e(TAG, "同步批次失败，保留全量对账请求", failure)
+                    requestReconcile()
+                    delay(1000)
                 }
-                saveIndex()
-
-                // 如果达到批次上限，说明可能正处于大量修改阶段，短暂延迟让服务器缓冲一下
-                if (batch.size >= maxSyncBatchSize) {
-                    delay(300)
-                }
+                if (batch.paths.size >= batchLimit) delay(300)
             }
         }
 
@@ -185,6 +240,7 @@ class SyncEngine(
                             syncClient.reconnect(connection.host, connection.port, connection.username, auth)
                             backoffMs = RECONNECT_BASE_MS
                             _connectionState.value = SyncConnectionState.CONNECTED
+                            requestReconcile()
                             FileLogger.i(TAG, "Sync: 自动重连成功（${connection.name}）")
                         } catch (e: Exception) {
                             if (e is CancellationException) throw e
@@ -192,6 +248,8 @@ class SyncEngine(
                             backoffMs = (backoffMs * 2).coerceAtMost(RECONNECT_MAX_MS)
                         }
                     }
+                    _connectionState.value = SyncConnectionState.CONNECTED
+                    requestReconcile()
                 }
             }
         }
@@ -219,17 +277,21 @@ class SyncEngine(
                 val lFile = File(localDir, file.name)
                 if (file.isDirectory) {
                     lFile.mkdirs()
+                    updateFingerprint(relativeKey(lFile.absolutePath), FileFingerprint(-1, 0))
                     pull(rPath, lFile)
                 } else {
                     try {
                         syncClient.downloadFile(rPath, lFile.absolutePath)
-                        fingerprints[relativeKey(lFile.absolutePath)] =
-                            FileFingerprint(lFile.length(), lFile.lastModified(), null)
+                        val sha = sha256Of(lFile)
+                        if (sha != null) updateFingerprint(relativeKey(lFile.absolutePath),
+                            FileFingerprint(lFile.length(), lFile.lastModified(), sha))
+                        else requestReconcile()
                         delay(FILE_SYNC_DELAY_MS)
                     } catch (e: Exception) {
                         if (e is CancellationException) throw e
                         FileLogger.e(TAG, "Download Error for $rPath: ${e.message}")
-                        if (e !is RemoteFileRejectedException) forceReconnect()
+                        if (e is IndexWriteFailure) throw e
+                        if (e !is RemoteFileRejectedException) { requestReconcile(); forceReconnect() }
                     }
                 }
             }
@@ -256,9 +318,13 @@ class SyncEngine(
                 val rPath = "$remoteDir/${file.name}"
                 if (file.isDirectory) {
                     // 远程目录可能已由先前同步创建，已存在时报错可忽略。
-                    try { syncClient.createDirectory(rPath) } catch (e: Exception) {
-                        if (e is CancellationException) throw e
+                    try {
+                        syncClient.createDirectory(rPath)
+                        updateFingerprint(relativeKey(file.absolutePath), FileFingerprint(-1, 0))
+                    } catch (e: Exception) {
+                        if (e is CancellationException || e is IndexWriteFailure) throw e
                         FileLogger.w(TAG, "Sync: 远程目录创建失败 $rPath: ${e.message}")
+                        if (e !is RemoteFileRejectedException) requestReconcile()
                     }
                     push(file, rPath)
                 } else {
@@ -268,19 +334,15 @@ class SyncEngine(
                         continue
                     }
                     try {
-                        syncClient.uploadFile(file.absolutePath, rPath)
-                        recordUploaded(rel, file)
+                        uploadAndRecord(rel, file, rPath)
                         delay(FILE_SYNC_DELAY_MS)
                     } catch (e: Exception) {
                         if (e is CancellationException) throw e
                         FileLogger.e(TAG, "Upload Error for $rPath: ${e.message}")
+                        if (e is IndexWriteFailure) throw e
                         if (e is RemoteFileRejectedException) continue
+                        requestReconcile()
                         forceReconnect()
-                        // 全量同步失败的也放入增量队列兜底重传
-                        scope.launch {
-                            delay(1000)
-                            syncChannel.send(file.absolutePath)
-                        }
                     }
                 }
             }
@@ -294,64 +356,141 @@ class SyncEngine(
      * 本地变更后投递进来；与失败重试共用同一队列，保持原有批处理与节流语义。
      */
     fun enqueueLocalChange(localPath: String) {
-        FileLogger.d(TAG, "[diag] enqueueLocalChange localPath=$localPath ignored=${isIgnored(localPath)}")
-        syncChannel.trySend(localPath)
+        val root = File(mount.localMountPath).absoluteFile.toPath().normalize()
+        val candidate = File(localPath).absoluteFile.toPath().normalize()
+        if (candidate == root || !candidate.startsWith(root) || indexStore.ownsPath(localPath)) return
+        if (useGitIgnore && candidate == root.resolve(".gitignore")) requestReconcile()
+        if (!isIgnored(localPath)) pending.offer(candidate.toString())
     }
 
-    private suspend fun handleLocalChange(localPath: String) {
+    fun requestReconcile() = pending.requestReconcile()
+
+    suspend fun clearSyncIndex() {
+        val operation = scope.async {
+            operationMutex.withLock {
+                indexStore.clear(mount.id)
+                fingerprints.clear()
+                pendingIndex.clear()
+                observed.clear()
+                val baseline = indexStore.observationBaseline(mount.id)
+                if (baseline != null) observed.putAll(baseline)
+                observationInitialized = baseline != null
+            }
+        }
+        try { operation.await() } finally { operation.cancel() }
+    }
+
+    private suspend fun ensureObservationBaseline() {
+        if (observationInitialized) return
+        val existing = indexStore.observationBaseline(mount.id)
+        val baseline = existing ?: run {
+            val root = File(mount.localMountPath)
+            check(root.isDirectory) { "Local sync root unavailable" }
+            val result = LinkedHashMap<String, FileFingerprint>()
+            suspend fun visit(dir: File) {
+                val files = dir.listFiles() ?: error("Cannot enumerate local sync directory")
+                for (file in files) {
+                    currentCoroutineContext().ensureActive()
+                    if (isIgnored(file.absolutePath)) continue
+                    val rel = relativeKey(file.absolutePath)
+                    if (!fingerprints.containsKey(rel)) result[rel] = if (file.isDirectory) FileFingerprint(-1, 0)
+                    else FileFingerprint(file.length(), file.lastModified(),
+                        sha256Of(file) ?: error("Cannot fingerprint local sync baseline"))
+                    if (file.isDirectory && !java.nio.file.Files.isSymbolicLink(file.toPath())) visit(file)
+                }
+            }
+            visit(root)
+            indexStore.initializeObservationBaseline(mount.id, result)
+            result
+        }
+        observed.putAll(baseline)
+        observationInitialized = true
+    }
+
+    private suspend fun reconcileWorkspace() {
+        val root = File(mount.localMountPath)
+        check(root.isDirectory) { "Local sync root unavailable" }
+        if (useGitIgnore) gitIgnorePatterns = File(root, ".gitignore").takeIf { it.isFile }?.readLines()
+            ?.map { it.trim().removeSuffix("/") }?.filter { it.isNotEmpty() && !it.startsWith("#") }.orEmpty()
+        suspend fun visit(dir: File) {
+            val files = dir.listFiles() ?: error("Cannot enumerate local sync directory")
+            for (file in files) {
+                currentCoroutineContext().ensureActive()
+                if (isIgnored(file.absolutePath)) continue
+                handleLocalChange(file.absolutePath, reconcile = true)
+                if (file.isDirectory && !java.nio.file.Files.isSymbolicLink(file.toPath())) visit(file)
+            }
+        }
+        visit(root)
+        val missing = (fingerprints.keys + pendingIndex.keys + observed.keys).filter { rel ->
+            (currentFingerprint(rel) != null || rel in observed) &&
+                !isIgnored(File(root, rel).absolutePath) && !File(root, rel).exists()
+        }.sortedByDescending { it.length }
+        for (rel in missing) if (currentFingerprint(rel) != null || rel in observed) {
+            handleLocalChange(File(root, rel).absolutePath, reconcile = true)
+        }
+        saveIndex()
+    }
+
+    private suspend fun handleLocalChange(localPath: String, force: Boolean = false, reconcile: Boolean = false) {
         if (isIgnored(localPath)) return
         val file = File(localPath)
         // 计算对应的远程路径
-        val relativePath = localPath.removePrefix(mount.localMountPath).removePrefix("/")
+        val relativePath = relativeKey(localPath)
         val remotePath = "${mount.remotePath}/$relativePath"
 
         try {
             if (file.exists()) {
                 if (file.isDirectory) {
+                    if (reconcile && currentFingerprint(relativePath) == null && observed[relativePath]?.size == -1L) return
                     syncClient.createDirectory(remotePath)
+                    updateFingerprint(relativePath, FileFingerprint(-1, 0))
+                    if (!reconcile) requestReconcile()
                     FileLogger.i(TAG, "Sync: Created remote directory $remotePath")
-                } else if (!shouldUpload(relativePath, file)) {
+                } else if (!force && (if (reconcile) {
+                    matchesContent(relativePath, file) || (currentFingerprint(relativePath) == null &&
+                        observed[relativePath]?.let { it.size == file.length() && it.sha256 == sha256Of(file) } == true)
+                } else !shouldUpload(relativePath, file))) {
                     FileLogger.d(TAG, "Sync: 未变化，跳过上传 $remotePath")
                 } else {
-                    syncClient.uploadFile(localPath, remotePath)
-                    recordUploaded(relativePath, file)
+                    uploadAndRecord(relativePath, file, remotePath)
                     FileLogger.i(TAG, "Sync: Uploaded to $remotePath")
                     delay(FILE_SYNC_DELAY_MS)
                 }
             } else {
+                val descendants = (fingerprints.keys + pendingIndex.keys + observed.keys).filter {
+                    it.startsWith("$relativePath/") && (currentFingerprint(it) != null || it in observed)
+                }.sortedByDescending { it.length }
+                for (child in descendants) {
+                    syncClient.delete("${mount.remotePath}/$child")
+                    updateFingerprint(child, null)
+                }
                 syncClient.delete(remotePath)
-                fingerprints.remove(relativePath)
+                updateFingerprint(relativePath, null)
                 FileLogger.i(TAG, "Sync: Deleted $remotePath")
                 delay(FILE_SYNC_DELAY_MS)
             }
-            retryCounts.remove(localPath) // 成功后清除重试计数
         } catch (e: Exception) {
             if (e is CancellationException) throw e
             FileLogger.e(TAG, "Sync Error for $localPath: ${e.message}", e)
             if (e is RemoteFileRejectedException) {
-                retryCounts.remove(localPath)
                 FileLogger.w(TAG, "Sync: 服务器拒绝该路径，跳过重连和重试: $remotePath")
                 return
             }
+            requestReconcile()
+            if (e is IndexWriteFailure || reconcile) throw e
             forceReconnect()
-            val count = retryCounts.getOrDefault(localPath, 0)
-            if (count < 3) {
-                retryCounts[localPath] = count + 1
-                FileLogger.i(TAG, "Sync: Retry ${count + 1}/3 for $localPath")
-                // 将失败的文件重新放入队列
-                scope.launch {
-                    delay(1000)
-                    syncChannel.send(localPath)
-                }
-            } else {
-                FileLogger.e(TAG, "Sync: Max retries reached for $localPath. Giving up.")
-                retryCounts.remove(localPath)
-            }
+            if (force) throw e
         }
     }
 
     private suspend fun runFullSync(block: suspend () -> Unit) {
-        val operation = scope.async { block() }
+        val operation = scope.async {
+            operationMutex.withLock {
+                ensureObservationBaseline()
+                try { block() } finally { saveIndex() }
+            }
+        }
         try {
             operation.await()
         } finally {
@@ -362,10 +501,17 @@ class SyncEngine(
     suspend fun shutdown() {
         _connectionState.value = SyncConnectionState.DISCONNECTED
         scope.cancel()
-        withContext(NonCancellable) {
+        withContext(NonCancellable + Dispatchers.IO) {
             scope.coroutineContext[Job]?.join()
-            runCatching { syncClient.disconnect() }
-                .onFailure { FileLogger.w(TAG, "关闭同步连接失败", it) }
+            try {
+                operationMutex.withLock { saveIndex() }
+            } catch (failure: Exception) {
+                FileLogger.w(TAG, "关闭同步前保存索引失败", failure)
+                throw failure
+            } finally {
+                runCatching { syncClient.disconnect() }
+                    .onFailure { FileLogger.w(TAG, "关闭同步连接失败", it) }
+            }
         }
     }
 
@@ -375,6 +521,7 @@ class SyncEngine(
             // 断开与重连必须原子完成，否则其它协程可能插入到半连接状态上操作。
             syncClient.reconnect(connection.host, connection.port, connection.username, auth)
             _connectionState.value = SyncConnectionState.CONNECTED
+            requestReconcile()
             FileLogger.i(TAG, "Sync: Force reconnected to server successfully.")
         } catch (e: Exception) {
             if (e is CancellationException) throw e

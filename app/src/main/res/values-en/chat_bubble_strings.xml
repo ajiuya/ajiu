@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="chat_bubble_settings_title">Chat bubbles</string>
+    <string name="chat_bubble_settings_hint">Choose user and AI styles independently. Only message bodies are affected.</string>
+    <string name="chat_bubble_user_title">User bubbles</string>
+    <string name="chat_bubble_assistant_title">AI bubbles</string>
+    <string name="chat_bubble_user_sheet_title">Choose user bubbles</string>
+    <string name="chat_bubble_assistant_sheet_title">Choose AI bubbles</string>
+    <string name="chat_bubble_user_sheet_hint">Your messages appear on the right. Changes are saved immediately.</string>
+    <string name="chat_bubble_assistant_sheet_hint">AI text appears on the left, with Markdown, code, and tables preserved.</string>
+    <string name="chat_bubble_preview_label">Preview</string>
+    <string name="chat_bubble_preview_user">Help me plan my day.</string>
+    <string name="chat_bubble_preview_assistant">Sure. List the **key tasks** first, then set aside time for each.</string>
+    <string name="chat_bubble_preview_sample">Bubble style</string>
+    <string name="chat_bubble_style_classic">Classic outline</string>
+    <string name="chat_bubble_style_shadow">Soft shadow</string>
+    <string name="chat_bubble_style_minimal">Minimal</string>
+    <string name="chat_bubble_style_dark">Night</string>
+    <string name="chat_bubble_style_square">Comic square</string>
+    <string name="chat_bubble_style_green">Fresh green</string>
+    <string name="chat_bubble_style_valentine">Valentine</string>
+    <string name="chat_bubble_style_original">Original</string>
+    <string name="chat_bubble_style_document">Document flow</string>
+    <string name="chat_bubble_document_hint">Text appears directly on the chat background.</string>
+</resources>

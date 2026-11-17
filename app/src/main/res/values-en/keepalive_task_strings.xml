@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="keepalive_task_public_body">Background activity protected. Open the app to view.</string>
+    <string name="keepalive_task_summary">Commands %1$d · AI %2$d · Terminals %3$d</string>
+    <string name="keepalive_task_terminal_row">%1$s terminal %2$d · %3$s</string>
+    <string name="keepalive_task_agent_row">AI session %1$d · %2$s</string>
+    <string name="keepalive_task_local">Local</string>
+    <string name="keepalive_task_ssh">SSH</string>
+    <string name="keepalive_task_command_running">Command running</string>
+    <string name="keepalive_task_terminal_idle">Terminal connected</string>
+    <string name="keepalive_task_agent_running">AI is working</string>
+    <string name="keepalive_task_completed_title">Done</string>
+    <string name="keepalive_task_completed_body">This run has completed. Open the app to view the result.</string>
+    <string name="keepalive_task_failed_title">Failed</string>
+    <string name="keepalive_task_failed_body">A task in this run failed. Open the app for details.</string>
+    <string name="keepalive_task_ended_title">Ended</string>
+    <string name="keepalive_task_ended_body">This run ended without a verified result. Open the app to check.</string>
+    <string name="keepalive_task_action_running">Running</string>
+    <string name="keepalive_task_action_thinking">Think</string>
+    <string name="keepalive_task_action_editing">Editing</string>
+    <string name="keepalive_task_action_reading">Reading</string>
+    <string name="keepalive_task_action_image">Image</string>
+    <string name="keepalive_task_action_search">Search</string>
+    <string name="keepalive_task_action_browser">Browser</string>
+    <string name="keepalive_task_action_command">Command</string>
+    <string name="keepalive_task_action_question">Answer</string>
+    <string name="keepalive_task_action_generate">Picture</string>
+    <string name="keepalive_task_action_todo">Tasks</string>
+    <string name="keepalive_task_action_subagent">Subtask</string>
+    <string name="keepalive_task_action_memory">Memory</string>
+    <string name="keepalive_task_action_tool">Tools</string>
+    <string name="keepalive_task_action_context">Context</string>
+    <string name="keepalive_task_action_approval">Approve</string>
+</resources>

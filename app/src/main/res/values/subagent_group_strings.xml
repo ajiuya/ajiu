@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="subagent_group_title">子代理</string>
+    <string name="subagent_group_total_count">%1$d 个</string>
+    <string name="subagent_group_status_count">%1$s %2$d</string>
+    <string name="subagent_group_member_status">%1$s：%2$s</string>
+    <string name="subagent_group_working_count">工作中 %1$d</string>
+    <string name="subagent_group_completed_count">已完成 %1$d</string>
+    <string name="subagent_group_confirmation_count">待确认 %1$d</string>
+    <string name="subagent_group_failed_count">失败 %1$d</string>
+    <string name="subagent_group_interrupted_count">已中断 %1$d</string>
+    <string name="subagent_group_deleted_count">已删除 %1$d</string>
+    <string name="subagent_group_history_count">历史 %1$d</string>
+    <string name="subagent_group_expand">展开子代理卡片列表</string>
+    <string name="subagent_group_collapse">收起子代理卡片列表</string>
+    <string name="subagent_group_expanded">子代理卡片列表已展开</string>
+    <string name="subagent_group_collapsed">子代理卡片列表已收起</string>
+</resources>

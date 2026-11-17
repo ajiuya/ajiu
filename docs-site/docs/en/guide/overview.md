@@ -1,6 +1,6 @@
 # Feature Overview
 
-This page is a quick index of the user manual, mapping the main UI workflows and settings entries to their documentation.
+This page is a quick index of the Ajiu Workbench user manual, mapping the main UI workflows and settings entries to their documentation.
 
 ::: tip Version notes
 Entries marked with a version (e.g. "since 1.11.0") were introduced in that version.
@@ -11,7 +11,6 @@ Entries marked with a version (e.g. "since 1.11.0") were introduced in that vers
 | Feature | Description |
 | --- | --- |
 | Chat & workspace | Title bar, sidebar, toolbar, message queue, workspace switching |
-| Modes (three modes) | Permission control and use cases for Build / Plan / Auto |
 | Checkpoints & undo | Automatic snapshot before AI edits, one-tap safe rollback |
 | Terminal | Multi-tab sessions, auxiliary key bar, color and font settings |
 | File browsing & code editing | Indented tree view, syntax highlighting, built-in code editor (since 1.11.0) |
@@ -44,7 +43,7 @@ Entries marked with a version (e.g. "since 1.11.0") were introduced in that vers
 
 | Entry | Description |
 | --- | --- |
-| Tool authorization | Rules for which tools the AI may call |
+| Tool authorization | Ordinary tools run automatically; explicit project/global deny rules take precedence, with one-time or session-scoped approvals for high-risk calls |
 | System permissions | Keep-alive, screen always on, notifications, storage, battery optimization |
 | Logs | View runtime logs, crash reports, access the app private directory |
 

@@ -1,6 +1,7 @@
 package com.aicode.feature.agent.domain.shizuku
 
 import android.os.Bundle
+import android.os.Process as AndroidProcess
 import com.aicode.feature.agent.domain.container.BoundedOutput
 import java.util.concurrent.TimeUnit
 
@@ -21,6 +22,11 @@ class ShizukuShellService : IShizukuShellService.Stub() {
 
     override fun exec(command: String, timeoutMs: Int): Bundle {
         val result = Bundle()
+        if (AndroidProcess.myUid() != 2000) {
+            result.putString(KEY_OUTPUT, "")
+            result.putInt(KEY_EXIT_CODE, EXIT_SHELL_REQUIRED)
+            return result
+        }
         var process: Process? = null
         try {
             process = ProcessBuilder("sh", "-c", command)
@@ -63,6 +69,7 @@ class ShizukuShellService : IShizukuShellService.Stub() {
 
         /** 启动/读取异常时的退出码。 */
         const val EXIT_FAILURE = -1
+        const val EXIT_SHELL_REQUIRED = -2
 
         private const val READER_JOIN_TIMEOUT_MS = 2_000L
     }

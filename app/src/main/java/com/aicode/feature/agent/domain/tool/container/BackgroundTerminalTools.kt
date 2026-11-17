@@ -179,7 +179,7 @@ class TerminalSessionTool @Inject constructor(
         "elevate" to ToolParameter(
             name = "elevate",
             type = ParameterType.BOOLEAN,
-            description = "start/send 的命令被安全防护拒绝且确需执行时，设为 true 重试，通过弹窗申请用户单次授权，不保存为长期规则。PLAN 模式不支持。",
+            description = "start/send 的命令被安全防护拒绝且确需执行时，设为 true 重试，通过弹窗申请仅本次允许或本会话始终允许；会话授权只匹配相同完整命令，显式禁止规则仍优先生效。",
             required = false
         )
     )

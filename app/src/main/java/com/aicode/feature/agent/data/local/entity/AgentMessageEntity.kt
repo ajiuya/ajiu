@@ -4,6 +4,7 @@ import androidx.room.ColumnInfo
 import androidx.room.Entity
 import androidx.room.Index
 import androidx.room.PrimaryKey
+import com.aicode.feature.agent.domain.model.ContextUsageBreakdown
 import com.aicode.feature.agent.presentation.AgentAttachment
 import com.aicode.feature.agent.presentation.BACKGROUND_NOTIFICATION_PREFIX
 import com.aicode.feature.agent.presentation.COMPACTION_FAILURE_TOOL_NAME
@@ -54,7 +55,19 @@ data class AgentMessageEntity(
     val cachedInputTokens: Int = 0,
     @ColumnInfo(defaultValue = "0")
     val isContextExcluded: Boolean = false,
-    val compactedBySummaryId: String? = null
+    val compactedBySummaryId: String? = null,
+    val contextInputTokens: Int? = null,
+    val contextInputBudget: Int? = null,
+    @ColumnInfo(defaultValue = "1")
+    val contextEstimated: Boolean = true,
+    val contextBreakdownJson: String? = null,
+    val toolActionTitle: String? = null,
+    val toolStartedAtMs: Long? = null,
+    val toolDurationMs: Long? = null,
+    val turnDurationMs: Long? = null,
+    val modelInputSnapshotJson: String? = null,
+    val continuationOfMessageId: String? = null,
+    val continuationDraft: String? = null
 ) {
     fun toUIMessage(): AgentUIMessage {
         val roleEnum = MessageRole.valueOf(role)
@@ -75,7 +88,19 @@ data class AgentMessageEntity(
                 content.startsWith(BACKGROUND_NOTIFICATION_PREFIX),
             inputTokens = inputTokens,
             outputTokens = outputTokens,
-            cachedInputTokens = cachedInputTokens
+            cachedInputTokens = cachedInputTokens,
+            contextInputTokens = contextInputTokens,
+            contextInputBudget = contextInputBudget,
+            contextEstimated = contextEstimated,
+            contextBreakdown = contextBreakdownJson?.let {
+                runCatching { json.decodeFromString<ContextUsageBreakdown>(it) }.getOrNull()
+            },
+            toolActionTitle = toolActionTitle,
+            toolStartedAtMs = toolStartedAtMs,
+            toolDurationMs = toolDurationMs,
+            turnDurationMs = turnDurationMs,
+            continuationOfMessageId = continuationOfMessageId,
+            continuationDraft = continuationDraft
         )
     }
 

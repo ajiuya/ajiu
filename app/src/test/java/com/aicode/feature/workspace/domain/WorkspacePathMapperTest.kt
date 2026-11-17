@@ -1,11 +1,18 @@
 package com.aicode.feature.workspace.domain
 
 import com.aicode.feature.agent.domain.container.ContainerInstaller
+import com.aicode.feature.agent.domain.container.ContainerProfile
 import com.aicode.feature.settings.data.repository.ContainerSettingsRepository
 import com.aicode.feature.workspace.data.repository.WorkspaceRepository
 import io.mockk.every
 import io.mockk.mockk
-import kotlinx.coroutines.flow.emptyFlow
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
 import org.junit.Rule
@@ -18,8 +25,7 @@ import java.nio.file.Files
 /**
  * WorkspacePathMapper：容器路径 ↔ 宿主真实路径互转。
  * 固定环境：宿主工作区=/data/ws、AI 配置目录=/data/aicode、rootfs=/data/rootfs、容器 home=/root。
- * activeProfileIdFlow 用 emptyFlow()，让 init 协程的 collect 永不触发，避免真实 DataStore 调用
- * 与异步 profile 切换（extraBindings 挂载分支依赖该异步更新，纯 JVM 下竞态不稳定，不在本类覆盖）。
+ * 有限 profile 流固定为内置 Alpine，创建 mapper 后等待初始化 collector 结束，避免后台调用跨过 mock 清理。
  */
 class WorkspacePathMapperTest {
 
@@ -48,7 +54,12 @@ class WorkspacePathMapperTest {
         every { workspaceRepository.currentPath() } returns wsRoot
         every { containerInstaller.aicodeDir } returns File(aicodeDir)
         every { containerInstaller.rootfsDirFor(any()) } returns File(rootfsDir)
-        every { containerSettingsRepository.activeProfileIdFlow } returns emptyFlow()
+        val mapperInitialized = CompletableDeferred<Job>()
+        every { containerSettingsRepository.customProfilesFlow } returns flowOf(listOf(ContainerProfile.BUILTIN_ALPINE))
+        every { containerSettingsRepository.activeProfileIdFlow } returns flow {
+            emit(ContainerProfile.BUILTIN_ID)
+            mapperInitialized.complete(currentCoroutineContext()[Job]!!)
+        }
         every { pathHomeResolver.home() } returns home
         // expandHome 保持真实展开语义，让 toHostFile 里的 ~ 前缀与生产行为一致
         every { pathHomeResolver.expandHome(any()) } answers {
@@ -59,7 +70,9 @@ class WorkspacePathMapperTest {
                 else -> p
             }
         }
-        return WorkspacePathMapper(workspaceRepository, containerInstaller, containerSettingsRepository, pathHomeResolver)
+        val mapper = WorkspacePathMapper(workspaceRepository, containerInstaller, containerSettingsRepository, pathHomeResolver)
+        runBlocking { withTimeout(5_000) { mapperInitialized.await().join() } }
+        return mapper
     }
 
     // ---------- toHostFile：容器路径 → 宿主文件 ----------

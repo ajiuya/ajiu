@@ -83,7 +83,7 @@ class AnthropicAdapter @Inject constructor(
             AnthropicToolDefinition(
                 name = tool.name,
                 description = tool.description,
-                input_schema = tool.toJsonSchema(),
+                input_schema = tool.toModelJsonSchema(),
                 // 断点预算有限（每请求最多 4 个），tools 只打最后一个。
                 cache_control = if (cacheBreakpointsEnabled && index == tools.lastIndex) CACHE_BREAKPOINT else null
             )
@@ -169,7 +169,7 @@ class AnthropicAdapter @Inject constructor(
             AnthropicToolDefinition(
                 name = tool.name,
                 description = tool.description,
-                input_schema = tool.toJsonSchema(),
+                input_schema = tool.toModelJsonSchema(),
                 cache_control = if (cacheBreakpointsEnabled && index == tools.lastIndex) CACHE_BREAKPOINT else null
             )
         }
@@ -209,6 +209,7 @@ class AnthropicAdapter @Inject constructor(
             val budget = StreamBudget()
             // content block index -> 累积中的 tool_use（仅 tool_use 块建条目，保序）。
             val toolBlocks = LinkedHashMap<Int, ToolBlockAcc>()
+            val argumentPreviews = ToolArgumentsPreview()
             var stopReason: String? = null
             var stopDetail: String? = null
             var streamInputTokens = 0
@@ -273,11 +274,15 @@ class AnthropicAdapter @Inject constructor(
                                             val name = block.get("name")?.asString ?: ""
                                             toolBlocks[index] = ToolBlockAcc(
                                                 id = block.get("id")?.asString ?: "",
-                                                name = name
+                                                name = name,
+                                                initialArgs = block.get("input")?.takeIf { it.isJsonObject }?.toString().orEmpty().also { budget.add(it) }
                                             )
                                             // 工具名先于参数到达：立刻告诉 UI「模型准备调什么」，
                                             // 免得参数流式期间一直停在「正在思考」
                                             if (name.isNotEmpty()) send(AIStreamChunk.ToolCallDeclared(name))
+                                            toolBlocks[index]?.let { acc ->
+                                                argumentPreviews.update(acc.id, acc.name, acc.initialArgs)?.let { send(it) }
+                                            }
                                         }
                                         "thinking" -> thinkingBlocks[index] = ThinkingBlockAcc(type = "thinking").also { acc ->
                                             val initial = block.get("thinking")?.takeIf { !it.isJsonNull }?.asString ?: ""
@@ -340,7 +345,10 @@ class AnthropicAdapter @Inject constructor(
                                             val index = obj.get("index")?.asInt
                                             val partial = delta.get("partial_json")?.asString ?: ""
                                             budget.add(partial)
-                                            if (index != null) toolBlocks[index]?.args?.append(partial)
+                                            if (index != null) toolBlocks[index]?.let { acc ->
+                                                acc.args.append(partial)
+                                                argumentPreviews.update(acc.id, acc.name, acc.args)?.let { send(it) }
+                                            }
                                         }
                                     }
                                 }
@@ -374,6 +382,8 @@ class AnthropicAdapter @Inject constructor(
                             }
                         } catch (e: CancellationException) {
                             throw e
+                        } catch (e: StreamApiException) {
+                            throw e
                         } catch (e: Exception) {
                             coroutineContext.ensureActive()
                             // 该行 SSE 解析失败，跳过；不影响已累积文本与后续行。
@@ -385,10 +395,14 @@ class AnthropicAdapter @Inject constructor(
                 }
             }
 
-            val toolCalls = toolBlocks.values.map { acc ->
-                ToolCall(id = acc.id, name = acc.name, arguments = parseArgs(acc.args.toString()))
+            val requestDurationMillis = firstContent.requestDurationMillis()
+            toolBlocks.values.forEach { acc ->
+                argumentPreviews.update(acc.id, acc.name, acc.argumentText(), force = true)?.let { send(it) }
             }
-            send(AIStreamChunk.Final(AIResponse(content = textBuilder.toString(), toolCalls = toolCalls, stopReason = stopReason, stopDetail = stopDetail, signature = signature, thinkingBlocksJson = encodeThinkingBlocks(thinkingBlocks.values.map { it.toBlock() }), inputTokens = totalInputTokens(streamInputTokens, streamCachedInputTokens, streamCacheCreationTokens), outputTokens = streamOutputTokens, cachedInputTokens = streamCachedInputTokens, cacheCreationTokens = streamCacheCreationTokens)))
+            val toolCalls = toolBlocks.values.map { acc ->
+                ToolCall(id = acc.id, name = acc.name, arguments = parseArgs(acc.argumentText().toString()))
+            }
+            send(AIStreamChunk.Final(AIResponse(content = textBuilder.toString(), toolCalls = toolCalls, stopReason = stopReason, stopDetail = stopDetail, signature = signature, thinkingBlocksJson = encodeThinkingBlocks(thinkingBlocks.values.map { it.toBlock() }), inputTokens = totalInputTokens(streamInputTokens, streamCachedInputTokens, streamCacheCreationTokens), outputTokens = streamOutputTokens, cachedInputTokens = streamCachedInputTokens, cacheCreationTokens = streamCacheCreationTokens), requestDurationMillis))
                     }
                 },
                 onRetry = { attempt, max, error -> send(AIStreamChunk.Retrying(attempt, max, error)) }
@@ -409,8 +423,10 @@ class AnthropicAdapter @Inject constructor(
     }.flowOn(Dispatchers.IO)
 
     /** 流式过程中按 content block index 累积的 tool_use 状态。 */
-    private class ToolBlockAcc(val id: String, val name: String) {
+    private class ToolBlockAcc(val id: String, val name: String, val initialArgs: String) {
         val args = StringBuilder()
+
+        fun argumentText(): CharSequence = if (args.isNotEmpty()) args else initialArgs
     }
 
     /** 流式过程中按 content block index 累积的 thinking / redacted_thinking 状态。 */

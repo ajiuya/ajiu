@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="speed_tier_menu_entry">Request speed · %1$s</string>
+    <string name="speed_tier_menu_back">Back</string>
+    <string name="speed_tier_standard">Standard</string>
+    <string name="speed_tier_fast">Fast</string>
+    <string name="speed_tier_ultrafast">Ultrafast</string>
+    <string name="speed_tier_chosen">Global preference · %1$s</string>
+    <string name="speed_tier_effective">Request tier for this configuration · %1$s</string>
+    <string name="speed_tier_standard_hint">Use the server default tier</string>
+    <string name="speed_tier_fast_requirement">Requires an explicit xAI channel, or a GPT model with the Responses API enabled</string>
+    <string name="speed_tier_ultrafast_requirement">Requires a gpt-6-astra prefixed model with the Responses API enabled</string>
+    <string name="speed_tier_global_hint">Applies to all sessions starting with the next request; retries keep their original tier. Unsupported configurations adjust only the request tier and retain your global preference. Reasoning effort is unchanged.</string>
+    <string name="speed_tier_cost_hint">Fast or Ultrafast may cost more. Acceptance and actual speed depend on the provider and account; this does not imply official entitlements.</string>
+    <string name="speed_tier_open_mcp">MCP services</string>
+</resources>

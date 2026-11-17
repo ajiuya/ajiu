@@ -40,6 +40,8 @@ import com.aicode.core.ui.LocalImageViewer
 import com.aicode.core.ui.ThumbnailCache
 import com.aicode.core.util.ApkInstaller
 import com.aicode.feature.agent.presentation.AgentAttachment
+import com.aicode.feature.player.domain.PlayerMediaTypes
+import com.aicode.feature.player.presentation.PlayerActivity
 import com.aicode.feature.workspace.domain.FileAccessProvider
 import compose.icons.FeatherIcons
 import compose.icons.feathericons.ChevronRight
@@ -60,7 +62,7 @@ private val AttachmentThumbSize = 44.dp
  * 一行一个才能一眼看清发的是哪几份。
  *
  * 点击语义：图片一律走内置全屏查看器（隐式依赖组合树上层提供 [LocalImageViewer]，聊天区都满足）；
- * 非图片用调用方给的 [onClick] —— 工具卡片传的是「系统 app 打开」，助手气泡不传即不可点。
+ * 音视频使用内置播放器，其余文件进入聊天覆盖式预览或调用方提供的 [onClick]。
  */
 @Composable
 internal fun MessageAttachmentList(
@@ -85,10 +87,13 @@ private fun MessageAttachmentRow(
     onClick: ((AgentAttachment) -> Unit)? = null
 ) {
     val viewer = LocalImageViewer.current
+    val opener = LocalAttachmentOpener.current
     val handler: (() -> Unit)? = if (attachment.isImage) {
         { viewer.show(attachment.toViewerRequest()) }
     } else if (onClick != null) {
         { onClick(attachment) }
+    } else if (attachment.containerPath.isNotBlank() || attachment.localPath.isNotBlank()) {
+        { opener.open(attachment) }
     } else {
         null
     }
@@ -146,7 +151,7 @@ private fun MessageAttachmentRow(
                     overflow = TextOverflow.Ellipsis
                 )
             }
-            // 有动作才给指示箭头：不可点的行不该长得像能点（如助手气泡里的非图片附件）
+            // 没有可读路径的历史附件不提供打开动作。
             if (handler != null) {
                 Icon(
                     FeatherIcons.ChevronRight,
@@ -210,7 +215,7 @@ private fun AttachmentImageThumb(attachment: AgentAttachment) {
 }
 
 /**
- * 打开已发送的非图片附件（用系统 app）。默认空实现，与 `LocalImageViewer` 同一套路 ——
+ * 已发送的非图片附件入口。默认空实现，与 `LocalImageViewer` 同一套路 ——
  * 卡片渲染在 `ToolMessageBody` 这类中间层，用 CompositionLocal 避免一路加回调参数、
  * 免去中间层为转发 lambda 改签名。
  */
@@ -221,7 +226,7 @@ fun interface AttachmentOpener {
 internal val LocalAttachmentOpener = staticCompositionLocalOf<AttachmentOpener> { AttachmentOpener { } }
 
 /**
- * 用系统对应 app 打开附件文件（FileProvider 授权 URI）。
+ * 音视频交给内置播放器，其余附件使用 FileProvider 授权 URI。
  *
  * 卡片记录的 [AgentAttachment.localPath] 不保证仍然有效：远程 SSH 模式下它是 `copyToLocal` 的临时副本
  * （进程重启或系统清缓存后消失），外部本地目录工作区、自定义挂载源的文件又落在 FileProvider 声明的目录树之外。
@@ -233,6 +238,10 @@ internal suspend fun openSentAttachment(
     attachment: AgentAttachment,
     fileAccess: FileAccessProvider
 ) {
+    if (attachment.containerPath.isNotBlank() && PlayerMediaTypes.supports(attachment.fileName, attachment.mimeType)) {
+        PlayerActivity.open(context, PlayerMediaTypes.request(attachment.containerPath, attachment.fileName, attachment.mimeType))
+        return
+    }
     val local = withContext(Dispatchers.IO) { resolveLocalFile(attachment, fileAccess) }
     if (local == null) {
         Toast.makeText(context, context.getString(R.string.chat_open_file_missing), Toast.LENGTH_SHORT).show()

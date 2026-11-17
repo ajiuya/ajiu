@@ -35,12 +35,15 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
@@ -168,7 +171,6 @@ class BrowserManager @Inject constructor(
         private const val MAX_CONTENT_CHARS = 100_000
         private const val MAX_BACKBONE_NODES = 600
         private const val DOM_STABLE_QUIET_MS = 500L
-        private const val DOM_STABLE_POLL_MS = 200L
         private const val GO_URL_TIMEOUT_MS = 3_000L
         private const val GO_POLL_MS = 100L
         private const val GO_LOAD_TIMEOUT_MS = 10_000L
@@ -209,6 +211,11 @@ class BrowserManager @Inject constructor(
         val pendingJsCalls: ConcurrentHashMap<String, CompletableDeferred<String>> = ConcurrentHashMap(),
         var loadDeferred: CompletableDeferred<Result<String>>? = null
     ) {
+        val lifetime = BrowserDocumentLifetime(pendingJsCalls)
+        val domWaits = mutableSetOf<String>()
+        var loadGeneration = 0L
+        var awaitingPageStart = false
+
         fun toState(): BrowserTabState = BrowserTabState(
             id = id,
             url = url,
@@ -316,18 +323,20 @@ class BrowserManager @Inject constructor(
     """.trimIndent()
 
     inner class BrowserJsBridge(private val tabId: String) {
+        private val lifetime = findTab(tabId)?.lifetime
+
         @JavascriptInterface
         fun resolve(callId: String, result: String) {
-            val tab = findTab(tabId) ?: return
-            tab.pendingJsCalls[callId]?.complete(result)
-            tab.pendingJsCalls.remove(callId)
+            mainHandler.post {
+                lifetime?.pendingJsCalls?.remove(callId)?.complete(result)
+            }
         }
 
         @JavascriptInterface
         fun reject(callId: String, error: String) {
-            val tab = findTab(tabId) ?: return
-            tab.pendingJsCalls[callId]?.completeExceptionally(RuntimeException(error))
-            tab.pendingJsCalls.remove(callId)
+            mainHandler.post {
+                lifetime?.pendingJsCalls?.remove(callId)?.completeExceptionally(RuntimeException(error))
+            }
         }
     }
 
@@ -347,12 +356,17 @@ class BrowserManager @Inject constructor(
         return findTab(tabId) ?: throw IllegalArgumentException("标签页不存在: $tabId")
     }
 
-    private fun configureWebView(wv: WebView, tabId: String) {
-        val tabHolderRef = { findTab(tabId) }
+    private fun configureWebView(tab: TabHolder) {
+        val wv = tab.webView
+        val tabId = tab.id
+        val tabHolderRef = { findTab(tabId)?.takeIf { it === tab && !it.lifetime.destroyed } }
 
         wv.webViewClient = object : WebViewClient() {
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                 val tab = tabHolderRef() ?: return
+                invalidateDocument(tab, preserveLoad = tab.awaitingPageStart || tab.loading)
+                tab.awaitingPageStart = false
+                tab.loadGeneration = tab.lifetime.generation
                 tab.loading = true
                 tab.url = url.orEmpty()
                 tab.title = ""
@@ -364,21 +378,27 @@ class BrowserManager @Inject constructor(
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 val tab = tabHolderRef() ?: return
+                if (tab.awaitingPageStart || url.orEmpty() != tab.url ||
+                    (view?.url != null && view.url != url)) return
+                val generation = tab.lifetime.generation
+                val load = tab.loadDeferred
                 tab.loading = false
-                tab.url = url.orEmpty()
                 if (view != null && nightMode) applyNightModeTo(view)
                 if (view != null && tab.devToolsOpen) injectEruda(view, autoShow = false)
                 val finish = {
-                    tab.loadDeferred?.complete(Result.success(url.orEmpty()))
-                    tab.loadDeferred = null
-                    publishState()
+                    if (tabHolderRef() === tab && tab.lifetime.isCurrent(generation)) {
+                        if (tab.loadDeferred === load && tab.loadGeneration == generation) {
+                            load?.complete(Result.success(url.orEmpty()))
+                        }
+                        publishState()
+                    }
                 }
                 if (view == null) {
                     finish()
                 } else {
                     view.evaluateJavascript("(function(){return document.title})()") { result ->
-                        val title = result?.trim()?.trim('"') ?: ""
-                        tab.title = title
+                        if (tabHolderRef() !== tab || !tab.lifetime.isCurrent(generation)) return@evaluateJavascript
+                        tab.title = result?.trim()?.trim('"') ?: ""
                         finish()
                     }
                 }
@@ -388,12 +408,12 @@ class BrowserManager @Inject constructor(
                 view: WebView?, request: WebResourceRequest?, error: WebResourceError?
             ) {
                 val tab = tabHolderRef() ?: return
-                if (request?.isForMainFrame == true) {
+                if (!tab.awaitingPageStart && request?.isForMainFrame == true && request.url.toString() == tab.url) {
                     val msg = error?.description?.toString() ?: "未知错误"
                     tab.loading = false
                     tab.error = msg
-                    tab.loadDeferred?.complete(Result.failure(RuntimeException(msg)))
-                    tab.loadDeferred = null
+                    tab.loadDeferred?.takeIf { tab.loadGeneration == tab.lifetime.generation }
+                        ?.complete(Result.failure(RuntimeException(msg)))
                     publishState()
                 }
             }
@@ -507,9 +527,9 @@ class BrowserManager @Inject constructor(
         val contextWrapper = MutableContextWrapper(containerView?.context ?: appContext)
         val themedContext = ContextThemeWrapper(contextWrapper, webViewThemeRes(nightMode))
         val wv = WebView(themedContext)
-        configureWebView(wv, id)
         val tab = TabHolder(id = id, webView = wv, themedContext = themedContext, contextWrapper = contextWrapper)
         tabs.add(tab)
+        configureWebView(tab)
         activeTabId = id
 
         // 若当前前端面板未打开，自动挂到 hiddenHost 激活 Chromium 渲染管线
@@ -584,6 +604,7 @@ class BrowserManager @Inject constructor(
             val active = findTab(activeTabId)
             if (active != null && active.url.isNotBlank()) {
                 try {
+                    invalidateDocument(active)
                     active.webView.reload()
                 } catch (e: Throwable) {
                     FileLogger.w(TAG, "Failed to reload after User-Agent change", e)
@@ -880,19 +901,47 @@ class BrowserManager @Inject constructor(
         }
     }
 
-    fun destroy() {
-        tabs.forEach { tab ->
-            tab.webView.apply {
-                stopLoading()
-                removeJavascriptInterface("__browserBridge__")
-                destroy()
-            }
-            tab.loadDeferred?.cancel()
-            tab.pendingJsCalls.values.forEach { it.cancel() }
-            tab.dialogTimeout?.let { mainHandler.removeCallbacks(it) }
-            tab.pendingDialogResult?.cancel()
-            tab.consoleLogs.clear()
+    private fun cleanupDomWait(tab: TabHolder, id: String) {
+        try {
+            tab.webView.evaluateJavascript(DomStableScript.cleanup(JsonPrimitive(id).toString()), null)
+        } catch (e: Exception) {
+            FileLogger.w(TAG, "Failed to clean up DOM wait", e)
         }
+    }
+
+    private fun invalidateDocument(tab: TabHolder, preserveLoad: Boolean = false) {
+        tab.domWaits.toList().forEach { cleanupDomWait(tab, it) }
+        tab.domWaits.clear()
+        tab.lifetime.invalidate()
+        if (!preserveLoad) {
+            tab.loadDeferred?.cancel()
+            tab.loadDeferred = null
+        }
+        tab.awaitingPageStart = false
+        tab.dialogTimeout?.let { mainHandler.removeCallbacks(it) }
+        tab.dialogTimeout = null
+        tab.pendingDialogResult?.cancel()
+        tab.pendingDialogResult = null
+        tab.pendingDialog = null
+    }
+
+    private fun disposeTab(tab: TabHolder) {
+        invalidateDocument(tab)
+        tab.lifetime.close()
+        val view = tab.webView
+        (view.parent as? ViewGroup)?.removeView(view)
+        view.stopLoading()
+        view.removeJavascriptInterface("__browserBridge__")
+        view.destroy()
+        tab.consoleLogs.clear()
+    }
+
+    fun destroy() {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mainHandler.post { destroy() }
+            return
+        }
+        tabs.forEach { disposeTab(it) }
         tabs.clear()
         containerView?.removeAllViews()
         containerView = null
@@ -922,16 +971,7 @@ class BrowserManager @Inject constructor(
     suspend fun closeTab(tabId: String): Boolean = withContext(Dispatchers.Main) {
         val tab = findTab(tabId) ?: return@withContext false
         val index = tabs.indexOf(tab)
-        tab.webView.apply {
-            stopLoading()
-            removeJavascriptInterface("__browserBridge__")
-            destroy()
-        }
-        tab.loadDeferred?.cancel()
-        tab.pendingJsCalls.values.forEach { it.cancel() }
-        tab.dialogTimeout?.let { mainHandler.removeCallbacks(it) }
-        tab.pendingDialogResult?.cancel()
-        tab.consoleLogs.clear()
+        disposeTab(tab)
         tabs.remove(tab)
 
         if (tabs.isEmpty()) {
@@ -1041,15 +1081,40 @@ class BrowserManager @Inject constructor(
         return Uri.fromFile(host).toString()
     }
 
-    private suspend fun loadInto(tab: TabHolder, finalUrl: String): String {
+    private suspend fun <T> withNavigation(
+        tab: TabHolder,
+        action: (WebView) -> Unit,
+        block: suspend (CompletableDeferred<Result<String>>) -> T
+    ): T {
+        invalidateDocument(tab)
         val deferred = CompletableDeferred<Result<String>>()
         tab.loadDeferred = deferred
-        tab.webView.loadUrl(finalUrl)
-        return withTimeout(NAVIGATE_TIMEOUT_MS) { deferred.await() }.getOrThrow()
+        tab.loadGeneration = tab.lifetime.generation
+        tab.awaitingPageStart = true
+        try {
+            action(tab.webView)
+            return block(deferred)
+        } finally {
+            if (tab.loadDeferred === deferred) {
+                tab.loadDeferred = null
+                tab.awaitingPageStart = false
+            }
+            deferred.cancel()
+        }
     }
 
-    suspend fun evaluateJavaScript(script: String, tabId: String? = null): String? = withContext(Dispatchers.Main) {
-        val tab = resolveTab(tabId)
+    private suspend fun loadInto(tab: TabHolder, finalUrl: String): String =
+        withNavigation(tab, { it.loadUrl(finalUrl) }) { deferred ->
+            withTimeout(NAVIGATE_TIMEOUT_MS) { deferred.await() }.getOrThrow()
+        }
+
+    private suspend fun <T> withDocument(tabId: String?, block: suspend (TabHolder) -> T): T =
+        withContext(Dispatchers.Main) {
+            val tab = resolveTab(tabId)
+            tab.lifetime.operation { block(tab) }
+        }
+
+    suspend fun evaluateJavaScript(script: String, tabId: String? = null): String? = withDocument(tabId) { tab ->
         val callId = UUID.randomUUID().toString()
         val deferred = CompletableDeferred<String>()
         tab.pendingJsCalls[callId] = deferred
@@ -1080,17 +1145,16 @@ class BrowserManager @Inject constructor(
             })();
         """.trimIndent()
 
-        tab.webView.evaluateJavascript(wrapped) { }
         try {
+            tab.webView.evaluateJavascript(wrapped, null)
             withTimeout(EVAL_TIMEOUT_MS) { deferred.await() }
-        } catch (e: Exception) {
+        } finally {
             tab.pendingJsCalls.remove(callId)
-            throw e
+            deferred.cancel()
         }
     }
 
-    suspend fun clickElement(selector: String, tabId: String? = null): String = withContext(Dispatchers.Main) {
-        val tab = resolveTab(tabId)
+    suspend fun clickElement(selector: String, tabId: String? = null): String = withDocument(tabId) { tab ->
         val wv = tab.webView
 
         // 步骤 1：先在 JS 层面解析元素、平滑滚动到视口中心并获取视口几何坐标
@@ -1121,7 +1185,7 @@ class BrowserManager @Inject constructor(
         val prepJson = wv.evaluateJavascriptSync(prepareScript) ?: "{}"
         val prep = parseEvalResult(prepJson) as? JsonObject
         val matched = (prep?.get("matched") as? JsonPrimitive)?.content != "false"
-        if (!matched) return@withContext """{"matched":false}"""
+        if (!matched) return@withDocument """{"matched":false}"""
 
         val x = (prep?.get("x") as? JsonPrimitive)?.content?.toFloatOrNull() ?: 0f
         val y = (prep?.get("y") as? JsonPrimitive)?.content?.toFloatOrNull() ?: 0f
@@ -1137,12 +1201,16 @@ class BrowserManager @Inject constructor(
             val downTime = SystemClock.uptimeMillis()
             val down = MotionEvent.obtain(downTime, downTime, MotionEvent.ACTION_DOWN, clickX, clickY, 0)
             val up = MotionEvent.obtain(downTime, downTime + 50, MotionEvent.ACTION_UP, clickX, clickY, 0)
-            val downHandled = wv.dispatchTouchEvent(down)
-            delay(50)
-            val upHandled = wv.dispatchTouchEvent(up)
-            down.recycle()
-            up.recycle()
-            downHandled || upHandled
+            try {
+                val downHandled = wv.dispatchTouchEvent(down)
+                delay(50)
+                currentCoroutineContext().ensureActive()
+                val upHandled = wv.dispatchTouchEvent(up)
+                downHandled || upHandled
+            } finally {
+                down.recycle()
+                up.recycle()
+            }
         } else false
 
         // 步骤 3：若物理点击未生效或元素尺寸为 0，回退到 JS dispatchEvent
@@ -1181,8 +1249,7 @@ class BrowserManager @Inject constructor(
         )).toString()
     }
 
-    suspend fun fillElement(selector: String, value: String, tabId: String? = null): String = withContext(Dispatchers.Main) {
-        val tab = resolveTab(tabId)
+    suspend fun fillElement(selector: String, value: String, tabId: String? = null): String = withDocument(tabId) { tab ->
         val js = """
             $selectorHelper
             (function(sel, val){
@@ -1225,8 +1292,7 @@ class BrowserManager @Inject constructor(
         tab.webView.evaluateJavascriptSync(js) ?: "{}"
     }
 
-    suspend fun selectOption(selector: String, value: String, tabId: String? = null): String = withContext(Dispatchers.Main) {
-        val tab = resolveTab(tabId)
+    suspend fun selectOption(selector: String, value: String, tabId: String? = null): String = withDocument(tabId) { tab ->
         val js = """
             $selectorHelper
             (function(sel, val){
@@ -1312,8 +1378,7 @@ class BrowserManager @Inject constructor(
         """{"count":${filtered.size},"logs":[$logs]}"""
     }
 
-    suspend fun hoverElement(selector: String, tabId: String? = null): String = withContext(Dispatchers.Main) {
-        val tab = resolveTab(tabId)
+    suspend fun hoverElement(selector: String, tabId: String? = null): String = withDocument(tabId) { tab ->
         val js = """
             $selectorHelper
             (function(sel){
@@ -1336,8 +1401,7 @@ class BrowserManager @Inject constructor(
         result ?: "{}"
     }
 
-    suspend fun pressKey(key: String, tabId: String? = null): Boolean = withContext(Dispatchers.Main) {
-        val tab = resolveTab(tabId)
+    suspend fun pressKey(key: String, tabId: String? = null): Boolean = withDocument(tabId) { tab ->
         val js = """
             (function(key){
                 var keyMap = {
@@ -1367,8 +1431,7 @@ class BrowserManager @Inject constructor(
         result == "true"
     }
 
-    suspend fun getText(selector: String? = null, tabId: String? = null): String = withContext(Dispatchers.Main) {
-        val tab = resolveTab(tabId)
+    suspend fun getText(selector: String? = null, tabId: String? = null): String = withDocument(tabId) { tab ->
         val wv = tab.webView
 
         // 异步渲染沉淀等待：若页面仍处于加载态，等待最多 2000ms
@@ -1413,8 +1476,7 @@ class BrowserManager @Inject constructor(
         text
     }
 
-    suspend fun getHtml(selector: String? = null, tabId: String? = null): String = withContext(Dispatchers.Main) {
-        val tab = resolveTab(tabId)
+    suspend fun getHtml(selector: String? = null, tabId: String? = null): String = withDocument(tabId) { tab ->
         val wv = tab.webView
 
         // 异步渲染沉淀等待：若页面仍处于加载态，等待最多 2000ms
@@ -1435,8 +1497,7 @@ class BrowserManager @Inject constructor(
         if (raw.length > MAX_CONTENT_CHARS) raw.take(MAX_CONTENT_CHARS) + "\n\n[网页内容超长，已截断]" else raw
     }
 
-    suspend fun getBackbone(maxDepth: Int = 15, tabId: String? = null): String = withContext(Dispatchers.Main) {
-        val tab = resolveTab(tabId)
+    suspend fun getBackbone(maxDepth: Int = 15, tabId: String? = null): String = withDocument(tabId) { tab ->
         val js = """
             (function(maxDepth, maxNodes){
                 var SKIP = {SCRIPT:1, STYLE:1, NOSCRIPT:1, TEMPLATE:1, LINK:1, META:1, HEAD:1};
@@ -1572,8 +1633,7 @@ class BrowserManager @Inject constructor(
         unescapeJsString(result)
     }
 
-    suspend fun wait(condition: String, timeoutMs: Long = 10_000, tabId: String? = null): Boolean = withContext(Dispatchers.Main) {
-        val tab = resolveTab(tabId)
+    suspend fun wait(condition: String, timeoutMs: Long = 10_000, tabId: String? = null): Boolean = withDocument(tabId) { tab ->
         when {
             condition == "domStable" -> waitForDomStable(tab, timeoutMs)
             condition.startsWith("text=") -> {
@@ -1606,29 +1666,28 @@ class BrowserManager @Inject constructor(
     }
 
     private suspend fun waitForDomStable(tab: TabHolder, timeoutMs: Long = 5_000): Boolean {
-        val sigJs = "(function(){var b=document.body||document.documentElement;" +
-            "return b?b.getElementsByTagName('*').length+':'+b.innerHTML.length:'0:0'})()"
-        val deadline = System.currentTimeMillis() + timeoutMs
-        var last = ""
-        var stableSince = 0L
-        while (System.currentTimeMillis() < deadline) {
-            val sig = tab.webView.evaluateJavascriptSync(sigJs)?.trim('"') ?: ""
-            val now = System.currentTimeMillis()
-            if (sig.isNotEmpty() && sig == last) {
-                if (stableSince == 0L) stableSince = now
-                if (now - stableSince >= DOM_STABLE_QUIET_MS) return true
-            } else {
-                last = sig
-                stableSince = 0L
-            }
-            delay(DOM_STABLE_POLL_MS)
+        if (timeoutMs <= 0) return false
+        val generation = tab.lifetime.generation
+        val id = UUID.randomUUID().toString()
+        val deferred = CompletableDeferred<String>()
+        tab.pendingJsCalls[id] = deferred
+        tab.domWaits.add(id)
+        try {
+            tab.webView.evaluateJavascript(
+                DomStableScript.install(JsonPrimitive(id).toString(), DOM_STABLE_QUIET_MS, timeoutMs), null
+            )
+            val result = withTimeoutOrNull(timeoutMs) { deferred.await() }
+            tab.lifetime.check(generation)
+            return result == "true"
+        } finally {
+            tab.pendingJsCalls.remove(id)
+            deferred.cancel()
+            if (tab.domWaits.remove(id) && tab.lifetime.isCurrent(generation)) cleanupDomWait(tab, id)
         }
-        return false
     }
 
     suspend fun scroll(selector: String? = null, x: Int? = null, y: Int? = null, tabId: String? = null): String =
-        withContext(Dispatchers.Main) {
-            val tab = resolveTab(tabId)
+        withDocument(tabId) { tab ->
             val beforeJs = "(function(){return JSON.stringify({y:window.scrollY||0,x:window.scrollX||0})})()"
             val beforeResult = tab.webView.evaluateJavascriptSync(beforeJs)
             val before = unescapeJsString(beforeResult)
@@ -1654,48 +1713,103 @@ class BrowserManager @Inject constructor(
             """{"from":$before,"to":$after}"""
         }
 
+    /** Observes only an existing viewport; returned bitmaps belong to the local preview caller. */
+    suspend fun captureThumbnail(tabId: String, maxEdge: Int = 480): Bitmap? = captureBrowserPreviewFrame {
+        var owned: Bitmap? = null
+        try {
+            val result = withContext(Dispatchers.Main.immediate) {
+                currentCoroutineContext().ensureActive()
+                val tab = findTab(tabId.takeIf { it.isNotBlank() } ?: return@withContext null)
+                    ?.takeUnless { it.lifetime.destroyed } ?: return@withContext null
+                tab.lifetime.capture { generation ->
+                    val wv = tab.webView
+                    if (tab.loading || tab.loadDeferred != null || wv.progress < 100 || wv.width <= 0 || wv.height <= 0) {
+                        return@capture null
+                    }
+                    val url = wv.url
+                    val tabUrl = tab.url
+                    val edge = maxEdge.coerceIn(1, 2048)
+                    val scale = minOf(1f, edge.toFloat() / maxOf(wv.width, wv.height))
+                    val bitmap = Bitmap.createBitmap(
+                        (wv.width * scale).toInt().coerceAtLeast(1),
+                        (wv.height * scale).toInt().coerceAtLeast(1),
+                        Bitmap.Config.ARGB_8888,
+                    )
+                    owned = bitmap
+                    val canvas = Canvas(bitmap).apply { scale(scale, scale) }
+                    val layer = wv.layerType
+                    try {
+                        // Software Canvas cannot read the existing hardware layer's pixels.
+                        wv.setLayerType(View.LAYER_TYPE_SOFTWARE, null)
+                        wv.draw(canvas)
+                    } finally {
+                        if (!tab.lifetime.destroyed) wv.setLayerType(layer, null)
+                    }
+                    tab.lifetime.check(generation)
+                    if (findTab(tabId) !== tab || tab.loading || tab.loadDeferred != null || wv.progress < 100 ||
+                        wv.url != url || tab.url != tabUrl) null else bitmap
+                }
+            }
+            if (result != null) owned = null
+            result
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            null
+        } finally {
+            owned?.recycle()
+        }
+    }
+
     suspend fun screenshot(tabId: String? = null): AgentImage? = withContext(Dispatchers.Main) {
         val tab = resolveTab(tabId)
-        val wv = tab.webView
+        tab.lifetime.capture { generation ->
+            val wv = tab.webView
+            awaitPageLoaded(tab)
+            tab.lifetime.check(generation)
 
-        // 导航进行中 WebView 显示的仍是上一个页面，此时绘制会截到旧画面，先等加载结束
-        awaitPageLoaded(tab)
+            if (wv.width <= 0 || wv.height <= 0) {
+                val density = appContext.resources.displayMetrics.density
+                val width = (HEADLESS_WIDTH_DP * density).toInt().coerceAtLeast(1)
+                val height = (HEADLESS_HEIGHT_DP * density).toInt().coerceAtLeast(1)
+                wv.measure(
+                    View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
+                    View.MeasureSpec.makeMeasureSpec(height, View.MeasureSpec.EXACTLY)
+                )
+                wv.layout(0, 0, width, height)
+            }
+            if (wv.width <= 0 || wv.height <= 0) return@capture null
 
-        // 离屏兜底尺寸：若未被系统布局过（w/h <= 0），手动测量布局
-        if (wv.width <= 0 || wv.height <= 0) {
-            val density = appContext.resources.displayMetrics.density
-            val width = (HEADLESS_WIDTH_DP * density).toInt().coerceAtLeast(1)
-            val height = (HEADLESS_HEIGHT_DP * density).toInt().coerceAtLeast(1)
-            wv.measure(
-                View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
-                View.MeasureSpec.makeMeasureSpec(height, View.MeasureSpec.EXACTLY)
-            )
-            wv.layout(0, 0, width, height)
+            waitForVisualState(tab, generation)
+            val bitmap = Bitmap.createBitmap(wv.width, wv.height, Bitmap.Config.ARGB_8888)
+            try {
+                // Software Canvas cannot read GPU pixels; restore the layer even when a visual wait is cancelled.
+                val oldLayerType = wv.layerType
+                try {
+                    wv.setLayerType(View.LAYER_TYPE_SOFTWARE, null)
+                    waitForVisualState(tab, generation)
+                    tab.lifetime.check(generation)
+                    wv.draw(Canvas(bitmap))
+                } finally {
+                    if (!tab.lifetime.destroyed) wv.setLayerType(oldLayerType, null)
+                }
+                tab.lifetime.check(generation)
+                val image = withContext(Dispatchers.Default) {
+                    currentCoroutineContext().ensureActive()
+                    ByteArrayOutputStream().use { output ->
+                        check(bitmap.compress(Bitmap.CompressFormat.JPEG, SCREENSHOT_QUALITY, output))
+                        currentCoroutineContext().ensureActive()
+                        val base64 = Base64.encodeToString(output.toByteArray(), Base64.NO_WRAP)
+                        currentCoroutineContext().ensureActive()
+                        AgentImage(mimeType = "image/jpeg", base64Data = base64)
+                    }
+                }
+                tab.lifetime.check(generation)
+                image
+            } finally {
+                bitmap.recycle()
+            }
         }
-        if (wv.width <= 0 || wv.height <= 0) return@withContext null
-
-        // 等待视觉状态就绪（API 23+ 原生机制，保证光栅化合成完毕）
-        waitForVisualState(wv)
-
-        val bitmap = Bitmap.createBitmap(wv.width, wv.height, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(bitmap)
-
-        // 关键：WebView 处于硬件层时，software Canvas 回读不到 GPU 帧缓冲——离屏未挂载、或挂载到窗口（打开过浏览器面板）都会白屏；
-        // 因此截图期间一律临时切为 LAYER_TYPE_SOFTWARE 遍历 display list 真实绘制到 Bitmap，画完还原。
-        val oldLayerType = wv.layerType
-        wv.setLayerType(View.LAYER_TYPE_SOFTWARE, null)
-        try {
-            // 切层会触发一次重绘；等视觉状态与最新内容一致后再绘制，否则会截到切换前的旧帧
-            waitForVisualState(wv)
-            wv.draw(canvas)
-        } finally {
-            wv.setLayerType(oldLayerType, null)
-        }
-
-        val baos = ByteArrayOutputStream()
-        bitmap.compress(Bitmap.CompressFormat.JPEG, SCREENSHOT_QUALITY, baos)
-        bitmap.recycle()
-        AgentImage(mimeType = "image/jpeg", base64Data = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP))
     }
 
     /** 页面仍在加载时等待其结束：导航过程中 WebView 呈现的还是上一个页面，直接绘制会截到旧内容。 */
@@ -1708,25 +1822,26 @@ class BrowserManager @Inject constructor(
         }
     }
 
-    private suspend fun waitForVisualState(wv: WebView, timeoutMs: Long = 1_000L) {
-        val deferred = CompletableDeferred<Unit>()
-        wv.postVisualStateCallback(1L, object : WebView.VisualStateCallback() {
-            override fun onComplete(requestId: Long) {
-                deferred.complete(Unit)
-            }
-        })
+    private suspend fun waitForVisualState(tab: TabHolder, generation: Long, timeoutMs: Long = 1_000L) {
+        val deferred = tab.lifetime.callback<Unit>(generation)
         try {
-            withTimeout(timeoutMs) { deferred.await() }
-        } catch (_: Exception) {
-            // 超时兜底，直接继续绘制
+            tab.webView.postVisualStateCallback(generation, object : WebView.VisualStateCallback() {
+                override fun onComplete(requestId: Long) {
+                    tab.lifetime.complete(generation, deferred, Unit)
+                }
+            })
+            // Only this visual timeout is a fallback; document/caller cancellation must propagate.
+            withTimeoutOrNull(timeoutMs) { deferred.await() }
+            tab.lifetime.check(generation)
+        } finally {
+            tab.lifetime.release(deferred)
         }
     }
 
     suspend fun screenshotIfVisible(tabId: String? = null): AgentImage? =
         if (isVisible(tabId)) screenshot(tabId) else null
 
-    suspend fun getViewportInfo(tabId: String? = null): String = withContext(Dispatchers.Main) {
-        val tab = resolveTab(tabId)
+    suspend fun getViewportInfo(tabId: String? = null): String = withDocument(tabId) { tab ->
         val js = "(function(){return JSON.stringify({w:window.innerWidth,h:window.innerHeight,dpr:window.devicePixelRatio||1,scrollY:window.scrollY||0,scrollHeight:document.body?document.body.scrollHeight:0})})()"
         unescapeJsString(tab.webView.evaluateJavascriptSync(js))
     }
@@ -1746,34 +1861,34 @@ class BrowserManager @Inject constructor(
         val wv = tab.webView
         if (!canGo(wv)) return@withContext false
         val before = wv.url.orEmpty()
-        val deferred = CompletableDeferred<Result<String>>()
-        tab.loadDeferred = deferred
-        action(wv)
-
-        val urlDeadline = System.currentTimeMillis() + GO_URL_TIMEOUT_MS
-        var after = before
-        while (after == before && System.currentTimeMillis() < urlDeadline) {
-            delay(GO_POLL_MS)
-            after = wv.url.orEmpty()
-        }
-        if (after == before) {
-            val href = currentHref(tab)
-            if (href.isNotEmpty() && href != before) after = href
-        }
-        if (after == before) {
-            if (tab.loadDeferred === deferred) tab.loadDeferred = null
-            return@withContext false
-        }
-        if (tab.loading) {
-            try {
-                withTimeout(GO_LOAD_TIMEOUT_MS) { deferred.await() }
-            } catch (e: Exception) {
-                // 同文档导航不会触发 onPageFinished，超时后直接继续
+        withNavigation(tab, action) { deferred ->
+            val urlDeadline = System.currentTimeMillis() + GO_URL_TIMEOUT_MS
+            var after = before
+            while (after == before && System.currentTimeMillis() < urlDeadline) {
+                delay(GO_POLL_MS)
+                checkNavigation(tab, deferred)
+                after = wv.url.orEmpty()
             }
+            if (after == before) {
+                val href = currentHref(tab)
+                if (href.isNotEmpty() && href != before) after = href
+            }
+            checkNavigation(tab, deferred)
+            if (after == before) return@withNavigation false
+            if (tab.loading) {
+                withTimeoutOrNull(GO_LOAD_TIMEOUT_MS) { deferred.await() }
+            }
+            checkNavigation(tab, deferred)
+            syncTitle(tab)
+            true
         }
-        if (tab.loadDeferred === deferred) tab.loadDeferred = null
-        syncTitle(tab)
-        true
+    }
+
+    private suspend fun checkNavigation(tab: TabHolder, deferred: CompletableDeferred<Result<String>>) {
+        currentCoroutineContext().ensureActive()
+        if (tab.lifetime.destroyed || tab.loadDeferred !== deferred || deferred.isCancelled) {
+            throw CancellationException("Browser navigation changed")
+        }
     }
 
     private suspend fun currentHref(tab: TabHolder): String {
@@ -1789,10 +1904,9 @@ class BrowserManager @Inject constructor(
 
     suspend fun reload(tabId: String? = null): String = withContext(Dispatchers.Main) {
         val tab = resolveTab(tabId)
-        val deferred = CompletableDeferred<Result<String>>()
-        tab.loadDeferred = deferred
-        tab.webView.reload()
-        withTimeout(NAVIGATE_TIMEOUT_MS) { deferred.await() }.getOrThrow()
+        withNavigation(tab, { it.reload() }) { deferred ->
+            withTimeout(NAVIGATE_TIMEOUT_MS) { deferred.await() }.getOrThrow()
+        }
     }
 
     fun getUrl(tabId: String? = null): String = findTab(tabId ?: activeTabId)?.url ?: _state.value.url
@@ -1813,9 +1927,19 @@ class BrowserManager @Inject constructor(
     }
 
     private suspend fun WebView.evaluateJavascriptSync(script: String): String? {
-        val deferred = CompletableDeferred<String?>()
-        evaluateJavascript(script) { result -> deferred.complete(result) }
-        return deferred.await()
+        currentCoroutineContext().ensureActive()
+        val tab = tabs.firstOrNull { it.webView === this && !it.lifetime.destroyed }
+            ?: throw CancellationException("Browser tab closed")
+        val generation = tab.lifetime.generation
+        val deferred = tab.lifetime.callback<String?>(generation)
+        try {
+            evaluateJavascript(script) { result -> tab.lifetime.complete(generation, deferred, result) }
+            val result = withTimeout(EVAL_TIMEOUT_MS) { deferred.await() }
+            tab.lifetime.check(generation)
+            return result
+        } finally {
+            tab.lifetime.release(deferred)
+        }
     }
 
     /**

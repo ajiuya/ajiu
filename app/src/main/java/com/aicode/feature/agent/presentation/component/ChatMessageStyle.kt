@@ -25,6 +25,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -42,7 +43,9 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
 import com.aicode.R
+import com.aicode.core.theme.Radius
 import com.aicode.core.theme.Spacing
+import com.aicode.feature.settings.data.repository.ChatBubbleStyle
 import compose.icons.FeatherIcons
 import compose.icons.feathericons.Check
 import compose.icons.feathericons.Copy
@@ -67,7 +70,7 @@ internal object ChatStyle {
     val hairline = 1.dp
 
     /** 用户药丸圆角。 */
-    val bubbleCorner = 14.dp
+    val bubbleCorner = Radius.lg
 
     /** 代码卡/差异卡圆角。 */
     val cardCorner = 10.dp
@@ -85,13 +88,8 @@ internal object ChatStyle {
     val rowIconSize = 16.dp
 }
 
-/** 用户消息底色：浅色主题下即主题容器色（默认蓝即参考图那种淡蓝），深色下自动变深。 */
-@Composable
-internal fun chatUserBubbleColor(): Color = MaterialTheme.colorScheme.primaryContainer
-
-/** 用户消息文字：压在浅药丸上的深色文字，不再用白字反白。 */
-@Composable
-internal fun chatUserBubbleTextColor(): Color = MaterialTheme.colorScheme.onPrimaryContainer
+val LocalUserChatBubbleStyle = staticCompositionLocalOf { ChatBubbleStyle.ORIGINAL }
+val LocalAssistantChatBubbleStyle = staticCompositionLocalOf { ChatBubbleStyle.DOCUMENT }
 
 /** 1px 细线：扁平风格里唯一的分组手段。 */
 @Composable

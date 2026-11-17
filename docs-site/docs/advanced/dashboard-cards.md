@@ -1,6 +1,6 @@
 # 自定义面板 (DIY Dashboard) 与 Adaptive Cards 设计规范指南
 
-本文档定义了 AiCode 在聊天输入框上方「自定义面板 (DIY Dashboard)」中支持的 **Adaptive Cards 声明式微模板规范**。
+本文档定义了阿九工作台在聊天输入框上方「自定义面板 (DIY Dashboard)」中支持的 **Adaptive Cards 声明式微模板规范**。
 
 AI 助手与开发者可以依据此规范，编写面板脚本（Python / Node / Shell）输出结构化卡片 JSON，从而完全自定义面板在收起态（Compact）与展开态（Expanded）下的排版、配色、进度条、指标卡片及明细信息。
 
@@ -31,7 +31,7 @@ AI 助手与开发者可以依据此规范，编写面板脚本（Python / Node 
 
 ## 2. 脚本运行环境与注入的环境变量
 
-执行面板脚本时，AiCode 会自动注入以下环境变量，供脚本自由消费并构建动态面板：
+执行面板脚本时，阿九工作台会自动注入以下环境变量，供脚本自由消费并构建动态面板：
 
 ### Token 类变量
 
@@ -61,10 +61,11 @@ AI 助手与开发者可以依据此规范，编写面板脚本（Python / Node 
 
 ### 会话状态变量
 
+旧脚本使用的 `AICODE_SESSION_MODE` 不再提供。需要显示当前工作进度时，请使用下面的 `AICODE_AGENT_STATE`；它表示执行状态，而不是工作模式。本地容器与远程 SSH 的执行环境选择不受影响。
+
 | 环境变量名 | 示例值 | 说明 |
 | :--- | :--- | :--- |
 | `AICODE_AGENT_STATE` | `streaming` | 当前 Agent 工作状态：`idle`（空闲）/ `loading`（加载中）/ `streaming`（流式输出中）/ `result`（完成）/ `error`（出错） |
-| `AICODE_SESSION_MODE` | `build` | 当前会话模式：`build`（构建）/ `plan`（计划）/ `auto`（自动） |
 | `AICODE_REASONING_EFFORT` | `high` | 当前思考强度档位：`none` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max` |
 | `AICODE_REFRESH_REASON` | `llm` | 本次面板刷新的触发原因：`session`（进入/切换会话，数据就绪后触发）、`llm`（LLM 请求返回后自动刷新）、`done`（AI 一轮任务完成后自动刷新，此时 `AICODE_AGENT_STATE` 为最终状态）、`manual`（手动点击刷新/错误重试）、`button`（卡片内刷新按钮触发） |
 

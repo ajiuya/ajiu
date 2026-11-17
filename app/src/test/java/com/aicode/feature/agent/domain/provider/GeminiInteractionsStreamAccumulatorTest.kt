@@ -29,6 +29,102 @@ class GeminiInteractionsStreamAccumulatorTest {
         JsonParser.parseString(response.thinkingBlocksJson!!).asJsonArray
 
     @Test
+    fun argumentPreviewsArePartialBoundedAndIsolatedWithoutChangingSignedHistory() {
+        val acc = GeminiInteractionsStreamAccumulator()
+        feed(acc,
+            "{'event_type':'step.start','index':0,'step':{'type':'thought','signature':'raw-signature'}}",
+            "{'event_type':'step.start','index':1,'step':{'type':'function_call','id':'one','name':'writeFile'}}",
+            "{'event_type':'step.start','index':2,'step':{'type':'function_call','id':'two','name':'writeFile'}}"
+        )
+        fun delta(index: Int, arguments: String) = JsonObject().apply {
+            addProperty("event_type", "step.delta")
+            addProperty("index", index)
+            add("delta", JsonObject().apply {
+                addProperty("type", "arguments_delta")
+                addProperty("arguments", arguments)
+            })
+        }
+        val partial = """{"tool_title":"Write a","content":""""
+        acc.accept(delta(1, partial))
+        assertEquals(partial, acc.argumentPreviews(force = true).single().accumulated)
+        acc.accept(delta(2, """{"tool_title":"Write b","content":"b"}"""))
+        assertEquals("two", acc.argumentPreviews(force = true).single().id)
+        val content = "a".repeat(150_000)
+        acc.accept(delta(1, "$content\"}"))
+        val snapshotBeforePreview = acc.toResponse().thinkingBlocksJson
+        val preview = acc.argumentPreviews(force = true).single()
+        assertEquals("one", preview.id)
+        assertEquals(128 * 1024, preview.accumulated.length)
+        assertEquals(snapshotBeforePreview, acc.toResponse().thinkingBlocksJson)
+        val response = acc.toResponse()
+        assertEquals(content, (response.toolCalls[0].arguments["content"] as kotlinx.serialization.json.JsonPrimitive).content)
+        assertEquals("Write a", (response.toolCalls[0].arguments["tool_title"] as kotlinx.serialization.json.JsonPrimitive).content)
+        val snapshot = snapshotOf(response)
+        assertEquals("raw-signature", snapshot[0].asJsonObject.get("signature").asString)
+        assertEquals("Write a", snapshot[1].asJsonObject.getAsJsonObject("arguments").get("tool_title").asString)
+    }
+
+    @Test
+    fun terminalStepsKeepRawArgumentCountsWithoutCanonicalReplay() {
+        val acc = GeminiInteractionsStreamAccumulator()
+        feed(acc, "{'event_type':'step.start','index':0,'step':{'type':'function_call','id':'one','name':'writeFile'}}")
+        val raw = """ { "content" : "\u6c49" } """
+        acc.accept(JsonObject().apply {
+            addProperty("event_type", "step.delta")
+            addProperty("index", 0)
+            add("delta", JsonObject().apply {
+                addProperty("type", "arguments_delta")
+                addProperty("arguments", raw)
+            })
+        })
+        val preview = acc.argumentPreviews(force = true).single()
+        assertEquals(raw.length, preview.totalAsciiChars)
+        assertEquals(0, preview.totalOtherChars)
+        feed(acc, "{'event_type':'interaction.completed','interaction':{'status':'requires_action','steps':[" +
+            "{'type':'function_call','id':'one','name':'writeFile','arguments':{'content':'汉'}}]}}")
+        repeat(3) { assertTrue(acc.argumentPreviews(force = true).isEmpty()) }
+        assertEquals("汉", (acc.toResponse().toolCalls.single().arguments["content"] as kotlinx.serialization.json.JsonPrimitive).content)
+    }
+
+    @Test
+    fun aStepWhoseNameOnlyArrivesAtCompletionStillPublishesItsArgumentCounts() {
+        val acc = GeminiInteractionsStreamAccumulator()
+        feed(acc, "{'event_type':'step.start','index':0,'step':{'type':'function_call','id':'one','arguments':{'content':'汉'}}}")
+        assertTrue(acc.argumentPreviews(force = true).isEmpty())
+        feed(acc, "{'event_type':'interaction.completed','interaction':{'status':'requires_action','steps':[" +
+            "{'type':'function_call','id':'one','name':'writeFile','arguments':{'content':'汉'}}]}}")
+        val preview = acc.argumentPreviews(force = true).single()
+        assertEquals("one", preview.id)
+        assertEquals("writeFile", preview.name)
+        assertEquals(preview.accumulated.length - 1, preview.totalAsciiChars)
+        assertEquals(1, preview.totalOtherChars)
+        assertTrue(acc.argumentPreviews(force = true).isEmpty())
+    }
+
+    @Test
+    fun terminalOnlyStepsStillPublishArgumentCountsOnce() {
+        val acc = GeminiInteractionsStreamAccumulator()
+        feed(acc, "{'event_type':'interaction.completed','interaction':{'status':'requires_action','steps':[" +
+            "{'type':'function_call','id':'one','name':'writeFile','arguments':{'content':'汉'}}]}}")
+        val preview = acc.argumentPreviews(force = true).single()
+        assertEquals("one", preview.id)
+        assertEquals(preview.accumulated.length - 1, preview.totalAsciiChars)
+        assertEquals(1, preview.totalOtherChars)
+        assertTrue(acc.argumentPreviews(force = true).isEmpty())
+    }
+
+    @Test
+    fun argumentPreviewsDoNotInventIdAndSupportCompleteStartPayload() {
+        val acc = GeminiInteractionsStreamAccumulator()
+        feed(acc, "{'event_type':'step.start','index':1,'step':{'type':'function_call','name':'readFile','arguments':{'tool_title':'Read'}}}")
+        assertTrue(acc.argumentPreviews(force = true).isEmpty())
+        feed(acc, "{'event_type':'step.start','index':1,'step':{'type':'function_call','id':'id','name':'readFile','arguments':{'tool_title':'Read'}}}")
+        val preview = acc.argumentPreviews(force = true).single()
+        assertEquals("id", preview.id)
+        assertEquals("{\"tool_title\":\"Read\"}", preview.accumulated)
+    }
+
+    @Test
     fun text_deltas_accumulate_and_stream_out() {
         val acc = GeminiInteractionsStreamAccumulator()
         val deltas = feed(

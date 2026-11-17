@@ -1,7 +1,6 @@
 package com.aicode.feature.agent.domain.workflow
 
 import com.aicode.feature.agent.domain.model.AgentContext
-import com.aicode.feature.agent.domain.model.AgentMode
 import com.aicode.feature.agent.domain.provider.RetryErrorInfo
 import com.aicode.feature.agent.domain.tool.AgentTool
 import com.aicode.feature.agent.domain.tool.ToolCall
@@ -27,8 +26,14 @@ sealed class AgentEvent {
         /** 模型直出图片（Gemini 图像模型）落盘后构造的文件卡片，随消息落库供 UI 渲染。 */
         val attachments: List<com.aicode.feature.agent.presentation.AgentAttachment> = emptyList(),
         val messageId: String = java.util.UUID.randomUUID().toString(),
-        val persisted: kotlinx.coroutines.CompletableDeferred<Unit>? = null
+        val persisted: kotlinx.coroutines.CompletableDeferred<Unit>? = null,
+        val contextUsage: ContextUsage? = null,
+        val contextBreakdown: com.aicode.feature.agent.domain.model.ContextUsageBreakdown? = null,
+        val recoveryStep: com.aicode.feature.agent.domain.recovery.RecoveryStep? = null
     ) : AgentEvent()
+
+    object GenerationStarted : AgentEvent()
+    data class GenerationSpeed(val tokensPerSecond: Double, val estimated: Boolean) : AgentEvent()
 
     /** 流式过程中模型逐字吐出的文字（[accumulated] 为本轮已累积的完整文本，用于 UI 实时渲染，不落库）。 */
     data class AssistantDelta(val accumulated: String) : AgentEvent()
@@ -37,7 +42,16 @@ sealed class AgentEvent {
     data class ReasoningDelta(val accumulated: String) : AgentEvent()
 
     /** 模型决定调用某工具（执行前）。 */
-    data class ToolCallStarted(val id: String, val toolName: String, val argsPreview: String) : AgentEvent()
+    data class ToolCallStarted(
+        val id: String,
+        val toolName: String,
+        val argsPreview: String,
+        val actionTitle: String? = null
+    ) : AgentEvent()
+
+    data class ToolExecutionStarted(val id: String, val startedAtMs: Long, val startedElapsedMs: Long) : AgentEvent()
+    data class ToolCallArgumentsPreview(val id: String, val toolName: String, val accumulated: String) : AgentEvent()
+    data class TurnFinished(val messageId: String?, val durationMs: Long) : AgentEvent()
 
     /**
      * 模型刚开始产出某次工具调用、工具名已知（参数还在流式传输中）。
@@ -59,7 +73,11 @@ sealed class AgentEvent {
         val argsPreview: String? = null,
         /** 仅 sendFile 等展示型工具：随结果附带的文件卡片元数据，落库供 UI 渲染，不回放进模型上下文。 */
         val attachments: List<com.aicode.feature.agent.presentation.AgentAttachment> = emptyList(),
-        val persisted: kotlinx.coroutines.CompletableDeferred<Unit>? = null
+        val persisted: kotlinx.coroutines.CompletableDeferred<Unit>? = null,
+        val actionTitle: String? = null,
+        val startedAtMs: Long? = null,
+        val durationMs: Long? = null,
+        val notificationSeqs: List<Long> = emptyList()
     ) : AgentEvent()
 
     /** 网络请求正在重试（首字节前失败触发自动重试）。仅用于 UI 实时展示，不落库。[error] 为触发重试的错误摘要。 */
@@ -69,15 +87,20 @@ sealed class AgentEvent {
     data class KeySwitched(val newIndex: Int, val total: Int) : AgentEvent()
 
     /** 正在进行上下文压缩。仅用于 UI 实时展示，不落库。 */
-    data class CompactionStarted(val estimatedTokens: Int) : AgentEvent()
+    data class CompactionStarted(val estimatedTokens: Int, val attemptId: String) : AgentEvent()
+
+    data class CompactionProgress(
+        val progress: com.aicode.feature.agent.domain.context.CompactionProgress,
+        val attemptId: String
+    ) : AgentEvent()
 
     /** 上下文压缩流程已结束（成功或失败）。仅用于 UI 实时展示，不落库。 */
-    object CompactionFinished : AgentEvent()
+    data class CompactionFinished(val attemptId: String) : AgentEvent()
 
     data class ContextUsage(val inputTokens: Int, val inputBudget: Int, val estimated: Boolean) : AgentEvent()
 
     /** 上下文压缩失败（如压缩模型不可用）。携带失败原因，UI 展示为可展开的失败卡片；不落库。 */
-    data class CompactionFailed(val reason: String) : AgentEvent()
+    data class CompactionFailed(val reason: String, val attemptId: String) : AgentEvent()
 
     /**
      * 整个流程因错误终止（如流式请求被网络中断、达到迭代上限）。与 [Completed] 区别：携带错误，UI 应展示错误而非成功。
@@ -86,11 +109,10 @@ sealed class AgentEvent {
      */
     data class Failed(val error: String, val reasonCode: String? = null) : AgentEvent()
 
+    object PlanRejected : AgentEvent()
+
     /** 整个流程结束。 */
     object Completed : AgentEvent()
-
-    /** 模式已切换（由 AI 调用 planMode 触发），UI 据此展示计划审查面板等。 */
-    data class ModeChanged(val newMode: AgentMode, val reason: String) : AgentEvent()
 }
 
 interface AgentWorkflow {
@@ -110,7 +132,12 @@ interface AgentWorkflow {
      * 压缩结果由 ContextCompactor 内部持久化，通过 [onEvent] 回调推送压缩进度事件。
      * @return 是否实际触发了压缩（历史未超阈值时返回 false，不改动）。
      */
-    suspend fun compactSession(sessionId: String, onEvent: suspend (AgentEvent) -> Unit = {}): Boolean
+    suspend fun compactSession(
+        sessionId: String,
+        context: AgentContext,
+        tools: List<AgentTool>,
+        onEvent: suspend (AgentEvent) -> Unit = {}
+    ): Boolean
 
     /**
      * 为新建会话生成标题（供首条用户消息后异步调用）。

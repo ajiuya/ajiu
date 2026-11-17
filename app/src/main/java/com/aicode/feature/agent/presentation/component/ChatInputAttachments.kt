@@ -65,8 +65,9 @@ import com.aicode.R
 import com.aicode.core.theme.Radius
 import com.aicode.core.theme.Spacing
 import com.aicode.core.ui.LocalImageViewer
-import com.aicode.core.ui.THUMBNAIL_MAX_EDGE
-import com.aicode.core.ui.decodeSampledBitmap
+import com.aicode.core.ui.ThumbnailCache
+import com.aicode.feature.agent.presentation.preview.UiWorkEffect
+import kotlinx.coroutines.CancellationException
 import com.aicode.feature.agent.presentation.QueuedRequest
 import com.aicode.core.ui.ExpandableChevronIcon
 import compose.icons.FeatherIcons
@@ -227,6 +228,7 @@ internal fun QueuedRequestPanel(
                             )
                             IconButton(
                                 onClick = { onInterjectQueued(req.id) },
+                                enabled = req.subAgentInstructionId == null,
                                 modifier = Modifier.size(28.dp)
                             ) {
                                 Icon(
@@ -238,6 +240,7 @@ internal fun QueuedRequestPanel(
                             }
                             IconButton(
                                 onClick = { onEditQueued(req) },
+                                enabled = req.subAgentInstructionId == null,
                                 modifier = Modifier.size(28.dp)
                             ) {
                                 Icon(
@@ -347,15 +350,18 @@ private fun ImageThumbnail(
     modifier: Modifier = Modifier.size(44.dp)
 ) {
     val base64Data = attachment.image?.base64Data.orEmpty()
-    // Base64 解码 + 位图解码都放到 IO 线程：写在 remember 里的话，选图后的首帧会在主线程
-    // 组合阶段同步解码，大图直接掉帧。采样与 OOM 兜底统一走 decodeSampledBitmap。
-    val bitmap by produceState<ImageBitmap?>(null, base64Data) {
-        if (base64Data.isEmpty()) return@produceState
-        value = withContext(Dispatchers.IO) {
-            // Base64 解码本身会对非法输入抛异常，位图解码那一层已自带兜底
-            runCatching {
-                decodeSampledBitmap(Base64.getDecoder().decode(base64Data), THUMBNAIL_MAX_EDGE)
-            }.getOrNull()
+    val path = attachment.localPath.takeIf { it.isNotBlank() }
+    var bitmap by remember(path, base64Data) {
+        mutableStateOf(path?.let(ThumbnailCache::peek) ?: ThumbnailCache.peekBase64(base64Data))
+    }
+    UiWorkEffect(path, base64Data) {
+        bitmap = try {
+            path?.let { ThumbnailCache.load(it) }
+                ?: base64Data.takeIf { it.isNotEmpty() }?.let { ThumbnailCache.loadBase64(it) }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: IllegalArgumentException) {
+            null
         }
     }
     Surface(

@@ -63,7 +63,8 @@ class MessageParentTool @Inject constructor(
                 subSessionId = sessionId,
                 parentSessionId = parentSessionId,
                 type = SubAgentEventType.MESSAGE_FROM_SUB,
-                detail = message
+                detail = message,
+                origin = "SUB"
             )
         )
         FileLogger.i(TAG, "子代理向主会话发消息: session=$sessionId parent=$parentSessionId")

@@ -1,5 +1,7 @@
 package com.aicode.feature.agent.domain.tool
 
+import android.content.Context
+import com.aicode.R
 import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -18,7 +20,7 @@ import javax.inject.Singleton
  *
  * ### 协议
  *
- * - **读**：`readFile` 成功后 [record] 当前指纹。
+ * - **读**：`readFile` 成功后 [recordRead] 当前指纹。
  * - **写**：写前比对 [get] 与当前指纹；不一致即拒绝（返回 `STALE_FILE`），
  *   由模型重新读取后重试。
  * - **没读过就写**（[get] 返回 null）**放行**：新文件、覆盖配置等场景模型不会先读，
@@ -37,13 +39,15 @@ import javax.inject.Singleton
 @Singleton
 class FileVersionRegistry @Inject constructor() {
 
+    private data class FileVersion(val fingerprint: String, val readSinceRecovery: Boolean)
+
     /**
      * sessionId → (逻辑路径 → 指纹)。
      *
      * 内层用**访问序** LinkedHashMap 并在超出上限时淘汰最久未用的条目；因为要维持访问序，
      * 内层所有访问都在 `synchronized` 下进行（[get] 用无副作用的定位，见其注释）。
      */
-    private val sessions = ConcurrentHashMap<String, MutableMap<String, String>>()
+    private val sessions = ConcurrentHashMap<String, MutableMap<String, FileVersion>>()
 
     /**
      * 记录 [sessionId] 最后一次看到的 [key] 的内容指纹。
@@ -54,7 +58,27 @@ class FileVersionRegistry @Inject constructor() {
         val sid = sessionId?.trim().orEmpty()
         if (sid.isEmpty() || key.isEmpty()) return
         val map = sessions.computeIfAbsent(sid) { newSessionMap() }
-        synchronized(map) { map[key] = fingerprint }
+        synchronized(map) {
+            map[key] = FileVersion(fingerprint, map[key]?.readSinceRecovery == true)
+        }
+    }
+
+    fun beginRecovery(sessionId: String) {
+        clearSession(sessionId)
+    }
+
+    fun recordRead(sessionId: String?, key: String, fingerprint: String) {
+        val sid = sessionId?.trim().orEmpty()
+        if (sid.isEmpty() || key.isEmpty() || fingerprint.isBlank()) return
+        val map = sessions.computeIfAbsent(sid) { newSessionMap() }
+        synchronized(map) { map[key] = FileVersion(fingerprint, readSinceRecovery = true) }
+    }
+
+    fun wasReadSinceRecovery(sessionId: String?, key: String): Boolean {
+        val sid = sessionId?.trim().orEmpty()
+        if (sid.isEmpty() || key.isEmpty()) return false
+        val map = sessions[sid] ?: return false
+        synchronized(map) { return map[key]?.readSinceRecovery == true }
     }
 
     /** 取 [sessionId] 记录的 [key] 指纹；从未记录过返回 null。 */
@@ -62,7 +86,7 @@ class FileVersionRegistry @Inject constructor() {
         val sid = sessionId?.trim().orEmpty()
         if (sid.isEmpty() || key.isEmpty()) return null
         val map = sessions[sid] ?: return null
-        synchronized(map) { return map[key] }
+        synchronized(map) { return map[key]?.fingerprint }
     }
 
     /**
@@ -75,19 +99,19 @@ class FileVersionRegistry @Inject constructor() {
     fun recordExternal(key: String, fingerprint: String) {
         if (key.isEmpty()) return
         for (map in sessions.values) {
-            synchronized(map) { map[key] = fingerprint }
+            synchronized(map) { map[key] = FileVersion(fingerprint, readSinceRecovery = false) }
         }
     }
 
     /** 忘记某会话对某路径的记录（如文件被删除、或回滚后需要重新建立基线）。 */
     fun forget(sessionId: String, key: String) {
-        val map = sessions[sessionId] ?: return
+        val map = sessions[sessionId.trim()] ?: return
         synchronized(map) { map.remove(key) }
     }
 
     /** 会话结束时清空其全部记录，避免长期驻留。 */
     fun clearSession(sessionId: String) {
-        sessions.remove(sessionId)
+        sessions.remove(sessionId.trim())
     }
 
     /** 当前跟踪的会话数，供测试与诊断使用。 */
@@ -99,11 +123,11 @@ class FileVersionRegistry @Inject constructor() {
         synchronized(map) { return map.size }
     }
 
-    private fun newSessionMap(): MutableMap<String, String> =
+    private fun newSessionMap(): MutableMap<String, FileVersion> =
         // 不用 Collections.synchronizedMap：包装器与内层 map 是两把不同的锁，
         // 而所有访问点都显式 synchronized(map)，只用内层锁才是一致的。
-        object : LinkedHashMap<String, String>(16, 0.75f, true) {
-            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>): Boolean =
+        object : LinkedHashMap<String, FileVersion>(16, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, FileVersion>): Boolean =
                 size > MAX_ENTRIES_PER_SESSION
         }
 
@@ -116,3 +140,9 @@ class FileVersionRegistry @Inject constructor() {
         const val MAX_ENTRIES_PER_SESSION = 512
     }
 }
+
+const val RECOVERY_READ_REQUIRED_CODE = "RECOVERY_READ_REQUIRED"
+
+fun recoveryReadRequiredMessage(context: Context?, displayPath: String): String =
+    context?.getString(R.string.recovery_file_read_required, displayPath)
+        ?: "Before modifying an existing file in a recovered session, read the file again to obtain a valid content version, then retry. (File: $displayPath)"

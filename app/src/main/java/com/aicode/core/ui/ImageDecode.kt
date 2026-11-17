@@ -6,10 +6,15 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
 import com.aicode.core.util.FileLogger
+import java.util.Base64
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 
 /**
  * 全局统一的位图采样解码。
@@ -123,26 +128,32 @@ data class ImageDecodeSpec(val maxEdge: Int, val maxPixels: Long)
 /**
  * 缩略图内存缓存：聊天列表里带图消息滑出视口就会被回收，滑回来时每次都要重新读盘解码原图。
  * 按路径索引：附件落盘时已保证文件名唯一，不会被原地替换；也因此 [peek] 在组合阶段调用时不做任何文件 IO。
- * 缩略图最大边 180px，单张约 130KB，条数上限即内存上限。
+ * 以真实 allocationByteCount 计费，保留 96 条上限；淘汰不回收仍被 painter 持有的位图。
  */
 object ThumbnailCache {
     private const val MAX_ENTRIES = 96
 
-    private val cache = object : LinkedHashMap<String, ImageBitmap>(32, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ImageBitmap>?): Boolean =
-            size > MAX_ENTRIES
+    private data class Key(val source: String, val base64: Boolean = false)
+    private val cache = KeyedDeferredCache<Key, ImageBitmap?>(
+        CoroutineScope(SupervisorJob() + Dispatchers.IO), MAX_ENTRIES,
+        retain = { it != null },
+        maxWeight = 64L * 1024 * 1024,
+        weigh = { key, image -> 128L + key.source.length * 2L + (image?.asAndroidBitmap()?.allocationByteCount?.toLong() ?: 0L) },
+    )
+
+    fun peek(path: String): ImageBitmap? = cache.peek(Key(path))
+
+    suspend fun load(path: String): ImageBitmap? = cache.get(Key(path)) {
+        decodeSampledBitmap(path, THUMBNAIL_MAX_EDGE)
     }
 
-    /** 命中则同步返回（可作 produceState 初值，避免闪占位图）。 */
-    fun peek(path: String): ImageBitmap? = synchronized(cache) { cache[path] }
+    internal fun peekBase64(data: String): ImageBitmap? = cache.peek(Key(data, base64 = true))
 
-    /** 取缓存，未命中则解码并写入；解码失败不缓存。应在后台线程调用。 */
-    fun load(path: String): ImageBitmap? {
-        peek(path)?.let { return it }
-        val decoded = decodeSampledBitmap(path, THUMBNAIL_MAX_EDGE) ?: return null
-        synchronized(cache) { cache[path] = decoded }
-        return decoded
+    internal suspend fun loadBase64(data: String): ImageBitmap? = cache.get(Key(data, base64 = true)) {
+        decodeSampledBitmap(Base64.getDecoder().decode(data), THUMBNAIL_MAX_EDGE)
     }
+
+    internal fun stats() = cache.stats()
 }
 
 /**

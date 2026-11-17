@@ -35,6 +35,25 @@ class MigrationFilesParseTest {
     }
 
     @Test
+    fun tool_action_title_migration_only_adds_a_nullable_text_column() {
+        val statements = SqlScriptSplitter.split(File(migrationsDir, "67_add_tool_action_title.sql").readText())
+        assertEquals(listOf("ALTER TABLE agent_messages ADD COLUMN toolActionTitle TEXT"), statements)
+    }
+
+    @Test
+    fun message_timing_migration_only_adds_nullable_integer_columns() {
+        val statements = SqlScriptSplitter.split(File(migrationsDir, "68_add_message_timing.sql").readText())
+        assertEquals(
+            listOf(
+                "ALTER TABLE agent_messages ADD COLUMN toolStartedAtMs INTEGER",
+                "ALTER TABLE agent_messages ADD COLUMN toolDurationMs INTEGER",
+                "ALTER TABLE agent_messages ADD COLUMN turnDurationMs INTEGER"
+            ),
+            statements
+        )
+    }
+
+    @Test
     fun versions_are_contiguous_unique_and_match_schema_version() {
         val versions = migrationFiles().mapNotNull { file ->
             Regex("(\\d+)_").find(file.name)?.groupValues?.get(1)?.toInt()

@@ -231,6 +231,7 @@ class GeminiAdapter @Inject constructor(
                 val textBuilder = StringBuilder()
                 val budget = StreamBudget()
                 val toolCalls = mutableListOf<ToolCall>()
+                val argumentPreviews = ToolArgumentsPreview()
                 val images = mutableListOf<AgentImage>()
                 // model 轮的 parts 原样快照：文本分片按段合并，functionCall 与 thoughtSignature 原样保留。
                 val snapshotParts = mutableListOf<JsonObject>()
@@ -315,6 +316,8 @@ class GeminiAdapter @Inject constructor(
                                             if (name.isNotEmpty()) send(AIStreamChunk.ToolCallDeclared(name))
                                             val callId = fnCall.get("id")?.takeIf { !it.isJsonNull }?.asString?.takeIf { it.isNotBlank() } ?: name
                                             val argsStr = fnCall.getAsJsonObject("args")?.toString() ?: "{}"
+                                            val wireId = fnCall.get("id")?.takeIf { !it.isJsonNull }?.asString.orEmpty()
+                                            argumentPreviews.update(wireId, name, argsStr, force = true)?.let { send(it) }
                                             val argsJson = parseArgs(argsStr)
                                             toolCalls.add(ToolCall(id = callId, name = name, arguments = argsJson))
                                         }
@@ -334,7 +337,8 @@ class GeminiAdapter @Inject constructor(
                     }
                 }
 
-                send(AIStreamChunk.Final(AIResponse(content = textBuilder.toString(), toolCalls = toolCalls, stopReason = currentFinishReason, thinkingBlocksJson = snapshotOf(snapshotParts), inputTokens = streamInputTokens, outputTokens = streamOutputTokens, cachedInputTokens = streamCachedInputTokens, images = images)))
+                val requestDurationMillis = firstContent.requestDurationMillis()
+                send(AIStreamChunk.Final(AIResponse(content = textBuilder.toString(), toolCalls = toolCalls, stopReason = currentFinishReason, thinkingBlocksJson = snapshotOf(snapshotParts), inputTokens = streamInputTokens, outputTokens = streamOutputTokens, cachedInputTokens = streamCachedInputTokens, images = images), requestDurationMillis))
                     }
                 },
                 onRetry = { attempt, max, error -> send(AIStreamChunk.Retrying(attempt, max, error)) }
@@ -551,6 +555,7 @@ class GeminiAdapter @Inject constructor(
                                     }
                                     null -> {}
                                 }
+                                acc.argumentPreviews().forEach { send(it) }
                             }
                         } finally {
                             idleWatchdog.cancel()
@@ -558,7 +563,9 @@ class GeminiAdapter @Inject constructor(
                         }
                     }
 
-                    send(AIStreamChunk.Final(acc.toResponse()))
+                    val requestDurationMillis = firstContent.requestDurationMillis()
+                    acc.argumentPreviews(force = true).forEach { send(it) }
+                    send(AIStreamChunk.Final(acc.toResponse(), requestDurationMillis))
                     }
                 },
                 onRetry = { attempt, max, error -> send(AIStreamChunk.Retrying(attempt, max, error)) }
@@ -600,7 +607,7 @@ class GeminiAdapter @Inject constructor(
             mapOf(
                 "name" to tool.name,
                 "description" to tool.description,
-                "parameters" to tool.toJsonSchema()
+                "parameters" to tool.toModelJsonSchema()
             )
         }?.let { request["tools"] = listOf(mapOf("functionDeclarations" to it)) }
 

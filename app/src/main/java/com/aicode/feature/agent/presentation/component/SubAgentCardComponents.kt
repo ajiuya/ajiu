@@ -36,16 +36,24 @@ import com.aicode.core.theme.Spacing
 import com.aicode.core.theme.semanticColors
 import com.aicode.feature.agent.presentation.SubAgentCardState
 import com.aicode.feature.agent.presentation.SubAgentCardStatus
+import com.aicode.feature.agent.presentation.SubAgentExecutionPage
+import com.aicode.feature.agent.presentation.SubAgentInstructionFailure
+import com.aicode.feature.agent.presentation.SubAgentInstructionResult
+import com.aicode.feature.agent.presentation.SubAgentInteractionPage
+import com.aicode.feature.agent.presentation.SubAgentInteractionSummary
 import compose.icons.FeatherIcons
 import compose.icons.feathericons.AlertCircle
 import compose.icons.feathericons.ChevronRight
 import compose.icons.feathericons.Cpu
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.jsonObject
+import java.util.Locale
 
 /**
  * `task` 工具的专属卡片宿主：操作用 CompositionLocal 下发，避免参数一路穿过
@@ -54,7 +62,23 @@ import kotlinx.serialization.json.jsonObject
 data class SubAgentCardHost(
     val states: Map<String, SubAgentCardState> = emptyMap(),
     val onOpen: (String) -> Unit = {},
-    val onStop: (String) -> Unit = {}
+    val onStop: (String) -> Unit = {},
+    val summaries: Map<String, SubAgentInteractionSummary> = emptyMap(),
+    val conversation: (String) -> Flow<SubAgentInteractionPage> = {
+        flowOf(SubAgentInteractionPage(loaded = true))
+    },
+    val execution: (String) -> Flow<SubAgentExecutionPage> = {
+        flowOf(SubAgentExecutionPage(loaded = true))
+    },
+    // Several expanded cards may hold a lease for the same child.
+    val onExpanded: (String, Boolean) -> Unit = { _, _ -> },
+    val onLoadMore: (String) -> Unit = {},
+    val onLoadMoreExecution: (String) -> Unit = {},
+    val onSend: suspend (String, String) -> SubAgentInstructionResult = { _, _ ->
+        SubAgentInstructionResult(sent = false, failure = SubAgentInstructionFailure.SESSION_MISSING)
+    },
+    val onOpenConfirm: (String) -> Unit = {},
+    val onContentInteraction: () -> Unit = {},
 )
 
 val LocalSubAgentCardHost = staticCompositionLocalOf<SubAgentCardHost?> { null }
@@ -81,10 +105,62 @@ internal data class ParsedSubAgentDispatchItem(
     val description: String,
     val tier: String?,
     val model: String?,
-    val warning: String?
+    val warning: String?,
+    val claimable: Boolean = true,
 )
 
 private val json = Json { ignoreUnknownKeys = true }
+
+private fun parseDispatchObject(raw: String): JsonObject? {
+    if (raw.length > SUB_AGENT_METADATA_MAX_CHARS) return null
+    var depth = 0
+    var inString = false
+    var escaped = false
+    for (char in raw) {
+        if (inString) when {
+            escaped -> escaped = false
+            char == '\\' -> escaped = true
+            char == '"' -> inString = false
+        } else when (char) {
+            '"' -> inString = true
+            '{', '[' -> if (++depth > 256) return null
+            '}', ']' -> depth--
+        }
+    }
+    return runCatching { json.parseToJsonElement(raw) as? JsonObject }.getOrNull()
+}
+
+private fun JsonObject.dispatchString(key: String): String? =
+    (this[key] as? JsonPrimitive)?.takeIf { it.isString }?.contentOrNull
+
+private fun validDispatchArgs(args: JsonObject): Boolean {
+    val fields = listOf("action", "id", "description", "prompt", "agent", "tier", "message")
+    if (fields.any { key -> args[key]?.let { it != JsonNull && (it !is JsonPrimitive || !it.isString) } == true }) return false
+    if ("action" in args && args["action"] == JsonNull) return false
+    if ("tasks" !in args) return true
+    val tasks = args["tasks"] as? JsonArray ?: return false
+    return tasks.size <= SUB_AGENT_METADATA_MAX_ITEMS && tasks.all { task ->
+        task is JsonObject && fields.all { key ->
+            val value = task[key]
+            value == null || value == JsonNull || value is JsonPrimitive && value.isString
+        }
+    }
+}
+
+private fun isSubAgentDispatchClaimable(item: JsonObject?, transportStatus: String?): Boolean {
+    if (item == null || transportStatus?.lowercase(Locale.ROOT) !in setOf("success", "partial")) return false
+    val id = item["id"] as? JsonPrimitive ?: return false
+    if (!id.isString || id.contentOrNull.isNullOrBlank()) return false
+    fun recognizedField(name: String, allowed: Set<String>): Boolean {
+        val field = item[name] ?: return true
+        val value = (field as? JsonPrimitive)?.takeIf { it.isString }?.contentOrNull
+            ?.trim()?.lowercase(Locale.ROOT) ?: return false
+        return value in allowed
+    }
+    return recognizedField("status", setOf("success", "completed", "running", "created")) &&
+        recognizedField("state", setOf("running", "completed", "queued", "created", "awaiting_confirmation")) &&
+        (item["error"] == null || item["error"] == JsonNull)
+}
 
 /**
  * 解析 `task(create)`：支持单个与批量任务派发的双重解析。
@@ -93,32 +169,41 @@ private val json = Json { ignoreUnknownKeys = true }
  * 解析不出 id 时卡片仍按参数渲染，只是不能跳转。
  */
 internal fun parseSubAgentDispatch(argsJson: String?, content: String?): ParsedSubAgentDispatch? {
-    val args = argsJson?.let { runCatching { json.parseToJsonElement(it).jsonObject }.getOrNull() }
-    val action = (args?.get("action") as? JsonPrimitive)?.contentOrNull?.trim()?.lowercase() ?: "create"
+    if ((argsJson?.length ?: 0) > SUB_AGENT_METADATA_MAX_CHARS ||
+        (content?.length ?: 0) > SUB_AGENT_METADATA_MAX_CHARS) return null
+    val args = argsJson?.let(::parseDispatchObject)?.takeIf(::validDispatchArgs) ?: return null
+    val action = if ("action" in args) args.dispatchString("action")?.trim()?.lowercase(Locale.ROOT) else "create"
     if (action != "create") return null
-
-    val result = content?.let { runCatching { json.parseToJsonElement(it).jsonObject }.getOrNull() }
-    val status = (result?.get("status") as? JsonPrimitive)?.contentOrNull
+    val result = content?.let { parseDispatchObject(it.withoutToolStatusPrefix()) }
+    val status = result?.dispatchString("status")
     if (status == "error") return null
-
-    val data = result?.get("data").let { element ->
-        when (element) {
-            is JsonObject -> element
-            is JsonPrimitive -> runCatching { json.parseToJsonElement(element.content).jsonObject }.getOrNull()
-            else -> null
-        }
+    val data = when (val element = result?.get("data")) {
+        is JsonObject -> element
+        is JsonPrimitive -> element.takeIf { it.isString }?.contentOrNull?.let(::parseDispatchObject)
+        else -> null
     }
+    if (data?.containsKey("subagents") == true && data["subagents"] !is JsonArray) return null
+    if (((data?.get("subagents") as? JsonArray)?.size ?: 0) > SUB_AGENT_METADATA_MAX_ITEMS) return null
 
     // 1. 尝试从 result 的 subagents 数组解析批量结果
-    val resultSubagents = (data?.get("subagents") as? JsonArray)?.mapNotNull { el ->
-        val obj = el as? JsonObject ?: return@mapNotNull null
+    val resultSubagents = (data?.get("subagents") as? JsonArray)?.map { el ->
+        val obj = el as? JsonObject
+        if (obj == null) return@map ParsedSubAgentDispatchItem(
+            subSessionId = null, agentName = null, description = el.toString(),
+            tier = null, model = null, warning = null, claimable = false,
+        )
         ParsedSubAgentDispatchItem(
             subSessionId = (obj["id"] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() },
-            agentName = (obj["agent"] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() },
+            agentName = obj.dispatchString("agent")?.trim()?.takeIf { it.isNotBlank() },
             description = (obj["description"] as? JsonPrimitive)?.contentOrNull?.trim().orEmpty(),
             tier = (obj["tier"] as? JsonPrimitive)?.contentOrNull,
             model = (obj["model"] as? JsonPrimitive)?.contentOrNull,
             warning = (obj["warning"] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }
+                ?: if (!isSubAgentDispatchClaimable(obj, status)) {
+                    (obj["error"] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }
+                        ?: (obj["message"] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }
+                } else null,
+            claimable = isSubAgentDispatchClaimable(obj, status),
         )
     }
 
@@ -135,26 +220,30 @@ internal fun parseSubAgentDispatch(argsJson: String?, content: String?): ParsedS
             description = desc,
             tier = (obj["tier"] as? JsonPrimitive)?.contentOrNull,
             model = null,
-            warning = null
+            warning = null,
+            claimable = false,
         )
     }
 
     val items: List<ParsedSubAgentDispatchItem> = when {
         !resultSubagents.isNullOrEmpty() -> {
             resultSubagents.mapIndexed { idx, item ->
-                val fallbackDesc = argTasks?.getOrNull(idx)?.description
-                if (item.description.isBlank() && !fallbackDesc.isNullOrBlank()) {
-                    item.copy(description = fallbackDesc)
-                } else {
-                    item
-                }
+                val resultItem = (data?.get("subagents") as? JsonArray)?.getOrNull(idx) as? JsonObject
+                val fallbackName = if (!argTasks.isNullOrEmpty()) argTasks.getOrNull(idx)?.agentName
+                    else if (resultSubagents.size == 1) args.dispatchString("agent") else null
+                item.copy(
+                    description = item.description.ifBlank { argTasks?.getOrNull(idx)?.description.orEmpty() },
+                    agentName = item.agentName ?: fallbackName?.takeIf {
+                        item.claimable && resultItem?.containsKey("agent") == false
+                    },
+                )
             }
         }
         !argTasks.isNullOrEmpty() -> argTasks
         else -> {
             // 单个子代理处理
-            val agentName = (data?.get("agent") as? JsonPrimitive)?.contentOrNull
-                ?: (args?.get("agent") as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }
+            val agentName = if (data?.containsKey("agent") == true) data.dispatchString("agent")
+                else args.dispatchString("agent")?.takeIf { it.isNotBlank() }
             val description = (args?.get("description") as? JsonPrimitive)?.contentOrNull?.trim()
                 ?.takeIf { it.isNotBlank() }
                 ?: (args?.get("prompt") as? JsonPrimitive)?.contentOrNull?.trim()
@@ -166,7 +255,8 @@ internal fun parseSubAgentDispatch(argsJson: String?, content: String?): ParsedS
                 description = description,
                 tier = (data?.get("tier") as? JsonPrimitive)?.contentOrNull,
                 model = (data?.get("model") as? JsonPrimitive)?.contentOrNull,
-                warning = (data?.get("warning") as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }
+                warning = (data?.get("warning") as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() },
+                claimable = isSubAgentDispatchClaimable(data, status),
             )
             listOf(singleItem)
         }
@@ -180,39 +270,36 @@ internal fun parseSubAgentDispatch(argsJson: String?, content: String?): ParsedS
     )
 }
 
-/**
- * 子代理派发卡片（结构对标网络搜索结果卡片）：
- *
- * 顶部概览 Summary 展示图标、标题、数量统计与「已派发」状态药丸；
- * 下方平铺各子代理任务卡片项（01, 02...），仅展示发出时的状态（代理名称、模型/档位、指令描述与告警），
- * 点击任意子任务项直接进入对应子会话。
- */
+internal fun unrepresentedSubAgentDispatchItems(
+    items: List<ParsedSubAgentDispatchItem>,
+    representedIds: Set<String>,
+): List<ParsedSubAgentDispatchItem> = items.filterNot {
+    it.claimable && it.subSessionId != null && it.subSessionId in representedIds
+}
+
+internal fun subAgentDispatchWarnings(dispatch: ParsedSubAgentDispatch): List<String> =
+    (listOfNotNull(dispatch.globalWarning) + dispatch.items.mapNotNull {
+        it.warning?.takeIf { _ -> it.subSessionId != null && it.claimable }
+    }).filter { it.isNotBlank() }.distinct()
+
 @Composable
 internal fun SubAgentDispatchCard(dispatch: ParsedSubAgentDispatch) {
     val host = LocalSubAgentCardHost.current
-    val items = dispatch.items
-    if (items.isEmpty()) return
-
-    Column(
-        modifier = Modifier.fillMaxWidth(),
-        verticalArrangement = Arrangement.spacedBy(Spacing.sm)
-    ) {
-        // 1. 顶部 Summary（参考 WebSearchSummary）
-        SubAgentDispatchSummary(count = items.size)
-
-        // 2. 全局警告（如有）
-        dispatch.globalWarning?.takeIf { items.size > 1 }?.let { warning ->
-            SubAgentWarningBanner(warning)
-        }
-
-        // 3. 任务卡片列表（参考 WebSearchResultItem）
+    val items = unrepresentedSubAgentDispatchItems(dispatch.items, LocalRepresentedSubAgentIds.current)
+    val warnings = subAgentDispatchWarnings(dispatch)
+    if (items.isEmpty() && warnings.isEmpty()) return
+    Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(Spacing.sm)) {
+        if (items.isNotEmpty() && items.all { it.subSessionId == null }) SubAgentDispatchSummary(items.size)
+        warnings.forEach { SubAgentWarningBanner(it) }
         items.forEachIndexed { index, item ->
-            SubAgentDispatchItemCard(
-                index = index + 1,
-                item = item,
-                liveState = item.subSessionId?.let { host?.states?.get(it) },
-                onOpen = { sessionId -> host?.onOpen?.invoke(sessionId) }
-            )
+            val sessionId = item.subSessionId
+            if (sessionId != null && item.claimable && host?.summaries?.get(sessionId)?.subSessionId == sessionId) {
+                SubAgentInteractionCapsule(
+                    sessionId, title = item.description, fallbackAgentName = item.agentName,
+                )
+            } else {
+                SubAgentDispatchItemCard(index + 1, item, liveState = null, onOpen = { host?.onOpen?.invoke(it) })
+            }
         }
     }
 }
@@ -270,7 +357,8 @@ private fun SubAgentDispatchItemCard(
     liveState: SubAgentCardState?,
     onOpen: (String) -> Unit
 ) {
-    val hasSession = item.subSessionId != null
+    val host = LocalSubAgentCardHost.current
+    val hasSession = item.claimable && item.subSessionId?.let { host?.summaries?.get(it)?.sessionExists } == true
 
     Surface(
         modifier = Modifier.fillMaxWidth(),
@@ -417,7 +505,7 @@ private fun SubAgentWarningBanner(warning: String) {
 @Composable
 private fun SubAgentDispatchedChip() {
     SubAgentStatusPill(
-        label = stringResource(R.string.subagent_card_status_dispatched),
+        label = stringResource(R.string.subagent_interaction_dispatch_unconfirmed),
         color = MaterialTheme.colorScheme.primary
     )
 }

@@ -1,20 +1,20 @@
 ---
 layout: home
-title: AiCode - AI Coding Tool & Linux Terminal on Android
+title: Ajiu Workbench - AI Coding Tool & Linux Terminal on Android
 titleTemplate: false
-description: AiCode is an open-source AI coding tool for Android that needs no computer. It ships a built-in Linux container and terminal so the AI Agent can read/write code and run builds on its own, with Git version control, the MCP protocol and remote SSH support.
+description: Ajiu Workbench is an open-source AI coding tool for Android that needs no computer. It ships a built-in Linux container and terminal so the AI Agent can read/write code and run builds on its own, with Git version control, the MCP protocol and remote SSH support.
 head:
   - - meta
     - name: keywords
-      content: AiCode, Android AI coding, mobile development, Linux terminal, PRoot, Termux, AI Agent, MCP, code editor, Git client, mobile workstation, remote SSH
+      content: Ajiu Workbench, AiCode, Android AI coding, mobile development, Linux terminal, PRoot, Termux, AI Agent, MCP, code editor, Git client, mobile workstation, remote SSH
 
 hero:
-  name: AiCode
+  name: Ajiu Workbench
   text: AI Coding Tool & Mobile Workstation on Your Phone
   tagline: No computer needed — write, debug and commit entirely from your phone. A built-in Linux container and terminal let the AI Agent read/write files, run shell commands and execute builds on its own, with Git, MCP, remote SSH and a full model ecosystem.
   image:
     src: /logo.png
-    alt: AiCode
+    alt: Ajiu Workbench
   actions:
     - theme: brand
       text: Quick Start
@@ -28,7 +28,7 @@ hero:
 
 features:
   - title: AI Agent
-    details: Supports OpenAI / Anthropic / Gemini compatible protocols, with multiple vendors switchable anytime. Built-in tools cover file read/write, shell execution, background terminal, web search and image recognition, with streaming output and automatic context compression for long conversations.
+    details: Supports OpenAI / Anthropic / Gemini compatible protocols, with multiple vendors switchable anytime. Built-in tools cover file read/write, shell execution, background terminal, web search and image recognition, with streaming output and automatic context compression for long conversations. Ordinary tools run automatically, while explicit deny rules and high-risk approvals remain in force.
   - title: Built-in Terminal & Linux Container
     details: A local container built on Termux components and PRoot, shipping with an Alpine image. Import custom rootfs, mount host directories, and keep terminals running in the background.
   - title: Remote SSH Mode

@@ -3,24 +3,12 @@ package com.aicode.feature.agent.domain.permission
 import kotlinx.serialization.Serializable
 
 /**
- * 工具授权规则的作用域。scope 不存在规则对象里，而是由「存在哪个文件」隐含：
- * 项目文件（`.aicode/permissions.json`）或全局文件。管理界面「提升为全局」= 从项目文件删、往全局文件加。
- */
-enum class PermissionScope { PROJECT, GLOBAL }
-
-/**
- * 规则的判定方向。弹窗的「始终允许」只会产生 [ALLOW]；[DENY] 仅由权限配置文件（deny 列表）提供，
- * 评估时 DENY 跨 scope 优先于 ALLOW（安全优先：全局禁可挡项目允许）。
+ * 规则的判定方向。DENY 由权限配置文件提供；旧 ALLOW 规则会保留在配置中，但当前不再参与授权裁决。
  */
 enum class PermissionDecision { ALLOW, DENY }
 
-/**
- * 授权弹窗的用户选择。
- * - [REJECT]：拒绝本次调用，不记忆。
- * - [ONCE]：仅放行本次，不记忆。
- * - [ALWAYS]：放行并记忆为规则（弹窗路径固定写入当前项目 scope）。
- */
-enum class PermissionChoice { REJECT, ONCE, ALWAYS }
+/** 授权弹窗的用户选择。 */
+enum class PermissionChoice { REJECT, ONCE, ALWAYS_SESSION }
 
 /**
  * 一条工具授权规则。
