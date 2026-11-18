@@ -1,8 +1,6 @@
 package com.aicode.core.ui
 
 import androidx.compose.animation.core.Animatable
-import androidx.compose.animation.core.Spring
-import androidx.compose.animation.core.spring
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -189,25 +187,19 @@ fun SwipeToDeleteRow(
                                 if (offsetX.value < revealPx / 2) {
                                     offsetX.animateTo(
                                         targetValue = revealPx,
-                                        animationSpec = spring(
-                                            dampingRatio = Spring.DampingRatioLowBouncy,
-                                            stiffness = Spring.StiffnessMediumLow
-                                        )
+                                        animationSpec = AppMotion.settle()
                                     )
                                 } else {
                                     offsetX.animateTo(
                                         targetValue = 0f,
-                                        animationSpec = spring(
-                                            dampingRatio = Spring.DampingRatioNoBouncy,
-                                            stiffness = Spring.StiffnessMedium
-                                        )
+                                        animationSpec = AppMotion.settle()
                                     )
                                 }
                             }
                         },
                         onDragCancel = {
                             coroutineScope.launch {
-                                offsetX.animateTo(0f)
+                                offsetX.animateTo(0f, AppMotion.settle())
                             }
                         },
                         onHorizontalDrag = { change, dragAmount ->
@@ -224,7 +216,7 @@ fun SwipeToDeleteRow(
                         Modifier.clickable {
                             if (offsetX.value < -10f) {
                                 coroutineScope.launch {
-                                    offsetX.animateTo(0f, spring(stiffness = Spring.StiffnessMedium))
+                                    offsetX.animateTo(0f, AppMotion.settle())
                                 }
                             } else {
                                 onClick()

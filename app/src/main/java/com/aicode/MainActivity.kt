@@ -11,7 +11,6 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.animation.core.animateDpAsState
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -62,6 +61,7 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.aicode.core.theme.AIEditorTheme
 import com.aicode.core.theme.AppThemePreset
+import com.aicode.core.ui.AppMotion
 import com.aicode.core.ui.BetaWatermark
 import com.aicode.core.ui.ImageSource
 import com.aicode.core.ui.ImageViewerHost
@@ -427,7 +427,6 @@ fun AppNavigation(
     val expandedPaths by agentViewModel.expandedPaths.collectAsStateWithLifecycle()
     val expandingPath by agentViewModel.expandingPath.collectAsStateWithLifecycle()
     val fileOpPaths by agentViewModel.fileOpPaths.collectAsStateWithLifecycle()
-    val browseState by agentViewModel.browseState.collectAsStateWithLifecycle()
     val browseClipboard by agentViewModel.browseClipboard.collectAsStateWithLifecycle()
     val pasteConflict by agentViewModel.pasteConflict.collectAsStateWithLifecycle()
     val chatSearchQuery by agentViewModel.chatSearchQuery.collectAsStateWithLifecycle()
@@ -467,14 +466,7 @@ fun AppNavigation(
     // 常驻侧栏只看窗口宽度：它只在聊天页展开，切到其他页会滑回去（见下方 sidebarWidth）。
     val permanentDrawer = expanded
 
-    // 侧栏出现时刷一次文件列表：本地模式兼顾 inotify 漏事件，远程模式无 inotify 则完全靠它。
-    // 不能直接盯 drawerState.isOpen：大屏常驻侧栏不走 ModalNavigationDrawer，drawerState 永远是 Closed，
-    // 那样大屏远程模式下文件树只能靠手动刷新按钮。改取「侧栏可见」：窄窗看抽屉开没开，
-    // 大屏看是否停在聊天页（侧栏只在聊天页展开）。
-    val sidebarVisible = if (permanentDrawer) currentRoute == "chat" else drawerState.isOpen
-    LaunchedEffect(sidebarVisible) {
-        if (sidebarVisible) agentViewModel.refreshBrowse()
-    }
+    val sidebarVisible = currentRoute == "chat" && (permanentDrawer || drawerState.isOpen)
 
     // 右栏工作台：大屏下编辑器 / 终端 / Git 与聊天并排，窄窗仍走全屏路由。
     var paneKind by rememberSaveable { mutableStateOf(WorkbenchPaneKind.NONE) }
@@ -578,7 +570,8 @@ fun AppNavigation(
             agentStates = agentStates,
             awaitingPermissionSessionIds = approvalSessionIds,
             subSessionsByParent = subSessionsByParent,
-            browseState = browseState,
+            browseStateFlow = agentViewModel.browseState,
+            sidebarVisible = sidebarVisible,
             expandedPaths = expandedPaths,
             expandingPath = expandingPath,
             fileOpPaths = fileOpPaths,
@@ -877,7 +870,7 @@ fun AppNavigation(
         // 时长与页面过渡取同一个值，两段动画同时收尾。
         val sidebarWidth by animateDpAsState(
             targetValue = if (currentRoute == "chat") drawerWidth() else 0.dp,
-            animationSpec = tween(durationMillis = PAGE_MOTION_MS),
+            animationSpec = AppMotion.tween(PAGE_MOTION_MS),
             label = "sidebar-width"
         )
         // 侧栏完全收起后整棵子树离开组合，要拿 SaveableStateHolder 接住内部状态，

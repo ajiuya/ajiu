@@ -1,8 +1,7 @@
 package com.aicode.core.ui
 
-import androidx.compose.animation.core.Spring
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateDpAsState
-import androidx.compose.animation.core.spring
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -29,6 +28,7 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import com.aicode.core.theme.semanticColors
 
@@ -64,14 +64,14 @@ fun SegmentedTabs(
     ) {
         val thumbWidth = maxWidth / labels.size
         // 选中滑块位移：临界阻尼弹簧（不过冲），切换时滑块顺滑到位，不是硬切。
-        val thumbOffset by animateDpAsState(
+        val thumbOffset = animateDpAsState(
             targetValue = thumbWidth * selected,
-            animationSpec = spring(dampingRatio = 1f, stiffness = Spring.StiffnessMediumLow),
+            animationSpec = AppMotion.settle(),
             label = "segmented-thumb"
         )
         Surface(
             modifier = Modifier
-                .offset(x = thumbOffset)
+                .offset { IntOffset(thumbOffset.value.roundToPx(), 0) }
                 .width(thumbWidth)
                 .fillMaxHeight(),
             shape = RoundedCornerShape(9.dp),
@@ -82,6 +82,12 @@ fun SegmentedTabs(
         Row(modifier = Modifier.fillMaxSize()) {
             labels.forEachIndexed { index, label ->
                 val isSelected = selected == index
+                val textColor by animateColorAsState(
+                    targetValue = if (isSelected) MaterialTheme.colorScheme.onSurface
+                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                    animationSpec = AppMotion.tween(AppMotion.colorMillis),
+                    label = "segmented-text-color"
+                )
                 Box(
                     modifier = Modifier
                         .weight(1f)
@@ -105,8 +111,7 @@ fun SegmentedTabs(
                         text = label,
                         style = MaterialTheme.typography.labelLarge,
                         fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
-                        color = if (isSelected) MaterialTheme.colorScheme.onSurface
-                        else MaterialTheme.colorScheme.onSurfaceVariant
+                        color = textColor
                     )
                 }
             }

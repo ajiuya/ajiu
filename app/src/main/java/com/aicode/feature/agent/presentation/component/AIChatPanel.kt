@@ -19,6 +19,7 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -32,6 +33,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
@@ -44,6 +46,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.State
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
@@ -55,6 +58,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.structuralEqualityPolicy
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -88,6 +92,7 @@ import com.aicode.feature.filepreview.presentation.attachmentUsesPlayer
 import com.aicode.feature.player.presentation.PlayerActivity
 import com.aicode.feature.player.domain.PlayerMediaTypes
 import com.aicode.core.theme.Spacing
+import com.aicode.core.ui.AppMotion
 import com.aicode.core.ui.ImageViewerHost
 import com.aicode.core.ui.LocalImageViewer
 import com.aicode.core.ui.readableContentMaxWidth
@@ -105,6 +110,7 @@ import com.aicode.feature.onboarding.domain.OnboardingStep
 import com.aicode.feature.onboarding.presentation.onboardingTarget
 import com.aicode.feature.settings.presentation.SettingsViewModel
 import com.aicode.feature.settings.data.repository.BackgroundSettingsRepository
+import com.aicode.feature.settings.data.repository.GeneralSettingsRepository.Companion.DEFAULT_TYPEWRITER_CHARS_PER_SECOND
 import com.aicode.feature.settings.data.repository.ThemeSettingsRepository
 import com.aicode.feature.settings.data.repository.ChatBubbleStyle
 import com.aicode.feature.agent.presentation.preview.ToolPreviewHost
@@ -151,8 +157,23 @@ private val FLOATING_LAYER_GAP_DP = 8.dp
 /** 内容底部驱动校准的容差（px）：最后内容底部超出安全区超过该值才向下校准，避免亚像素抖动。 */
 private const val AUTO_SCROLL_TOLERANCE_PX = 2
 
-/** AI 收工后继续逐帧校准的时长（ms）：md 异步解析仍可能改高度，不能一停就收手。 */
-private const val CALIBRATE_TAIL_MS = 1_200L
+/** 用同一次测量的留白与末项坐标校准；逐字增长不能反复重置列表的首项锚点。 */
+internal suspend fun LazyListState.followChatBottom(tolerancePx: Int = AUTO_SCROLL_TOLERANCE_PX) {
+    if (!canScrollForward) return
+    var layout = layoutInfo
+    val lastVisible = layout.visibleItemsInfo.lastOrNull() ?: return
+    if (lastVisible.index < layout.totalItemsCount - 1) {
+        // 新增的末项尚未测到高度：先将其起点放到安全区下沿，再按实际高度补齐。
+        val anchor = (layout.viewportEndOffset - layout.afterContentPadding)
+            .coerceIn(0, (layout.viewportEndOffset - 1).coerceAtLeast(0))
+        scrollToItem(layout.totalItemsCount - 1, -anchor)
+        layout = layoutInfo
+    }
+    val tail = layout.visibleItemsInfo.lastOrNull() ?: return
+    if (tail.index != layout.totalItemsCount - 1) return
+    val overflow = tail.offset.toLong() + tail.size - (layout.viewportEndOffset - layout.afterContentPadding)
+    if (overflow > tolerancePx && canScrollForward) scrollBy(overflow.toFloat())
+}
 
 /** 滚动到底部按钮直径（dp）。 */
 private const val SCROLL_TO_BOTTOM_BTN_SIZE = 34
@@ -184,6 +205,8 @@ internal data class ChatRenderItem(
     val key: String,
     val contentType: String,
     val slice: String? = null,
+    /** 分块首字符在持久化原文中的 UTF-16 偏移。 */
+    val sliceStart: Int = 0,
     val isChunkHeader: Boolean = true,
     val isChunkFooter: Boolean = true,
     /** 整轮过程状态；运行中的轮在展平时只保留过程项。 */
@@ -299,12 +322,16 @@ private fun messageRenderItems(message: AgentUIMessage): List<ChatRenderItem> {
             ChatRenderItem(message = message, key = message.id, contentType = message.role.name)
         )
     }
+    var offset = 0
     return slices.mapIndexed { idx, slice ->
+        val start = offset
+        offset += slice.length
         ChatRenderItem(
             message = message,
             key = "${message.id}#chunk$idx",
             contentType = "assistant-chunk",
             slice = slice,
+            sliceStart = start,
             isChunkHeader = idx == 0,
             isChunkFooter = idx == slices.lastIndex,
         )
@@ -583,94 +610,54 @@ private fun buildTurnPersistentItems(
 /** 超过该长度（字符）的助手正文拆成多条有界 chunk。 */
 private const val CHUNK_SPLIT_THRESHOLD_CHARS = 2_000
 
-/** 每条 chunk 的目标字符预算：正文按 markdown 块打包，单块超出预算（如巨大表格）时
- *  按行硬切兜底，保证任意 chunk 高度有界（≈0.5-0.7 屏）。 */
+/** 段落、表格按字符预算打包；超预算时只在行间拆分，代码围栏始终保持完整。 */
 private const val CHUNK_BUDGET_CHARS = 1_200
 
-/**
- * 长正文拆块：以行为单位识别三类 markdown 块——代码围栏（整段）、表格（连续 | 行，
- * 整表保持完整）、普通段落（以空行分隔），然后按字符预算贪心打包成 chunk。
- * 超预算的单块按行拆分为多个块，宁可打断表格也不让某条 item 无界长高。
- */
+/** 每个分块都是原文的连续区间：空行、CRLF、Markdown 硬换行和正在输入的行尾均不改写。 */
 internal fun splitLongContent(text: String): List<String> {
     val lines = text.lines()
-    val rawBlocks = ArrayList<String>()
+    val starts = IntArray(lines.size + 1)
+    for (i in lines.indices) {
+        var next = starts[i] + lines[i].length
+        if (next < text.length && text[next] == '\r') next++
+        if (next < text.length && text[next] == '\n') next++
+        starts[i + 1] = next
+    }
+    val chunks = ArrayList<String>()
+    var chunkStart = 0
+    var hasBlock = false
+    fun pack(first: Int, end: Int) {
+        if (hasBlock && starts[end] - chunkStart > CHUNK_BUDGET_CHARS) {
+            chunks.add(text.substring(chunkStart, starts[first]))
+            chunkStart = starts[first]
+        }
+        hasBlock = true
+    }
     var i = 0
     while (i < lines.size) {
-        val line = lines[i]
-        val trimmed = line.trimStart()
-        when {
-            trimmed.startsWith("```") || trimmed.startsWith("~~~") -> {
-                val fence = if (trimmed.startsWith("```")) "```" else "~~~"
-                val sb = StringBuilder(line)
-                var j = i + 1
-                while (j < lines.size && !lines[j].trimStart().startsWith(fence)) {
-                    sb.append('\n').append(lines[j]); j++
-                }
-                if (j < lines.size) {
-                    sb.append('\n').append(lines[j]); j++
-                }
-                rawBlocks.add(sb.toString()); i = j
+        val first = i++
+        val line = lines[first].trimStart()
+        if (line.isEmpty()) continue
+        if (line.startsWith("```") || line.startsWith("~~~")) {
+            val marker = line.first()
+            val width = line.indexOfFirst { it != marker }.let { if (it == -1) line.length else it }
+            while (i < lines.size) {
+                val closing = lines[i++].trim()
+                if (closing.length >= width && closing.all { it == marker }) break
             }
-            line.isBlank() -> i++
-            trimmed.startsWith("|") -> {
-                val sb = StringBuilder(line)
-                var j = i + 1
-                while (j < lines.size && lines[j].isNotBlank() && lines[j].trimStart().startsWith("|")) {
-                    sb.append('\n').append(lines[j]); j++
-                }
-                rawBlocks.add(sb.toString()); i = j
-            }
-            else -> {
-                val sb = StringBuilder(line)
-                var j = i + 1
-                while (j < lines.size && lines[j].isNotBlank() &&
-                    !lines[j].trimStart().startsWith("```") &&
-                    !lines[j].trimStart().startsWith("~~~") &&
-                    !lines[j].trimStart().startsWith("|")
-                ) {
-                    sb.append('\n').append(lines[j]); j++
-                }
-                rawBlocks.add(sb.toString()); i = j
-            }
-        }
-    }
-    if (rawBlocks.isEmpty()) return listOf(text)
-
-    // 超预算单块（如巨型表格/巨型段落）按行切成预算内的小块，兜底保证有界。
-    // 代码块（``` / ~~~）作为不可分割的语法单元必须保持完整，绝不能按行拆碎，
-    // 否则围栏闭合被破坏，后续片段会退化为普通正文、丢失高亮与复制，HTML 更会被预处理器误清洗。
-    val blocks = ArrayList<String>()
-    for (block in rawBlocks) {
-        val isCodeBlock = block.trimStart().let { it.startsWith("```") || it.startsWith("~~~") }
-        if (block.length <= CHUNK_BUDGET_CHARS || isCodeBlock) {
-            blocks.add(block)
+            pack(first, i)
         } else {
-            val piece = StringBuilder()
-            var weight = 0
-            for (ln in block.lines()) {
-                if (weight > 0 && weight + 1 + ln.length > CHUNK_BUDGET_CHARS) {
-                    blocks.add(piece.toString()); piece.setLength(0); weight = 0
-                }
-                piece.append(ln).append('\n'); weight += ln.length + 1
+            val table = line.startsWith('|')
+            while (i < lines.size) {
+                val next = lines[i].trimStart()
+                if (next.isEmpty() || next.startsWith('|') != table || next.startsWith("```") || next.startsWith("~~~")) break
+                i++
             }
-            if (piece.isNotBlank()) blocks.add(piece.toString())
+            if (starts[i] - starts[first] <= CHUNK_BUDGET_CHARS) pack(first, i)
+            else for (row in first until i) pack(row, row + 1)
         }
     }
-
-    val chunks = ArrayList<String>()
-    val cur = StringBuilder()
-    var weight = 0
-    for (block in blocks) {
-        val w = block.length + 2
-        if (weight > 0 && weight + w > CHUNK_BUDGET_CHARS) {
-            chunks.add(cur.toString()); cur.setLength(0); weight = 0
-        }
-        // 块间必须留空行：丢空行会让 markdown 语义粘连（段落 + 紧跟 --- 会被解析成 setext 标题，段落被夸成标题字号）。
-        if (weight > 0) cur.append('\n')
-        cur.append(block).append('\n'); weight += w
-    }
-    if (cur.isNotBlank()) chunks.add(cur.toString())
+    chunks.add(text.substring(chunkStart))
     return chunks
 }
 
@@ -797,10 +784,80 @@ internal fun reconcileChatTypewriters(
 
 private data class ChatTypewriterPlayback(
     val entry: ChatTypewriterEntry,
-    val body: TypewriterText,
-    val reasoning: TypewriterText,
+    val body: State<TypewriterText>,
+    val reasoning: State<TypewriterText>,
 ) {
-    val settled: Boolean get() = body.settled && reasoning.settled
+    val settled: State<Boolean> = derivedStateOf(structuralEqualityPolicy()) {
+        body.value.let { it.settled && it.source == entry.text } &&
+            reasoning.value.let { it.settled && it.source == entry.reasoning }
+    }
+}
+
+internal class TypewriterContentPlan(items: List<ChatRenderItem>, target: String) {
+    private val rows = items.filter {
+        it.contentType == MessageRole.ASSISTANT.name || it.contentType == "assistant-chunk"
+    }
+    private val rowIndex = rows.mapIndexed { index, row -> row.key to index }.toMap()
+    private val starts = rows.map { it.sliceStart }
+    private val source = rows.firstOrNull()?.message?.content.orEmpty()
+    private var observedSource = target
+    private var commonPrefix = source.commonPrefixWith(target).length
+
+    private fun compatiblePrefix(frame: TypewriterText): Int {
+        if (observedSource !== frame.source) {
+            observedSource = frame.source
+            commonPrefix = source.commonPrefixWith(frame.source).length
+        }
+        return commonPrefix
+    }
+
+    fun visibleCount(frame: TypewriterText): Int {
+        if (rows.isEmpty()) return 0
+        val shownLength = frame.text.length
+        if (shownLength > compatiblePrefix(frame)) return 1
+        var low = 0
+        var high = starts.size
+        while (low < high) {
+            val mid = (low + high) ushr 1
+            if (starts[mid] < shownLength) low = mid + 1 else high = mid
+        }
+        return low.coerceAtLeast(1)
+    }
+
+    fun includes(item: ChatRenderItem, count: Int): Boolean = rowIndex[item.key]?.let { it < count } ?: true
+
+    fun render(item: ChatRenderItem, frame: TypewriterText): ChatRenderItem? {
+        if (item.key !in rowIndex) return item
+        val shown = frame.text
+        if (shown.length > compatiblePrefix(frame)) {
+            return if (item.isChunkHeader) item.copy(slice = shown, isChunkFooter = true) else null
+        }
+        val chunk = item.slice ?: return item.copy(slice = shown)
+        val count = shown.length - item.sliceStart
+        if (count <= 0 && !item.isChunkHeader) return null
+        val footer = count <= chunk.length
+        return if (count >= chunk.length && footer == item.isChunkFooter) item
+        else item.copy(slice = chunk.take(count.coerceAtLeast(0)), isChunkFooter = footer)
+    }
+}
+
+@Composable
+internal fun rememberTypewriterItemProjection(
+    items: List<ChatRenderItem>,
+    playback: Map<String, Pair<TypewriterContentPlan, State<TypewriterText>>>,
+): State<List<ChatRenderItem>> {
+    val counts = playback.mapValues { (_, value) ->
+        val (plan, text) = value
+        remember(plan, text) { derivedStateOf(structuralEqualityPolicy()) { plan.visibleCount(text.value) } }
+    }
+    return remember(items, counts) {
+        derivedStateOf(structuralEqualityPolicy()) {
+            val visible = counts.mapValues { it.value.value }
+            if (playback.isEmpty()) items else items.filter { item ->
+                playback[item.message.id]?.first?.includes(item, visible.getValue(item.message.id)) ?: true
+            }
+        }
+    }
 }
 
 internal fun applyTypewriterContentSlices(
@@ -808,23 +865,11 @@ internal fun applyTypewriterContentSlices(
     contentByMessageId: Map<String, String>,
 ): List<ChatRenderItem> {
     if (contentByMessageId.isEmpty()) return items
-    val emitted = mutableSetOf<String>()
-    return buildList {
-        for (item in items) {
-            val text = contentByMessageId[item.message.id]
-            if (text == null || item.turnHeader != null || item.contentType == REASONING_CONTENT_TYPE) {
-                add(item)
-            } else if (emitted.add(item.message.id)) {
-                messageRenderItems(item.message.copy(content = text)).forEach { slice ->
-                    add(slice.copy(
-                        message = item.message,
-                        slice = slice.slice ?: text,
-                        reasoningVisible = item.reasoningVisible,
-                        chatTurnKey = item.chatTurnKey,
-                    ))
-                }
-            }
-        }
+    val plans = items.filter { it.message.id in contentByMessageId }.groupBy { it.message.id }
+        .mapValues { (id, rows) -> TypewriterContentPlan(rows, contentByMessageId.getValue(id)) }
+    return items.mapNotNull { item ->
+        val shown = contentByMessageId[item.message.id]
+        if (shown == null) item else plans.getValue(item.message.id).render(item, TypewriterText(shown, false))
     }
 }
 
@@ -886,7 +931,8 @@ fun AIChatPanel(
     val recoverySnapshot by viewModel.recoveryItems.collectAsStateWithLifecycle()
     val recoveryBusy by viewModel.recovering.collectAsStateWithLifecycle()
     val recoveryItems = recoverySnapshot.takeIf { it.first == currentSessionId }?.second.orEmpty()
-    val typewriterCharsPerSecond = settingsViewModel?.typewriterCharsPerSecond?.collectAsStateWithLifecycle()?.value ?: 30
+    val typewriterCharsPerSecond = settingsViewModel?.typewriterCharsPerSecond?.collectAsStateWithLifecycle()?.value
+        ?: DEFAULT_TYPEWRITER_CHARS_PER_SECOND
     val chatTextScale = settingsViewModel?.chatTextScale?.collectAsStateWithLifecycle()?.value
         ?: ThemeSettingsRepository.DEFAULT_CHAT_TEXT_SCALE
     val chatBackgroundImagePath = settingsViewModel?.chatBackgroundImagePath?.collectAsStateWithLifecycle()?.value
@@ -1336,7 +1382,7 @@ fun AIChatPanel(
             )
         }
     }
-    val playbackByMessageId = playbacks.filter { !it.settled && it.entry.messageId != null }
+    val playbackByMessageId = playbacks.filter { it.entry.messageId != null }
         .associateBy { it.entry.messageId!! }
     val collapsedSubAgentProjection = metadata?.collapsedGroups
         ?: SubAgentGroupProjection(emptyList(), emptyList(), emptyList(), emptySet(), emptySet())
@@ -1363,12 +1409,15 @@ fun AIChatPanel(
     val turnUsages = displayedMetadata?.turnUsages.orEmpty()
     val actionableMessageIds = displayedMetadata?.actionableMessageIds.orEmpty()
     val displayedMessageIds = displayedMetadata?.messageIds.orEmpty()
-    SideEffect {
-        val completed = playbacks.filter {
-            it.settled && chatPlaybackHandedOff(it.entry, displayedMessageIds) && it.entry.key != playbackState.streamKey
-        }.mapTo(mutableSetOf()) { it.entry.key }
-        typewriterState = playbackState.copy(entries = playbackState.entries.filterNot { it.key in completed })
+    val completedPlaybacks by remember(playbacks, displayedMessageIds, playbackState.streamKey) {
+        derivedStateOf(structuralEqualityPolicy()) {
+            playbacks.filter {
+                it.settled.value && chatPlaybackHandedOff(it.entry, displayedMessageIds) && it.entry.key != playbackState.streamKey
+            }.mapTo(mutableSetOf()) { it.entry.key }
+        }
     }
+    val retainedPlaybackState = playbackState.copy(entries = playbackState.entries.filterNot { it.key in completedPlaybacks })
+    SideEffect { typewriterState = retainedPlaybackState }
     val displayReady = messagesReady && (messages.isEmpty() || displayedMetadata != null)
     UiWorkEffect(currentSessionId, displayReady) {
         if (displayReady) {
@@ -1378,10 +1427,17 @@ fun AIChatPanel(
         delay(MESSAGES_LOADING_HINT_DELAY_MS)
         showMessagesLoading = true
     }
-    val playbackContent = playbackByMessageId.mapValues { it.value.body.text }
-    val subAgentProjection = remember(grouped, playbackContent) {
-        grouped.copy(bodyItems = applyTypewriterContentSlices(grouped.bodyItems, playbackContent),
-            footerItems = applyTypewriterContentSlices(grouped.footerItems, playbackContent))
+    val playbackContent = remember(grouped, playbackByMessageId) {
+        grouped.items.filter { it.message.id in playbackByMessageId }.groupBy { it.message.id }
+            .mapValues { (id, rows) ->
+                val playback = playbackByMessageId.getValue(id)
+                TypewriterContentPlan(rows, playback.entry.text) to playback.body
+            }
+    }
+    val bodyItems by rememberTypewriterItemProjection(grouped.bodyItems, playbackContent)
+    val footerItems by rememberTypewriterItemProjection(grouped.footerItems, playbackContent)
+    val subAgentProjection = remember(grouped, bodyItems, footerItems) {
+        grouped.copy(bodyItems = bodyItems, footerItems = footerItems)
     }
     val subAgentGroupsByKey = remember(subAgentProjection.groups) { subAgentProjection.groups.associateBy { it.key } }
     val chatItems = subAgentProjection.items
@@ -1391,7 +1447,6 @@ fun AIChatPanel(
     }
     val showStreaming = tailPlaybacks.any { it.entry.text.hasVisibleContent() }
     val showReasoning = tailPlaybacks.any { it.entry.reasoning.hasVisibleContent() }
-    val uiPlaybackActive = playbacks.any { !it.settled }
 
     // 自动滚动跟随
     // 两个状态都必须 saveable：窄窗打开编辑器 / 终端 / Git / 设置都是全屏路由，聊天页整棵组合
@@ -1424,9 +1479,7 @@ fun AIChatPanel(
         }
     }
 
-    // key 必须带上 inputBarReservePx：闭包捕获的是创建时的值，用无 key 的 remember 会让
-    // 判定永远停在首帧的兜底留白（156dp）上，面板展开把悬浮层顶高后仍按旧安全区算。
-    val isAtBottom by remember(inputBarReservePx) {
+    val isAtBottom by remember(listState) {
         derivedStateOf {
             val layout = listState.layoutInfo
             // 列表还没测量（首帧、或消息未就绪期间 LazyColumn 未挂载）时 layoutInfo 为空、
@@ -1438,7 +1491,7 @@ fun AIChatPanel(
             val lastIndex = layout.totalItemsCount - 1
             // 到底 = 最后内容底部停在安全区（悬浮层上沿）附近，而非视口底：
             // 判定更严格，避免用户拖走一小段后仍被判「在底部」而恢复跟随、立即被拉回。
-            val safeBottom = layout.viewportEndOffset - inputBarReservePx
+            val safeBottom = layout.viewportEndOffset - layout.afterContentPadding
             lastVisible.index >= lastIndex &&
                 (lastVisible.offset + lastVisible.size) <= safeBottom + AUTO_SCROLL_TOLERANCE_PX
         }
@@ -1458,7 +1511,7 @@ fun AIChatPanel(
     // 「最后一次布局 pass」的产物，LazyColumn 卸载（空会话 WelcomeState、加载占位）后不会自动
     // 清空——旧会话翻历史后切到空会话，残留布局会让按钮悬在新会话上。totalItemsCount 再拦截
     // 「新列表尚未按当前消息重测」（layout 开始前 layoutInfo 仍是旧会话的）那一帧。
-    val isFarFromBottom by remember(inputBarReservePx, messagesReady, messages.size, chatItems.size) {
+    val isFarFromBottom by remember(listState, messagesReady, messages.size, chatItems.size) {
         derivedStateOf {
             if (!messagesReady || messages.isEmpty()) return@derivedStateOf false
             if (!listState.canScrollForward) return@derivedStateOf false
@@ -1467,7 +1520,7 @@ fun AIChatPanel(
                 ?: return@derivedStateOf false
             if (layout.totalItemsCount != chatItems.size + 1) return@derivedStateOf false
             if (lastVisible.index < layout.totalItemsCount - 1) return@derivedStateOf true
-            val safeBottom = layout.viewportEndOffset - inputBarReservePx
+            val safeBottom = layout.viewportEndOffset - layout.afterContentPadding
             (lastVisible.offset + lastVisible.size) - safeBottom > layout.viewportEndOffset / 2
         }
     }
@@ -1498,80 +1551,16 @@ fun AIChatPanel(
         }
     }
 
-    // 贴底定位（发送消息、切换会话）：直接滚到锚点——scrollToItem 的目标 offset 使
-    // 最后一项底部恰好停在悬浮层上方（contentPadding 预留 reserve，滚到该位置即列表
-    // 可滚的最底部，无需依赖动画与逐步对齐）。
-    val snapToBottom: suspend () -> Unit = {
-        val lastIndex = listState.layoutInfo.totalItemsCount - 1
-        if (lastIndex >= 0) {
-            // 滚到列表可滚最底部：scrollToItem 的 offset 会被 clamp 到 maxScroll，
-            // 最后一项底部恰好停在 contentPadding 底部（= 悬浮层上沿预留），无需手算项高度。
-            listState.scrollToItem(lastIndex, Int.MAX_VALUE)
-        }
-    }
+    val snapToBottom: suspend () -> Unit = { listState.followChatBottom(tolerancePx = 0) }
 
-    // 锚点式常驻校准循环：锚点 = 最后内容底部恰好停在悬浮层（输入框）上沿。
-    // scrollToItem(最后一项, Int.MAX_VALUE) 会被 LazyColumn clamp 到可滚的最底部
-    // （contentPadding 底部预留 reserve 保证），即最后一项底部停在悬浮层上沿，
-    // 数学上任何时刻都成立——消息足够时，最后一条消息永不落入输入框之下，
-    // 且不依赖“最后可见项 == 最后一项”的高度假设（高度跳变时也不会算错目标）。
-    // 每帧检查最后可见项：最后内容被增长推下（底部超安全区）或有内容被推出视口下方
-    // （最后可见项不是最后一项，即跟丢）时，滚回锚点；md 异步解析的高度跳变也会在
-    // 下一帧被检测到，不存在信号与渲染错位。
-    // 只向下校准：内容变矮（流式结束、折叠）时保持当前位置，避免「往回滚」与拉锯。
-    // reserve 经 State 传递：下面这个 lambda 只创建一次，直接捕获局部 Int 会一直用首帧的兜底值。
-    val reservePxState = rememberUpdatedState(inputBarReservePx)
-    val busyState = rememberUpdatedState(isBusy || uiPlaybackActive)
-    val calibrateToAnchor: suspend () -> Unit = remember(listState) {
-        {
-            // 无向下滚动空间（内容不满屏或已滚到锚点）：最后内容必然在安全区上方，无需校准。
-            if (followBottom && !userScrollGesture && listState.canScrollForward) {
-                val layout = listState.layoutInfo
-                val lastIndex = layout.totalItemsCount - 1
-                if (lastIndex >= 0) {
-                    val lastVisible = layout.visibleItemsInfo.lastOrNull()
-                    val safeBottom = layout.viewportEndOffset - reservePxState.value
-                    // 最后一项被推出视口下方（跟丢）或最后内容底部越过安全区：滚回锚点。
-                    // 用户在别处浏览时 followBottom 已为 false，不会走到这里。
-                    val lost = lastVisible == null || lastVisible.index < lastIndex
-                    val pushedDown = lastVisible != null &&
-                        lastVisible.offset + lastVisible.size > safeBottom + AUTO_SCROLL_TOLERANCE_PX
-                    if (lost || pushedDown) listState.scrollToItem(lastIndex, Int.MAX_VALUE)
-                }
-            }
-        }
-    }
-
-    // 只在「跟随中且内容可能还在动」时逐帧校准。原来是无条件 while(true)，followBottom
-    // 为 false 也只 continue、帧回调照旧注册，等于让主线程全程每帧醒一次（空闲也在耗电）。
-    UiWorkEffect(listState, messagesReady) {
-        if (!messagesReady) return@UiWorkEffect
-        snapshotFlow { followBottom && (busyState.value || listState.isScrollInProgress) }
-            .collectLatest { active ->
-                if (active) {
-                    while (true) {
-                        withFrameNanos { }
-                        calibrateToAnchor()
-                    }
-                } else {
-                    // 收工那一刻内容未必已稳定（md 异步解析往往落在后面），再兜一小段再收手。
-                    val deadline = System.nanoTime() + CALIBRATE_TAIL_MS * 1_000_000L
-                    while (System.nanoTime() < deadline) {
-                        withFrameNanos { }
-                        calibrateToAnchor()
-                    }
-                }
-            }
-    }
-
-    // 内容变化信号旁路：文本/思考/消息条数变化时立即校准一次，不等下一帧——
-    // 与常驻校准循环互为补充，覆盖「无动画帧」的间隙，杜绝跟丢窗口。
-    val latestMessageCount = rememberUpdatedState(messages.size)
-    UiWorkEffect(listState, messagesReady) {
-        if (!messagesReady) return@UiWorkEffect
+    // 正文接收与 Markdown 实际长高可能不在同一帧；只用已测量布局驱动一个跟随者。
+    UiWorkEffect(listState, currentSessionId, displayReady) {
+        if (!displayReady) return@UiWorkEffect
         snapshotFlow {
-            Triple(streamingText?.length, streamingReasoning?.length, latestMessageCount.value)
-        }.collect { calibrateToAnchor() }
+            if (followBottom && !userScrollGesture && positionedSession == currentSessionId) listState.layoutInfo else null
+        }.collectLatest { layout ->
+            if (layout != null && followBottom && !userScrollGesture) listState.followChatBottom()
+        }
     }
 
     val sendMessage: () -> Unit = {
@@ -1694,7 +1683,14 @@ fun AIChatPanel(
 
     // 过程始终按独立列表项组合，追加工具时不切换布局结构。
     @Composable
-    fun RenderChatItem(item: ChatRenderItem) {
+    fun RenderChatItem(sourceItem: ChatRenderItem) {
+        val content = playbackContent[sourceItem.message.id]
+        val item = if (content == null) sourceItem else {
+            val rendered by remember(sourceItem, content) {
+                derivedStateOf(structuralEqualityPolicy()) { content.first.render(sourceItem, content.second.value) }
+            }
+            rendered ?: return
+        }
         val header = item.turnHeader
         when {
             item.contentType == SUB_AGENT_GROUP_CONTENT_TYPE -> {
@@ -1740,7 +1736,7 @@ fun AIChatPanel(
             item.contentType == REASONING_CONTENT_TYPE -> {
                 // 助手的思考抽为过程项：展开态交给宿主持久化，划出视口/切页返回仍保持。
                 ReasoningBubble(
-                    text = playbackByMessageId[item.message.id]?.reasoning?.text ?: item.message.reasoning.orEmpty(),
+                    text = playbackByMessageId[item.message.id]?.reasoning?.value?.text ?: item.message.reasoning.orEmpty(),
                     cache = markdownCache,
                     preRendered = item.message.id in playbackByMessageId,
                     durationMs = reasoningDurations[item.message.id],
@@ -1754,10 +1750,10 @@ fun AIChatPanel(
             else -> {
                 val message = item.message
                 val live = runningTool.firstOrNull { it.messageId == message.id }?.text
-                val playback = playbackByMessageId[message.id]
+                val playback = playbackByMessageId[message.id]?.takeUnless { it.settled.value }
                 if (playback != null && item.isChunkHeader && item.reasoningVisible && playback.entry.reasoning.isNotEmpty()) {
                     ReasoningBubble(
-                        text = playback.reasoning.text,
+                        text = playback.reasoning.value.text,
                         cache = markdownCache,
                         preRendered = true,
                         durationMs = reasoningDurations[message.id],
@@ -1962,7 +1958,7 @@ fun AIChatPanel(
                                                 viewModel.streamingReasoningKey(it)
                                             }
                                             ReasoningBubble(
-                                                text = playback.reasoning.text,
+                                                text = playback.reasoning.value.text,
                                                 cache = markdownCache,
                                                 showTimer = reasoningLive,
                                                 durationMs = playback.entry.messageId?.let { reasoningDurations[it] }
@@ -1979,7 +1975,7 @@ fun AIChatPanel(
                                             )
                                         }
                                         if (playback.entry.text.hasVisibleContent()) {
-                                            StreamingBubble(text = playback.body.text, cache = markdownCache)
+                                            StreamingBubble(text = playback.body.value.text, cache = markdownCache)
                                         }
                                     }
                                 }
@@ -2014,7 +2010,7 @@ fun AIChatPanel(
             // 悬浮层：错误气泡 / 面板 / 输入框（蒙版在 ChatInputBar 内部，跟随键盘上移）
             val floatingPanelAlpha by animateFloatAsState(
                 targetValue = if (listState.isScrollInProgress) 0.4f else 1f,
-                animationSpec = tween(200),
+                animationSpec = AppMotion.tween(AppMotion.colorMillis),
                 label = "floating-panel-alpha"
             )
             Column(

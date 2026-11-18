@@ -32,11 +32,11 @@ import androidx.compose.ui.unit.dp
 import com.aicode.R
 import com.aicode.core.theme.Radius
 import com.aicode.core.theme.Spacing
+import com.aicode.core.ui.ChevronRotationStyle
+import com.aicode.core.ui.ExpandableChevronIcon
 import com.aicode.core.theme.semanticColors
 import com.aicode.feature.agent.presentation.SubAgentInteractionStatus
 import compose.icons.FeatherIcons
-import compose.icons.feathericons.ChevronDown
-import compose.icons.feathericons.ChevronRight
 import compose.icons.feathericons.Cpu
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -132,11 +132,11 @@ internal fun SubAgentGroupCapsule(
                     )
                 }
             }
-            Icon(
-                imageVector = if (expanded) FeatherIcons.ChevronDown else FeatherIcons.ChevronRight,
-                contentDescription = null,
+            ExpandableChevronIcon(
+                expanded = expanded,
+                style = ChevronRotationStyle.RIGHT_DOWN,
                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.size(Spacing.lg),
+                size = Spacing.lg,
             )
         }
     }

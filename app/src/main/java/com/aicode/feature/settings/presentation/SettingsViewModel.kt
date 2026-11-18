@@ -2164,8 +2164,8 @@ class SettingsViewModel @Inject constructor(
         }
     }
 
-    fun setTypewriterCharsPerSecond(value: Int) {
-        viewModelScope.launch { generalSettingsRepository.setTypewriterCharsPerSecond(value) }
+    fun setTypewriterCharsPerSecond(value: Int): Job = viewModelScope.launch {
+        generalSettingsRepository.setTypewriterCharsPerSecond(value)
     }
 
     fun setRootAccessEnabled(enabled: Boolean) {

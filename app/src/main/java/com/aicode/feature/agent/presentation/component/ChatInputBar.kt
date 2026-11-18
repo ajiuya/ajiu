@@ -116,6 +116,7 @@ import com.aicode.feature.settings.domain.model.modelMetadataKey
 import com.aicode.feature.settings.domain.model.ProviderDashboardState
 import com.aicode.feature.workspace.presentation.WorkspaceViewModel
 import com.aicode.feature.workspace.presentation.component.WorkspaceIconButton
+import com.aicode.core.ui.AppMotion
 import com.aicode.core.ui.ExpandableChevronIcon
 import compose.icons.FeatherIcons
 import compose.icons.feathericons.AlertCircle
@@ -274,7 +275,7 @@ internal fun ChatInputBar(
         // 滚动弱化：内容区（slash 菜单/排队面板/数据面板/输入框本体）整体淡出到 40%，蒙版渐变保持不透明。
         val contentAlpha by animateFloatAsState(
             targetValue = if (isScrolling) 0.4f else 1f,
-            animationSpec = tween(200),
+            animationSpec = AppMotion.tween(AppMotion.colorMillis),
             label = "inputbar-content-alpha"
         )
         // 渐变终点固定在蒙版可视高度内：若跟随整个 Box（含 imeInset 被键盘拉长的部分），
@@ -902,7 +903,7 @@ internal fun ToolPermissionPanel(
     // 滚动弱化：用户上下滑动列表时，悬浮授权弹窗跟随淡化为 40%，避免遮挡用户查看背后消息；停止滑动后平滑恢复
     val panelAlpha by animateFloatAsState(
         targetValue = if (isScrolling) 0.4f else 1f,
-        animationSpec = tween(durationMillis = 200),
+        animationSpec = AppMotion.tween(AppMotion.colorMillis),
         label = "permission-panel-alpha"
     )
 

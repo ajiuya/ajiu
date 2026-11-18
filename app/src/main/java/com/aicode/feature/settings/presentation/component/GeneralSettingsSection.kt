@@ -21,6 +21,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.mutableFloatStateOf
@@ -29,6 +30,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -40,8 +43,10 @@ import com.aicode.core.ui.AppTextField
 import com.aicode.feature.settings.data.repository.StartupSessionMode
 import com.aicode.feature.settings.data.repository.GeneralSettingsRepository
 import kotlin.math.roundToInt
+import kotlinx.coroutines.Job
 import compose.icons.FeatherIcons
 import compose.icons.feathericons.Check
+import compose.icons.feathericons.Zap
 
 /**
  * 偏好设置：集中放置不属于单个提供商配置、也不针对某个专用模型的全局偏好。
@@ -70,10 +75,22 @@ internal fun GeneralSettingsSection(
     onSetGoalMaxTokens: (Int) -> Unit,
     deleteExternalWorkspaceSessions: Boolean,
     onToggleDeleteExternalWorkspaceSessions: (Boolean) -> Unit,
-    typewriterCharsPerSecond: Int = GeneralSettingsRepository.DEFAULT_TYPEWRITER_CHARS_PER_SECOND,
-    onSetTypewriterCharsPerSecond: (Int) -> Unit = {}
+    typewriterCharsPerSecond: Int,
+    onSetTypewriterCharsPerSecond: (Int) -> Job
 ) {
     var showStartupSessionSheet by remember { mutableStateOf(false) }
+    var showTypewriterSpeedSheet by remember { mutableStateOf(false) }
+    var pendingTypewriterSpeed by remember { mutableStateOf<Pair<Int, Job>?>(null) }
+    LaunchedEffect(pendingTypewriterSpeed, typewriterCharsPerSecond) {
+        val pending = pendingTypewriterSpeed ?: return@LaunchedEffect
+        val (value, save) = pending
+        if (value == typewriterCharsPerSecond) {
+            // 快速复位可能合并成与旧值相同的回读，须等这次保存真正结束。
+            save.join()
+            if (pendingTypewriterSpeed === pending) pendingTypewriterSpeed = null
+        }
+    }
+    val displayedTypewriterSpeed = pendingTypewriterSpeed?.first ?: typewriterCharsPerSecond
     var editingFirstByteTimeout by remember { mutableStateOf(false) }
     var editingStreamIdleTimeout by remember { mutableStateOf(false) }
     var editingMaxNetworkRetries by remember { mutableStateOf(false) }
@@ -162,29 +179,19 @@ internal fun GeneralSettingsSection(
             )
         }
 
-        SettingsGroupHeader(text = stringResource(R.string.settings_typewriter_speed))
         SettingsGroup {
-            var speed by remember(typewriterCharsPerSecond) { mutableFloatStateOf(typewriterCharsPerSecond.toFloat()) }
-            Column(modifier = Modifier.fillMaxWidth().padding(Spacing.lg)) {
-                Text(
-                    text = stringResource(R.string.settings_typewriter_speed_value, speed.roundToInt()),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurface
-                )
-                Slider(
-                    value = speed,
-                    onValueChange = { speed = it },
-                    onValueChangeFinished = { onSetTypewriterCharsPerSecond(speed.roundToInt()) },
-                    valueRange = GeneralSettingsRepository.MIN_TYPEWRITER_CHARS_PER_SECOND.toFloat()..
-                        GeneralSettingsRepository.MAX_TYPEWRITER_CHARS_PER_SECOND.toFloat(),
-                    steps = 21
-                )
-                Text(
-                    text = stringResource(R.string.settings_typewriter_speed_hint),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
+            SettingsRow(
+                icon = FeatherIcons.Zap,
+                title = stringResource(R.string.settings_typewriter_speed),
+                onClick = { showTypewriterSpeedSheet = true },
+                trailing = {
+                    Text(
+                        text = stringResource(R.string.settings_typewriter_speed_value, displayedTypewriterSpeed),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.semanticColors.subtleText
+                    )
+                }
+            )
         }
 
         SettingsGroupHeader(text = stringResource(R.string.settings_general_network))
@@ -289,6 +296,18 @@ internal fun GeneralSettingsSection(
                 showStartupSessionSheet = false
             },
             onDismiss = { showStartupSessionSheet = false }
+        )
+    }
+
+    if (showTypewriterSpeedSheet) {
+        TypewriterSpeedSheet(
+            speed = displayedTypewriterSpeed,
+            onChangeSpeed = { value ->
+                if (value != (pendingTypewriterSpeed?.first ?: typewriterCharsPerSecond)) {
+                    pendingTypewriterSpeed = value to onSetTypewriterCharsPerSecond(value)
+                }
+            },
+            onDismiss = { showTypewriterSpeedSheet = false }
         )
     }
 
@@ -499,6 +518,90 @@ private fun StartupSessionSheet(
                         )
                     }
                 }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun TypewriterSpeedSheet(
+    speed: Int,
+    onChangeSpeed: (Int) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val title = stringResource(R.string.settings_typewriter_speed)
+    val defaultSpeed = GeneralSettingsRepository.DEFAULT_TYPEWRITER_CHARS_PER_SECOND
+    var preview by remember { mutableFloatStateOf(speed.toFloat()) }
+    var editing by remember { mutableStateOf(false) }
+    LaunchedEffect(speed) {
+        if (!editing) preview = speed.toFloat()
+    }
+
+    fun saveSpeed(value: Int) {
+        editing = false
+        preview = value.toFloat()
+        onChangeSpeed(value)
+    }
+
+    AdaptiveModalBottomSheet(
+        onDismissRequest = {
+            if (editing) saveSpeed(preview.roundToInt())
+            onDismiss()
+        },
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = Spacing.lg, vertical = Spacing.md)
+                .padding(bottom = Spacing.lg),
+            verticalArrangement = Arrangement.spacedBy(Spacing.md)
+        ) {
+            Text(title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
+            Text(
+                text = stringResource(R.string.settings_typewriter_speed_hint),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+                text = stringResource(R.string.settings_typewriter_speed_value, preview.roundToInt()),
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.align(Alignment.CenterHorizontally)
+            )
+            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = stringResource(R.string.settings_typewriter_speed_slow),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Slider(
+                    value = preview,
+                    onValueChange = {
+                        editing = true
+                        preview = it
+                    },
+                    onValueChangeFinished = { if (editing) saveSpeed(preview.roundToInt()) },
+                    valueRange = GeneralSettingsRepository.MIN_TYPEWRITER_CHARS_PER_SECOND.toFloat()..
+                        GeneralSettingsRepository.MAX_TYPEWRITER_CHARS_PER_SECOND.toFloat(),
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(horizontal = Spacing.sm)
+                        .semantics { contentDescription = title }
+                )
+                Text(
+                    text = stringResource(R.string.settings_typewriter_speed_fast),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            TextButton(
+                onClick = { saveSpeed(defaultSpeed) },
+                modifier = Modifier.align(Alignment.CenterHorizontally)
+            ) {
+                Text(stringResource(R.string.settings_typewriter_speed_reset, defaultSpeed))
             }
         }
     }

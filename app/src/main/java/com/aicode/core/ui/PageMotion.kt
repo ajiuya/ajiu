@@ -2,7 +2,6 @@ package com.aicode.core.ui
 
 import androidx.compose.animation.EnterTransition
 import androidx.compose.animation.ExitTransition
-import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -22,19 +21,15 @@ import androidx.compose.ui.unit.IntOffset
  *
  * 淡出比淡入快且淡入延后一点，两页几乎不同时可见，避免重叠期两层内容混色发糊。
  */
-const val PAGE_MOTION_MS = 260
+const val PAGE_MOTION_MS = AppMotion.pageMillis
 
-private const val PAGE_FADE_IN_MS = 200
-private const val PAGE_FADE_IN_DELAY_MS = 60
-private const val PAGE_FADE_OUT_MS = 90
+private const val PAGE_FADE_IN_MS = 180
+private const val PAGE_FADE_IN_DELAY_MS = 20
+private const val PAGE_FADE_OUT_MS = 100
 
-/** 横移幅度占容器宽度的比例。整屏位移在大屏上像「甩」页，取四分之一足够表达方向。 */
-private const val PAGE_SLIDE_FRACTION = 0.25f
+private const val PAGE_SLIDE_FRACTION = 0.06f
 
-private val PageSlideSpec = tween<IntOffset>(
-    durationMillis = PAGE_MOTION_MS,
-    easing = FastOutSlowInEasing
-)
+private val PageSlideSpec = AppMotion.tween<IntOffset>(PAGE_MOTION_MS)
 
 /**
  * 入场页过渡：[forward] 为 true（进入下一层）时从右侧滑入，false（返回上一层）时从左侧滑入。
@@ -43,11 +38,11 @@ fun pageEnter(forward: Boolean): EnterTransition =
     slideInHorizontally(PageSlideSpec) { width ->
         val offset = (width * PAGE_SLIDE_FRACTION).toInt()
         if (forward) offset else -offset
-    } + fadeIn(tween(PAGE_FADE_IN_MS, delayMillis = PAGE_FADE_IN_DELAY_MS))
+    } + fadeIn(tween(PAGE_FADE_IN_MS, delayMillis = PAGE_FADE_IN_DELAY_MS, easing = AppMotion.easing))
 
 /** 退场页过渡：与 [pageEnter] 同向，前进时向左退出、返回时向右退出。 */
 fun pageExit(forward: Boolean): ExitTransition =
     slideOutHorizontally(PageSlideSpec) { width ->
         val offset = (width * PAGE_SLIDE_FRACTION).toInt()
         if (forward) -offset else offset
-    } + fadeOut(tween(PAGE_FADE_OUT_MS))
+    } + fadeOut(AppMotion.tween(PAGE_FADE_OUT_MS))

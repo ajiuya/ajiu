@@ -1,6 +1,10 @@
 package com.aicode.feature.settings.data.repository
 
 import android.content.Context
+import androidx.datastore.core.DataStore
+import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.intPreferencesKey
 import io.mockk.every
 import io.mockk.mockk
 import kotlinx.coroutines.flow.first
@@ -25,13 +29,30 @@ class GeneralTypewriterSettingsTest {
     }
 
     @Test
-    fun defaultsToThirtyAndPersistsAcrossRepositoryInstances() = runTest {
+    @Suppress("UNCHECKED_CAST")
+    fun missingValueDefaultsToThirtyAndReadsExistingSettingsWithTheNewBounds() = runTest {
+        val getter = Class.forName("com.aicode.feature.settings.data.repository.GeneralSettingsRepositoryKt")
+            .getDeclaredMethod("getGeneralDataStore", Context::class.java)
+        getter.isAccessible = true
+        val store = getter.invoke(null, context) as DataStore<Preferences>
+        val key = intPreferencesKey("typewriter_chars_per_second")
         val repository = GeneralSettingsRepository(context)
-        repository.setTypewriterCharsPerSecond(30)
+        store.edit { it.remove(key) }
         assertEquals(30, repository.typewriterCharsPerSecond())
-        repository.setTypewriterCharsPerSecond(75)
-        assertEquals(75, repository.typewriterCharsPerSecondFlow.first())
-        assertEquals(75, GeneralSettingsRepository(context).typewriterCharsPerSecond())
+        for ((stored, expected) in listOf(10 to 30, 25 to 30, 85 to 85, 120 to 120, 400 to 350)) {
+            store.edit { it[key] = stored }
+            assertEquals(expected, repository.typewriterCharsPerSecond())
+        }
+    }
+
+    @Test
+    fun integerSpeedsPersistAcrossRepositoryInstances() = runTest {
+        val repository = GeneralSettingsRepository(context)
+        for (speed in listOf(30, 75, 173, 350)) {
+            repository.setTypewriterCharsPerSecond(speed)
+            assertEquals(speed, repository.typewriterCharsPerSecondFlow.first())
+            assertEquals(speed, GeneralSettingsRepository(context).typewriterCharsPerSecond())
+        }
     }
 
     @Test
@@ -40,9 +61,9 @@ class GeneralTypewriterSettingsTest {
         repository.setEnterToSend(true)
         repository.setCompactionThresholdPercent(85)
         repository.setTypewriterCharsPerSecond(0)
-        assertEquals(10, repository.typewriterCharsPerSecond())
+        assertEquals(30, repository.typewriterCharsPerSecond())
         repository.setTypewriterCharsPerSecond(1_000)
-        assertEquals(120, repository.typewriterCharsPerSecond())
+        assertEquals(350, repository.typewriterCharsPerSecond())
         assertEquals(true, repository.enterToSendFlow.first())
         assertEquals(85, repository.compactionThresholdPercent())
     }

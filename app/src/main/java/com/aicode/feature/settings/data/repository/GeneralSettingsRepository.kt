@@ -45,8 +45,8 @@ class GeneralSettingsRepository @Inject constructor(
 ) {
     companion object {
         const val DEFAULT_TYPEWRITER_CHARS_PER_SECOND = 30
-        const val MIN_TYPEWRITER_CHARS_PER_SECOND = 10
-        const val MAX_TYPEWRITER_CHARS_PER_SECOND = 120
+        const val MIN_TYPEWRITER_CHARS_PER_SECOND = 30
+        const val MAX_TYPEWRITER_CHARS_PER_SECOND = 350
         private val TYPEWRITER_CHARS_PER_SECOND_KEY = intPreferencesKey("typewriter_chars_per_second")
         private val SPEED_TIER_KEY = stringPreferencesKey("speed_tier")
         private val AUTO_REMOVE_STALE_MODELS_KEY = booleanPreferencesKey("auto_remove_stale_models")

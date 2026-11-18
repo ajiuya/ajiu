@@ -37,7 +37,10 @@
     <string name="prompts_fragment_toggle_failed">无法更新片段开关，请检查提示词配置或重试。</string>
     <string name="settings_typewriter_speed">打字机速度</string>
     <string name="settings_typewriter_speed_value">%1$d 字符/秒</string>
-    <string name="settings_typewriter_speed_hint">默认 30 字符/秒。调整正文和思考的显示速度，不改变模型生成速度或 tok/s 统计。</string>
+    <string name="settings_typewriter_speed_hint">调低更有逐字感，调高可更快显示已收到的正文和思考。不影响模型生成速度或 tok/s 统计。</string>
+    <string name="settings_typewriter_speed_slow">慢</string>
+    <string name="settings_typewriter_speed_fast">快</string>
+    <string name="settings_typewriter_speed_reset">恢复默认（%1$d 字符/秒）</string>
     <string name="chat_tool_group_summary">%1$d 次工具调用 · %2$s · %3$d 次失败</string>
     <string name="chat_tool_group_summary_running">%1$d 次工具调用 · %2$s · %3$d 次失败 · 运行中</string>
     <string name="chat_tool_group_duration_unknown">—</string>

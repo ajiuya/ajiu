@@ -43,6 +43,25 @@ class LongMessageSplitTest {
     }
 
     @Test
+    fun chunksPartitionTheOriginalIncludingMarkdownWhitespaceAndLineEndings() {
+        val text = "\r\n" + (1..90).joinToString("\r\n \r\n") { "段落 $it  \r\n第二行🚀 " + "z".repeat(36) } + "\r\n\n"
+        val slices = splitLongContent(text)
+        assertTrue(slices.size > 1)
+        assertEquals(text, slices.joinToString(""))
+        assertTrue(slices.all { it.isNotBlank() })
+    }
+
+    @Test
+    fun longerFenceKeepsShorterFenceAndFenceLikeSourceLinesInOneCodeBlock() {
+        val code = "````markdown\n" + "a".repeat(1300) + "\n```\n" + "b".repeat(1300) +
+            "\n````suffix\n" + "c".repeat(1300) + "\n````"
+        val text = "说明\n\n$code\n\n尾文"
+        val slices = splitLongContent(text)
+        assertTrue(slices.any { code in it })
+        assertEquals(text, slices.joinToString(""))
+    }
+
+    @Test
     fun `huge normal text block is sliced by lines to stay bounded`() {
         val hugeParagraph = buildString {
             repeat(50) { i ->

@@ -91,7 +91,7 @@ class BackupMetadataTest {
 
     @Test
     fun typewriterSettingRoundtripMapsToMetadata() {
-        for (speed in listOf(null, 10, 30, 120)) {
+        for (speed in listOf(null, 10, 30, 120, 350)) {
             val snapshot = BackupSnapshot(
                 schemaVersion = 66, createdAt = 123, themeMode = "DARK", typewriterCharsPerSecond = speed
             )

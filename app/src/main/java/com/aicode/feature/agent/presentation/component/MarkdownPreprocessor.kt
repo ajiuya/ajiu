@@ -40,8 +40,9 @@ internal object MarkdownPreprocessor {
 
     fun process(raw: String): String = cache[raw] ?: processUncached(raw).also { cache.put(raw, it) }
 
-    private fun processUncached(raw: String, checkpoint: () -> Unit = {}): String {
-        if (raw.isEmpty()) return raw
+    private fun processUncached(source: String, checkpoint: () -> Unit = {}): String {
+        // 解析器只用 LF 识别围栏行尾；已显示前缀、分块偏移及缓存 key 始终用原文。
+        val raw = if ('\r' in source) source.replace("\r\n", "\n").replace('\r', '\n') else source
         // 无需处理的快速路径：既没有 HTML 标签、没有 $ 或 \( / \[ 数学定界符，也没有 & 实体
         if (!raw.contains('<') && !raw.contains('$') && !raw.contains('\\') && !raw.contains('&')) return raw
 

@@ -1,5 +1,8 @@
 package com.aicode.feature.agent.presentation.component
 
+import org.intellij.markdown.MarkdownElementTypes
+import org.intellij.markdown.flavours.gfm.GFMFlavourDescriptor
+import org.intellij.markdown.parser.MarkdownParser
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -110,6 +113,24 @@ class MarkdownPreprocessorTest {
     fun `html entities are decoded`() {
         // `&lt;` 先被解码为 `<`，再被 neutralizeHtmlOpenBracket 插入零宽空格
         assertEquals("a <\u200B b & c > d", process("a &lt; b &amp; c &gt; d"))
+    }
+
+    @Test
+    fun rawWindowsAndCarriageReturnLineEndingsKeepTheFenceSeparateFromFollowingText() {
+        val parser = MarkdownParser(GFMFlavourDescriptor())
+        for (lineEnd in listOf("\r\n", "\r")) {
+            for (sample in listOf("val n = 1", "<b>\$x\$ &amp;</b>")) {
+                val fence = "```text\n$sample\n```"
+                val raw = (fence + "\n\n正文  \n第二行").replace("\n", lineEnd)
+                val processed = process(raw)
+                assertEquals(fence + "\n\n正文  \n第二行", processed)
+                assertEquals(processed, MarkdownPreprocessor.peek(raw))
+                val nodes = parser.buildMarkdownTreeFromString(processed).children
+                val code = nodes.single { it.type == MarkdownElementTypes.CODE_FENCE }
+                assertEquals(fence, processed.substring(code.startOffset, code.endOffset).trimEnd('\n'))
+                assertTrue(nodes.any { it.type == MarkdownElementTypes.PARAGRAPH })
+            }
+        }
     }
 
     @Test

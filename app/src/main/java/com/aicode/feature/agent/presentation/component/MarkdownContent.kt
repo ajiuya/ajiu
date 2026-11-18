@@ -13,7 +13,6 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -190,6 +189,7 @@ internal fun MarkdownContent(
 
     val highlightTheme = remember(isDark) { SyntaxThemes.atom(darkMode = isDark) }
     val renderCache = cache ?: remember { MarkdownRenderCache() }
+    val highlightOwner = remember(renderCache) { Any() }
     val baseTransformer = LocalMarkdownImageTransformer.current
     val density = LocalDensity.current
     val textSizePx = with(density) { body.fontSize.toPx() }
@@ -217,19 +217,16 @@ internal fun MarkdownContent(
                 state: MarkdownParseState.Success,
                 components: MarkdownComponents,
                 modifier: Modifier
-            ) -> Unit = remember(lazyScroll) {
+            ) -> Unit = remember(lazyScroll, highlightOwner) {
                 if (lazyScroll) {
                     { state, components, m ->
                         LazyColumn(modifier = m) {
                             items(
                                 items = state.node.children,
-                                key = { node -> node.startOffset },
+                                key = { node -> CodeHighlightBlockIdentity(highlightOwner, node.startOffset, node.type.toString()).key },
                                 contentType = { node -> node.type }
                             ) { node ->
-                                // 列表位置按偏移保留，节点内部状态与当前 AST 绑定。
-                                key(node) {
-                                    MarkdownElement(node, components, state.content)
-                                }
+                                MarkdownElement(node, components, state.content)
                             }
                         }
                     }
@@ -245,19 +242,21 @@ internal fun MarkdownContent(
                 // 外层 SelectionContainer（MessageBubbles）统一负责选区；超长助手消息已由
                 // AIChatPanel 拆成多条有界 item，不存在超长单 item 的选区树/交互失效问题。
                 codeFence = {
+                    val blockIdentity = CodeHighlightBlockIdentity(highlightOwner, it.node.startOffset, it.node.type.toString())
                     MarkdownCodeFence(
                         content = it.content,
                         node = it.node,
                     ) { code, language, style ->
-                        SafeMarkdownHighlightedCode(code, language, style, highlightTheme, showHeader = true)
+                        SafeMarkdownHighlightedCode(blockIdentity, code, language, style, highlightTheme, showHeader = true)
                     }
                 },
                 codeBlock = {
+                    val blockIdentity = CodeHighlightBlockIdentity(highlightOwner, it.node.startOffset, it.node.type.toString())
                     MarkdownCodeBlock(
                         content = it.content,
                         node = it.node,
                     ) { code, language, style ->
-                        SafeMarkdownHighlightedCode(code, language, style, highlightTheme, showHeader = true)
+                        SafeMarkdownHighlightedCode(blockIdentity, code, language, style, highlightTheme, showHeader = true)
                     }
                 },
                 // 库默认 maxLines=1 + Ellipsis，单元格长文会被截断；这里放开为完整多行显示。
@@ -347,6 +346,7 @@ internal object CodeHighlightCache {
 
 @Composable
 private fun SafeMarkdownHighlightedCode(
+    blockIdentity: CodeHighlightBlockIdentity,
     code: String,
     language: String?,
     style: TextStyle,
@@ -354,10 +354,14 @@ private fun SafeMarkdownHighlightedCode(
     showHeader: Boolean,
 ) {
     val isDark = MaterialTheme.colorScheme.background.luminance() < 0.5f
-    val cached = CodeHighlightCache.get(code, language, isDark)
-    var highlighted by remember(code, language, isDark) { mutableStateOf(cached ?: AnnotatedString(code)) }
-    UiWorkEffect(code, language, isDark) {
-        highlighted = CodeHighlightCache.resolve(code, language, isDark, highlightTheme)
+    val highlighted = rememberCodeHighlightState(
+        blockIdentity = blockIdentity,
+        code = code,
+        language = language,
+        dark = isDark,
+        cached = CodeHighlightCache.get(code, language, isDark),
+    ) { raw ->
+        CodeHighlightCache.resolve(raw, language, isDark, highlightTheme)
     }
 
     MarkdownCodeBackground(

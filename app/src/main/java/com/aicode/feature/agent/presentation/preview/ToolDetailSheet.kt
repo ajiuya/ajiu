@@ -7,6 +7,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -72,6 +73,7 @@ import com.aicode.core.theme.Spacing
 import com.aicode.core.theme.ToolPreviewPalette
 import com.aicode.core.theme.semanticColors
 import com.aicode.core.ui.AdaptiveModalBottomSheet
+import com.aicode.core.ui.appPressFeedback
 import com.aicode.core.ui.isCompactWidth
 import com.aicode.feature.agent.domain.tool.browser.BrowserManager
 import com.aicode.feature.agent.presentation.SubAgentInteractionSummary
@@ -113,18 +115,47 @@ internal fun ToolDetailSheet(
     workDispatcher: CoroutineDispatcher = Dispatchers.Default,
     initialPresentation: ToolPreviewPresentation? = null,
 ) {
+    val detailIdentity = remember(state, target.sourceSessionId, target.id, target.name) { Any() }
+    val latestDetailIdentity by rememberUpdatedState(detailIdentity)
     var touching by remember { mutableStateOf(false) }
     var settling by remember { mutableStateOf(false) }
     var dismissing by remember { mutableStateOf(false) }
+    var buttonDismissOwner by remember { mutableStateOf<Any?>(null) }
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true, confirmValueChange = {
         if (it == SheetValue.Hidden) dismissing = true
         true
     })
     val compact = isCompactWidth()
+    val closeDetails: () -> Unit = {
+        if (latestDetailIdentity === detailIdentity && state.detailOpen && state.detailMessageId == target.id) state.closeDetails()
+    }
+    val requestClose: () -> Unit = {
+        if (latestDetailIdentity === detailIdentity && state.detailOpen && state.detailMessageId == target.id) {
+            if (!compact) closeDetails()
+            else if (!dismissing && buttonDismissOwner == null) {
+                dismissing = true
+                buttonDismissOwner = detailIdentity
+            }
+        }
+    }
+    LaunchedEffect(detailIdentity) {
+        if (buttonDismissOwner != null && buttonDismissOwner !== detailIdentity) {
+            buttonDismissOwner = null
+            dismissing = false
+            // A new target must not inherit the previous target's interrupted exit.
+            if (compact) sheetState.show()
+        }
+    }
+    LaunchedEffect(detailIdentity, buttonDismissOwner, compact) {
+        if (compact && buttonDismissOwner === detailIdentity) {
+            sheetState.hide()
+            if (sheetState.currentValue == SheetValue.Hidden && !sheetState.isAnimationRunning) closeDetails()
+        }
+    }
     val scrollState = key(target.sourceSessionId, target.id, target.name, safety.bodyHidden) { rememberLazyListState() }
     val updateContent by remember(sheetState, compact, scrollState) {
         derivedStateOf {
-            !touching && !settling && !dismissing && !scrollState.isScrollInProgress && (!compact || !sheetState.isAnimationRunning &&
+            !touching && !settling && !dismissing && buttonDismissOwner == null && !scrollState.isScrollInProgress && (!compact || !sheetState.isAnimationRunning &&
                 sheetState.currentValue == SheetValue.Expanded && sheetState.targetValue == SheetValue.Expanded)
         }
     }
@@ -136,12 +167,12 @@ internal fun ToolDetailSheet(
                 !compact || !sheetState.isAnimationRunning &&
                     sheetState.currentValue == SheetValue.Expanded && sheetState.targetValue == SheetValue.Expanded
             }.first { it }
-            dismissing = false
+            if (buttonDismissOwner == null) dismissing = false
             settling = false
         }
     }
     val presentation = rememberToolPreviewPresentation(target, enabled = updateContent, dispatcher = workDispatcher, safety = safety,
-        initialPresentation = initialPresentation, prepareInitialWhilePaused = !touching && !settling && !dismissing)
+        initialPresentation = initialPresentation, prepareInitialWhilePaused = !touching && !settling && !dismissing && buttonDismissOwner == null)
     val display = presentation.display
     val stage = display?.stage ?: target.stage
     val active = stage == ToolPreviewStage.PREPARING || stage == ToolPreviewStage.RUNNING
@@ -198,8 +229,8 @@ internal fun ToolDetailSheet(
         }
     }
     val copyLabel = stringResource(R.string.tool_preview_copy_all)
-    AdaptiveModalBottomSheet(onDismissRequest = state::closeDetails, sheetState = sheetState, dragHandle = null,
-        containerColor = MaterialTheme.colorScheme.surface) {
+    AdaptiveModalBottomSheet(onDismissRequest = closeDetails, sheetState = sheetState, dragHandle = null,
+        sheetGesturesEnabled = buttonDismissOwner == null, containerColor = MaterialTheme.colorScheme.surface) {
         Column(Modifier.fillMaxWidth().height((LocalConfiguration.current.screenHeightDp * ToolPreviewMetrics.detailHeightFraction).dp)
             .imePadding().background(MaterialTheme.colorScheme.surface)
             .pointerInput(Unit) {
@@ -217,7 +248,7 @@ internal fun ToolDetailSheet(
                 }
             }) {
             key(target.sourceSessionId, target.id, target.name, safety.bodyHidden) {
-                DetailHeader(target, presentation, state::closeDetails, copyText.isNotBlank(), copied, copyFailed, copyAll)
+                DetailHeader(target, presentation, requestClose, copyText.isNotBlank(), copied, copyFailed, copyAll)
             }
             if (!isTask || stage == ToolPreviewStage.FAILED) {
                 Row(Modifier.fillMaxWidth().padding(horizontal = ToolPreviewMetrics.detailPagerInset, vertical = Spacing.xs),
@@ -287,13 +318,15 @@ internal fun ToolDetailSheet(
 @Composable
 private fun DetailHeader(target: ToolPreviewTarget, presentation: ToolPreviewPresentation, onDismiss: () -> Unit,
     copyEnabled: Boolean, copied: Boolean, copyFailed: Boolean, onCopy: () -> Unit) {
+    val closeInteraction = remember { MutableInteractionSource() }
     Box(Modifier.fillMaxWidth().padding(horizontal = Spacing.md, vertical = Spacing.sm), contentAlignment = Alignment.Center) {
         Text(previewActionTitle(target, presentation), Modifier.fillMaxWidth().padding(horizontal = Spacing.xxl + Spacing.sm),
             fontSize = ToolPreviewMetrics.detailTitleSize, fontWeight = FontWeight.Medium,
             textAlign = TextAlign.Center, maxLines = 1, overflow = TextOverflow.Ellipsis)
         Box(Modifier.align(Alignment.CenterStart).size(Spacing.xxl).clip(CircleShape)
+            .clickable(interactionSource = closeInteraction, indication = null, onClick = onDismiss).appPressFeedback(closeInteraction)
             .background(MaterialTheme.colorScheme.surfaceVariant)
-            .border(ToolPreviewMetrics.barBorder, MaterialTheme.colorScheme.outlineVariant, CircleShape).clickable(onClick = onDismiss),
+            .border(ToolPreviewMetrics.barBorder, MaterialTheme.colorScheme.outlineVariant, CircleShape),
             contentAlignment = Alignment.Center) {
             Icon(FeatherIcons.X, stringResource(R.string.tool_preview_close), Modifier.size(Spacing.lg))
         }

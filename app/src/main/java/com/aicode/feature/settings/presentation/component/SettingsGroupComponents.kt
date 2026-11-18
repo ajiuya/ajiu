@@ -1,8 +1,11 @@
 package com.aicode.feature.settings.presentation.component
 
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -23,11 +26,14 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import com.aicode.core.ui.AppMotion
 import com.aicode.core.ui.ChevronRotationStyle
 import com.aicode.core.ui.ExpandableChevronIcon
 import androidx.compose.ui.graphics.Color
@@ -173,9 +179,21 @@ internal fun SettingsRow(
     enabled: Boolean = true,
     modifier: Modifier = Modifier
 ) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val pressed by interactionSource.collectIsPressedAsState()
+    val feedback = animateFloatAsState(
+        targetValue = if (enabled && onClick != null && pressed) 1f else 0f,
+        animationSpec = AppMotion.tween(if (pressed) AppMotion.pressMillis else AppMotion.releaseMillis),
+        label = "settings-row-press"
+    )
+    val feedbackColor = MaterialTheme.colorScheme.primary
     val baseModifier = modifier
         .fillMaxWidth()
-        .let { if (onClick != null && enabled) it.clickable { onClick() } else it }
+        .drawBehind { drawRect(feedbackColor.copy(alpha = feedback.value * 0.06f)) }
+        .let {
+            if (onClick != null && enabled) it.clickable(interactionSource = interactionSource, indication = null) { onClick() }
+            else it
+        }
         .padding(horizontal = Spacing.lg, vertical = 11.dp)
     Row(
         modifier = baseModifier.alpha(if (enabled) 1f else 0.5f),

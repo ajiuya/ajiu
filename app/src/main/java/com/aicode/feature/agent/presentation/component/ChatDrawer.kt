@@ -67,6 +67,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.listSaver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -86,6 +87,9 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
 import com.aicode.core.theme.Radius
 import com.aicode.core.theme.Spacing
 import com.aicode.core.theme.semanticColors
@@ -138,6 +142,30 @@ import java.time.temporal.ChronoUnit
 import java.util.Date
 import java.util.Locale
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.StateFlow
+
+@Composable
+internal fun rememberDrawerBrowseState(
+    source: StateFlow<FileBrowseState>,
+    sidebarVisible: Boolean,
+    selectedTab: Int,
+    onRefresh: () -> Unit
+): FileBrowseState {
+    var state by remember(source) { mutableStateOf(source.value) }
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    val refresh by rememberUpdatedState(onRefresh)
+    val treeVisible = sidebarVisible && selectedTab == 1
+    LaunchedEffect(source, lifecycle, treeVisible) {
+        if (treeVisible) {
+            lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                // 短暂离开时上游仍在 5 秒宽限期内，远程目录没有事件也必须在回来时重读。
+                refresh()
+                source.collect { state = it }
+            }
+        }
+    }
+    return state
+}
 
 /**
  * 侧边栏内容：顶部 Tab 切换「会话」/「文件」，底部「设置」入口卡片。
@@ -156,7 +184,8 @@ fun ChatDrawerContent(
     onTogglePin: (ChatSession) -> Unit,
     onExport: (ChatSession) -> Unit,
     subSessionsByParent: Map<String, List<ChatSession>> = emptyMap(),
-    browseState: FileBrowseState,
+    browseStateFlow: StateFlow<FileBrowseState>,
+    sidebarVisible: Boolean,
     expandedPaths: Set<String>,
     expandingPath: String? = null,
     fileOpPaths: Set<String> = emptySet(),
@@ -188,6 +217,7 @@ fun ChatDrawerContent(
     // tab 与展开状态进 saveable：大屏下侧栏收起后整棵子树会离开组合（见 MainActivity 的
     // SaveableStateProvider），用 remember 存会让每次回到聊天页都重置回「会话」页。
     var selectedTab by rememberSaveable { mutableStateOf(0) }
+    val browseState = rememberDrawerBrowseState(browseStateFlow, sidebarVisible, selectedTab, onRefreshBrowse)
     var isSelectionMode by rememberSaveable { mutableStateOf(false) }
     val selectedSessionIds = remember { mutableStateListOf<String>() }
     var showBatchDeleteConfirm by remember { mutableStateOf(false) }

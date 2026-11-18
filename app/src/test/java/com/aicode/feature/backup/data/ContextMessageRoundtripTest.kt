@@ -412,7 +412,7 @@ class ContextMessageRoundtripTest {
 
     @Test
     fun typewriterExportIsScopedToAppSettings() = runTest {
-        coEvery { generalSettings.typewriterCharsPerSecond() } returns 45
+        coEvery { generalSettings.typewriterCharsPerSecond() } returns 350
         val withSettings = ByteArrayOutputStream()
         val withoutSettings = ByteArrayOutputStream()
 
@@ -422,7 +422,7 @@ class ContextMessageRoundtripTest {
         val included = json.decodeFromString<BackupMetadata>(readArchive(withSettings.toByteArray()).getValue("metadata.json"))
         val excluded = json.decodeFromString<BackupMetadata>(readArchive(withoutSettings.toByteArray()).getValue("metadata.json"))
         assertTrue(included.includesAppSettings)
-        assertEquals(45, included.typewriterCharsPerSecond)
+        assertEquals(350, included.typewriterCharsPerSecond)
         assertFalse(excluded.includesAppSettings)
         assertNull(excluded.typewriterCharsPerSecond)
         coVerify(exactly = 1) { generalSettings.typewriterCharsPerSecond() }
@@ -430,7 +430,7 @@ class ContextMessageRoundtripTest {
 
     @Test
     fun streamingAndLegacyImportsRestoreTypewriterSetting() = runTest {
-        for (speed in listOf(10, 30, 120)) {
+        for (speed in listOf(10, 30, 120, 350)) {
             val metadata = BackupMetadata(
                 schemaVersion = 66, createdAt = 0, includesAppSettings = true, typewriterCharsPerSecond = speed
             )
@@ -446,7 +446,7 @@ class ContextMessageRoundtripTest {
 
             coVerify(exactly = 2) { generalSettings.setTypewriterCharsPerSecond(speed) }
         }
-        coVerify(exactly = 6) { generalSettings.setTypewriterCharsPerSecond(any()) }
+        coVerify(exactly = 8) { generalSettings.setTypewriterCharsPerSecond(any()) }
     }
 
     @Test

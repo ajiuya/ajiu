@@ -2,10 +2,6 @@ package com.aicode.feature.agent.presentation.component
 
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.expandVertically
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.StartOffset
 import androidx.compose.animation.core.animateFloat
@@ -33,11 +29,13 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
@@ -66,8 +64,12 @@ import com.aicode.core.theme.Spacing
 import com.aicode.feature.agent.presentation.preview.UiWorkEffect
 import com.aicode.feature.agent.domain.provider.RetryErrorInfo
 import com.aicode.feature.agent.domain.provider.RetryErrorKind
+import com.aicode.feature.settings.data.repository.GeneralSettingsRepository.Companion.DEFAULT_TYPEWRITER_CHARS_PER_SECOND
+import com.aicode.feature.settings.data.repository.GeneralSettingsRepository.Companion.MAX_TYPEWRITER_CHARS_PER_SECOND
+import com.aicode.feature.settings.data.repository.GeneralSettingsRepository.Companion.MIN_TYPEWRITER_CHARS_PER_SECOND
 import compose.icons.FeatherIcons
 import compose.icons.feathericons.AlertCircle
+import com.aicode.core.ui.AppMotion
 import com.aicode.core.ui.ExpandableChevronIcon
 import compose.icons.feathericons.Clock
 import compose.icons.feathericons.Key
@@ -338,6 +340,10 @@ private fun rememberThrottledStreamingText(text: String): String {
 }
 
 private const val TYPEWRITER_RENDER_INTERVAL_MS = 24L
+private const val TYPEWRITER_RATE_WINDOW_NANOS = 500_000_000L
+private const val TYPEWRITER_FOLLOW_RATIO = 0.95f
+private const val TYPEWRITER_CATCHUP_SECONDS = 0.12f
+private const val TYPEWRITER_DRAIN_SECONDS = 0.2f
 
 internal fun typewriterCodePointCount(text: String): Int {
     val end = text.length - if (text.lastOrNull()?.isHighSurrogate() == true) 1 else 0
@@ -407,61 +413,92 @@ internal fun isStreamContinuation(text: String, seenChars: Int, seenHead: Int): 
     return text.take(minOf(seenChars, CONTINUITY_HEAD_CHARS)).hashCode() == seenHead
 }
 
-internal fun typewriterRate(lag: Float, charsPerSecond: Int = 30): Float =
-    if (lag <= 0f) 0f else charsPerSecond.coerceIn(10, 120).toFloat()
+internal class TypewriterArrivalRate {
+    private val arrivals = ArrayDeque<Pair<Long, Int>>()
 
-internal fun typewriterDrainRate(lag: Float, charsPerSecond: Int = 30): Float =
-    typewriterRate(lag, charsPerSecond)
+    fun rateAt(frameNanos: Long, availableCodePoints: Int): Float {
+        // 保留窗口前最后一个累计值，才能计入窗口内第一个批次的增量。
+        while (arrivals.size > 1 && frameNanos - arrivals[1].first >= TYPEWRITER_RATE_WINDOW_NANOS) {
+            arrivals.removeFirst()
+        }
+        val last = arrivals.lastOrNull()
+        if (last?.second != availableCodePoints) {
+            if (last?.first == frameNanos) arrivals.removeLast()
+            arrivals.addLast(frameNanos to availableCodePoints)
+        }
+        val (oldestNanos, oldestCodePoints) = arrivals.first()
+        val elapsedNanos = (frameNanos - oldestNanos).coerceAtMost(TYPEWRITER_RATE_WINDOW_NANOS)
+        return if (elapsedNanos > 0L) {
+            (availableCodePoints - oldestCodePoints) * 1_000_000_000f / elapsedNanos
+        } else 0f
+    }
+
+    fun clear() = arrivals.clear()
+}
+
+internal fun typewriterRate(lag: Float, arrivalRate: Float, charsPerSecond: Int): Float =
+    boundTypewriterRate(lag, maxOf(arrivalRate * TYPEWRITER_FOLLOW_RATIO, lag / TYPEWRITER_CATCHUP_SECONDS), charsPerSecond)
+
+internal fun typewriterDrainRate(initialLag: Float, charsPerSecond: Int): Float =
+    boundTypewriterRate(initialLag, initialLag / TYPEWRITER_DRAIN_SECONDS, charsPerSecond)
+
+private fun boundTypewriterRate(lag: Float, rate: Float, charsPerSecond: Int): Float =
+    if (lag <= 0f) 0f else rate.coerceIn(
+        MIN_TYPEWRITER_CHARS_PER_SECOND.toFloat(),
+        charsPerSecond.coerceIn(MIN_TYPEWRITER_CHARS_PER_SECOND, MAX_TYPEWRITER_CHARS_PER_SECOND).toFloat(),
+    )
 
 internal fun advanceTypewriter(
     shownCodePoints: Double,
     availableCodePoints: Int,
     elapsedNanos: Long,
-    charsPerSecond: Int = 30,
-): Double {
-    val rate = typewriterRate((availableCodePoints - shownCodePoints).toFloat(), charsPerSecond)
-    return (shownCodePoints + rate.toDouble() * elapsedNanos.coerceAtLeast(0L) / 1_000_000_000.0)
-        .coerceAtMost(availableCodePoints.toDouble())
-}
+    rate: Float,
+): Double = (shownCodePoints + rate.toDouble() * elapsedNanos.coerceAtLeast(0L) / 1_000_000_000.0)
+    .coerceAtMost(availableCodePoints.toDouble())
 
 /** 打字机当前渲染结果：[text] 为应渲染文本（上游全文的前缀），[settled] 表示是否已追平全文。 */
-internal data class TypewriterText(val text: String, val settled: Boolean)
+internal data class TypewriterText(val text: String, val settled: Boolean, val source: String = text)
 
 /**
- * 按码点限速的 UI 播放；上游结束不改变速率。调用方在 LazyColumn 外持有，落库后继续以
- * [TypewriterText.settled] 判定交棒。saveable 只存长度与指纹，不保存整段正文。
+ * 调用方在 LazyColumn 外持有播放器，落库后以 [TypewriterText.settled] 判定交棒。
+ * saveable 只存长度与指纹，不保存整段正文。
  */
 @Composable
 internal fun rememberTypewriterStreamingText(
     text: String,
     active: Boolean,
     sessionKey: String? = null,
-    charsPerSecond: Int = 30,
+    charsPerSecond: Int = DEFAULT_TYPEWRITER_CHARS_PER_SECOND,
     initialText: String = text,
     revealImmediately: Boolean = false,
     workActive: Boolean = chatUiWorkActive(),
-): TypewriterText {
+): State<TypewriterText> {
     var shownChars by rememberSaveable(sessionKey) { mutableStateOf(initialText.length) }
     var shownHead by rememberSaveable(sessionKey) { mutableStateOf(streamHeadFingerprint(initialText)) }
     val restored = remember(sessionKey) {
-        val prefix = if (isStreamContinuation(text, shownChars, shownHead)) {
-            text.substring(0, shownChars)
-        } else {
-            initialText.takeIf { text.startsWith(it) }.orEmpty()
+        Snapshot.withoutReadObservation {
+            val prefix = if (isStreamContinuation(text, shownChars, shownHead)) {
+                text.substring(0, shownChars)
+            } else {
+                initialText.takeIf { text.startsWith(it) }.orEmpty()
+            }
+            truncateToCodePoints(prefix, typewriterCodePointCount(prefix))
         }
-        truncateToCodePoints(prefix, typewriterCodePointCount(prefix))
     }
-    var renderText by remember(sessionKey) { mutableStateOf(restored) }
+    val rendered = remember(sessionKey) { mutableStateOf(TypewriterText(restored, restored == text, text)) }
     val latestInput by rememberUpdatedState(TypewriterInput(text, active, charsPerSecond, revealImmediately, workActive))
 
     LaunchedEffect(sessionKey) {
         val cursor = TypewriterCursor(restored)
+        val arrivals = TypewriterArrivalRate()
         var shownCodePoints = cursor.availableCodePoints.toDouble()
+        var drainLag: Double? = null
         var lastFrameNanos = 0L
         var lastRenderNanos = 0L
+        var source = text
         fun commitRender(snapshot: String) {
-            if (snapshot === renderText) return
-            renderText = snapshot
+            if (snapshot === rendered.value.text && source === rendered.value.source) return
+            rendered.value = TypewriterText(snapshot, snapshot == source, source)
             shownChars = snapshot.length
             shownHead = streamHeadFingerprint(snapshot)
         }
@@ -469,20 +506,37 @@ internal fun rememberTypewriterStreamingText(
             val input = latestInput
             if (!input.workActive) {
                 val resumed = androidx.compose.runtime.snapshotFlow { latestInput }.first { it.workActive }
+                source = resumed.text
                 cursor.update(resumed.text)
                 shownCodePoints = cursor.availableCodePoints.toDouble()
                 commitRender(cursor.render(cursor.availableCodePoints))
+                arrivals.clear()
+                drainLag = null
                 lastFrameNanos = 0L
                 lastRenderNanos = 0L
                 continue
             }
+            source = input.text
+            val previousAvailable = cursor.availableCodePoints
             if (cursor.update(input.text)) {
                 shownCodePoints = 0.0
+                arrivals.clear()
+                drainLag = null
                 lastFrameNanos = 0L
                 lastRenderNanos = 0L
                 commitRender("")
             }
+            if (rendered.value.source !== source) commitRender(rendered.value.text)
             val available = cursor.availableCodePoints
+            val initialDrainLag = if (input.active) {
+                if (drainLag != null) arrivals.clear()
+                null
+            } else if (available != previousAvailable) {
+                available - shownCodePoints
+            } else {
+                drainLag ?: (available - shownCodePoints)
+            }
+            drainLag = initialDrainLag
             if (input.revealImmediately) shownCodePoints = available.toDouble()
             if (shownCodePoints >= available) {
                 commitRender(cursor.render(available))
@@ -492,22 +546,28 @@ internal fun rememberTypewriterStreamingText(
                 continue
             }
             withFrameNanos { frameNanos ->
-                if (!latestInput.workActive) {
+                val latest = latestInput
+                if (!latest.workActive) {
                     lastFrameNanos = 0L
                     lastRenderNanos = 0L
                     return@withFrameNanos
                 }
-                if (lastFrameNanos != 0L) {
-                    shownCodePoints = advanceTypewriter(
-                        shownCodePoints, available, frameNanos - lastFrameNanos, latestInput.charsPerSecond
+                val rate = if (initialDrainLag != null) {
+                    typewriterDrainRate(initialDrainLag.toFloat(), latest.charsPerSecond)
+                } else {
+                    typewriterRate(
+                        (available - shownCodePoints).toFloat(), arrivals.rateAt(frameNanos, available), latest.charsPerSecond
                     )
+                }
+                if (lastFrameNanos != 0L) {
+                    shownCodePoints = advanceTypewriter(shownCodePoints, available, frameNanos - lastFrameNanos, rate)
                 }
                 lastFrameNanos = frameNanos
                 if (frameNanos - lastRenderNanos >= TYPEWRITER_RENDER_INTERVAL_MS * 1_000_000L ||
                     shownCodePoints >= available
                 ) {
                     val snapshot = cursor.render(shownCodePoints.toInt())
-                    if (snapshot != renderText) {
+                    if (snapshot != rendered.value.text) {
                         lastRenderNanos = frameNanos
                         commitRender(snapshot)
                     }
@@ -515,7 +575,7 @@ internal fun rememberTypewriterStreamingText(
             }
         }
     }
-    return TypewriterText(text = renderText, settled = renderText == text)
+    return rendered
 }
 
 private data class TypewriterInput(
@@ -531,7 +591,7 @@ private data class TypewriterInput(
  * 尾部带三个跳动的点表示仍在生成。本轮结束后由落库的助手气泡接管。
  *
  * 流式阶段以打字机效果渲染（打字进度由调用方经
- * [rememberTypewriterStreamingText] 驱动，见 [AIChatPanel]），落库后继续按所选速率播放尾文。
+ * [rememberTypewriterStreamingText] 驱动，见 [AIChatPanel]），落库后继续播放尚未显示的尾文。
  */
 @Composable
 internal fun StreamingBubble(
@@ -675,8 +735,8 @@ internal fun ReasoningBubble(
         }
         AnimatedVisibility(
             visible = expanded,
-            enter = expandVertically(expandFrom = Alignment.Top) + fadeIn(),
-            exit = shrinkVertically(shrinkTowards = Alignment.Top) + fadeOut(),
+            enter = AppMotion.contentEnter(animateSize = !live && !preRendered && text.length <= AppMotion.expandingContentMaxChars),
+            exit = AppMotion.contentExit(animateSize = !live && !preRendered && text.length <= AppMotion.expandingContentMaxChars),
         ) {
             Column {
                 Spacer(Modifier.height(Spacing.sm))

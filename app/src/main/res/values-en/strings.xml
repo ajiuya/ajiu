@@ -37,7 +37,10 @@
     <string name="prompts_fragment_toggle_failed">Could not update the fragment switch. Check the prompt configuration or retry.</string>
     <string name="settings_typewriter_speed">Typewriter speed</string>
     <string name="settings_typewriter_speed_value">%1$d characters/second</string>
-    <string name="settings_typewriter_speed_hint">Defaults to 30 characters/second. Controls message and reasoning display, without changing model generation or tok/s statistics.</string>
+    <string name="settings_typewriter_speed_hint">Lower for a more gradual typing effect, or raise to show received replies and reasoning sooner. This does not change model generation or tok/s statistics.</string>
+    <string name="settings_typewriter_speed_slow">Slow</string>
+    <string name="settings_typewriter_speed_fast">Fast</string>
+    <string name="settings_typewriter_speed_reset">Reset to default (%1$d characters/second)</string>
     <string name="chat_tool_group_summary">%1$d tool calls · %2$s · %3$d failures</string>
     <string name="chat_tool_group_summary_running">%1$d tool calls · %2$s · %3$d failures · running</string>
     <string name="chat_tool_group_duration_unknown">—</string>

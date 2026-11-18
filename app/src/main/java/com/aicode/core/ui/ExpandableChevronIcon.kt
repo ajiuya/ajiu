@@ -1,15 +1,12 @@
 package com.aicode.core.ui
 
-import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.size
 import androidx.compose.material3.Icon
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -28,8 +25,6 @@ enum class ChevronRotationStyle {
     RIGHT_DOWN,
 }
 
-private const val CHEVRON_ANIM_DURATION_MS = 200
-
 /**
  * 统一折叠小箭头组件：封装平滑的旋转动画与统一的时长/缓动曲线。
  */
@@ -46,9 +41,9 @@ fun ExpandableChevronIcon(
         ChevronRotationStyle.UP_DOWN -> if (expanded) 180f else 0f
         ChevronRotationStyle.RIGHT_DOWN -> if (expanded) 90f else 0f
     }
-    val rotation by animateFloatAsState(
+    val rotation = animateFloatAsState(
         targetValue = targetRotation,
-        animationSpec = tween(durationMillis = CHEVRON_ANIM_DURATION_MS, easing = FastOutSlowInEasing),
+        animationSpec = AppMotion.tween(AppMotion.expandMillis),
         label = "chevron_rotation"
     )
     val baseIcon: ImageVector = when (style) {
@@ -61,6 +56,6 @@ fun ExpandableChevronIcon(
         tint = tint,
         modifier = modifier
             .size(size)
-            .rotate(rotation)
+            .graphicsLayer { rotationZ = rotation.value }
     )
 }

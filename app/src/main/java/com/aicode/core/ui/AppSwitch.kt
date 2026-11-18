@@ -1,31 +1,28 @@
 package com.aicode.core.ui
 
 import androidx.compose.animation.animateColorAsState
-import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateDpAsState
-import androidx.compose.animation.core.spring
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.offset
-import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 
 /**
@@ -50,9 +47,9 @@ fun AppSwitch(
         isLight -> Color(0xFFE2E8F0)
         else -> Color(0xFF334155)
     }
-    val animatedTrackColor by animateColorAsState(
+    val animatedTrackColor = animateColorAsState(
         targetValue = targetTrackColor,
-        animationSpec = tween(durationMillis = 200),
+        animationSpec = AppMotion.tween(AppMotion.colorMillis),
         label = "switchTrackColor"
     )
 
@@ -60,12 +57,9 @@ fun AppSwitch(
     val thumbColor = if (isLight) Color.White else Color(0xFFF8FAFC)
 
     // 滑块位移（轨道宽 42dp，内边距 2dp，滑块 20dp，位移范围 2dp -> 20dp）
-    val thumbOffset by animateDpAsState(
+    val thumbOffset = animateDpAsState(
         targetValue = if (checked) 20.dp else 2.dp,
-        animationSpec = spring(
-            dampingRatio = 0.8f,
-            stiffness = Spring.StiffnessMediumLow
-        ),
+        animationSpec = AppMotion.tween(AppMotion.colorMillis),
         label = "switchThumbOffset"
     )
 
@@ -88,12 +82,12 @@ fun AppSwitch(
             .then(toggleModifier)
             .size(width = 42.dp, height = 24.dp)
             .clip(RoundedCornerShape(12.dp))
-            .background(animatedTrackColor),
+            .drawBehind { drawRect(animatedTrackColor.value) },
         contentAlignment = Alignment.CenterStart
     ) {
         Box(
             modifier = Modifier
-                .offset(x = thumbOffset)
+                .offset { IntOffset(thumbOffset.value.roundToPx(), 0) }
                 .size(20.dp)
                 .shadow(elevation = 2.dp, shape = CircleShape)
                 .background(thumbColor, CircleShape)

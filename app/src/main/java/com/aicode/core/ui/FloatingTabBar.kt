@@ -1,17 +1,12 @@
 package com.aicode.core.ui
 
 import androidx.compose.animation.animateColorAsState
-import androidx.compose.animation.core.Animatable
-import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.spring
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -30,7 +25,6 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -86,9 +80,9 @@ fun FloatingTabBar(
     val coroutineScope = rememberCoroutineScope()
     val isLight = MaterialTheme.colorScheme.background.luminance() > 0.5f
 
-    val contentAlpha by animateFloatAsState(
+    val contentAlpha = animateFloatAsState(
         targetValue = if (isScrolling) 0.35f else 1f,
-        animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
+        animationSpec = AppMotion.tween(),
         label = "tabbar-content-alpha"
     )
 
@@ -147,22 +141,6 @@ fun FloatingTabBar(
         }
     }
 
-    val floorIndex = continuousPosition.toInt().coerceIn(0, items.lastIndex)
-    val ceilIndex = (floorIndex + 1).coerceIn(0, items.lastIndex)
-    val fraction = continuousPosition - floorIndex
-
-    val floorBounds = tabBounds[floorIndex]
-    val ceilBounds = tabBounds[ceilIndex]
-
-    val indicatorX = if (floorBounds != null && ceilBounds != null) {
-        floorBounds.left + (ceilBounds.left - floorBounds.left) * fraction
-    } else {
-        tabBounds[pagerState.currentPage]?.left ?: 0f
-    }
-
-    // 果冻拉伸：在位移时根据 offsetFraction 产生平滑微拉伸
-    val stretchScaleX = 1f + 0.14f * (1f - abs(fraction - 0.5f) * 2f)
-
     Box(
         modifier = modifier
             .fillMaxWidth()
@@ -177,7 +155,7 @@ fun FloatingTabBar(
         Box(
             modifier = Modifier
                 .padding(bottom = 6.dp)
-                .graphicsLayer { alpha = contentAlpha }
+                .graphicsLayer { alpha = contentAlpha.value }
                 .shadow(
                     elevation = 8.dp,
                     shape = RoundedCornerShape(Radius.pill),
@@ -214,7 +192,7 @@ fun FloatingTabBar(
                                 val targetPage = (pagerState.currentPage + pagerState.currentPageOffsetFraction).roundToInt()
                                 pagerState.animateScrollToPage(
                                     page = targetPage.coerceIn(0, items.lastIndex),
-                                    animationSpec = spring(dampingRatio = 0.78f, stiffness = 380f)
+                                    animationSpec = AppMotion.settle()
                                 )
                             }
                         },
@@ -223,7 +201,7 @@ fun FloatingTabBar(
                                 val targetPage = (pagerState.currentPage + pagerState.currentPageOffsetFraction).roundToInt()
                                 pagerState.animateScrollToPage(
                                     page = targetPage.coerceIn(0, items.lastIndex),
-                                    animationSpec = spring(dampingRatio = 0.78f, stiffness = 380f)
+                                    animationSpec = AppMotion.settle()
                                 )
                             }
                         }
@@ -258,10 +236,18 @@ fun FloatingTabBar(
                 Box(
                     modifier = Modifier
                         .align(Alignment.CenterStart)
-                        .offset { IntOffset(indicatorX.roundToInt(), 0) }
-                        .graphicsLayer {
-                            scaleX = stretchScaleX
-                            scaleY = (2f - stretchScaleX).coerceIn(0.94f, 1f)
+                        .offset {
+                            val position = continuousPosition
+                            val floorIndex = position.toInt().coerceIn(0, items.lastIndex)
+                            val ceilIndex = (floorIndex + 1).coerceIn(0, items.lastIndex)
+                            val floorBounds = tabBounds[floorIndex]
+                            val ceilBounds = tabBounds[ceilIndex]
+                            val indicatorX = if (floorBounds != null && ceilBounds != null) {
+                                floorBounds.left + (ceilBounds.left - floorBounds.left) * (position - floorIndex)
+                            } else {
+                                tabBounds[pagerState.currentPage]?.left ?: 0f
+                            }
+                            IntOffset(indicatorX.roundToInt(), 0)
                         }
                         .width(indicatorWidthDp)
                         .height(44.dp)
@@ -284,36 +270,17 @@ fun FloatingTabBar(
                 items.forEachIndexed { index, item ->
                     val isSelected = index == pagerState.currentPage
                     val interactionSource = remember(index) { MutableInteractionSource() }
-                    val isPressed by interactionSource.collectIsPressedAsState()
-
-                    val tabScale by animateFloatAsState(
-                        targetValue = if (isPressed) 0.94f else 1f,
-                        animationSpec = spring(stiffness = Spring.StiffnessMedium),
-                        label = "tab-press-scale"
-                    )
-
                     val fgColor by animateColorAsState(
                         targetValue = if (isSelected) MaterialTheme.colorScheme.primary
                         else MaterialTheme.colorScheme.onSurfaceVariant,
-                        animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
+                        animationSpec = AppMotion.tween(AppMotion.colorMillis),
                         label = "tab-fg-color"
-                    )
-
-                    val iconScale by animateFloatAsState(
-                        targetValue = if (isSelected) 1.08f else 1f,
-                        animationSpec = spring(dampingRatio = 0.7f, stiffness = Spring.StiffnessMediumLow),
-                        label = "tab-icon-scale"
                     )
 
                     Column(
                         modifier = Modifier
                             .onGloballyPositioned { tabBounds[index] = it.boundsInParent() }
                             .widthIn(min = 84.dp)
-                            .graphicsLayer {
-                                scaleX = tabScale
-                                scaleY = tabScale
-                            }
-                            .clip(RoundedCornerShape(16.dp))
                             .clickable(
                                 interactionSource = interactionSource,
                                 indication = null,
@@ -321,11 +288,13 @@ fun FloatingTabBar(
                                     coroutineScope.launch {
                                         pagerState.animateScrollToPage(
                                             page = index,
-                                            animationSpec = spring(dampingRatio = 0.78f, stiffness = 380f)
+                                            animationSpec = AppMotion.settle()
                                         )
                                     }
                                 }
                             )
+                            .appPressFeedback(interactionSource)
+                            .clip(RoundedCornerShape(16.dp))
                             .padding(horizontal = Spacing.md, vertical = 7.dp),
                         horizontalAlignment = Alignment.CenterHorizontally,
                         verticalArrangement = Arrangement.Center
@@ -333,12 +302,7 @@ fun FloatingTabBar(
                         Icon(
                             imageVector = item.icon,
                             contentDescription = null,
-                            modifier = Modifier
-                                .size(20.dp)
-                                .graphicsLayer {
-                                    scaleX = iconScale
-                                    scaleY = iconScale
-                                },
+                            modifier = Modifier.size(20.dp),
                             tint = fgColor
                         )
                         Spacer(Modifier.height(3.dp))
@@ -369,9 +333,9 @@ fun FloatingTabBar(
     modifier: Modifier = Modifier,
     isScrolling: Boolean = false
 ) {
-    val contentAlpha by animateFloatAsState(
+    val contentAlpha = animateFloatAsState(
         targetValue = if (isScrolling) 0.35f else 1f,
-        animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
+        animationSpec = AppMotion.tween(),
         label = "tabbar-content-alpha"
     )
 
@@ -429,23 +393,11 @@ fun FloatingTabBar(
 
     val indicatorTarget = if (isDragging) dragX else tabBounds[selected]?.left ?: 0f
 
-    val indicatorX by animateFloatAsState(
+    val indicatorX = animateFloatAsState(
         targetValue = indicatorTarget,
-        animationSpec = if (isDragging) tween(0) else spring(
-            dampingRatio = 0.76f,
-            stiffness = 380f
-        ),
+        animationSpec = if (isDragging) AppMotion.tween(0) else AppMotion.settle(),
         label = "indicator-x"
     )
-
-    val stretchScale = remember { Animatable(1f) }
-    LaunchedEffect(selected) {
-        stretchScale.snapTo(1.10f)
-        stretchScale.animateTo(
-            targetValue = 1f,
-            animationSpec = spring(dampingRatio = 0.65f, stiffness = Spring.StiffnessMediumLow)
-        )
-    }
 
     Box(
         modifier = modifier
@@ -461,7 +413,7 @@ fun FloatingTabBar(
         Box(
             modifier = Modifier
                 .padding(bottom = 6.dp)
-                .graphicsLayer { alpha = contentAlpha }
+                .graphicsLayer { alpha = contentAlpha.value }
                 .shadow(
                     elevation = 8.dp,
                     shape = RoundedCornerShape(Radius.pill),
@@ -523,10 +475,8 @@ fun FloatingTabBar(
                 Box(
                     modifier = Modifier
                         .align(Alignment.CenterStart)
-                        .offset { IntOffset(indicatorX.roundToInt(), 0) }
-                        .graphicsLayer {
-                            scaleX = if (isDragging) 1.05f else stretchScale.value
-                            scaleY = if (isDragging) 0.98f else (2f - stretchScale.value).coerceIn(0.95f, 1f)
+                        .offset {
+                            IntOffset((if (isDragging) dragX else indicatorX.value).roundToInt(), 0)
                         }
                         .width(indicatorWidthDp)
                         .height(44.dp)
@@ -549,41 +499,24 @@ fun FloatingTabBar(
                 items.forEachIndexed { index, item ->
                     val isSelected = index == selected
                     val interactionSource = remember(index) { MutableInteractionSource() }
-                    val isPressed by interactionSource.collectIsPressedAsState()
-
-                    val tabScale by animateFloatAsState(
-                        targetValue = if (isPressed) 0.94f else 1f,
-                        animationSpec = spring(stiffness = Spring.StiffnessMedium),
-                        label = "tab-press-scale"
-                    )
-
                     val fgColor by animateColorAsState(
                         targetValue = if (isSelected) MaterialTheme.colorScheme.primary
                         else MaterialTheme.colorScheme.onSurfaceVariant,
-                        animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
+                        animationSpec = AppMotion.tween(AppMotion.colorMillis),
                         label = "tab-fg-color"
-                    )
-
-                    val iconScale by animateFloatAsState(
-                        targetValue = if (isSelected) 1.08f else 1f,
-                        animationSpec = spring(dampingRatio = 0.7f, stiffness = Spring.StiffnessMediumLow),
-                        label = "tab-icon-scale"
                     )
 
                     Column(
                         modifier = Modifier
                             .onGloballyPositioned { tabBounds[index] = it.boundsInParent() }
                             .widthIn(min = 84.dp)
-                            .graphicsLayer {
-                                scaleX = tabScale
-                                scaleY = tabScale
-                            }
-                            .clip(RoundedCornerShape(16.dp))
                             .clickable(
                                 interactionSource = interactionSource,
                                 indication = null,
                                 onClick = { onSelect(index) }
                             )
+                            .appPressFeedback(interactionSource)
+                            .clip(RoundedCornerShape(16.dp))
                             .padding(horizontal = Spacing.md, vertical = 7.dp),
                         horizontalAlignment = Alignment.CenterHorizontally,
                         verticalArrangement = Arrangement.Center
@@ -591,12 +524,7 @@ fun FloatingTabBar(
                         Icon(
                             imageVector = item.icon,
                             contentDescription = null,
-                            modifier = Modifier
-                                .size(20.dp)
-                                .graphicsLayer {
-                                    scaleX = iconScale
-                                    scaleY = iconScale
-                                },
+                            modifier = Modifier.size(20.dp),
                             tint = fgColor
                         )
                         Spacer(Modifier.height(3.dp))

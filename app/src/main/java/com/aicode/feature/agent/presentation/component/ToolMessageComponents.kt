@@ -3,10 +3,6 @@ package com.aicode.feature.agent.presentation.component
 import androidx.annotation.StringRes
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.expandVertically
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
@@ -108,6 +104,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import com.aicode.R
+import com.aicode.core.ui.AppMotion
 
 internal val DiffAddBg: Color
     @Composable get() = MaterialTheme.semanticColors.diffAddBg
@@ -250,8 +247,8 @@ internal fun ToolMessageBody(
             // 折叠态只保留胶囊标题。
             AnimatedVisibility(
                 visible = effectiveExpanded,
-                enter = expandVertically(expandFrom = Alignment.Top) + fadeIn(),
-                exit = shrinkVertically(shrinkTowards = Alignment.Top) + fadeOut(),
+                enter = AppMotion.contentEnter(animateSize = false),
+                exit = AppMotion.contentExit(animateSize = false),
             ) {
                 val preparedArgs by key(message.id, message.toolArgs, running) {
                     produceState<String?>(initialValue = null) {
@@ -274,8 +271,8 @@ internal fun ToolMessageBody(
         } else {
             AnimatedVisibility(
                 visible = effectiveExpanded,
-                enter = expandVertically(expandFrom = Alignment.Top) + fadeIn(),
-                exit = shrinkVertically(shrinkTowards = Alignment.Top) + fadeOut(),
+                enter = AppMotion.contentEnter(animateSize = message.content.length + message.toolArgs.orEmpty().length <= AppMotion.expandingContentMaxChars),
+                exit = AppMotion.contentExit(animateSize = message.content.length + message.toolArgs.orEmpty().length <= AppMotion.expandingContentMaxChars),
             ) {
                 // 详情任务跟随 AnimatedVisibility 的内容生命周期，收起时保留至退出动画结束。
                 val details by key(

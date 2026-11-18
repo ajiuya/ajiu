@@ -38,6 +38,7 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
@@ -97,6 +98,31 @@ class ToolDetailGestureTest {
     fun wideDialogLoadsItsOutputWithoutWaitingForBottomSheetAnimation() =
         dragDetail(fromBody = true, wideDialogOnly = true)
 
+    @Test(timeout = 30_000)
+    fun headerCloseWaitsForTheSheetExitAndFreezesOutputAfterTouchRelease() =
+        dragDetail(fromBody = false, buttonClose = true)
+
+    @Test(timeout = 30_000)
+    fun repeatedHeaderCloseRequestsDoNotRestartTheExit() =
+        dragDetail(fromBody = false, buttonClose = true, repeatButtonClose = true)
+
+    @Test(timeout = 30_000)
+    fun anUpwardHeaderDragCannotInterruptTheButtonExitOrPublishLiveOutput() =
+        dragDetail(fromBody = false, buttonClose = true, repeatButtonClose = true, dragDuringButtonClose = true)
+
+    @Test(timeout = 30_000)
+    fun switchingTargetsDuringHeaderCloseDoesNotCloseOrFreezeTheNewDetail() =
+        dragDetail(fromBody = false, buttonClose = true, switchTargetDuringClose = true)
+
+    @Test(timeout = 30_000)
+    fun switchingSessionsDuringHeaderCloseDoesNotCloseOrFreezeTheNewDetail() =
+        dragDetail(fromBody = false, buttonClose = true, switchSessionDuringClose = true)
+
+    @Test(timeout = 30_000)
+    @Config(qualifiers = "w800dp-h1000dp")
+    fun wideHeaderCloseUsesTheNativeDialogWithoutWaitingForAHiddenSheet() =
+        dragDetail(fromBody = false, wideDialogOnly = true, buttonClose = true)
+
     private fun dragDetail(
         fromBody: Boolean,
         plainControl: Boolean = false,
@@ -105,12 +131,17 @@ class ToolDetailGestureTest {
         wideDialogOnly: Boolean = false,
         releaseUpdates: Boolean = false,
         emptyOutputOnly: Boolean = false,
+        buttonClose: Boolean = false,
+        repeatButtonClose: Boolean = false,
+        dragDuringButtonClose: Boolean = false,
+        switchTargetDuringClose: Boolean = false,
+        switchSessionDuringClose: Boolean = false,
     ) = runTest(timeout = 20.seconds) {
         val output = if (emptyOutputOnly) "" else if (longOutput) List(if (releaseUpdates) 800 else 120) { "Line $it: public tool output" }.joinToString("\n") else "public output"
         val target = ToolPreviewTarget("call", "Bash", if (emptyOutputOnly) "{}" else """{"command":"pwd"}""", output,
             ToolPreviewStage.COMPLETED, actionTitle = "Inspect workspace", sourceSessionId = "session")
         var currentTarget by mutableStateOf(target)
-        val state = ToolPreviewHostState("session").apply { openDetails(target.id) }
+        var state by mutableStateOf(ToolPreviewHostState("session").apply { openDetails(target.id) })
         val cache = ToolPreviewBitmapCache()
         val controller = Robolectric.buildActivity(ComponentActivity::class.java).setup().visible()
         val activity = controller.get()
@@ -122,7 +153,6 @@ class ToolDetailGestureTest {
             recomposer.runRecomposeAndApplyChanges()
         }
         val mainLooper = shadowOf(Looper.getMainLooper())
-        var frame = 0L
         var controlDelta = 0f
         var controlReleased = false
         var dialogRoot: ViewRootForTest? = null
@@ -135,6 +165,7 @@ class ToolDetailGestureTest {
         }
         fun pump() {
             mainLooper.idleFor(Duration.ofMillis(16))
+            advanceTimeBy(16L)
             Snapshot.sendApplyNotifications()
             runCurrent()
             view.measure(View.MeasureSpec.makeMeasureSpec(400, View.MeasureSpec.EXACTLY),
@@ -148,7 +179,7 @@ class ToolDetailGestureTest {
                 dialogRoot = composeRoot(window)
                 dialogRoot?.measureAndLayoutForTest()
             }
-            if (clock.hasAwaiters) clock.sendFrame(++frame * 16_000_000L)
+            if (clock.hasAwaiters) clock.sendFrame(testScheduler.currentTime * 1_000_000L)
             runCurrent()
             Snapshot.sendApplyNotifications()
         }
@@ -192,28 +223,104 @@ class ToolDetailGestureTest {
             assertTrue("The actual output viewport must be visible: $bodyTop + $bodyHeight", bodyTop >= 0f && bodyTop + bodyHeight <= 1000f)
             if (body != null) assertTrue("The output starts at its scroll top", body.config.getOrNull(SemanticsProperties.VerticalScrollAxisRange)!!.value() == 0f)
             val startY = if (fromBody) bodyTop + 80f else bodyTop - 45f
-            if (wideDialogOnly || emptyOutputOnly) {
+            if ((wideDialogOnly && !buttonClose) || emptyOutputOnly) {
                 assertTrue("A wide dialog must render the output", containsText(visibleOutput))
                 return@runTest
             }
             var downTime = SystemClock.uptimeMillis()
             var moveEventsDelivered = 0
-            fun touch(action: Int, y: Float) {
+            fun touch(action: Int, y: Float, x: Float = 200f) {
                 val properties = MotionEvent.PointerProperties().apply { id = 0; toolType = MotionEvent.TOOL_TYPE_FINGER }
-                val coords = MotionEvent.PointerCoords().apply { x = 200f; this.y = y; pressure = 1f; size = 1f }
+                val coords = MotionEvent.PointerCoords().apply { this.x = x; this.y = y; pressure = 1f; size = 1f }
                 val event = MotionEvent.obtain(downTime, SystemClock.uptimeMillis(), action, 1,
                     arrayOf(properties), arrayOf(coords), 0, 0, 1f, 1f, 0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0)
                 try {
                     assertEquals(y, event.y, 0f)
-                    assertEquals(200f, event.x, 0f)
+                    assertEquals(x, event.x, 0f)
                     assertEquals(y, event.rawY, 0f)
-                    assertEquals(200f, event.rawX, 0f)
+                    assertEquals(x, event.rawX, 0f)
                     assertEquals(MotionEvent.TOOL_TYPE_FINGER, event.getToolType(0))
                     val delivered = window.dispatchTouchEvent(event)
                     if (action == MotionEvent.ACTION_DOWN) assertTrue("The Compose root must accept the initial touch", delivered)
                     if (action == MotionEvent.ACTION_MOVE && delivered) moveEventsDelivered++
                 } finally { event.recycle() }
                 pump()
+            }
+            if (buttonClose) {
+                val closeDescription = activity.getString(R.string.tool_preview_close)
+                val closeNode = root.semanticsOwner.getAllSemanticsNodes(mergingEnabled = true).single {
+                    it.config.getOrNull(SemanticsProperties.ContentDescription)?.contains(closeDescription) == true &&
+                        it.config.getOrNull(SemanticsActions.OnClick)?.action != null
+                }
+                val closeAction = requireNotNull(closeNode.config.getOrNull(SemanticsActions.OnClick)?.action)
+                val closePosition = closeNode.boundsInRoot.center
+                touch(MotionEvent.ACTION_DOWN, closePosition.y, closePosition.x)
+                assertTrue("Pressing X must leave the detail open until release", state.detailOpen)
+                val buttonExitStartedAt = testScheduler.currentTime
+                touch(MotionEvent.ACTION_UP, closePosition.y, closePosition.x)
+                if (wideDialogOnly) {
+                    assertFalse("The wide dialog must close natively without waiting for SheetState.hide()", state.detailOpen)
+                    return@runTest
+                }
+                assertTrue("X must request the real exit instead of immediately disposing the sheet", state.detailOpen)
+                assertTrue("The exit starts with the current output still visible", containsText(output))
+                if (switchTargetDuringClose || switchSessionDuringClose) {
+                    repeat(3) { pump() }
+                    val next = target.copy(id = if (switchSessionDuringClose) target.id else "other-call",
+                        sourceSessionId = if (switchSessionDuringClose) "other-session" else target.sourceSessionId,
+                        content = "new detail output")
+                    if (switchSessionDuringClose) state = ToolPreviewHostState(next.sourceSessionId).apply { openDetails(next.id) }
+                    else state.selectDetail(next.id)
+                    currentTarget = next
+                    repeat(90) {
+                        pump()
+                        assertTrue("An old exit must not close the new detail", state.detailOpen)
+                        assertEquals(next.id, state.detailMessageId)
+                    }
+                    assertTrue("An interrupted exit must not keep the new detail frozen", containsText(next.content))
+                    assertTrue(closeAction())
+                    repeat(3) { pump() }
+                    assertTrue("The old header's close callback must not start an exit for the new detail", state.detailOpen)
+                    currentTarget = next.copy(content = "fresh output after interrupted exit")
+                    repeat(90) { pump() }
+                    assertTrue(state.detailOpen)
+                    assertTrue("The new detail must keep accepting live output", containsText(currentTarget.content))
+                    return@runTest
+                }
+                var closeFrames = 0
+                var exitMoved = false
+                if (dragDuringButtonClose) {
+                    val dragStartY = requireNotNull(closeNode.layoutInfo.coordinates).localToRoot(Offset.Zero).y + closeNode.boundsInRoot.height / 2f
+                    downTime = SystemClock.uptimeMillis()
+                    currentTarget = target.copy(content = "late button-close output before drag", stage = ToolPreviewStage.FAILED)
+                    touch(MotionEvent.ACTION_DOWN, dragStartY, closePosition.x)
+                    repeat(4) { index ->
+                        assertTrue(closeAction())
+                        currentTarget = target.copy(content = "late button-close output during drag $index", stage = ToolPreviewStage.FAILED)
+                        touch(MotionEvent.ACTION_MOVE, dragStartY - (index + 1) * 20f, closePosition.x)
+                        assertFalse("A real upward drag must not publish output during the button exit", containsText("late button-close output"))
+                        if (state.detailOpen) assertTrue("The interrupted touch must retain the displayed frame", containsText(output))
+                        val top = body?.layoutInfo?.coordinates?.takeIf { it.isAttached }?.localToRoot(Offset.Zero)?.y
+                        if (top != null && top > bodyTop + 1f) exitMoved = true
+                    }
+                    touch(MotionEvent.ACTION_UP, dragStartY - 80f, closePosition.x)
+                    assertTrue("The real Compose root must receive the upward drag moves", moveEventsDelivered >= 4)
+                    assertFalse("Release after the upward drag must not publish live output", containsText("late button-close output"))
+                }
+                while (state.detailOpen && closeFrames++ < 120) {
+                    if (repeatButtonClose) assertTrue(closeAction())
+                    currentTarget = target.copy(content = "late button-close output $closeFrames", stage = ToolPreviewStage.FAILED)
+                    pump()
+                    assertFalse("Closing must never publish live body changes, including after touch release", containsText("late button-close output"))
+                    val top = body?.layoutInfo?.coordinates?.takeIf { it.isAttached }?.localToRoot(Offset.Zero)?.y
+                    if (top != null && top > bodyTop + 1f) exitMoved = true
+                }
+                assertTrue("X must move the real sheet through its existing hide animation", exitMoved)
+                val exitFrames = (testScheduler.currentTime - buttonExitStartedAt) / 16L
+                assertTrue("Repeated close requests and touches must not prolong the existing exit: $exitFrames frames", exitFrames <= 40)
+                assertFalse("The detail must close once the hide animation finishes", state.detailOpen)
+                assertEquals(null, state.detailMessageId)
+                return@runTest
             }
             if (pauseUpdates) {
                 assertTrue(containsText(output))
