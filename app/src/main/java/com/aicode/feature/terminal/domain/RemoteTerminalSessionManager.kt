@@ -109,6 +109,30 @@ class RemoteTerminalSessionManager @Inject constructor(
         return id
     }
 
+    override suspend fun startPluginCommand(command: String, title: String?, owner: TerminalResourceOwner, onOutput: (ByteArray) -> Unit): String {
+        val execution = WorkspaceExecutionContext.current() ?: error("Captured execution required")
+        execution.requireMode(ExecutionMode.REMOTE_SSH)
+        return openShellTab(command, true, false, title, null, owner, onOutput)
+    }
+
+    override fun pluginTabStatus(id: String, owner: TerminalResourceOwner): TerminalTabStatus? =
+        tab(id)?.takeIf { it.isOwnedBy(owner) }?.let { TerminalTabStatus(it.session.isRunning, (it.runState as? RunState.Finished)?.exitCode) }
+
+    override fun writePluginInput(id: String, owner: TerminalResourceOwner, text: String, appendNewline: Boolean): Boolean =
+        tab(id)?.takeIf { it.isOwnedBy(owner) }?.let { sendInput(id, text, appendNewline) } ?: false
+
+    override fun interruptPluginTab(id: String, owner: TerminalResourceOwner): Boolean =
+        tab(id)?.takeIf { it.isOwnedBy(owner) }?.let { writeBytesToTab(id, 3) } ?: false
+
+    override suspend fun closePluginTab(id: String, owner: TerminalResourceOwner): Boolean {
+        val tab = tab(id)?.takeIf { it.isOwnedBy(owner) } ?: return false
+        tab.session.finishIfRunning()
+        while (tab.session.isRunning) delay(25)
+        tab.session.setRawOutputListener(null)
+        closeTab(id)
+        return true
+    }
+
     /**
      * 开一个 SSH shell channel，分配 PTY，构造 [TerminalSession]（接 [SshShellBackend]），
      * 加入标签列表。交互标签与后台命令共用此路径，区别仅在元数据。
@@ -118,7 +142,9 @@ class RemoteTerminalSessionManager @Inject constructor(
         isBackground: Boolean,
         notify: Boolean,
         title: String?,
-        sourceSessionId: String?
+        sourceSessionId: String?,
+        owner: TerminalResourceOwner? = null,
+        onOutput: ((ByteArray) -> Unit)? = null
     ): String {
         val execution = WorkspaceExecutionContext.current()
         execution?.requireMode(ExecutionMode.REMOTE_SSH)
@@ -148,6 +174,7 @@ class RemoteTerminalSessionManager @Inject constructor(
             connection.checkIdentity(identity)
             val termSession = TerminalSession(TRANSCRIPT_ROWS, AppRemoteSessionClient(), backend)
             terminal = termSession
+            if (onOutput != null) termSession.setRawOutputListener { _, data, length -> onOutput(data.copyOf(length)) }
             termSession.updateSize(DEFAULT_COLUMNS, DEFAULT_ROWS)
             val wsPath = execution?.remoteSource?.workspaceRoot ?: workspaceRepository.currentPath()
             if (wsPath.isNotBlank() && wsPath != "/") {
@@ -160,7 +187,9 @@ class RemoteTerminalSessionManager @Inject constructor(
                 termSession.write(cd + "\n")
             }
             if (command != null) {
-                val init = if (notify) {
+                val init = if (owner != null) {
+                    "exec /bin/sh -c ${shellQuote(command)}"
+                } else if (notify) {
                     "$command; ec=\$?; echo \"$EXIT_MARKER_PREFIX\$ec]\"; exit \$ec"
                 } else {
                     "$command; ec=\$?; echo \"$EXIT_MARKER_PREFIX\$ec]\"; exec /bin/sh"
@@ -178,12 +207,14 @@ class RemoteTerminalSessionManager @Inject constructor(
                 sourceSessionId = sourceSessionId,
                 runState = RunState.Running,
                 sourceMode = ExecutionMode.REMOTE_SSH.name,
-                channelGeneration = channelGeneration
+                channelGeneration = channelGeneration,
+                ownerPluginId = owner?.pluginId,
+                ownerResourceId = owner?.resourceId
             )
             execution?.checkCurrent()
             connection.checkIdentity(identity)
             addTab(tab)
-            if (_activeTabId.value == null) _activeTabId.value = id
+            if (owner == null && _activeTabId.value == null) _activeTabId.value = id
             return id
         } catch (failure: Throwable) {
             runCatching { terminal?.finishIfRunning() }.exceptionOrNull()?.let(failure::addSuppressed)
@@ -226,7 +257,7 @@ class RemoteTerminalSessionManager @Inject constructor(
         return runCatching { tab.readOutput() }.getOrDefault("")
     }
 
-    override fun listTabs(): List<TabInfo> = _tabs.value.map {
+    override fun listTabs(): List<TabInfo> = _tabs.value.filter { it.ownerPluginId == null }.map {
         TabInfo(
             id = it.id,
             title = it.title,
@@ -349,7 +380,7 @@ class RemoteTerminalSessionManager @Inject constructor(
         val completedExitCode = (tab.runState as RunState.Finished).exitCode
         releaseKeepalive(tab.id)
         bumpRevision()
-        if (tab.notifyOnExit && !tab.finishedNotified) {
+        if (tab.ownerPluginId == null && tab.notifyOnExit && !tab.finishedNotified) {
             tab.finishedNotified = true
             _tabFinishedEvents.tryEmit(
                 TabFinishedEvent(

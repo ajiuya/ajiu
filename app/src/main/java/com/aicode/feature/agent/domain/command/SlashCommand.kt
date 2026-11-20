@@ -59,7 +59,7 @@ interface ActionCommandHandler {
 
 /**
  * 命令执行上下文：只暴露命令需要的最小能力，避免命令直接持有 ViewModel。
- * 由 AIAgentViewModel 实现，新增命令时在此接口补方法并在 ViewModel 实现。
+ * 每次派发绑定发起会话与编辑快照，异步命令不得回读界面后来选择的会话。
  */
 interface SlashCommandContext {
     fun compactCurrentSession()

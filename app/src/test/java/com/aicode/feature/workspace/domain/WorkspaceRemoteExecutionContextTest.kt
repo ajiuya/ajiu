@@ -92,6 +92,7 @@ class WorkspaceRemoteExecutionContextTest {
             if (firstArg<RemoteConnectionIdentity>() !== current) throw CancellationException("Changed connection")
         }
         every { connection.isConnected() } returns true
+        every { connection.gitCredentialWorkspaceRoot } returns null
         every { connection.sftpOperationMutex } returns Mutex()
         every { workspace.currentPath() } answers { root }
         coEvery { connection.openReadChannel(any()) } answers {
@@ -119,9 +120,16 @@ class WorkspaceRemoteExecutionContextTest {
         every { command.outputStream } returns ByteArrayOutputStream()
         every { command.exitStatus } returns 0
         every { command.isOpen } returns true
-        remote = RemoteSftpFileAccess(connection, workspace)
-        access = DelegatingFileAccess(holder, local, remote)
-        factory = WorkspaceExecutionContextFactory(access, holder, local, remote, settings)
+        remote = RemoteSftpFileAccess(connection, workspace, mockk<RemoteAgentConfigCache>(relaxed = true) {
+            every { captureProfile() } returns RemoteAgentConfigProfile("fixture", 0)
+            every { invalidation(any()) } returns {}
+        })
+        val localFolders = mockk<LocalFolderGrantRepository>(relaxed = true) {
+            every { snapshot() } returns LocalFolderSnapshot.EMPTY
+        }
+        every { settings.activeProfileSelectionRevision } returns 0L
+        access = DelegatingFileAccess(holder, local, remote, localFolders)
+        factory = WorkspaceExecutionContextFactory(access, holder, local, remote, settings, localFolders)
         engine = RemoteSshEngine(connection)
     }
 
@@ -181,6 +189,7 @@ class WorkspaceRemoteExecutionContextTest {
 
     @Test
     fun syncAndStreamUseCapturedExecOwnerAndNeverLiveConnectionSessionRouting() = runBlocking {
+        every { connection.gitCredentialWorkspaceRoot } returns root
         val execution = factory.freeze()
         withContext(execution) {
             assertEquals("captured\n", engine.runCommandSync("identity", root, 1_000))
@@ -188,7 +197,10 @@ class WorkspaceRemoteExecutionContextTest {
         }
         verify(exactly = 2) { owner.startSession() }
         verify(exactly = 0) { connection.startExecSession(any()) }
-        verify(exactly = 2) { session.exec(match { it.contains("cd '/projects/one' && identity") && !it.contains("cd ~/workspace") }) }
+        verify(exactly = 2) { session.exec(match {
+            it.contains("cd '/projects/one' && identity") && !it.contains("cd ~/workspace") &&
+                it.contains("includeIf.gitdir:/projects/one/.path") && !it.contains("GIT_CONFIG_GLOBAL")
+        }) }
         coVerify(exactly = 0) { connection.connect() }
         current = RemoteConnectionIdentity(newOwner, "/home/alice")
         assertTrue(runCatching { withContext(execution) { engine.runCommandSync("late", root, 1_000) } }.exceptionOrNull() is CancellationException)

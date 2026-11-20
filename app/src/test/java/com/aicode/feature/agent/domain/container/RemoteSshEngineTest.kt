@@ -45,6 +45,7 @@ class RemoteSshEngineTest {
         every { FileLogger.w(any(), any(), any()) } just Runs
         every { FileLogger.e(any(), any(), any()) } just Runs
         every { connection.isConnected() } returns true
+        every { connection.gitCredentialWorkspaceRoot } returns null
         every { connection.startExecSession(any()) } returns command
         every { command.inputStream } returns ByteArrayInputStream(byteArrayOf())
         every { command.errorStream } returns ByteArrayInputStream(byteArrayOf())

@@ -6,7 +6,7 @@ import com.aicode.feature.agent.domain.container.BoundedOutput
 import java.util.concurrent.TimeUnit
 
 /**
- * Shizuku UserService：由 Shizuku 在 shell（uid 2000）进程中实例化，代 App 执行 shell 命令。
+ * Shizuku UserService：由 Shizuku 在 Root（uid 0）或 shell（uid 2000）进程中实例化。
  *
  * 本进程不是合法的 Android 应用进程，只能用 Java/系统级 API，不能用 Context 相关能力
  * （getContentResolver / registerReceiver 等），故实现只用 [ProcessBuilder]。
@@ -20,9 +20,10 @@ class ShizukuShellService : IShizukuShellService.Stub() {
         System.exit(0)
     }
 
-    override fun exec(command: String, timeoutMs: Int): Bundle {
+    override fun exec(command: String, timeoutMs: Int, expectedUid: Int): Bundle {
         val result = Bundle()
-        if (AndroidProcess.myUid() != 2000) {
+        val uid = AndroidProcess.myUid()
+        if ((uid != 0 && uid != 2000) || uid != expectedUid) {
             result.putString(KEY_OUTPUT, "")
             result.putInt(KEY_EXIT_CODE, EXIT_SHELL_REQUIRED)
             return result

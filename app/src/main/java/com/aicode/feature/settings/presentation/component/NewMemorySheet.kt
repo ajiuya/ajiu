@@ -38,7 +38,8 @@ internal fun NewMemorySheet(
     saving: Boolean,
     error: MemoryManagementError?,
     onSave: (String, String, String, MemoryScope) -> Unit,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    initialScope: MemoryScope = MemoryScope.GLOBAL
 ) {
     val sheetState = rememberNewMemorySheetState(saving)
     AdaptiveModalBottomSheet(
@@ -46,7 +47,7 @@ internal fun NewMemorySheet(
         sheetState = sheetState,
         sheetGesturesEnabled = !saving
     ) {
-        NewMemoryForm(hasWorkspace, saving, error, onSave)
+        NewMemoryForm(hasWorkspace, saving, error, onSave, initialScope)
     }
 }
 
@@ -65,12 +66,13 @@ internal fun NewMemoryForm(
     hasWorkspace: Boolean,
     saving: Boolean,
     error: MemoryManagementError?,
-    onSave: (String, String, String, MemoryScope) -> Unit
+    onSave: (String, String, String, MemoryScope) -> Unit,
+    initialScope: MemoryScope = MemoryScope.GLOBAL
 ) {
     var name by rememberSaveable { mutableStateOf("") }
     var description by rememberSaveable { mutableStateOf("") }
     var body by rememberSaveable { mutableStateOf("") }
-    var scope by rememberSaveable { mutableStateOf(MemoryScope.GLOBAL) }
+    var scope by rememberSaveable { mutableStateOf(if (hasWorkspace) initialScope else MemoryScope.GLOBAL) }
     Column(
         Modifier.fillMaxWidth().imePadding().verticalScroll(rememberScrollState())
             .padding(horizontal = Spacing.lg).padding(bottom = Spacing.xl),

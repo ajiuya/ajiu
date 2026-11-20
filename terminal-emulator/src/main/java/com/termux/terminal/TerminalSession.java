@@ -45,6 +45,16 @@ public final class TerminalSession extends TerminalOutput {
     /** Callback which gets notified when a session finishes or changes title. */
     TerminalSessionClient mClient;
 
+    public interface RawOutputListener {
+        void onOutput(TerminalSession session, byte[] data, int length);
+    }
+
+    private RawOutputListener mRawOutputListener;
+
+    public void setRawOutputListener(RawOutputListener listener) {
+        mRawOutputListener = listener;
+    }
+
     /** The pid of the shell process. 0 if not started and -1 if finished running. -2 for non-subprocess backends. */
     int mShellPid;
 
@@ -385,6 +395,8 @@ public final class TerminalSession extends TerminalOutput {
         public void handleMessage(Message msg) {
             int bytesRead = mProcessToTerminalIOQueue.read(mReceiveBuffer, false);
             if (bytesRead > 0) {
+                RawOutputListener listener = mRawOutputListener;
+                if (listener != null) listener.onOutput(TerminalSession.this, mReceiveBuffer, bytesRead);
                 mEmulator.append(mReceiveBuffer, bytesRead);
                 notifyScreenUpdate();
             }

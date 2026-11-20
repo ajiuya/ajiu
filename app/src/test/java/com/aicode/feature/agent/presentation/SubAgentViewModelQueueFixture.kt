@@ -28,6 +28,7 @@ import com.aicode.feature.agent.domain.recovery.RecoveryStatus
 import com.aicode.feature.agent.domain.recovery.RecoveryStep
 import com.aicode.feature.agent.domain.root.RootAccessState
 import com.aicode.feature.agent.domain.session.MessagePersistenceUseCase
+import com.aicode.feature.agent.domain.session.SessionSelectionStore
 import com.aicode.feature.agent.domain.session.SessionUseCase
 import com.aicode.feature.agent.domain.subagent.AgentDefinitionRepository
 import com.aicode.feature.agent.domain.subagent.SubAgentEventBus
@@ -39,25 +40,42 @@ import com.aicode.feature.agent.domain.tool.ToolRegistry
 import com.aicode.feature.agent.domain.tool.plan.PlanApprovalManager
 import com.aicode.feature.agent.domain.tool.question.AskUserQuestionManager
 import com.aicode.feature.agent.domain.workflow.AgentWorkflow
+import com.aicode.feature.agent.presentation.runtime.AgentRunDependencies
+import com.aicode.feature.agent.presentation.runtime.AgentRunManager
 import com.aicode.feature.settings.data.repository.ApprovalNotificationSettingsRepository
 import com.aicode.feature.settings.data.repository.ContainerSettingsRepository
 import com.aicode.feature.settings.data.repository.GeneralSettingsRepository
-import com.aicode.feature.settings.data.repository.LiveNotificationSettingsRepository
+import com.aicode.feature.settings.data.repository.ExecutionModeHolder
 import com.aicode.feature.settings.data.repository.RootAccessSettingsRepository
 import com.aicode.feature.settings.data.repository.StartupSessionMode
 import com.aicode.feature.terminal.domain.TerminalSessionProvider
+import com.aicode.feature.workspace.domain.FileAccessProvider
+import com.aicode.feature.workspace.domain.WorkspaceExecutionContext
+import com.aicode.feature.workspace.domain.WorkspaceExecutionContextFactory
 import io.mockk.coEvery
 import io.mockk.every
 import io.mockk.mockk
+import kotlin.coroutines.ContinuationInterceptor
+import kotlin.coroutines.CoroutineContext
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flowOf
 
+@OptIn(ExperimentalCoroutinesApi::class)
 internal class SubAgentViewModelQueueFixture(
-    context: Context,
-    recovery: RecoveryRepository? = null
+    private val context: Context,
+    recovery: RecoveryRepository? = null,
+    permissionManager: ToolPermissionManager? = null,
+    runtimeContext: CoroutineContext? = null,
+    configureBeforeStart: SubAgentViewModelQueueFixture.() -> Unit = {}
 ) : AutoCloseable {
     val sessionRows = mutableMapOf(
         PARENT to ChatSessionEntity(PARENT, "Parent", 1, 1, workspacePath = "/work", providerId = "provider", model = "model"),
@@ -66,6 +84,8 @@ internal class SubAgentViewModelQueueFixture(
     val sessions = mockk<SessionUseCase>(relaxed = true)
     val chatSessions = mockk<ChatSessionDao>(relaxed = true)
     val generalSettings = mockk<GeneralSettingsRepository>(relaxed = true)
+    val selectionStore = mockk<SessionSelectionStore>()
+    val savedSelections = mutableMapOf<String, String>()
     val recoveryRepository = recovery ?: mockk<RecoveryRepository>(relaxed = true)
     val projectJournal = mockk<ProjectMemoryJournal>(relaxed = true)
     val projectIdentityResolver = mockk<ProjectMemoryIdentityResolver>(relaxed = true)
@@ -85,8 +105,25 @@ internal class SubAgentViewModelQueueFixture(
     val events = SubAgentEventBus(journal)
     val notifications = AgentNotificationCenter()
     val plans = PlanApprovalManager()
-    private val store = ViewModelStore()
-    val viewModel: AIAgentViewModel
+    val executionModeHolder = ExecutionModeHolder()
+    val browseFileAccess = mockk<FileAccessProvider>(relaxed = true)
+    val executionFactory = mockk<WorkspaceExecutionContextFactory>()
+    val permissions = permissionManager ?: mockk<ToolPermissionManager>(relaxed = true)
+    val terminalEvents = MutableSharedFlow<com.aicode.feature.terminal.domain.TabFinishedEvent>()
+    private val container = mockk<LinuxContainerEngine>(relaxed = true)
+    private val containerSettings = mockk<ContainerSettingsRepository>(relaxed = true)
+    private val osDetector = mockk<ContainerOsDetector>(relaxed = true)
+    private val rootSettings = mockk<RootAccessSettingsRepository>(relaxed = true)
+    private val approvalSettings = mockk<ApprovalNotificationSettingsRepository>(relaxed = true)
+    private val terminals = mockk<TerminalSessionProvider>(relaxed = true)
+    private val previewFileAccess = mockk<ToolPreviewFileAccessAdapter>(relaxed = true)
+    private val localFolders = mockk<com.aicode.feature.workspace.domain.LocalFolderGrantRepository>(relaxed = true)
+    private val testOwner = TestScope()
+    private var processClose: Job? = null
+    private var ui: UiOwner? = null
+    val dependencies: AgentRunDependencies
+    val manager: AgentRunManager
+    val viewModel: AIAgentViewModel get() = checkNotNull(ui).viewModel
 
     init {
         coEvery { journal.isCurrent(any()) } returns true
@@ -99,18 +136,10 @@ internal class SubAgentViewModelQueueFixture(
                 instructionId = event.instructionId, generation = event.generation,
                 parentGeneration = event.parentGeneration, runId = event.runId)
         }
-        val container = mockk<LinuxContainerEngine>(relaxed = true)
-        val containerSettings = mockk<ContainerSettingsRepository>(relaxed = true)
-        val osDetector = mockk<ContainerOsDetector>(relaxed = true)
-        val permissions = mockk<ToolPermissionManager>(relaxed = true)
-        val rootSettings = mockk<RootAccessSettingsRepository>(relaxed = true)
-        val liveSettings = mockk<LiveNotificationSettingsRepository>(relaxed = true)
-        val approvalSettings = mockk<ApprovalNotificationSettingsRepository>(relaxed = true)
-        val terminals = mockk<TerminalSessionProvider>(relaxed = true)
-        val previewFileAccess = mockk<ToolPreviewFileAccessAdapter>(relaxed = true)
         every { previewFileAccess.readers } returns flowOf(null)
         every { messages.getMessagesBySessionPaged(any(), any()) } returns flowOf(emptyList())
         every { chatSessions.getByIdFlow(any()) } answers { flowOf(sessionRows[firstArg<String>()]) }
+        coEvery { chatSessions.getById(any()) } coAnswers { sessionRows[firstArg<String>()] }
         every { chatSessions.getRootSessionsByWorkspace(any()) } answers {
             val workspace = firstArg<String>()
             flowOf(sessionRows.values.filter { it.workspacePath == workspace && it.parentId == null })
@@ -121,6 +150,11 @@ internal class SubAgentViewModelQueueFixture(
         }
         every { generalSettings.speedTierFlow } returns flowOf(SpeedTier.STANDARD)
         coEvery { generalSettings.startupSessionMode() } returns StartupSessionMode.RECENT_SESSION
+        coEvery { selectionStore.load(any()) } coAnswers { savedSelections[firstArg<String>()] }
+        coEvery { selectionStore.save(any(), any()) } coAnswers {
+            savedSelections[secondArg<String>()] = firstArg<String>()
+        }
+        coEvery { selectionStore.clear(any()) } coAnswers { savedSelections.remove(firstArg<String>()); Unit }
         every { projectIdentityResolver.environmentChanges } returns emptyFlow()
         coEvery { projectIdentityResolver.capture(any(), any(), any()) } returns projectCapture
         every { projectJournal.sessionIdentity(any()) } returns null
@@ -174,14 +208,28 @@ internal class SubAgentViewModelQueueFixture(
         }
         every { container.initProgress } returns MutableStateFlow<ContainerInitState>(ContainerInitState.Idle)
         every { containerSettings.activeProfileFlow } returns emptyFlow()
+        every { containerSettings.activeProfileIdFlow } returns flowOf("test")
+        every { containerSettings.activeProfileSelectionRevision } returns 0L
+        every { containerSettings.activeProfileSelectionRevisions } returns MutableStateFlow(0L)
+        every { localFolders.snapshots } returns MutableStateFlow(com.aicode.feature.workspace.domain.LocalFolderSnapshot.EMPTY)
+        every { localFolders.revision } returns MutableStateFlow(0L)
+        every { localFolders.snapshot() } returns com.aicode.feature.workspace.domain.LocalFolderSnapshot.EMPTY
+        every { browseFileAccess.cacheIdentity() } returns "queue-fixture"
+        coEvery { executionFactory.freeze(any()) } coAnswers {
+            val mode = executionModeHolder.currentMode()
+            WorkspaceExecutionContext(mode, "queue-fixture", browseFileAccess, null, null) {
+                if (executionModeHolder.currentMode() != mode) throw kotlinx.coroutines.CancellationException("Fixture source changed")
+            }
+        }
         every { osDetector.osMap } returns MutableStateFlow(emptyMap())
-        every { permissions.pendingRequest } returns MutableStateFlow(null)
-        every { permissions.awaitingSessionIds } returns MutableStateFlow(emptySet())
-        every { permissions.pendingForSession(any()) } returns null
+        if (permissionManager == null) {
+            every { permissions.pendingRequest } returns MutableStateFlow(null)
+            every { permissions.awaitingSessionIds } returns MutableStateFlow(emptySet())
+            every { permissions.pendingForSession(any()) } returns null
+        }
         every { rootSettings.state } returns MutableStateFlow(RootAccessState())
-        every { liveSettings.enabledFlow } returns flowOf(false)
         every { approvalSettings.enabledFlow } returns flowOf(false)
-        every { terminals.tabFinishedEvents } returns MutableSharedFlow()
+        every { terminals.tabFinishedEvents } returns terminalEvents
         every { commands.commands } returns MutableStateFlow(emptyList())
         every { commands.resolve(any()) } returns null
         every { tools.getAvailableTools() } returns emptyList()
@@ -200,7 +248,7 @@ internal class SubAgentViewModelQueueFixture(
         coEvery { persistence.buildHistory(any(), any()) } returns emptyList()
         coEvery { workflow.generateTitle(any(), any()) } returns null
 
-        viewModel = AIAgentViewModel(
+        dependencies = AgentRunDependencies(
             agentWorkflow = workflow,
             toolRegistry = tools,
             agentMessageDao = messages,
@@ -213,37 +261,23 @@ internal class SubAgentViewModelQueueFixture(
             toolPermissionManager = permissions,
             askUserQuestionManager = AskUserQuestionManager(),
             planApprovalManager = plans,
-            containerEngine = container,
             sessionUseCase = sessions,
             messagePersistenceUseCase = persistence,
-            terminalSessionManager = mockk(relaxed = true),
             terminalSessionProvider = terminals,
+            terminalSessionManager = mockk(relaxed = true),
             slashCommandRegistry = commands,
-            fileMentionRepository = mockk(relaxed = true),
             checkpointManager = mockk(relaxed = true),
             checkpointDao = mockk(relaxed = true),
-            backupManager = mockk(relaxed = true),
-            mcpManager = mockk(relaxed = true),
             agentSoundSettings = mockk(relaxed = true),
-            containerSettingsRepository = containerSettings,
-            containerOsDetector = osDetector,
             generalSettingsRepository = generalSettings,
             rootAccessSettingsRepository = rootSettings,
-            liveNotificationSettings = liveSettings,
             agentLiveNotificationManager = mockk(relaxed = true),
             approvalNotificationSettings = approvalSettings,
             agentApprovalNotificationManager = mockk(relaxed = true),
             subAgentEventBus = events,
-            subAgentInteractionReader = mockk(relaxed = true),
-            subAgentInstructionGateway = SubAgentInstructionGateway(sessions, events),
             agentNotificationCenter = notifications,
             agentDefinitionRepository = agentDefinitions,
             todoItemDao = mockk(relaxed = true),
-            fileAccess = mockk(relaxed = true),
-            browserManager = mockk(relaxed = true),
-            previewPathMapper = mockk(relaxed = true),
-            toolPreviewFileAccessAdapter = previewFileAccess,
-            fileChangeHub = mockk(relaxed = true),
             recoveryRepository = recoveryRepository,
             projectMemoryJournal = projectJournal,
             projectMemoryIdentityResolver = projectIdentityResolver,
@@ -251,9 +285,91 @@ internal class SubAgentViewModelQueueFixture(
             projectMemoryRuntimeBindings = projectBindings,
             projectMemoryPathResolver = projectPaths,
             projectProgressTerminalTracker = projectTracker,
-            context = context
+            context = context.applicationContext,
+            fileVersions = com.aicode.feature.agent.domain.tool.FileVersionRegistry(),
+            executionModeHolder = executionModeHolder,
+            containerSettingsRepository = containerSettings,
+            remoteSshConnection = mockk(relaxed = true),
+            workspaceExecutionContextFactory = executionFactory
         )
-        store.put("queue-test", viewModel)
+        every { dependencies.llmCallRecordDao.getSummary(any()) } returns flowOf(
+            com.aicode.feature.agent.data.local.dao.CallSummary(0, 0, 0, 0, 0, 0, null, null)
+        )
+        every { dependencies.llmCallRecordDao.getModelProviderCostStats(any()) } returns flowOf(emptyList())
+        every { dependencies.aiProviderRepository.getAllProviders() } returns flowOf(emptyList())
+        configureBeforeStart()
+        val processContext = runtimeContext ?: testOwner.backgroundScope.coroutineContext
+        manager = AgentRunManager(dependencies, processContext, processContext[ContinuationInterceptor] as CoroutineDispatcher)
+        reopenUi()
+    }
+
+    private fun createViewModel() = AIAgentViewModel(
+        agentMessageDao = messages,
+        chatSessionDao = chatSessions,
+        defaultModelSettingsRepository = dependencies.defaultModelSettingsRepository,
+        modelReasoningEffortRepository = dependencies.modelReasoningEffortRepository,
+        containerEngine = container,
+        sessionUseCase = sessions,
+        messagePersistenceUseCase = persistence,
+        slashCommandRegistry = commands,
+        fileMentionRepository = mockk(relaxed = true),
+        backupManager = mockk(relaxed = true),
+        mcpManager = mockk(relaxed = true),
+        containerSettingsRepository = containerSettings,
+        containerOsDetector = osDetector,
+        generalSettingsRepository = generalSettings,
+        sessionSelectionStore = selectionStore,
+        subAgentInteractionReader = mockk(relaxed = true),
+        subAgentInstructionGateway = SubAgentInstructionGateway(sessions, events),
+        todoItemDao = dependencies.todoItemDao,
+        fileAccess = browseFileAccess,
+        browserManager = mockk(relaxed = true),
+        previewPathMapper = mockk(relaxed = true),
+        toolPreviewFileAccessAdapter = previewFileAccess,
+        fileChangeHub = mockk(relaxed = true),
+        executionModeHolder = executionModeHolder,
+        workspaceExecutionContextFactory = executionFactory,
+        localFolderGrants = localFolders,
+        fileBackendRouting = com.aicode.feature.workspace.domain.FileBackendRouting(),
+        fileTransfers = mockk(relaxed = true),
+        recoveryRepository = recoveryRepository,
+        projectMemoryIdentityResolver = projectIdentityResolver,
+        context = context,
+        agentRunManager = manager
+    )
+
+    fun createUiOwner(): UiOwner {
+        check(processClose == null)
+        return UiOwner(createViewModel())
+    }
+
+    fun reopenUi(): AIAgentViewModel {
+        check(ui == null)
+        return createUiOwner().also { ui = it }.viewModel
+    }
+
+    fun closeUi() {
+        ui?.close()
+        ui = null
+    }
+
+    fun closeProcessOwner(): Job = processClose ?: testOwner.backgroundScope.launch(start = CoroutineStart.UNDISPATCHED) {
+        jobs.values.toList().forEach { it.cancel() }
+        manager.closeForTest()
+    }.also { job ->
+        processClose = job
+        job.invokeOnCompletion { testOwner.cancel() }
+    }
+
+    internal class UiOwner(viewModel: AIAgentViewModel) : AutoCloseable {
+        private val store = ViewModelStore().apply { put("queue-test", viewModel) }
+        private var current: AIAgentViewModel? = viewModel
+        val viewModel: AIAgentViewModel get() = checkNotNull(current)
+
+        override fun close() {
+            store.clear()
+            current = null
+        }
     }
 
     fun installCommand(input: String): ActionCommandHandler {
@@ -265,20 +381,20 @@ internal class SubAgentViewModelQueueFixture(
     val jobs: MutableMap<String, Job> get() = state("sessionJobs")
     val stopping: MutableSet<String> get() = state("stoppingSessions")
     val liveNotifications: com.aicode.feature.agent.presentation.notification.AgentLiveNotificationManager
-        get() = state("agentLiveNotificationManager")
+        get() = dependencies.agentLiveNotificationManager
     val agentStates: MutableStateFlow<Map<String, AgentUIState>> get() = state("_agentStates")
     val runningTools: MutableStateFlow<Map<String, Map<String, RunningToolOutput>>> get() = state("_runningTools")
 
     // 只访问测试安排所需的运行时状态，不替代任何队列或停止逻辑。
     @Suppress("UNCHECKED_CAST")
-    private fun <T> state(name: String): T = AIAgentViewModel::class.java.getDeclaredField(name).run {
+    private fun <T> state(name: String): T = AgentRunManager::class.java.getDeclaredField(name).run {
         isAccessible = true
-        get(viewModel) as T
+        get(manager) as T
     }
 
     override fun close() {
-        store.clear()
-        jobs.values.toList().forEach { it.cancel() }
+        closeUi()
+        closeProcessOwner()
     }
 
     companion object {

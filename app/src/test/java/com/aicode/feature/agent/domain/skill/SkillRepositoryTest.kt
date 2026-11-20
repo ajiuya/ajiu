@@ -1,5 +1,6 @@
 package com.aicode.feature.agent.domain.skill
 
+import com.aicode.feature.agent.domain.plugin.PluginDefinitionSource
 import com.aicode.testutil.TestFileAccessProvider
 import io.mockk.every
 import io.mockk.mockk
@@ -15,15 +16,19 @@ class SkillRepositoryTest {
 
     private val provider = TestFileAccessProvider()
     private val globalSource = spyk(GlobalDirectorySkillSource(provider)).apply {
-        every { listSkills() } returns emptyList()
+        every { listSkills(any()) } returns emptyList()
     }
     private val projectSource = spyk(ProjectDirectorySkillSource(provider)).apply {
-        every { listSkills() } returns emptyList()
+        every { listSkills(any()) } returns emptyList()
     }
     private val config = mockk<SkillConfigRepository>().apply {
         every { disabledNames() } returns emptySet()
     }
-    private val repository = SkillRepository(globalSource, projectSource, config, provider)
+    private val pluginSource = mockk<PluginDefinitionSource>().apply {
+        every { revision } returns 0
+        every { skills() } returns emptyList()
+    }
+    private val repository = SkillRepository(globalSource, projectSource, config, provider, pluginSource)
 
     private fun skill(name: String) = Skill(
         name = name,
@@ -35,8 +40,8 @@ class SkillRepositoryTest {
     fun loadInstructions_projectOverridesSameNameWithDifferentBody() {
         val global = skill("same").copy(instructions = "global instructions")
         val project = skill("same").copy(instructions = "project instructions")
-        every { globalSource.listSkills() } returns listOf(global)
-        every { projectSource.listSkills() } returns listOf(project)
+        every { globalSource.listSkills(any()) } returns listOf(global)
+        every { projectSource.listSkills(any()) } returns listOf(project)
 
         val listed = repository.listSkills().single()
         assertEquals(project, listed)
@@ -48,8 +53,8 @@ class SkillRepositoryTest {
     fun loadInstructions_projectOverridesCaseInsensitiveName() {
         val global = skill("MixedCase").copy(instructions = "global instructions")
         val project = skill("mixedcase").copy(instructions = "project instructions")
-        every { globalSource.listSkills() } returns listOf(global)
-        every { projectSource.listSkills() } returns listOf(project)
+        every { globalSource.listSkills(any()) } returns listOf(global)
+        every { projectSource.listSkills(any()) } returns listOf(project)
 
         assertEquals(listOf(project), repository.listSkills())
         assertEquals("project instructions", repository.loadInstructions("MIXEDCASE"))
@@ -59,8 +64,8 @@ class SkillRepositoryTest {
     @Test
     fun loadInstructions_fallsBackToGlobalWhenProjectHasNoMatch() {
         val global = skill("GlobalOnly").copy(instructions = "global instructions")
-        every { globalSource.listSkills() } returns listOf(global)
-        every { projectSource.listSkills() } returns listOf(skill("other"))
+        every { globalSource.listSkills(any()) } returns listOf(global)
+        every { projectSource.listSkills(any()) } returns listOf(skill("other"))
 
         assertEquals("global instructions", repository.loadInstructions("GLOBALONLY"))
         verify(exactly = 1) { projectSource.loadInstructions("GLOBALONLY") }
@@ -69,8 +74,8 @@ class SkillRepositoryTest {
 
     @Test
     fun loadInstructions_returnsNullWhenNeitherSourceHasMatch() {
-        every { globalSource.listSkills() } returns listOf(skill("global"))
-        every { projectSource.listSkills() } returns listOf(skill("project"))
+        every { globalSource.listSkills(any()) } returns listOf(skill("global"))
+        every { projectSource.listSkills(any()) } returns listOf(skill("project"))
 
         assertNull(repository.loadInstructions("missing"))
         verify(exactly = 1) { projectSource.loadInstructions("missing") }
@@ -79,8 +84,8 @@ class SkillRepositoryTest {
 
     @Test
     fun loadInstructions_disabledNameBlocksBothSourcesCaseInsensitively() {
-        every { globalSource.listSkills() } returns listOf(skill("MixedCase"))
-        every { projectSource.listSkills() } returns listOf(skill("mixedcase"))
+        every { globalSource.listSkills(any()) } returns listOf(skill("MixedCase"))
+        every { projectSource.listSkills(any()) } returns listOf(skill("mixedcase"))
         every { config.disabledNames() } returns setOf("mixedcase")
 
         assertTrue(repository.listSkills().isEmpty())

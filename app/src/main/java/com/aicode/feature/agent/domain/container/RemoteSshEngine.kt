@@ -282,12 +282,9 @@ class RemoteSshEngine @Inject constructor(
 
     /** 拼接 cd 到 projectPath 再执行 command 的完整命令；projectPath 为 null 则直接执行。
      *  优先 cd 到 ~/workspace（符号链接），让 AI 执行 pwd 时看到 ~/workspace 而非真实路径。
-     *  ~/workspace 不存在（符号链接未建成）时 fallback 到 projectPath。
-     *  注入 GIT_CONFIG_GLOBAL 指向 App 管理的 ~/.aicode/gitconfig：
-     *  仅当用户开启「自动注入」时该文件存在（含 include 用户全局配置 + includeIf 限定工作区根），
-     *  文件不存在时 git 静默跳过——不影响用户在服务器上手动 git。 */
+     *  ~/workspace 不存在（符号链接未建成）时 fallback 到 projectPath。 */
     private fun buildCdCommand(command: String, projectPath: String?): String {
-        val prefix = "export GIT_CONFIG_GLOBAL=\"\$HOME/.aicode/gitconfig\"; "
+        val prefix = gitCredentialEnvPrefix()
         if (projectPath == null) return prefix + command
         WorkspaceExecutionContext.current()?.let { execution ->
             execution.requireMode(ExecutionMode.REMOTE_SSH)
@@ -295,5 +292,16 @@ class RemoteSshEngine @Inject constructor(
             return prefix + "cd ${shellQuote(root)} && $command"
         }
         return prefix + "cd ~/workspace 2>/dev/null || cd ${shellQuote(projectPath)} 2>/dev/null; $command"
+    }
+
+    private fun gitCredentialEnvPrefix(): String {
+        val root = connection.gitCredentialWorkspaceRoot ?: return ""
+        // gitdir 条件是 glob，工作区名称中的通配字符必须按字面匹配。
+        val pattern = root.replace("\\", "\\\\").replace("*", "\\*")
+            .replace("?", "\\?").replace("[", "\\[").replace("]", "\\]")
+        val key = shellQuote("includeIf.gitdir:$pattern/.path")
+        return "export GIT_CONFIG_COUNT=1; " +
+            "export GIT_CONFIG_KEY_0=$key; " +
+            "export GIT_CONFIG_VALUE_0=\"\${HOME}/.aicode/gitconfig.credential\"; "
     }
 }

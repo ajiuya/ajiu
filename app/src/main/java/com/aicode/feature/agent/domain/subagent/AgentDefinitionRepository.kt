@@ -1,7 +1,11 @@
 package com.aicode.feature.agent.domain.subagent
 
 import com.aicode.core.util.FileLogger
+import com.aicode.feature.agent.domain.plugin.PluginDefinitionReadOnlyException
+import com.aicode.feature.agent.domain.plugin.PluginDefinitionSource
 import com.aicode.feature.workspace.domain.FileAccessProvider
+import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.CancellationException
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -18,7 +22,8 @@ class AgentDefinitionRepository @Inject constructor(
     private val globalSource: GlobalDirectoryAgentSource,
     private val projectSource: ProjectDirectoryAgentSource,
     private val configRepository: AgentDefinitionConfigRepository,
-    private val fileAccess: FileAccessProvider
+    private val fileAccess: FileAccessProvider,
+    private val pluginSource: PluginDefinitionSource
 ) {
     /**
      * 定义内容版本：经本仓库的 save/delete/setDisabled 修改定义后递增。
@@ -26,32 +31,60 @@ class AgentDefinitionRepository @Inject constructor(
      * 要等到下一个会话才出现在主代理的派发清单里。外部直接改文件不经过这里，
      * 这部分维持原有的「新会话才刷新」行为。
      */
-    @Volatile private var definitionsVersionField: Long = 0
-    val definitionsVersion: Long get() = definitionsVersionField + BuiltinAgentPublication.revision.value
+    private val definitionsVersionField = AtomicLong()
+    val definitionsVersion: Long get() = definitionsVersionField.get() + BuiltinAgentPublication.revision.value + pluginSource.revision
+
+    fun sourceIdentity(): String =
+        "${fileAccess.agentConfigSourceIdentity()}:${definitionsVersionField.get() + BuiltinAgentPublication.revision.value}:plugins:${pluginSource.revision}"
+
+    fun checkSourceIdentity(expected: String) {
+        if (sourceIdentity() != expected) throw CancellationException("Agent definition source changed")
+    }
 
     private fun bumpVersion() {
-        definitionsVersionField++
+        definitionsVersionField.incrementAndGet()
     }
     /** 全部定义（含来源作用域），未过滤禁用，按名称排序。 */
-    fun listAll(): List<AgentDefinitionEntry> =
-        mergeAll(globalSource.listDefinitions(), projectSource.listDefinitions())
+    fun listAll(): List<AgentDefinitionEntry> = listAll(forceRefresh = false)
+
+    fun listAll(forceRefresh: Boolean): List<AgentDefinitionEntry> {
+        val source = sourceIdentity()
+        val host = mergeAll(globalSource.listDefinitions(forceRefresh), projectSource.listDefinitions(forceRefresh))
+        val hostNames = host.map { it.definition.name.lowercase() }.toSet()
+        return (host + pluginSource.agents().filterNot { it.definition.name.lowercase() in hostNames })
+            .sortedBy { it.definition.name.lowercase() }
+            .also { checkSourceIdentity(source) }
+    }
+
+    private fun definitionsIn(scope: AgentDefinitionScope): List<AgentDefinition> {
+        val source = sourceIdentity()
+        return when (scope) {
+            AgentDefinitionScope.GLOBAL -> globalSource.listDefinitions(forceRefresh = true)
+            AgentDefinitionScope.PROJECT -> projectSource.listDefinitions(forceRefresh = true)
+            AgentDefinitionScope.PLUGIN -> throw PluginDefinitionReadOnlyException()
+        }.also { checkSourceIdentity(source) }
+    }
 
     /** 已启用的定义（注入主代理的可派发清单用）。 */
-    fun listEnabled(): List<AgentDefinitionEntry> {
+    fun listEnabled(): List<AgentDefinitionEntry> = listEnabled(forceRefresh = false)
+
+    private fun listEnabled(forceRefresh: Boolean): List<AgentDefinitionEntry> {
+        val source = sourceIdentity()
         val disabled = configRepository.disabledNames()
-        return listAll().filterNot { it.definition.name.lowercase() in disabled }
+        return listAll(forceRefresh).filterNot { it.definition.name.lowercase() in disabled }
+            .also { checkSourceIdentity(source) }
     }
 
     /** 按名称查找可派发的定义（忽略大小写）；不存在或已被禁用时返回 null。 */
     fun find(name: String): AgentDefinition? =
-        listEnabled().firstOrNull { it.definition.name.equals(name, ignoreCase = true) }?.definition
+        listEnabled(forceRefresh = true).firstOrNull { it.definition.name.equals(name, ignoreCase = true) }?.definition
 
     /**
      * 按名称查找定义，包含已禁用的。已经派出去的子会话要用它还原自己的提示词与工具集——
      * 禁用只该拦住新的派发，不该让在跑的子代理中途换一套配置。
      */
     fun findIncludingDisabled(name: String): AgentDefinition? =
-        listAll().firstOrNull { it.definition.name.equals(name, ignoreCase = true) }?.definition
+        listAll(forceRefresh = true).firstOrNull { it.definition.name.equals(name, ignoreCase = true) }?.definition
 
     /** 当前被禁用的子代理名集合（小写归一化）。批量判断取一次即可，避免逐个重读配置文件。 */
     fun disabledNames(): Set<String> = configRepository.disabledNames()
@@ -61,6 +94,7 @@ class AgentDefinitionRepository @Inject constructor(
 
     /** 在指定作用域启用/禁用某个子代理。 */
     fun setDisabled(name: String, disabled: Boolean, scope: AgentDefinitionScope) {
+        if (scope == AgentDefinitionScope.PLUGIN) throw PluginDefinitionReadOnlyException()
         configRepository.setDisabled(name, disabled, scope)
         bumpVersion()
     }
@@ -74,22 +108,24 @@ class AgentDefinitionRepository @Inject constructor(
         scope: AgentDefinitionScope,
         originalName: String? = null
     ): AgentSaveError? {
+        if (scope == AgentDefinitionScope.PLUGIN) return AgentSaveError.READ_ONLY
         val name = form.name.trim()
         if (!isValidName(name)) return AgentSaveError.INVALID_NAME
         if (form.prompt.isBlank()) return AgentSaveError.EMPTY_PROMPT
 
+        val entries = try { definitionsIn(scope) } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            FileLogger.e(TAG, "读取子代理定义失败: $name", e)
+            return AgentSaveError.IO_FAILED
+        }
         val overwritingSelf = originalName != null && originalName.equals(name, ignoreCase = true)
         if (!overwritingSelf) {
-            val taken = listAll().any {
-                it.scope == scope && it.definition.name.equals(name, ignoreCase = true)
-            }
+            val taken = entries.any { it.name.equals(name, ignoreCase = true) }
             if (taken) return AgentSaveError.NAME_CONFLICT
         }
 
         val existingFile = originalName?.let { old ->
-            listAll().firstOrNull {
-                it.scope == scope && it.definition.name.equals(old, ignoreCase = true)
-            }?.definition?.filePath
+            entries.firstOrNull { it.name.equals(old, ignoreCase = true) }?.filePath
         }
 
         val provider = fileAccess
@@ -115,12 +151,14 @@ class AgentDefinitionRepository @Inject constructor(
             // 改名后清掉旧文件，否则会多出一个同内容的旧名子代理
             if (!overwritingSelf && existingFile != null && existingFile != target && provider.isFile(existingFile)) {
                 runCatching { provider.delete(existingFile) }.onFailure {
+                    if (it is CancellationException) throw it
                     FileLogger.w(TAG, "重命名后删除旧定义失败: $existingFile")
                 }
             }
             bumpVersion()
             null
         } catch (e: Exception) {
+            if (e is CancellationException) throw e
             FileLogger.e(TAG, "保存子代理定义失败: $name", e)
             AgentSaveError.IO_FAILED
         }
@@ -128,20 +166,25 @@ class AgentDefinitionRepository @Inject constructor(
 
     /** 删除指定作用域的定义文件，不可恢复。返回是否成功。 */
     fun delete(name: String, scope: AgentDefinitionScope): Boolean {
-        val entry = listAll().firstOrNull {
-            it.definition.name.equals(name, ignoreCase = true) && it.scope == scope
-        } ?: return false
-        val filePath = entry.definition.filePath ?: return false
+        if (scope == AgentDefinitionScope.PLUGIN) return false
+        val entry = definitionsIn(scope).firstOrNull { it.name.equals(name, ignoreCase = true) } ?: return false
+        val filePath = entry.filePath ?: return false
         val provider = fileAccess
         if (!provider.isFile(filePath)) return false
-        val deleted = runCatching { provider.delete(filePath); true }.getOrDefault(false)
+        val deleted = try { provider.delete(filePath); true } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            false
+        }
         if (deleted) bumpVersion()
         return deleted
     }
 
     /** 指定作用域的定义目录（容器路径）。 */
-    fun agentsRoot(scope: AgentDefinitionScope): String =
-        if (scope == AgentDefinitionScope.GLOBAL) globalSource.agentsRoot else projectSource.agentsRoot
+    fun agentsRoot(scope: AgentDefinitionScope): String = when (scope) {
+        AgentDefinitionScope.GLOBAL -> globalSource.agentsRoot
+        AgentDefinitionScope.PROJECT -> projectSource.agentsRoot
+        AgentDefinitionScope.PLUGIN -> throw PluginDefinitionReadOnlyException()
+    }
 
     companion object {
         private const val TAG = "AgentDefinitionRepository"

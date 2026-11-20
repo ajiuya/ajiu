@@ -1,7 +1,9 @@
 package com.aicode.feature.agent.domain.skill
 
 import com.aicode.core.util.FileLogger
+import com.aicode.feature.workspace.domain.AgentConfigKind
 import com.aicode.feature.workspace.domain.FileAccessProvider
+import kotlinx.coroutines.CancellationException
 
 /**
  * 目录型技能源的共享扫描逻辑：递归查找 SKILL.md / CLAUDE.md，
@@ -22,22 +24,31 @@ object SkillDirectoryScanner {
      * 目录不存在时返回空列表；扫描过程异常（IO 失败、远程工作区未连接等）时降级为空列表并记日志，
      * 不向上抛——技能扫描失败不该让调用方（工作区切换、AI 请求）崩溃。
      */
-    fun scan(provider: FileAccessProvider, root: String): List<Skill> = runCatching {
-        val dirs = provider.listFilesRecursive(root, MAX_DEPTH)
-            .filter { relative ->
-                val name = relative.substringAfterLast('/')
-                name.equals(SKILL_FILE, ignoreCase = true) || name.equals(CLAUDE_FILE, ignoreCase = true)
-            }
-            .map { it.substringBeforeLast('/', "") }
-            .distinct()
+    fun scan(provider: FileAccessProvider, root: String, forceRefresh: Boolean = false): List<Skill> {
+        provider.agentConfigSnapshot(root, AgentConfigKind.SKILLS, forceRefresh)?.let { snapshot ->
+            return snapshot.files.map { (path, text) ->
+                val dir = path.substringBeforeLast('/')
+                SkillParser.parseText(text, dir.substringAfterLast('/').ifBlank { dir }).copy(dirPath = dir)
+            }.sortedBy { it.name.lowercase() }
+        }
+        return runCatching {
+            val dirs = provider.listFilesRecursive(root, MAX_DEPTH)
+                .filter { relative ->
+                    val name = relative.substringAfterLast('/')
+                    name.equals(SKILL_FILE, ignoreCase = true) || name.equals(CLAUDE_FILE, ignoreCase = true)
+                }
+                .map { it.substringBeforeLast('/', "") }
+                .distinct()
 
-        val base = root.trimEnd('/')
-        dirs.mapNotNull { relative ->
-            val dirPath = if (relative.isEmpty()) base else "$base/$relative"
-            SkillParser.parse(provider, dirPath)
-        }.sortedBy { it.name.lowercase() }
-    }.getOrElse { e ->
-        FileLogger.w(TAG, "扫描技能目录失败: $root", e)
-        emptyList()
+            val base = root.trimEnd('/')
+            dirs.mapNotNull { relative ->
+                val dirPath = if (relative.isEmpty()) base else "$base/$relative"
+                SkillParser.parse(provider, dirPath)
+            }.sortedBy { it.name.lowercase() }
+        }.getOrElse { e ->
+            if (e is CancellationException) throw e
+            FileLogger.w(TAG, "扫描技能目录失败: $root", e)
+            emptyList()
+        }
     }
 }

@@ -1,4 +1,4 @@
-// Shizuku UserService 接口：运行在 shell（uid 2000）进程，代 App 执行 shell 命令。
+// Shizuku UserService 接口：运行在 Root（uid 0）或 shell（uid 2000）进程。
 // 返回 Bundle：output(String) 命令输出、exitCode(int) 退出码（超时/异常为负值）。
 package com.aicode.feature.agent.domain.shizuku;
 
@@ -9,5 +9,5 @@ interface IShizukuShellService {
     // unbindUserService(remove=true) 时触发，实现里应结束进程。不可改动。
     void destroy() = 16777114;
 
-    Bundle exec(String command, int timeoutMs) = 1;
+    Bundle exec(String command, int timeoutMs, int expectedUid) = 1;
 }

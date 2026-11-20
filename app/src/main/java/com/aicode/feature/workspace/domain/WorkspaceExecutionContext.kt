@@ -27,6 +27,7 @@ class WorkspaceExecutionContext internal constructor(
     internal val fileAccess: FileAccessProvider,
     internal val localMapping: WorkspacePathMapper.ExecutionMapping?,
     internal val remoteSource: RemoteSftpFileAccess.ExecutionSource?,
+    val localFolderSnapshot: LocalFolderSnapshot = LocalFolderSnapshot.EMPTY,
     private val checkSource: () -> Unit
 ) : ThreadContextElement<CoroutineContext?>, AbstractCoroutineContextElement(Key) {
 
@@ -35,6 +36,15 @@ class WorkspaceExecutionContext internal constructor(
     }
 
     internal fun ownedBlockingContext(owner: Job): CoroutineContext = this + owner + BlockingOwner(owner)
+
+    internal fun <T> useCaptured(block: () -> T): T {
+        checkCurrent()
+        val current = current()
+        if (current != null && current !== this) throw CancellationException("Workspace execution capture changed")
+        if (current === this) return block().also { checkCurrent() }
+        val previous = updateThreadContext(this)
+        return try { block().also { checkCurrent() } } finally { restoreThreadContext(this, previous) }
+    }
 
     @OptIn(InternalCoroutinesApi::class)
     internal fun onCancellation(close: () -> Unit): DisposableHandle? =
@@ -101,7 +111,8 @@ class WorkspaceExecutionContextFactory @Inject constructor(
     private val modeHolder: ExecutionModeHolder,
     private val localFileAccess: LocalFileAccess,
     private val remoteFileAccess: RemoteSftpFileAccess,
-    private val containerSettings: ContainerSettingsRepository
+    private val containerSettings: ContainerSettingsRepository,
+    private val localFolders: LocalFolderGrantRepository
 ) {
     suspend fun freeze(projectCapture: ProjectMemoryCapture? = null): WorkspaceExecutionContext {
         projectCapture?.assertCurrent()
@@ -110,6 +121,9 @@ class WorkspaceExecutionContextFactory @Inject constructor(
             checkProject(projectCapture, current)
             return current
         }
+        localFolders.awaitReady()
+        val roots = localFolders.snapshot()
+        val profileSelectionRevision = containerSettings.activeProfileSelectionRevision
         val mode = modeHolder.currentMode()
         val profileId = if (mode == ExecutionMode.LOCAL_PROOT) containerSettings.activeProfileIdFlow.first() else null
         val local = if (mode == ExecutionMode.LOCAL_PROOT) localFileAccess.captureExecutionMapping() else null
@@ -119,8 +133,11 @@ class WorkspaceExecutionContextFactory @Inject constructor(
         if (identity != backend.cacheIdentity() || (local != null && local.profile.id != profileId)) {
             throw CancellationException("Workspace execution source is not ready")
         }
-        val execution = WorkspaceExecutionContext(mode, identity, backend, local, remote) {
+        val execution = WorkspaceExecutionContext(mode, identity, backend, local, remote, roots) {
             if (modeHolder.currentMode() != mode) throw CancellationException("Workspace execution mode changed")
+            if (containerSettings.activeProfileSelectionRevision != profileSelectionRevision) {
+                throw CancellationException("Container profile selection changed")
+            }
             if (local != null && localFileAccess.captureExecutionMapping() != local) {
                 throw CancellationException("Local workspace execution mapping changed")
             }

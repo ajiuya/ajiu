@@ -210,6 +210,7 @@ internal fun SkillEditorScreen(
 }
 
 private fun SkillSaveError.messageRes(): Int = when (this) {
+    SkillSaveError.READ_ONLY -> R.string.plugin_definitions_read_only
     SkillSaveError.INVALID_NAME -> R.string.skills_editor_error_invalid_name
     SkillSaveError.EMPTY_INSTRUCTIONS -> R.string.skills_editor_error_empty_instructions
     SkillSaveError.NAME_CONFLICT -> R.string.skills_editor_error_name_conflict

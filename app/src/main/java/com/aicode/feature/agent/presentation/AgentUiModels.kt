@@ -9,8 +9,8 @@ import com.aicode.feature.workspace.domain.FileEntry
 import kotlinx.serialization.Serializable
 
 /**
- * 侧边栏文件树的根节点：工作区根与当前容器根各一个。
- * 根节点不可重命名/删除，只能在其下新建。
+ * 侧边栏文件树的根节点：工作区根、当前容器根与已关联的设备目录。
+ * 根节点不可复制/剪切/重命名/删除，设备目录根可解除关联。
  */
 @Immutable
 sealed interface FileTreeRoot {
@@ -32,16 +32,22 @@ sealed interface FileTreeRoot {
         val osId: String?,
         val remote: Boolean
     ) : FileTreeRoot
+
+    data class LocalFolder(
+        val grantId: String,
+        override val label: String,
+        val available: Boolean
+    ) : FileTreeRoot
 }
 
 /**
  * 侧边栏文件树的一个可见节点（已按展开状态扁平化，携带 [depth] 供 UI 缩进）。
- * 从工作区根与当前容器根就地展开：只有 [FileBrowseState.Success] 里出现的节点才是当前可见的。
+ * 从工作区根、当前容器根与设备目录根就地展开：只有 [FileBrowseState.Success] 里的节点才是当前可见的。
  */
 @Immutable
 data class FileTreeNode(
     val entry: FileEntry,
-    /** 容器绝对路径（如 `~/workspace/app/src`、`/etc/apk`）；根节点为其根路径（`~/workspace`、`/`）。 */
+    /** 控制器提供的节点路径；根节点为对应根路径，UI 不根据根类型拼接路径。 */
     val path: String,
     /** 缩进层级：根为 0，其直接子项为 1，依此类推。 */
     val depth: Int,
@@ -65,6 +71,17 @@ data class BrowseClipboard(
     /** 是否剪切（粘贴成功后删除源）。 */
     val isCut: Boolean
 )
+
+@Immutable
+data class BrowseUploadTarget internal constructor(
+    val targetDir: String,
+    internal val revision: Long,
+    internal val selectionRevision: Long
+)
+
+enum class BrowseOperationNotice {
+    FAILED, DIRECTORY_CONFLICT, COPIED_SOURCE_REMAINS, UPLOAD_COMPLETED, INVALID_SELECTION
+}
 
 /** 单轮工作流的最终结果状态（供 [AgentUIState.Result] 使用）。 */
 enum class WorkflowStatus {

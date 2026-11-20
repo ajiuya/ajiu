@@ -27,6 +27,7 @@ class TerminalInputKeepaliveTest {
         viewProvider = { null },
         modifiers = TerminalKeyModifiers(),
         currentFontSizeSp = { 14 },
+        onFontSizeChange = {},
         onFontSizeCommit = {},
         onUserInput = { received += it }
     )

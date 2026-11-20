@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.LocalTextSelectionColors
@@ -273,6 +274,8 @@ internal fun AgentMessageItem(
     onToolExpandedChange: ((Boolean) -> Unit)? = null,
     reasoningExpandedOverride: Boolean? = null,
     onReasoningExpandedChange: ((Boolean) -> Unit)? = null,
+    defaultReasoningExpanded: Boolean = false,
+    reasoningScrollState: LazyListState? = null,
     /** 本轮任务总耗时（ms）：仅轮末助手消息非空，见 [computeTaskDurations]。 */
     taskDurationMs: Long? = null,
     /** 本轮任务的 token 合计（1 轮 n 步求和）：仅轮末助手消息非空，见 [computeTurnUsage]。 */
@@ -408,7 +411,9 @@ internal fun AgentMessageItem(
                 cache = markdownCache,
                 durationMs = reasoningDurationMs,
                 expandedOverride = reasoningExpandedOverride,
-                onExpandedChange = onReasoningExpandedChange
+                defaultExpanded = defaultReasoningExpanded,
+                onExpandedChange = onReasoningExpandedChange,
+                scrollState = reasoningScrollState ?: remember { newReasoningScrollState() }
             )
         }
         if (hasContent || hasAttachments || message.role != MessageRole.ASSISTANT) {

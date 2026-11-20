@@ -50,7 +50,7 @@
     <string name="project_progress_outside_workspace">This project is outside the current workspace root. Its records can be viewed, but it cannot be bound here.</string>
     <string name="project_progress_handoff">Save a manual handoff</string>
     <string name="project_progress_handoff_hint">Saves a summary and complete body for the selected project as a reference for future tasks. Does not execute commands in the body or resume historical tasks.</string>
-    <string name="project_progress_capacity">Record capacity (all environments)</string>
+    <string name="project_progress_capacity">Record capacity</string>
     <string name="project_progress_capacity_value">Active %1$d / %2$d, archived %3$d; %4$d / %5$d bytes used</string>
     <string name="project_progress_capacity_unknown">Capacity is unknown; remaining record slots and storage space could not be confirmed</string>
     <string name="project_progress_capacity_warning">Capacity is running low and saves may fail. Archiving does not reduce stored bytes or guarantee free storage space.</string>

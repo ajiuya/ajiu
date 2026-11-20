@@ -28,6 +28,8 @@ data class SkillForm(
 
 /** 保存技能失败的原因。 */
 enum class SkillSaveError {
+    READ_ONLY,
+
     /** 名称为空、过长或含不能做目录名的字符。 */
     INVALID_NAME,
 

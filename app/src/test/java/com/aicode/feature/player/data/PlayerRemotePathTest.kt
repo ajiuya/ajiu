@@ -7,6 +7,8 @@ import com.aicode.feature.agent.domain.memory.ProjectMemoryCapture
 import com.aicode.feature.agent.domain.memory.ProjectMemoryIdentity
 import com.aicode.feature.settings.data.repository.ExecutionMode
 import com.aicode.feature.workspace.data.repository.WorkspaceRepository
+import com.aicode.feature.workspace.domain.RemoteAgentConfigCache
+import com.aicode.feature.workspace.domain.RemoteAgentConfigProfile
 import com.aicode.feature.workspace.domain.RemoteSftpFileAccess
 import com.aicode.feature.workspace.domain.WorkspaceExecutionContext
 import com.aicode.feature.workspace.domain.remote.RemoteAuth
@@ -65,7 +67,10 @@ class PlayerRemotePathTest {
         every { channel.statExistence(any()) } returns attributes
         every { attributes.type } returns FileMode.Type.REGULAR
         every { channel.open(any<String>()) } returns file
-        access = RemoteSftpFileAccess(connection, workspace)
+        access = RemoteSftpFileAccess(connection, workspace, mockk<RemoteAgentConfigCache>(relaxed = true) {
+            every { captureProfile() } returns RemoteAgentConfigProfile("fixture", 0)
+            every { invalidation(any()) } returns {}
+        })
     }
 
     @Test fun staticSymlinkOutsidePlaybackRootIsRejectedBeforeOpeningFileHandle() {

@@ -28,6 +28,9 @@ import androidx.compose.material3.VerticalDivider
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.graphics.drawscope.clipPath
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
@@ -51,6 +54,10 @@ import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.unit.dp
 import androidx.core.view.WindowCompat
 import androidx.hilt.navigation.compose.hiltViewModel
+import com.aicode.feature.plugin.presentation.PluginApprovalHost
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.navigation.NavType
@@ -60,6 +67,7 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.aicode.core.theme.AIEditorTheme
+import com.aicode.core.theme.Spacing
 import com.aicode.core.theme.AppThemePreset
 import com.aicode.core.ui.AppMotion
 import com.aicode.core.ui.BetaWatermark
@@ -78,8 +86,11 @@ import com.aicode.core.ui.rememberViewerDecodeSpec
 import com.aicode.core.util.ApkInstaller
 import com.aicode.feature.agent.presentation.AIAgentViewModel
 import com.aicode.feature.agent.presentation.AgentAttachment
+import com.aicode.feature.agent.presentation.BrowseOperationNotice
+import com.aicode.feature.agent.presentation.BrowseUploadTarget
 import com.aicode.feature.agent.presentation.component.AIChatPanel
 import com.aicode.feature.agent.presentation.component.ChatDrawerContent
+import com.aicode.feature.agent.presentation.component.LocalChatAnimationsEnabled
 import com.aicode.feature.agent.presentation.component.chatImageLoader
 import com.aicode.feature.agent.presentation.component.openSentAttachment
 import com.aicode.feature.agreement.presentation.AgreementGate
@@ -168,6 +179,12 @@ class MainActivity : ComponentActivity() {
 
     @Inject
     lateinit var browserManager: com.aicode.feature.agent.domain.tool.browser.BrowserManager
+
+    @Inject
+    lateinit var pluginPageOverlays: com.aicode.feature.plugin.presentation.PluginPageOverlayState
+
+    @Inject
+    lateinit var pluginSlotHost: com.aicode.feature.plugin.presentation.PluginSlotHost
 
     override fun attachBaseContext(newBase: android.content.Context) {
         // 在 Activity 创建前同步应用用户选择的语言，确保冷启动也生效。
@@ -267,14 +284,17 @@ class MainActivity : ComponentActivity() {
                 ) {
                     // 全局自定义背景图：叠加在所有页面内容之上（水印效果），透明度可调。
                     // 不拦截触摸事件；弹窗（Dialog 独立窗口）不受层级影响。
+                    val pluginOverlayRects by pluginPageOverlays.rects.collectAsStateWithLifecycle()
                     val bgPath by backgroundSettings.imagePathFlow.collectAsStateWithLifecycle(initialValue = null)
                     val bgAlpha by backgroundSettings.alphaFlow.collectAsStateWithLifecycle(initialValue = BackgroundSettingsRepository.DEFAULT_ALPHA)
                     Box(modifier = Modifier.fillMaxSize()) {
                         AgreementGate(repository = agreementRepository) { agreementAccepted ->
-                            AppNavigation(
-                                onboardingRepository = onboardingRepository,
-                                agreementAccepted = agreementAccepted
-                            )
+                            CompositionLocalProvider(com.aicode.feature.plugin.presentation.LocalPluginSlotHost provides pluginSlotHost) {
+                                AppNavigation(
+                                    onboardingRepository = onboardingRepository,
+                                    agreementAccepted = agreementAccepted
+                                )
+                            }
                             if (agreementAccepted) {
                                 // 全局凭据弹窗：覆盖所有页面，命令行 git 缺凭据在任意页面都能弹。
                                 com.aicode.feature.credentials.presentation.component.GlobalCredentialDialogHost(
@@ -301,6 +321,15 @@ class MainActivity : ComponentActivity() {
                                     modifier = Modifier
                                         .fillMaxSize()
                                         .alpha(bgAlpha)
+                                        .drawWithContent {
+                                            val density = this.density
+                                            val clip = androidx.compose.ui.graphics.Path().apply {
+                                                fillType = androidx.compose.ui.graphics.PathFillType.EvenOdd
+                                                addRect(androidx.compose.ui.geometry.Rect(0f, 0f, size.width, size.height))
+                                                pluginOverlayRects.forEach { rect -> addRect(androidx.compose.ui.geometry.Rect(rect.left * density, rect.top * density, rect.right * density, rect.bottom * density)) }
+                                            }
+                                            clipPath(clip) { this@drawWithContent.drawContent() }
+                                        }
                                 )
                             }
                         }
@@ -379,6 +408,27 @@ fun AppNavigation(
     val agentViewModel: AIAgentViewModel = hiltViewModel()
     val settingsViewModel: SettingsViewModel = hiltViewModel()
     val workspaceViewModel: WorkspaceViewModel = hiltViewModel()
+    PluginApprovalHost()
+    val pluginConversation: com.aicode.feature.plugin.presentation.PluginConversationViewModel = hiltViewModel()
+    val externalGroups by pluginConversation.groups.collectAsStateWithLifecycle()
+    val externalConversation by pluginConversation.state.collectAsStateWithLifecycle()
+    DisposableEffect(pluginConversation) {
+        val receiver = pluginConversation.requests.attach()
+        onDispose { receiver.close() }
+    }
+    LaunchedEffect(pluginConversation, agentViewModel) {
+        pluginConversation.requests.requests.collect { request ->
+            try {
+                request.checkCurrent()
+                val applied = agentViewModel.applyPluginChatUiRequest(request)
+                if (applied) {
+                    pluginConversation.close()
+                    if (navController.currentDestination?.route != "chat") navController.navigate("chat")
+                }
+                request.complete(applied)
+            } catch (_: Exception) { request.complete(false) }
+        }
+    }
 
     // ── 首次启动引导 ──
     val onboardingStateHolder = remember { OnboardingStateHolder() }
@@ -427,6 +477,7 @@ fun AppNavigation(
     val expandedPaths by agentViewModel.expandedPaths.collectAsStateWithLifecycle()
     val expandingPath by agentViewModel.expandingPath.collectAsStateWithLifecycle()
     val fileOpPaths by agentViewModel.fileOpPaths.collectAsStateWithLifecycle()
+    val browseTransferActive by agentViewModel.browseTransferActive.collectAsStateWithLifecycle()
     val browseClipboard by agentViewModel.browseClipboard.collectAsStateWithLifecycle()
     val pasteConflict by agentViewModel.pasteConflict.collectAsStateWithLifecycle()
     val chatSearchQuery by agentViewModel.chatSearchQuery.collectAsStateWithLifecycle()
@@ -435,6 +486,60 @@ fun AppNavigation(
     // ── 导出会话：SAF 保存文件 ──
     var pendingExportSessionId by remember { mutableStateOf<String?>(null) }
     val context = androidx.compose.ui.platform.LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, agentViewModel) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) agentViewModel.refreshLocalBrowseFolders()
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    LaunchedEffect(agentViewModel, context) {
+        agentViewModel.browseNotices.collect { notice ->
+            val message = when (notice) {
+                BrowseOperationNotice.FAILED -> R.string.file_browser_operation_failed
+                BrowseOperationNotice.DIRECTORY_CONFLICT -> R.string.file_browser_directory_conflict
+                BrowseOperationNotice.COPIED_SOURCE_REMAINS -> R.string.file_browser_copied_source_remains
+                BrowseOperationNotice.UPLOAD_COMPLETED -> R.string.file_browser_upload_completed
+                BrowseOperationNotice.INVALID_SELECTION -> R.string.file_browser_invalid_selection
+            }
+            Toast.makeText(
+                context,
+                context.getString(message),
+                if (notice == BrowseOperationNotice.UPLOAD_COMPLETED) Toast.LENGTH_SHORT else Toast.LENGTH_LONG
+            ).show()
+        }
+    }
+    var pendingUpload by remember { mutableStateOf<BrowseUploadTarget?>(null) }
+    val browseUploadFilesLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris ->
+        val target = pendingUpload
+        pendingUpload = null
+        if (uris.isNotEmpty()) {
+            if (target != null) agentViewModel.uploadBrowseFiles(target, uris)
+            else toastFileOpFailed(context, R.string.file_browser_invalid_selection)
+        }
+    }
+    val browseUploadDirectoryLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        val target = pendingUpload
+        pendingUpload = null
+        if (uri != null) {
+            if (target != null) agentViewModel.uploadBrowseDirectory(target, uri)
+            else toastFileOpFailed(context, R.string.file_browser_invalid_selection)
+        }
+    }
+    val addLocalBrowseFolderLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        if (uri != null) {
+            agentViewModel.addLocalBrowseFolder(uri) { success ->
+                if (!success) toastFileOpFailed(context, R.string.file_browser_add_local_folder_failed)
+            }
+        }
+    }
     val sessionExportLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("application/octet-stream")
     ) { uri ->
@@ -470,6 +575,8 @@ fun AppNavigation(
 
     // 右栏工作台：大屏下编辑器 / 终端 / Git 与聊天并排，窄窗仍走全屏路由。
     var paneKind by rememberSaveable { mutableStateOf(WorkbenchPaneKind.NONE) }
+    var pluginToolKey by rememberSaveable { mutableStateOf<String?>(null) }
+    var projectToolsOpen by rememberSaveable { mutableStateOf(false) }
     var paneEditorPath by rememberSaveable { mutableStateOf("") }
     var paneEditorLine by rememberSaveable { mutableIntStateOf(0) }
     var paneSplit by rememberSaveable { mutableFloatStateOf(DEFAULT_PANE_SPLIT) }
@@ -563,7 +670,8 @@ fun AppNavigation(
     }
 
     // 侧栏内容：modal 抽屉与大屏常驻栏共用同一份，不在两处重复几十行参数。
-    val drawerBody: @Composable () -> Unit = {
+    val drawerBody: @Composable (Boolean) -> Unit = { animationsVisible ->
+        CompositionLocalProvider(LocalChatAnimationsEnabled provides animationsVisible) {
         ChatDrawerContent(
             sessions = sessions,
             currentSessionId = currentSessionId,
@@ -575,6 +683,7 @@ fun AppNavigation(
             expandedPaths = expandedPaths,
             expandingPath = expandingPath,
             fileOpPaths = fileOpPaths,
+            transferActive = browseTransferActive,
             clipboard = browseClipboard,
             pasteConflict = pasteConflict,
             onToggleExpand = { agentViewModel.toggleExpand(it) },
@@ -612,7 +721,27 @@ fun AppNavigation(
             onClearClipboard = { agentViewModel.clearBrowseClipboard() },
             onPasteOverwrite = { agentViewModel.pasteBrowseEntryOverwrite() },
             onCancelPasteOverwrite = { agentViewModel.clearPasteConflict() },
+            onAddLocalFolder = { addLocalBrowseFolderLauncher.launch(null) },
+            onRemoveLocalFolder = { agentViewModel.removeLocalBrowseFolder(it) },
+            onUploadFiles = { targetDir ->
+                val target = agentViewModel.prepareBrowseUpload(targetDir)
+                pendingUpload = target
+                if (target != null) browseUploadFilesLauncher.launch(arrayOf("*/*"))
+            },
+            onUploadDirectory = { targetDir ->
+                val target = agentViewModel.prepareBrowseUpload(targetDir)
+                pendingUpload = target
+                if (target != null) browseUploadDirectoryLauncher.launch(null)
+            },
+            onCancelTransfer = { agentViewModel.cancelBrowseTransfer() },
+            externalSessions = {
+                com.aicode.feature.plugin.presentation.PluginSessionGroups(externalGroups, { session ->
+                    pluginConversation.select(session)
+                    if (!permanentDrawer) scope.launch { drawerState.close() }
+                }, pluginConversation::refresh)
+            },
             onSelect = {
+                pluginConversation.close()
                 agentViewModel.selectSession(it.id)
                 if (!permanentDrawer) scope.launch { drawerState.close() }
             },
@@ -646,6 +775,7 @@ fun AppNavigation(
                 if (!permanentDrawer) scope.launch { drawerState.close() }
             }
         )
+        }
     }
 
     // 页面主体（NavHost）：大屏放进 Row 的右侧，窄窗放进 modal 抽屉容器里。
@@ -688,7 +818,9 @@ fun AppNavigation(
                             CompositionLocalProvider(
                                 androidx.compose.ui.platform.LocalUriHandler provides fileUriHandler
                             ) {
-                                AIChatPanel(
+                                if (externalConversation.selected != null) {
+                                    com.aicode.feature.plugin.presentation.PluginConversationPanel(pluginConversation)
+                                } else AIChatPanel(
                                     viewModel = agentViewModel,
                                     settingsViewModel = settingsViewModel,
                                     workspaceViewModel = workspaceViewModel,
@@ -698,6 +830,7 @@ fun AppNavigation(
                                     onNavigateToGit = { openWorkbench(WorkbenchPaneKind.GIT) },
                                     onNavigateToBrowser = { openWorkbench(WorkbenchPaneKind.BROWSER) },
                                     onOpenMcp = { navController.navigate("mcp") },
+                                    onOpenProjectTools = { projectToolsOpen = true },
                                     terminalActive = paneOpen && paneKind == WorkbenchPaneKind.TERMINAL,
                                     gitActive = paneOpen && paneKind == WorkbenchPaneKind.GIT,
                                     browserActive = paneOpen && paneKind == WorkbenchPaneKind.BROWSER,
@@ -726,8 +859,33 @@ fun AppNavigation(
                                 // rc5 的平板右栏脏状态确认：主分支把调用重构进了 if (paneOpen)，
                                 // 故把该参数落在这里，而不是保留旧位置那份重复调用
                                 editorLeaveGuard = editorLeaveGuard,
-                                modifier = Modifier.weight(1f - paneSplit)
+                                modifier = Modifier.weight(1f - paneSplit),
+                                pluginToolKey = pluginToolKey
                             )
+                        }
+                    }
+                    if (projectToolsOpen) {
+                        androidx.compose.foundation.layout.BoxWithConstraints(Modifier.fillMaxSize()) {
+                            var toolsWidth by remember { mutableStateOf(0.8f) }
+                            androidx.compose.material3.Surface(
+                                modifier = Modifier.align(androidx.compose.ui.Alignment.CenterEnd).fillMaxHeight().width(maxWidth * toolsWidth),
+                                tonalElevation = Spacing.xs,
+                                shadowElevation = Spacing.md
+                            ) {
+                                com.aicode.feature.plugin.presentation.PluginProjectTools(onOpen = { key ->
+                                    pluginToolKey = key
+                                    projectToolsOpen = false
+                                    if (expanded) editorLeaveGuard.requestLeave { paneKind = WorkbenchPaneKind.PLUGIN }
+                                }, onClose = { projectToolsOpen = false })
+                            }
+                            Box(Modifier.align(androidx.compose.ui.Alignment.CenterEnd).fillMaxHeight().width(maxWidth * toolsWidth)) {
+                                VerticalSplitHandle(anchorX = 0, onDragDelta = { dx -> toolsWidth = (toolsWidth - dx / rowWidthPx.coerceAtLeast(1)).coerceIn(0.35f, 0.95f) })
+                            }
+                        }
+                    }
+                    if (!expanded && pluginToolKey != null && !projectToolsOpen) {
+                        androidx.compose.material3.Surface(Modifier.fillMaxSize()) {
+                            com.aicode.feature.plugin.presentation.PluginWorkspacePage(pluginToolKey!!) { pluginToolKey = null }
                         }
                     }
                     if (paneOpen && leftPaneWidthPx > 0) {
@@ -804,7 +962,7 @@ fun AppNavigation(
             composable("browser") {
                 val browserViewModel: com.aicode.feature.browser.presentation.BrowserViewModel = hiltViewModel()
                 BrowserScreen(
-                    browserManager = browserViewModel.browserManager,
+                    viewModel = browserViewModel,
                     onNavigateBack = { navController.popBackStack() }
                 )
             }
@@ -891,7 +1049,7 @@ fun AppNavigation(
                             .fillMaxHeight()
                     ) {
                         sidebarStateHolder.SaveableStateProvider("chat-sidebar") {
-                            drawerBody()
+                            drawerBody(true)
                         }
                     }
                 }
@@ -913,7 +1071,10 @@ fun AppNavigation(
                     drawerTonalElevation = 0.dp,
                     modifier = Modifier.width(drawerWidth())
                 ) {
-                    drawerBody()
+                    drawerBody(
+                        drawerState.currentValue == DrawerValue.Open ||
+                            drawerState.targetValue == DrawerValue.Open
+                    )
                 }
             }
         ) {

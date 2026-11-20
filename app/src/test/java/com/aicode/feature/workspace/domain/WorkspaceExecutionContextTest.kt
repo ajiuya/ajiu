@@ -90,8 +90,12 @@ class WorkspaceExecutionContextTest {
         mapper = WorkspacePathMapper(workspace, installer, mapperSettings, home)
         runBlocking { withTimeout(5_000) { mapperInitialized.await().join() } }
         val local = LocalFileAccess(mapper)
-        access = DelegatingFileAccess(holder, local, remote)
-        factory = WorkspaceExecutionContextFactory(access, holder, local, remote, settings)
+        val localFolders = mockk<LocalFolderGrantRepository>(relaxed = true) {
+            every { snapshot() } returns LocalFolderSnapshot.EMPTY
+        }
+        every { settings.activeProfileSelectionRevision } returns 0L
+        access = DelegatingFileAccess(holder, local, remote, localFolders)
+        factory = WorkspaceExecutionContextFactory(access, holder, local, remote, settings, localFolders)
     }
 
     @Test

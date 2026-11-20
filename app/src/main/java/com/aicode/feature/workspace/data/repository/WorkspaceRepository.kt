@@ -30,10 +30,16 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.encodeToString
 import java.io.File
+import java.io.IOException
+import java.nio.file.Files
+import java.nio.file.LinkOption.NOFOLLOW_LINKS
+import java.nio.file.NoSuchFileException
+import java.nio.file.attribute.BasicFileAttributes
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -144,6 +150,18 @@ class WorkspaceRepository @Inject constructor(
     private val _current = MutableStateFlow<Workspace?>(null)
     val current: StateFlow<Workspace?> = _current.asStateFlow()
 
+    internal class Selection(val workspace: Workspace?)
+    private val _selection = MutableStateFlow(Selection(null))
+    internal val selection: StateFlow<Selection> = _selection.asStateFlow()
+
+    @Synchronized
+    private fun publishCurrent(workspace: Workspace?) {
+        if (_current.value == workspace) return
+        // A → B → A must not restore authority to an operation captured on the first A.
+        _selection.value = Selection(workspace)
+        _current.value = workspace
+    }
+
     /** 远程工作区初始化失败（根路径/默认工作区创建失败）的提示文案；UI 消费后置 null。 */
     private val _initError = MutableStateFlow<String?>(null)
     val initError: StateFlow<String?> = _initError.asStateFlow()
@@ -162,7 +180,7 @@ class WorkspaceRepository @Inject constructor(
         }
         // 清掉上一个模式遗留的当前工作区：它不属于本模式的列表，留着会让下面的可达性校验
         // 误判为“当前工作区失效”而回退，并把本模式已保存的选择覆盖掉。
-        _current.value = null
+        publishCurrent(null)
         refreshWorkspaces()
 
         // 没有可用工作区时创建默认工作区（本地/远程一致），保证 AI 始终有可用目录；
@@ -188,7 +206,7 @@ class WorkspaceRepository @Inject constructor(
             } ?: context.getString(R.string.workspace_unavailable_current, saved.name)
             FileLogger.w(TAG, "上次工作区不可用，回退: ${saved.name} -> ${target?.name}")
         }
-        _current.value = target
+        publishCurrent(target)
         val location = if (isLocal()) projectsRoot.absolutePath else remoteSshConnection.config?.remoteWorkspacePath ?: ""
         FileLogger.i(TAG, "工作区初始化完成，当前: ${target?.name}，根目录: $location")
         // 远程模式：选中工作区后更新符号链接，让 Bash 的 ~/workspace 指向当前工作区
@@ -258,7 +276,7 @@ class WorkspaceRepository @Inject constructor(
         if (fallback == null && isLocal()) {
             fallback = createLocalFallbackWorkspace()
         }
-        _current.value = fallback
+        publishCurrent(fallback)
         context.workspaceDataStore.edit { prefs ->
             val key = currentNameKeyForMode()
             if (fallback != null) prefs[key] = fallback.name else prefs.remove(key)
@@ -342,7 +360,7 @@ class WorkspaceRepository @Inject constructor(
     /** 切换当前工作区并持久化。 */
     suspend fun selectWorkspace(name: String) = withContext(Dispatchers.IO) {
         val target = _workspaces.value.firstOrNull { it.name == name && it.available } ?: return@withContext
-        _current.value = target
+        publishCurrent(target)
         context.workspaceDataStore.edit { it[currentNameKeyForMode()] = name }
         FileLogger.i(TAG, "切换工作区: $name")
         // 远程模式：切换后更新符号链接指向新工作区
@@ -498,6 +516,79 @@ class WorkspaceRepository @Inject constructor(
         }
         refreshWorkspaces()
         FileLogger.i(TAG, "删除工作区: $name")
+    }
+
+    internal class BackupLocalWorkspace(val workspace: Workspace, val checkCurrent: () -> Unit)
+
+    internal suspend fun captureBackupLocalWorkspaces(): List<BackupLocalWorkspace> = withContext(Dispatchers.IO) {
+        val appRoot = context.filesDir.canonicalFile
+        val root = File(appRoot, "projects")
+        fun attributes(file: File): BasicFileAttributes? = try {
+            Files.readAttributes(file.toPath(), BasicFileAttributes::class.java, NOFOLLOW_LINKS)
+        } catch (_: NoSuchFileException) { null }
+        fun directoryIdentity(file: File): Any? {
+            var path = file.toPath().toAbsolutePath().normalize()
+            while (true) {
+                val attrs = attributes(path.toFile())
+                if (attrs != null && !attrs.isDirectory) throw IOException("Unsafe backup workspace parent")
+                path = path.parent ?: break
+            }
+            val attrs = attributes(file) ?: return null
+            if (!attrs.isDirectory || !Files.isReadable(file.toPath())) throw IOException("Backup workspace is unavailable")
+            return attrs.fileKey() ?: throw IOException("Backup workspace identity is unavailable")
+        }
+        suspend fun records(): List<ExternalWorkspaceRecord> {
+            val raw = context.workspaceDataStore.data.first()[externalWorkspacesKey] ?: return emptyList()
+            return json.decodeFromString<List<ExternalWorkspaceRecord>>(raw)
+        }
+        fun checkGrant(record: ExternalWorkspaceRecord) {
+            val uri = Uri.parse(record.uri)
+            if (UriPathResolver.toFilePath(context, uri) != record.path ||
+                context.contentResolver.persistedUriPermissions.none {
+                    it.uri == uri && it.isReadPermission && it.isWritePermission
+                }
+            ) throw IOException("Backup workspace authorization is unavailable")
+        }
+        val result = arrayListOf<BackupLocalWorkspace>()
+        val rootIdentity = directoryIdentity(root)
+        if (rootIdentity != null) {
+            Files.newDirectoryStream(root.toPath()).use { children ->
+                for (entry in children) {
+                    if (result.size >= 20_000) throw IOException("Too many backup workspaces")
+                    val attrs = attributes(entry.toFile()) ?: throw IOException("Backup workspace disappeared")
+                    if (attrs.isSymbolicLink) throw IOException("Linked backup workspace is not supported")
+                    if (!attrs.isDirectory) continue
+                    val directory = entry.toFile()
+                    val identity = directoryIdentity(directory) ?: throw IOException("Backup workspace disappeared")
+                    val workspace = Workspace(directory.name, directory.absolutePath)
+                    result += BackupLocalWorkspace(workspace) {
+                        if (directoryIdentity(root) != rootIdentity || directoryIdentity(directory) != identity) {
+                            throw IOException("Backup workspace source changed")
+                        }
+                    }
+                }
+            }
+            if (directoryIdentity(root) != rootIdentity) throw IOException("Backup workspace registry changed")
+        }
+        val captured = records()
+        for (record in captured) {
+            val directory = File(record.path)
+            val identity = try {
+                checkGrant(record)
+                directoryIdentity(directory)
+            } catch (_: IOException) { null } catch (_: SecurityException) { null } catch (_: IllegalArgumentException) { null }
+            val workspace = Workspace(record.name, record.path, WorkspaceType.EXTERNAL_LOCAL, available = identity != null)
+            result += BackupLocalWorkspace(workspace) {
+                if (identity == null) throw IOException("Backup workspace is unavailable")
+                val current = runBlocking(Dispatchers.IO) { records() }
+                if (record !in current || current.count { it.name == record.name } != 1 ||
+                    directoryIdentity(directory) != identity
+                ) throw IOException("Backup workspace registration changed")
+                checkGrant(record)
+            }
+        }
+        if (result.map { it.workspace.name }.toSet().size != result.size) throw IOException("Ambiguous backup workspace name")
+        result.sortedBy { it.workspace.name }
     }
 
     /** 外部本地工作区持久化记录。 */

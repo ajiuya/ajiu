@@ -786,6 +786,7 @@ private data class ChatTypewriterPlayback(
     val entry: ChatTypewriterEntry,
     val body: State<TypewriterText>,
     val reasoning: State<TypewriterText>,
+    val reasoningScrollState: LazyListState,
 ) {
     val settled: State<Boolean> = derivedStateOf(structuralEqualityPolicy()) {
         body.value.let { it.settled && it.source == entry.text } &&
@@ -881,6 +882,7 @@ fun AIChatPanel(
     onNavigateToGit: () -> Unit = {},
     onNavigateToBrowser: () -> Unit = {},
     onOpenMcp: () -> Unit = {},
+    onOpenProjectTools: () -> Unit = {},
     settingsViewModel: SettingsViewModel? = null,
     workspaceViewModel: WorkspaceViewModel? = null,
     onOpenDrawer: () -> Unit,
@@ -933,6 +935,7 @@ fun AIChatPanel(
     val recoveryItems = recoverySnapshot.takeIf { it.first == currentSessionId }?.second.orEmpty()
     val typewriterCharsPerSecond = settingsViewModel?.typewriterCharsPerSecond?.collectAsStateWithLifecycle()?.value
         ?: DEFAULT_TYPEWRITER_CHARS_PER_SECOND
+    val autoExpandReasoning = settingsViewModel?.autoExpandReasoning?.collectAsStateWithLifecycle()?.value ?: false
     val chatTextScale = settingsViewModel?.chatTextScale?.collectAsStateWithLifecycle()?.value
         ?: ThemeSettingsRepository.DEFAULT_CHAT_TEXT_SCALE
     val chatBackgroundImagePath = settingsViewModel?.chatBackgroundImagePath?.collectAsStateWithLifecycle()?.value
@@ -1379,6 +1382,9 @@ fun AIChatPanel(
                     revealImmediately = entry.key in revealedTypewriterKeys || cancelPlayback,
                     workActive = uiWorkActive,
                 ),
+                reasoningScrollState = rememberPlaybackReasoningScrollState(
+                    viewModel.reasoningScrollStates, currentSessionId, entry.key, entry.messageId
+                ),
             )
         }
     }
@@ -1653,18 +1659,25 @@ fun AIChatPanel(
     val connectionState = settingsViewModel?.connectionState?.collectAsStateWithLifecycle()?.value
     val isRemote = executionMode == com.aicode.feature.settings.data.repository.ExecutionMode.REMOTE_SSH
 
-    val markdownImageTransformer = remember(viewModel.fileAccess, projectRoot, executionMode, connectionState) {
+    val localFolderRevision by viewModel.localFolderRevision.collectAsStateWithLifecycle()
+    val fileSelectionRevision by viewModel.fileProfileSelectionRevisions.collectAsStateWithLifecycle()
+    val markdownImageTransformer = remember(viewModel.fileAccess, projectRoot, executionMode, connectionState,
+        localFolderRevision, fileSelectionRevision) {
         MarkdownImageTransformer(viewModel.fileAccess)
     }
     val imageViewerState = rememberImageViewerState()
     val filePreviewState = rememberFilePreviewState(currentSessionId)
-    LaunchedEffect(filePreviewState, projectRoot, executionMode, connectionState) { filePreviewState.close() }
+    LaunchedEffect(filePreviewState, projectRoot, executionMode, connectionState, localFolderRevision, fileSelectionRevision) {
+        filePreviewState.close()
+        imageViewerState.dismiss()
+    }
     val defaultUriHandler = LocalUriHandler.current
     val previewUriHandler = remember(defaultUriHandler, filePreviewState) {
         PreviewUriHandler(defaultUriHandler) { path -> filePreviewState.open(PreviewRequest(path)) }
     }
     val viewerDecodeSpec = rememberViewerDecodeSpec()
-    val chatImageLoad = remember(viewModel.fileAccess, viewerDecodeSpec, projectRoot, executionMode, connectionState) {
+    val chatImageLoad = remember(viewModel.fileAccess, viewerDecodeSpec, projectRoot, executionMode, connectionState,
+        localFolderRevision, fileSelectionRevision) {
         chatImageLoader(viewModel.fileAccess, viewerDecodeSpec.maxEdge, viewerDecodeSpec.maxPixels)
     }
 
@@ -1738,9 +1751,12 @@ fun AIChatPanel(
                 ReasoningBubble(
                     text = playbackByMessageId[item.message.id]?.reasoning?.value?.text ?: item.message.reasoning.orEmpty(),
                     cache = markdownCache,
+                    scrollState = playbackByMessageId[item.message.id]?.reasoningScrollState
+                        ?: rememberReasoningScrollState(viewModel.reasoningScrollStates, currentSessionId, item.message.id),
                     preRendered = item.message.id in playbackByMessageId,
                     durationMs = reasoningDurations[item.message.id],
                     expandedOverride = reasoningOverrideSnapshot[item.message.id],
+                    defaultExpanded = autoExpandReasoning,
                     onExpandedChange = {
                         viewModel.setReasoningExpanded(item.message.id, it)
                         onToolItemToggled()
@@ -1755,9 +1771,11 @@ fun AIChatPanel(
                     ReasoningBubble(
                         text = playback.reasoning.value.text,
                         cache = markdownCache,
+                        scrollState = playback.reasoningScrollState,
                         preRendered = true,
                         durationMs = reasoningDurations[message.id],
                         expandedOverride = reasoningOverrideSnapshot[message.id],
+                        defaultExpanded = autoExpandReasoning,
                         onExpandedChange = {
                             viewModel.setReasoningExpanded(message.id, it)
                             onToolItemToggled()
@@ -1774,6 +1792,10 @@ fun AIChatPanel(
                     isChunkHeader = item.isChunkHeader,
                     isChunkFooter = item.isChunkFooter,
                     reasoningVisible = item.reasoningVisible && playback == null,
+                    reasoningScrollState = if (item.isChunkHeader && item.reasoningVisible && message.reasoning.orEmpty().hasVisibleContent()) {
+                        playbackByMessageId[message.id]?.reasoningScrollState
+                            ?: rememberReasoningScrollState(viewModel.reasoningScrollStates, currentSessionId, message.id)
+                    } else null,
                     onRewindClick = { viewModel.openRewindMenu(it) },
                     onMoreClick = { messageForMenu = it },
                     onCompactContext = currentSessionId?.let { sid -> { viewModel.compactSession(sid, currentFile, selectedCode) } },
@@ -1786,6 +1808,7 @@ fun AIChatPanel(
                     onToolToggle = onToolItemToggled,
                     onToolPreview = { toolPreviewState.openDetails(message.id) },
                     reasoningExpandedOverride = reasoningOverrideSnapshot[message.id],
+                    defaultReasoningExpanded = autoExpandReasoning,
                     onReasoningExpandedChange = {
                         viewModel.setReasoningExpanded(message.id, it)
                         onToolItemToggled()
@@ -1852,7 +1875,9 @@ fun AIChatPanel(
                 chosenSpeedTier = speedTier,
                 onSpeedTierChange = viewModel::setSpeedTier,
                 providerConfig = activeProvider,
-                onOpenMcp = onOpenMcp
+                onOpenMcp = onOpenMcp,
+                onOpenProjectTools = onOpenProjectTools,
+                sessionId = currentSessionId
             )
         }
     ) { padding ->
@@ -1872,6 +1897,7 @@ fun AIChatPanel(
         ) {
             // 内容层：消息列表延伸到屏幕底部，输入框悬浮其上，滚动时卡片可滑入输入框后面
             Column(modifier = Modifier.fillMaxSize()) {
+            com.aicode.feature.plugin.presentation.PluginTipBanners()
             Box(modifier = Modifier.weight(1f)) {
                 if (!displayReady) {
                     // 远程模式连接未就绪时显示连接状态占位，避免空白或旧工作区记录闪烁
@@ -1888,10 +1914,16 @@ fun AIChatPanel(
                         }
                     }
                 } else if (messages.isEmpty()) {
-                    WelcomeState(
-                        bottomReserve = with(LocalDensity.current) { inputBarReservePx.toDp() },
-                        modifier = Modifier.fillMaxSize()
-                    )
+                    Column(Modifier.fillMaxSize()) {
+                        com.aicode.feature.plugin.presentation.PluginSlotContent(
+                            com.aicode.feature.plugin.domain.PluginUiSlots.CHAT_WELCOME,
+                            kotlinx.serialization.json.buildJsonObject { currentSessionId?.let { put("sessionId", kotlinx.serialization.json.JsonPrimitive(it)) } }
+                        )
+                        WelcomeState(
+                            bottomReserve = with(LocalDensity.current) { inputBarReservePx.toDp() },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
                 } else {
                     LazyColumn(
                         state = listState,
@@ -1960,6 +1992,7 @@ fun AIChatPanel(
                                             ReasoningBubble(
                                                 text = playback.reasoning.value.text,
                                                 cache = markdownCache,
+                                                scrollState = playback.reasoningScrollState,
                                                 showTimer = reasoningLive,
                                                 durationMs = playback.entry.messageId?.let { reasoningDurations[it] }
                                                     ?: reasoningTiming?.let { (start, end) -> end?.minus(start) },
@@ -1968,6 +2001,7 @@ fun AIChatPanel(
                                                 sessionKey = currentSessionId,
                                                 live = reasoningLive,
                                                 expandedOverride = expansionKey?.let { reasoningOverrideSnapshot[it] },
+                                                defaultExpanded = autoExpandReasoning,
                                                 onExpandedChange = { expanded ->
                                                     expansionKey?.let { viewModel.setReasoningExpanded(it, expanded) }
                                                     onToolItemToggled()

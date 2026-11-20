@@ -12,8 +12,10 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.util.concurrent.TimeUnit
 
-internal class RootMemoryDataStore : DataStore<Preferences> {
-    override val data = MutableStateFlow<Preferences>(emptyPreferences())
+internal class RootMemoryDataStore(
+    initial: Preferences = emptyPreferences()
+) : DataStore<Preferences> {
+    override val data = MutableStateFlow(initial)
     private val mutex = Mutex()
     var failWrites = false
 

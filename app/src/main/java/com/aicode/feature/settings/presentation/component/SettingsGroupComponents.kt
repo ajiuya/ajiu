@@ -42,6 +42,7 @@ import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.aicode.R
@@ -143,6 +144,7 @@ internal fun LazyGroupItem(
     index: Int,
     lastIndex: Int,
     modifier: Modifier = Modifier,
+    dividerStartInset: Dp = Spacing.lg,
     content: @Composable () -> Unit
 ) {
     val shape = RoundedCornerShape(
@@ -158,7 +160,7 @@ internal fun LazyGroupItem(
             .background(MaterialTheme.semanticColors.cardSurface)
     ) {
         content()
-        if (index != lastIndex) SettingsDivider()
+        if (index != lastIndex) SettingsDivider(startInset = dividerStartInset)
     }
 }
 
@@ -238,9 +240,9 @@ internal fun SettingsRow(
 
 /** 分组内行间分隔线：左右两端均缩进对齐行内容，末行不显示。 */
 @Composable
-internal fun SettingsDivider() {
+internal fun SettingsDivider(startInset: Dp = Spacing.lg) {
     HorizontalDivider(
-        modifier = Modifier.padding(horizontal = Spacing.lg),
+        modifier = Modifier.padding(start = startInset, end = Spacing.lg),
         thickness = 0.5.dp,
         color = MaterialTheme.semanticColors.subtleBorder
     )

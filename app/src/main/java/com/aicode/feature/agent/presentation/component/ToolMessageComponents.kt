@@ -3,9 +3,7 @@ package com.aicode.feature.agent.presentation.component
 import androidx.annotation.StringRes
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -494,17 +492,13 @@ internal fun ToolStatusIcon(running: Boolean, isError: Boolean, toolName: String
         ToolExecutionState.FAILED -> MaterialTheme.colorScheme.error
         ToolExecutionState.SUCCEEDED -> MaterialTheme.semanticColors.success
     }
-    val pulseAlpha = if (running) {
-        val transition = rememberInfiniteTransition(label = "tool-status-pulse")
-        transition.animateFloat(
-            initialValue = 1f,
-            targetValue = 0.35f,
-            animationSpec = infiniteRepeatable(animation = tween(650), repeatMode = RepeatMode.Reverse),
-            label = "tool-status-pulse-alpha"
-        ).value
-    } else {
-        1f
-    }
+    val pulseAlpha = rememberChatInfiniteFloat(
+        initialValue = 1f,
+        targetValue = 0.35f,
+        animationSpec = infiniteRepeatable(animation = tween(650), repeatMode = RepeatMode.Reverse),
+        label = "tool-status-pulse-alpha",
+        enabled = running
+    )
     val statusLabel = stringResource(
         when (state) {
             ToolExecutionState.RUNNING -> R.string.chat_tool_running
@@ -520,7 +514,7 @@ internal fun ToolStatusIcon(running: Boolean, isError: Boolean, toolName: String
             modifier = Modifier
                 // 与思考行同一格宽：两行的图标中心与后续文字左边缘才对得齐
                 .size(ChatStyle.rowIconSize)
-                .graphicsLayer { alpha = pulseAlpha }
+                .graphicsLayer { alpha = pulseAlpha.value }
         )
     }
 }

@@ -580,6 +580,7 @@ private fun ValueText(text: String) {
 }
 
 private fun AgentSaveError.messageRes(): Int = when (this) {
+    AgentSaveError.READ_ONLY -> R.string.plugin_definitions_read_only
     AgentSaveError.INVALID_NAME -> R.string.subagent_editor_error_invalid_name
     AgentSaveError.EMPTY_PROMPT -> R.string.subagent_editor_error_empty_prompt
     AgentSaveError.NAME_CONFLICT -> R.string.subagent_editor_error_name_conflict

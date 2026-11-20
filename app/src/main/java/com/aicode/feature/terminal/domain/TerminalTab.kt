@@ -55,7 +55,9 @@ class TerminalTab(
     val client: com.termux.terminal.TerminalSessionClient? = null,
     runState: RunState,
     val sourceMode: String? = null,
-    val channelGeneration: String? = null
+    val channelGeneration: String? = null,
+    val ownerPluginId: String? = null,
+    val ownerResourceId: String? = null
 ) {
     var title: String = title
         internal set

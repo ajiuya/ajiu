@@ -407,7 +407,8 @@ class SettingsViewModel @Inject constructor(
     private val apkVerifier: ApkVerifier,
     private val providerDashboardRunner: ProviderDashboardRunner,
     private val terminalSettingsRepository: TerminalSettingsRepository,
-    private val proxySettingsRepository: ProxySettingsRepository
+    private val proxySettingsRepository: ProxySettingsRepository,
+    private val definitionExecutionContextFactory: com.aicode.feature.workspace.domain.WorkspaceExecutionContextFactory
 ) : ViewModel() {
     private companion object {
         const val MAX_LOG_LINES = 1200
@@ -595,6 +596,8 @@ class SettingsViewModel @Inject constructor(
     val enterToSend: StateFlow<Boolean> = _enterToSend.asStateFlow()
     val typewriterCharsPerSecond: StateFlow<Int> = generalSettingsRepository.typewriterCharsPerSecondFlow
         .stateIn(viewModelScope, SharingStarted.Eagerly, GeneralSettingsRepository.DEFAULT_TYPEWRITER_CHARS_PER_SECOND)
+    val autoExpandReasoning: StateFlow<Boolean> = generalSettingsRepository.autoExpandReasoningFlow
+        .stateIn(viewModelScope, SharingStarted.Eagerly, false)
     val rootAccessState = rootAccessSettingsRepository.state
     private val _rootAccessChanging = MutableStateFlow(false)
     val rootAccessChanging: StateFlow<Boolean> = _rootAccessChanging.asStateFlow()
@@ -1521,21 +1524,55 @@ class SettingsViewModel @Inject constructor(
         }
     }
 
+    @Volatile private var skillRefreshOwner = 0L
+    @Volatile private var subAgentRefreshOwner = 0L
+    @Volatile private var skillsListSource: String? = null
+    @Volatile private var subAgentsListSource: String? = null
+
     /** 重新扫描技能（进入设置页 / 启停切换后调用，反映磁盘上增删改）。 */
     fun refreshSkills() {
+        val owner = ++skillRefreshOwner
         viewModelScope.launch {
-            _skills.value = withContext(Dispatchers.IO) {
-                val disabled = skillRepository.disabledNames()
-                skillRepository.listAllSkills().map { entry ->
-                    SkillUiEntry(
-                        name = entry.skill.name,
-                        description = entry.skill.description,
-                        scope = entry.scope,
-                        disabled = entry.skill.name.lowercase() in disabled,
-                        instructions = entry.skill.instructions,
-                        requiredTools = entry.skill.requiredTools
-                    )
+            val result = try {
+                val execution = definitionExecutionContextFactory.freeze()
+                withContext(Dispatchers.IO + execution) {
+                    val source = skillRepository.sourceIdentity()
+                    if (owner == skillRefreshOwner && skillsListSource != source) {
+                        _skills.value = emptyList()
+                        skillsListSource = source
+                    }
+                    val disabled = skillRepository.disabledNames()
+                    val entries = skillRepository.listAllSkills(forceRefresh = true).map { entry ->
+                        SkillUiEntry(
+                            name = entry.skill.name,
+                            description = entry.skill.description,
+                            scope = entry.scope,
+                            disabled = entry.skill.name.lowercase() in disabled,
+                            instructions = entry.skill.instructions,
+                            requiredTools = entry.skill.requiredTools
+                        )
+                    }
+                    skillRepository.checkSourceIdentity(source)
+                    source to entries
                 }
+            } catch (e: Exception) {
+                if (owner == skillRefreshOwner) {
+                    try {
+                        if (skillRepository.sourceIdentity() != skillsListSource) { _skills.value = emptyList(); skillsListSource = null }
+                    } catch (changed: Exception) {
+                        _skills.value = emptyList()
+                        skillsListSource = null
+                        if (changed is kotlinx.coroutines.CancellationException) throw changed
+                    }
+                }
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                FileLogger.w("SettingsViewModel", "刷新技能失败", e)
+                return@launch
+            }
+            if (owner == skillRefreshOwner) {
+                skillRepository.checkSourceIdentity(result.first)
+                skillsListSource = result.first
+                _skills.value = result.second
             }
         }
     }
@@ -1678,25 +1715,54 @@ class SettingsViewModel @Inject constructor(
 
     /** 重新扫描子代理定义（进入设置页 / 删除后调用，反映盘上增删改）。 */
     fun refreshSubAgents() {
+        val owner = ++subAgentRefreshOwner
         viewModelScope.launch {
-            _subAgents.value = withContext(Dispatchers.IO) {
-                val disabled = agentDefinitionRepository.disabledNames()
-                agentDefinitionRepository.listAll().map { entry ->
-                    SubAgentUiEntry(
-                        name = entry.definition.name,
-                        description = entry.definition.description,
-                        scope = entry.scope,
-                        disabled = entry.definition.name.lowercase() in disabled,
-                        providerId = entry.definition.providerId,
-                        model = entry.definition.model,
-                        reasoningEffort = entry.definition.reasoningEffort,
-                        allowedTools = entry.definition.allowedTools,
-                        disallowedTools = entry.definition.disallowedTools,
-                        inject = entry.definition.inject,
-                        prompt = entry.definition.prompt,
-                        filePath = entry.definition.filePath
-                    )
+            val result = try {
+                val execution = definitionExecutionContextFactory.freeze()
+                withContext(Dispatchers.IO + execution) {
+                    val source = agentDefinitionRepository.sourceIdentity()
+                    if (owner == subAgentRefreshOwner && subAgentsListSource != source) {
+                        _subAgents.value = emptyList()
+                        subAgentsListSource = source
+                    }
+                    val disabled = agentDefinitionRepository.disabledNames()
+                    val entries = agentDefinitionRepository.listAll(forceRefresh = true).map { entry ->
+                        SubAgentUiEntry(
+                            name = entry.definition.name,
+                            description = entry.definition.description,
+                            scope = entry.scope,
+                            disabled = entry.definition.name.lowercase() in disabled,
+                            providerId = entry.definition.providerId,
+                            model = entry.definition.model,
+                            reasoningEffort = entry.definition.reasoningEffort,
+                            allowedTools = entry.definition.allowedTools,
+                            disallowedTools = entry.definition.disallowedTools,
+                            inject = entry.definition.inject,
+                            prompt = entry.definition.prompt,
+                            filePath = entry.definition.filePath
+                        )
+                    }
+                    agentDefinitionRepository.checkSourceIdentity(source)
+                    source to entries
                 }
+            } catch (e: Exception) {
+                if (owner == subAgentRefreshOwner) {
+                    try {
+                        if (agentDefinitionRepository.sourceIdentity() != subAgentsListSource) { _subAgents.value = emptyList(); subAgentsListSource = null }
+                    } catch (changed: Exception) {
+                        _subAgents.value = emptyList()
+                        subAgentsListSource = null
+                        if (changed is kotlinx.coroutines.CancellationException) throw changed
+                    }
+                }
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                FileLogger.w("SettingsViewModel", "刷新子代理失败", e)
+                return@launch
+            }
+            if (owner == subAgentRefreshOwner) {
+                agentDefinitionRepository.checkSourceIdentity(result.first)
+                subAgentsListSource = result.first
+                _subAgents.value = result.second
             }
         }
     }
@@ -2166,6 +2232,10 @@ class SettingsViewModel @Inject constructor(
 
     fun setTypewriterCharsPerSecond(value: Int): Job = viewModelScope.launch {
         generalSettingsRepository.setTypewriterCharsPerSecond(value)
+    }
+
+    fun setAutoExpandReasoning(enabled: Boolean): Job = viewModelScope.launch {
+        generalSettingsRepository.setAutoExpandReasoning(enabled)
     }
 
     fun setRootAccessEnabled(enabled: Boolean) {

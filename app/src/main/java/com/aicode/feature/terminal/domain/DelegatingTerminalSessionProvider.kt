@@ -50,6 +50,24 @@ class DelegatingTerminalSessionProvider @Inject constructor(
         sourceSessionId: String?
     ): String = delegate().startBackgroundCommand(command, title, notify, sourceSessionId)
 
+    override suspend fun startPluginCommand(command: String, title: String?, owner: TerminalResourceOwner, onOutput: (ByteArray) -> Unit): String =
+        delegate().startPluginCommand(command, title, owner, onOutput)
+
+    private fun pluginBackend(id: String, owner: TerminalResourceOwner): TerminalSessionProvider? =
+        listOf(local, remote).firstOrNull { it.pluginTabStatus(id, owner) != null }
+
+    override fun pluginTabStatus(id: String, owner: TerminalResourceOwner): TerminalTabStatus? =
+        pluginBackend(id, owner)?.pluginTabStatus(id, owner)
+
+    override fun writePluginInput(id: String, owner: TerminalResourceOwner, text: String, appendNewline: Boolean): Boolean =
+        pluginBackend(id, owner)?.writePluginInput(id, owner, text, appendNewline) ?: false
+
+    override fun interruptPluginTab(id: String, owner: TerminalResourceOwner): Boolean =
+        pluginBackend(id, owner)?.interruptPluginTab(id, owner) ?: false
+
+    override suspend fun closePluginTab(id: String, owner: TerminalResourceOwner): Boolean =
+        pluginBackend(id, owner)?.closePluginTab(id, owner) ?: false
+
     override fun sendInput(id: String, input: String, appendNewline: Boolean): Boolean =
         delegate().sendInput(id, input, appendNewline)
 

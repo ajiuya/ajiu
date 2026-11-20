@@ -100,7 +100,9 @@ class SubAgentInteractionBackupTest {
         subAgentInteractionDao = interactionDao,
         projectMemoryJournal = projectMemoryJournal,
         recoveryRepository = recoveryRepository,
-        agentDatabase = agentDatabase
+        agentDatabase = agentDatabase,
+        pluginArchives = mockk(relaxed = true),
+        backupContent = mockk(relaxed = true)
     )
     private val options = BackupOptions(
         providers = false, remoteConnections = false, chatHistory = true, mcpServers = false,

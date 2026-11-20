@@ -8,9 +8,6 @@ import com.aicode.core.util.FileLogger
 import dagger.hilt.android.qualifiers.ApplicationContext
 import com.aicode.feature.agent.data.local.dao.LlmCallRecordDao
 import com.aicode.feature.agent.data.local.entity.LlmCallRecordEntity
-import com.aicode.feature.agent.data.remote.anthropic.AnthropicApi
-import com.aicode.feature.agent.data.remote.gemini.GeminiApi
-import com.aicode.feature.agent.data.remote.openai.OpenAIApi
 import com.aicode.feature.agent.domain.model.AgentContext
 import com.aicode.feature.agent.domain.model.AgentImage
 import com.aicode.feature.agent.domain.model.AgentMessage
@@ -34,6 +31,7 @@ import com.aicode.feature.agent.domain.tool.ToolCall
 import com.aicode.feature.agent.domain.tool.ToolPermissionManager
 import com.aicode.feature.agent.domain.tool.plan.SubmitPlanTool
 import com.aicode.feature.agent.domain.tool.ToolRegistry
+import com.aicode.feature.agent.domain.tool.forInvocation
 import com.aicode.feature.agent.domain.tool.ToolResult
 import com.aicode.feature.agent.domain.tool.ToolOutputStore
 import com.aicode.feature.agent.domain.tool.ToolStreamEvent
@@ -45,16 +43,11 @@ import com.aicode.feature.settings.data.remote.ModelMetadataService
 import com.aicode.feature.settings.data.repository.CompactionModelSettingsRepository
 import com.aicode.feature.settings.data.repository.DefaultModelSettingsRepository
 import com.aicode.feature.settings.data.repository.GeneralSettingsRepository
-import com.aicode.feature.settings.data.repository.ProviderKeyRotator
 import com.aicode.feature.settings.data.repository.TitleModelSettingsRepository
 import com.aicode.feature.settings.domain.model.AIProviderConfig
 import com.aicode.feature.agent.domain.provider.AnthropicAdapter
-import com.aicode.feature.agent.domain.provider.fixedTemperature
+import com.aicode.feature.agent.domain.provider.ProviderInstanceFactory
 import com.aicode.feature.agent.domain.provider.GeminiAdapter
-import com.aicode.feature.agent.domain.provider.AllKeysFailedException
-import com.aicode.feature.agent.domain.provider.KeySwitchOutcome
-import com.aicode.feature.agent.domain.provider.isKeySwitchFailure
-import com.aicode.feature.agent.domain.provider.OpenAIAdapter
 import com.aicode.feature.settings.domain.model.ProviderType
 import com.aicode.feature.settings.domain.model.ModelContextPolicy
 import com.aicode.feature.agent.domain.provider.StreamApiException
@@ -93,6 +86,11 @@ import kotlinx.serialization.json.longOrNull
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
+import com.aicode.feature.plugin.runtime.PluginHookDispatcher
+import com.aicode.feature.plugin.runtime.PluginToolDelegation
+import com.aicode.feature.plugin.domain.PluginHookEvents
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 
 /**
  * 阶段三重构 (完全版)：基于不可变状态 (Immutable State) 与 MVI 架构的 Agent 工作流引擎。
@@ -102,9 +100,7 @@ import javax.inject.Inject
 class StatefulAgentWorkflow @Inject constructor(
     private val toolRegistry: ToolRegistry,
     private val aiProviderRepository: AIProviderRepository,
-    private val openAIApi: OpenAIApi,
-    private val anthropicApi: AnthropicApi,
-    private val geminiApi: GeminiApi,
+    private val providerFactory: ProviderInstanceFactory,
     private val promptProvider: SystemPromptProvider,
     private val permissionManager: ToolPermissionManager,
     private val policyEngine: ToolPermissionPolicyEngine,
@@ -119,14 +115,15 @@ class StatefulAgentWorkflow @Inject constructor(
     private val messagePersistenceUseCase: MessagePersistenceUseCase,
     private val checkpointManager: CheckpointManager,
     private val llmCallRecordDao: LlmCallRecordDao,
-    private val keyRotator: ProviderKeyRotator,
     private val agentNotificationCenter: AgentNotificationCenter,
     private val eventInjector: AgentEventInjector,
     private val fileAccess: FileAccessProvider,
     @param:ApplicationContext private val appContext: Context,
     private val rootCommandManager: RootCommandManager,
+    private val shizukuManager: com.aicode.feature.agent.domain.shizuku.ShizukuManager,
     private val recoveryRepository: com.aicode.feature.agent.domain.recovery.RecoveryRepository,
-    private val workspaceExecutionContextFactory: com.aicode.feature.workspace.domain.WorkspaceExecutionContextFactory
+    private val workspaceExecutionContextFactory: com.aicode.feature.workspace.domain.WorkspaceExecutionContextFactory,
+    private val pluginHooks: PluginHookDispatcher
 ) : AgentWorkflow {
 
     private companion object {
@@ -187,7 +184,8 @@ class StatefulAgentWorkflow @Inject constructor(
         val approved: Boolean,
         val denyReason: String = "用户拒绝执行该工具",
         val errorCode: String = "USER_REJECTED",
-        val rootApprovalId: String? = null
+        val rootApprovalId: String? = null,
+        val shizukuApprovalId: String? = null
     )
 
     private data class ToolRunResult(
@@ -283,6 +281,7 @@ class StatefulAgentWorkflow @Inject constructor(
         // 摘要模型独立选择；窗口、固定开销与有效工具仍按同一主会话快照校验。
         val result = contextCompactor.compactIfNeeded(history, compactionProvider, sessionId,
             force = true, windowProvider = provider, systemPrompt = systemPrompt, tools = tools, onEvent = onEvent)
+        if (result.compacted) pluginHooks.observe(PluginHookEvents.AGENT_COMPACTION, context, buildJsonObject { put("compacted", true) })
         return result.compacted
     }
 
@@ -291,60 +290,8 @@ class StatefulAgentWorkflow @Inject constructor(
      * 用于上下文压缩等独立请求场景，完全不占用或修改主对话所用的 Provider 单例。
      * 同时把提供商级 LLM 缓存开关（Anthropic 断点 / OpenAI cache key）应用到实例。
      */
-    private suspend fun createStandaloneProvider(config: AIProviderConfig, sessionId: String?): AIProvider {
-        val provider: AIProvider = when (config.type) {
-            ProviderType.ANTHROPIC -> AnthropicAdapter(anthropicApi).also {
-                it.cacheBreakpointsEnabled = config.anthropicCacheBreakpoints
-            }
-            ProviderType.GEMINI -> GeminiAdapter(geminiApi)
-            else -> OpenAIAdapter(openAIApi).also {
-                it.chatCacheKeyEnabled = config.openaiChatCacheKey
-                it.speedTierSource = generalSettingsRepository::speedTier
-            }
-        }
-        // 多 Key 模式下由轮换器决定本次用哪个 Key（会话内粘住，Key 不可用时切下一个并重发）。
-        val activeKeys = config.effectiveApiKeys
-        provider.apiKey = keyRotator.activeKey(config, sessionId)
-            ?: throw IllegalStateException("「${config.name}」的 Key 均在冷却中，请稍后重试")
-        // 只有真正的多 Key 才需要自动切换：单 Key 冷却后没有可切换目标，只会把用户锁死一段时间。
-        val keySwitcher: (suspend (Throwable, String, Set<String>) -> KeySwitchOutcome?)? =
-            if (activeKeys.size > 1) {
-                { error, failedKey, triedKeys ->
-                    if (!error.isKeySwitchFailure(config.effectiveKeySwitchStatusCodes)) {
-                        null
-                    } else {
-                        val switched = keyRotator.reportFailure(config.id, sessionId, failedKey, triedKeys)
-                        if (switched == null) {
-                            throw AllKeysFailedException(
-                                "「${config.name}」的 ${activeKeys.size} 个 Key 均失败：${error.message ?: error.javaClass.simpleName}",
-                                error
-                            )
-                        }
-                        KeySwitchOutcome(switched.newKey, switched.newIndex, switched.total)
-                    }
-                }
-            } else {
-                null
-            }
-        provider.keySwitcher = keySwitcher
-        provider.baseUrl = config.baseUrl
-        provider.model = config.effectiveModel
-        provider.useFullUrl = config.useFullUrl
-        provider.useResponseApi = config.useResponseApi
-        provider.providerId = config.id
-        provider.logSessionId = sessionId
-        provider.customHeaders = config.customHeaders
-        val metadata = modelMetadataService.resolve(config.id, config.type, config.effectiveModel)
-        // 模型元数据的输出上限（models.dev limit.output）：不传时 Anthropic 会把输出卡在 adapter 兜底值上。
-        provider.maxOutputTokens = metadata.outputTokens
-        provider.reasoningCapability = metadata.toReasoningCapability()
-        // 元数据说不接受自定义温度就不发该字段（kimi-k3、gpt-5 系带了直接 400）；允许的只发官方固定值。
-        provider.temperature = if (metadata.supportsCustomTemperature) fixedTemperature(config.effectiveModel) else null
-        provider.firstByteTimeoutMs = generalSettingsRepository.firstByteTimeoutMs()
-        provider.streamIdleTimeoutMs = generalSettingsRepository.streamIdleTimeoutMs()
-        provider.maxNetworkRetries = generalSettingsRepository.maxNetworkRetries()
-        return provider
-    }
+    private suspend fun createStandaloneProvider(config: AIProviderConfig, sessionId: String?): AIProvider =
+        providerFactory.create(config, sessionId)
 
     /** 核心 Reducer，接收旧状态与 Action，返回新状态以及触发的副作用列表 (纯函数) */
     internal fun reduce(
@@ -531,6 +478,10 @@ class StatefulAgentWorkflow @Inject constructor(
         var currentContext = context
         var state = AgentSessionState()
         var currentTools = tools
+        var hookRunStatus = "cancelled"
+        var hookToolCalls = 0
+        pluginHooks.observe(PluginHookEvents.AGENT_RUN_STARTED, currentContext, buildJsonObject { put("status", "started"); put("toolCalls", 0) })
+        try {
         val actionQueue = ArrayDeque<AgentAction>()
         actionQueue.addLast(
             AgentAction.InitRequest(
@@ -588,6 +539,8 @@ class StatefulAgentWorkflow @Inject constructor(
         var continuationOutputTokens = 0L
 
         val rootApprovals = mutableMapOf<String, String>()
+        val shizukuApprovals = mutableMapOf<String, String>()
+        val delegations = mutableMapOf<String, PluginToolDelegation>()
         try {
         while (!state.isFinished && actionQueue.isNotEmpty()) {
             val action = actionQueue.removeFirst()
@@ -637,6 +590,7 @@ class StatefulAgentWorkflow @Inject constructor(
                             }
                             compactedMessages = compaction.messages
                             if (compaction.compacted) {
+                                pluginHooks.observe(PluginHookEvents.AGENT_COMPACTION, currentContext, buildJsonObject { put("compacted", true); put("estimatedInputTokens", predictedInput) })
                                 state = state.copy(messages = compaction.messages)
                                 baselineUsage = 0
                                 baselineEstimate = 0
@@ -662,6 +616,10 @@ class StatefulAgentWorkflow @Inject constructor(
                         val stream = StreamAccumulator(callStartElapsed) { send(it) }
                         val draftWindow = com.aicode.feature.agent.domain.recovery.RecoveryDraftWindow()
                         send(AgentEvent.GenerationStarted)
+                        val hookRequestId = UUID.randomUUID().toString()
+                        pluginHooks.observe(PluginHookEvents.AGENT_REQUEST_STARTED, currentContext, buildJsonObject {
+                            put("requestId", hookRequestId); put("messageCount", compactedMessages.size); put("toolCount", currentTools.size); put("estimatedInputTokens", predictedInput)
+                        })
 
                         try {
                             // 发送前按实际模型的视觉能力处理图片（同 execute 路径）。
@@ -718,6 +676,7 @@ class StatefulAgentWorkflow @Inject constructor(
                                     currentContext.sessionId, force = true, windowProvider = aiProvider,
                                     systemPrompt = systemPrompt, tools = currentTools, currentInputTokens = predictedInput) { send(it) }
                                 if (recovery.compacted) {
+                                    pluginHooks.observe(PluginHookEvents.AGENT_COMPACTION, currentContext, buildJsonObject { put("compacted", true); put("estimatedInputTokens", predictedInput) })
                                     state = state.copy(messages = recovery.messages)
                                     baselineUsage = 0
                                     baselineEstimate = 0
@@ -795,6 +754,7 @@ class StatefulAgentWorkflow @Inject constructor(
                                     currentContext.sessionId, force = true, windowProvider = aiProvider,
                                     systemPrompt = systemPrompt, tools = currentTools, currentInputTokens = predictedInput) { send(it) }
                                 if (recovery.compacted) {
+                                    pluginHooks.observe(PluginHookEvents.AGENT_COMPACTION, currentContext, buildJsonObject { put("compacted", true); put("estimatedInputTokens", predictedInput) })
                                     state = state.copy(messages = recovery.messages)
                                     baselineUsage = 0
                                     baselineEstimate = 0
@@ -832,6 +792,11 @@ class StatefulAgentWorkflow @Inject constructor(
                         } finally {
                             val durationMillis = (SystemClock.elapsedRealtime() - callStartElapsed).toInt()
                             val usage = stream.finalResponse
+                            pluginHooks.observe(PluginHookEvents.AGENT_REQUEST_FINISHED, currentContext, buildJsonObject {
+                                put("requestId", hookRequestId); put("status", if (callCompleted) "success" else if (callError != null) "error" else "cancelled")
+                                put("durationMs", durationMillis); put("inputTokens", usage?.inputTokens ?: 0); put("outputTokens", usage?.outputTokens ?: 0)
+                                put("toolCalls", usage?.toolCalls?.size ?: 0); usage?.stopReason?.let { put("stopReason", it) }
+                            })
                             runCatching {
                                 // 与适配器同源算一次「实际会发什么」：落库后能在统计页分辨
                                 // 「选了但没生效」「被降级」这些静默问题。
@@ -871,12 +836,16 @@ class StatefulAgentWorkflow @Inject constructor(
                                 throw CancellationException("Tool approval request is no longer current")
                             }
                         }
-                        val tool = toolRegistry.getTool(effect.toolCall.name)
+                        val tool = toolRegistry.forInvocation(effect.toolCall.name, currentTools)
                         val executionArgs = tool?.let { ToolPresentation.executionArguments(it, effect.toolCall.arguments) }
                             ?: effect.toolCall.arguments
-                        val argsPreview = JsonObject(executionArgs).toString()
+                        val mutation = pluginHooks.beforeTool(currentContext, effect.toolCall, JsonObject(executionArgs))
+                        val effectiveCall = effect.toolCall.copy(arguments = mutation.arguments)
+                        val argsPreview = mutation.arguments.toString()
                         val actionTitle = ToolPresentation.titleOf(effect.toolCall)
-                        val checkResult = requestPermissionIfNeeded(tool, effect.toolCall.id, executionArgs, argsPreview, currentContext.sessionId)
+                        hookToolCalls++
+                        val checkResult = if (mutation.denied) PermissionCheckResult(false, mutation.reason ?: "Plugin rejected this tool call", "PLUGIN_DENIED")
+                            else requestPermissionIfNeeded(tool, effect.toolCall.id, effectiveCall.arguments, argsPreview, currentContext)
 
                         if (!checkResult.approved) {
                             val rawResult = ToolResult.Error(checkResult.denyReason, checkResult.errorCode).toTransportString()
@@ -886,17 +855,24 @@ class StatefulAgentWorkflow @Inject constructor(
                                 actionTitle = actionTitle, persisted = persisted
                             ))
                             persisted.await()
+                            pluginHooks.observe(PluginHookEvents.AGENT_TOOL_FINISHED, currentContext, buildJsonObject {
+                                put("callId", effectiveCall.id); put("toolName", effectiveCall.name); put("status", "error"); put("durationMs", 0)
+                            })
                         } else {
+                            mutation.delegation?.let { delegations[effectiveCall.id] = it }
                             checkResult.rootApprovalId?.let { rootApprovals[effect.toolCall.id] = it }
+                            checkResult.shizukuApprovalId?.let { shizukuApprovals[effect.toolCall.id] = it }
                             send(AgentEvent.ToolCallStarted(effect.toolCall.id, effect.toolCall.name, argsPreview, actionTitle))
                         }
-                        actionQueue.addLast(AgentAction.PermissionEvaluated(effect.toolCall, checkResult.approved, argsPreview, checkResult.denyReason, checkResult.errorCode))
+                        actionQueue.addLast(AgentAction.PermissionEvaluated(effectiveCall, checkResult.approved, argsPreview, checkResult.denyReason, checkResult.errorCode))
                     }
                     is AgentSideEffect.CancelToolBatch -> {
                         // 整批取消：已批准未执行的工具补发完成事件（内容为未执行），
                         // 让 ViewModel 清理 runningTool 并 REPLACE 掉「执行中」占位消息。
                         effect.toolCalls.forEach { toolCall ->
+                            delegations.remove(toolCall.id)
                             rootApprovals.remove(toolCall.id)?.let { rootCommandManager.revokePermit(it) }
+                            shizukuApprovals.remove(toolCall.id)?.let { shizukuManager.revokePermit(it) }
                             val persisted = kotlinx.coroutines.CompletableDeferred<Unit>()
                             send(
                                 AgentEvent.ToolCallFinished(
@@ -907,10 +883,10 @@ class StatefulAgentWorkflow @Inject constructor(
                                         effect.errorCode
                                     ).toTransportString(),
                                     isError = true,
-                                    argsPreview = JsonObject(toolRegistry.getTool(toolCall.name)?.let {
+                                    argsPreview = JsonObject(toolRegistry.forInvocation(toolCall.name, currentTools)?.let {
                                         ToolPresentation.executionArguments(it, toolCall.arguments)
                                     } ?: toolCall.arguments).toString(),
-                                    actionTitle = ToolPresentation.titleOf(toolCall),
+                                    actionTitle = ToolPresentation.titleOf(state.batchToolCalls.firstOrNull { it.id == toolCall.id } ?: toolCall),
                                     persisted = persisted
                                 )
                             )
@@ -921,20 +897,11 @@ class StatefulAgentWorkflow @Inject constructor(
                     is AgentSideEffect.ExecuteToolBatch -> {
                         // 计划审批在进入此批次前已与其他调用隔离，避免并行工具越过审批。
                         val toolCalls = effect.toolCalls
-                        toolCalls.forEach { toolCall ->
-                            if (toolCall.name == "editFile" || toolCall.name == "writeFile") {
-                                (toolCall.arguments["path"] as? JsonPrimitive)?.contentOrNull?.let { path ->
-                                    currentContext.sessionId?.let { sid ->
-                                        withContext(workspaceExecutionContextFactory.freeze(currentContext.projectMemoryCapture)) {
-                                            checkpointManager.beforeFileModified(sid, path)
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
                         val executionContexts = toolCalls.associate { call ->
-                            call.id to currentContext.copy(rootApprovalId = rootApprovals[call.id])
+                            call.id to currentContext.copy(
+                                rootApprovalId = rootApprovals[call.id],
+                                shizukuApprovalId = shizukuApprovals[call.id]
+                            )
                         }
                         val runResults = if (toolCalls.isEmpty()) {
                             emptyList()
@@ -956,14 +923,28 @@ class StatefulAgentWorkflow @Inject constructor(
                                             }
                                             val started = toolTimer.start()
                                             send(AgentEvent.ToolExecutionStarted(toolCall.id, started.startedAtMs, started.startedElapsedMs))
-                                            val tool = toolRegistry.getTool(toolCall.name)
-                                            val executableCall = toolCall.copy(arguments = tool?.let {
-                                                ToolPresentation.executionArguments(it, toolCall.arguments)
-                                            } ?: toolCall.arguments)
-                                            val result = if (tool is StreamingAgentTool) {
-                                                runToolStream(tool, executableCall, executionContexts.getValue(toolCall.id)) { send(it) }
-                                            } else {
-                                                runToolSync(tool, executableCall, executionContexts.getValue(toolCall.id))
+                                            val tool = toolRegistry.forInvocation(toolCall.name, currentTools)
+                                            val executableCall = toolCall
+                                            val executionContext = executionContexts.getValue(toolCall.id)
+                                            pluginHooks.observe(PluginHookEvents.AGENT_TOOL_STARTED, executionContext, buildJsonObject { put("callId", toolCall.id); put("toolName", toolCall.name) })
+                                            val verdict = tool?.let { policyEngine.evaluate(it.name, executableCall.arguments, currentContext.sessionId) }
+                                            val delegation = delegations[toolCall.id]
+                                            if (verdict?.verdict != ToolPermissionPolicyEngine.Verdict.DENY && toolCall.name in setOf("editFile", "writeFile")) {
+                                                (toolCall.arguments["path"] as? JsonPrimitive)?.contentOrNull?.let { path ->
+                                                    currentContext.sessionId?.let { sid -> checkpointManager.beforeFileModified(sid, path) }
+                                                }
+                                            }
+                                            val result = when {
+                                                verdict?.verdict == ToolPermissionPolicyEngine.Verdict.DENY -> ToolRunResult(
+                                                    ToolResult.Error(verdict.denyReason ?: "Tool is denied by the current policy", "SYSTEM_DENIED").toTransportString(), true)
+                                                delegation != null && tool != null -> {
+                                                    val delegated = pluginHooks.executeDelegated(delegation, executableCall, currentContext.recoveryRunId ?: currentContext.inputMessageId) { chunk ->
+                                                        send(AgentEvent.ToolCallProgress(toolCall.id, toolCall.name, chunk.takeLast(LIVE_TAIL_CHARS)))
+                                                    }
+                                                    prepareToolResult(delegated, executableCall, executionContext)
+                                                }
+                                                tool is StreamingAgentTool -> runToolStream(tool, executableCall, executionContext) { send(it) }
+                                                else -> runToolSync(tool, executableCall, executionContext)
                                             }
                                             execution.checkCurrent()
                                             result.copy(timing = toolTimer.finish(started))
@@ -984,16 +965,20 @@ class StatefulAgentWorkflow @Inject constructor(
                                         val persisted = kotlinx.coroutines.CompletableDeferred<Unit>()
                                         send(AgentEvent.ToolCallFinished(
                                             toolCall.id, toolCall.name, committedResult.raw, result.isError,
-                                            argsPreview = JsonObject(toolRegistry.getTool(toolCall.name)?.let {
+                                            argsPreview = JsonObject(toolRegistry.forInvocation(toolCall.name, currentTools)?.let {
                                                 ToolPresentation.executionArguments(it, toolCall.arguments)
                                             } ?: toolCall.arguments).toString(),
                                             attachments = result.attachments, persisted = persisted,
-                                            actionTitle = ToolPresentation.titleOf(toolCall),
+                                            actionTitle = ToolPresentation.titleOf(state.batchToolCalls.firstOrNull { it.id == toolCall.id } ?: toolCall),
                                             startedAtMs = result.timing?.startedAtMs,
                                             durationMs = result.timing?.durationMs,
                                             notificationSeqs = notifications.map { it.seq }
                                         ))
                                         persisted.await()
+                                        pluginHooks.observe(PluginHookEvents.AGENT_TOOL_FINISHED, currentContext, buildJsonObject {
+                                            put("callId", toolCall.id); put("toolName", toolCall.name); put("status", if (result.isError) "error" else "success")
+                                            put("durationMs", result.timing?.durationMs ?: 0)
+                                        })
                                         committedResult
                                     }
                                 }.awaitAll()
@@ -1020,14 +1005,24 @@ class StatefulAgentWorkflow @Inject constructor(
         }
         
         } finally {
+            delegations.clear()
             rootApprovals.values.forEach(rootCommandManager::revokePermit)
+            shizukuApprovals.values.forEach(shizukuManager::revokePermit)
         }
+        hookRunStatus = if (state.error != null) "error" else "success"
         send(AgentEvent.TurnFinished(
             lastPersistedAssistantId,
             (SystemClock.elapsedRealtime() - turnStartedElapsed).coerceAtLeast(0L)
         ))
         state.error?.let { send(AgentEvent.Failed(it, state.errorCode)) }
         send(AgentEvent.Completed)
+        } catch (failure: CancellationException) { throw failure }
+        catch (failure: Exception) { hookRunStatus = "error"; throw failure }
+        finally {
+            pluginHooks.observe(PluginHookEvents.AGENT_RUN_FINISHED, currentContext, buildJsonObject {
+                put("status", hookRunStatus); put("toolCalls", hookToolCalls); state.errorCode?.let { put("errorCode", it) }
+            })
+        }
     }
 
     /**
@@ -1036,12 +1031,13 @@ class StatefulAgentWorkflow @Inject constructor(
      * 独立成类是为了不让 [executeEvents] 的协程状态机为每个增量都插入挂起点——那个 `channelFlow` 主体
      * 是本工程最大的协程方法，规模过大会被 ART 长期交给解释器执行。
      *
-     * 节流：上游每个 chunk 都携带完整累积文本，逐条推送会让 ViewModel 端每秒重建几十次状态、
-     * UI 端反复重启打字机协程。按时间窗口合并，窗口内只保留最新累积文本，到窗口边界才发送，
-     * 把下游事件频率压到 ~16/s；打字机渲染本身有 100ms 节流，少发中间态无感知。
+     * 节流：正文与思考各自按 60ms 窗口合并，窗口内只追加缓冲，发布时才物化累计文本，
+     * 避免高频增量反复复制全文，并将每类下游事件频率压到约 16/s；流结束时补发尾部。
+     * 下游打字机按自身渲染节奏消费快照，与此发布窗口独立。
      */
-    private class StreamAccumulator(
+    internal class StreamAccumulator(
         private val callStartElapsed: Long,
+        private val materialize: (StringBuilder) -> String = { it.toString() },
         private val emit: suspend (AgentEvent) -> Unit
     ) {
         private companion object {
@@ -1058,8 +1054,8 @@ class StatefulAgentWorkflow @Inject constructor(
         var ttfbElapsed: Long? = null
         var retryAttempts = 0
 
-        private var pendingText: String? = null
-        private var pendingReasoning: String? = null
+        private var textDirty = false
+        private var reasoningDirty = false
         private var lastTextSentAt = 0L
         private var lastReasoningSentAt = 0L
         private var requestDurationMillis: Long? = null
@@ -1080,7 +1076,7 @@ class StatefulAgentWorkflow @Inject constructor(
                     markTtfb()
                     text.append(chunk.text)
                     speed.append(chunk.text, SystemClock.elapsedRealtime())
-                    pendingText = text.toString()
+                    textDirty = true
                     val now = SystemClock.elapsedRealtime()
                     if (now - lastTextSentAt >= DELTA_THROTTLE_MS) {
                         flushText()
@@ -1092,7 +1088,7 @@ class StatefulAgentWorkflow @Inject constructor(
                     markTtfb()
                     reasoning.append(chunk.text)
                     speed.append(chunk.text, SystemClock.elapsedRealtime())
-                    pendingReasoning = reasoning.toString()
+                    reasoningDirty = true
                     val now = SystemClock.elapsedRealtime()
                     if (now - lastReasoningSentAt >= DELTA_THROTTLE_MS) {
                         flushReasoning()
@@ -1148,22 +1144,22 @@ class StatefulAgentWorkflow @Inject constructor(
             argumentPreviews.clear()
             text.setLength(0)
             reasoning.setLength(0)
-            pendingText = null
-            pendingReasoning = null
+            textDirty = false
+            reasoningDirty = false
             lastTextSentAt = 0L
             lastReasoningSentAt = 0L
         }
 
         private suspend fun flushText() {
-            val t = pendingText ?: return
-            pendingText = null
-            emit(AgentEvent.AssistantDelta(t))
+            if (!textDirty) return
+            textDirty = false
+            emit(AgentEvent.AssistantDelta(materialize(text)))
         }
 
         private suspend fun flushReasoning() {
-            val t = pendingReasoning ?: return
-            pendingReasoning = null
-            emit(AgentEvent.ReasoningDelta(t))
+            if (!reasoningDirty) return
+            reasoningDirty = false
+            emit(AgentEvent.ReasoningDelta(materialize(reasoning)))
         }
     }
 
@@ -1183,23 +1179,26 @@ class StatefulAgentWorkflow @Inject constructor(
             // 工具实现在此被调用；工作流本身在主线程收集，故统一切到 IO——避免远程模式下工具里的
             // 同步文件/网络 IO 阻塞主线程。依赖主线程的工具（浏览器）在自身实现内已切回 Main。
             withContext(Dispatchers.IO) {
-                val result = tool.executeWithContext(toolCall.arguments, context)
-                val fileAttachments = if (name == "sendFile" || name == "generateImage") extractAttachments(result) else emptyList()
-                val images = if (result is ToolResult.Success) result.images else emptyList()
-                val previewAttachments = if (fileAttachments.isEmpty() && images.isNotEmpty()) runCatching {
-                    ToolPreviewImageCache(java.io.File(appContext.cacheDir.canonicalFile, ToolPreviewImageCache.DIRECTORY))
-                        .store(context.sessionId, toolCall.id, name, images)
-                }.getOrDefault(emptyList()) else emptyList()
-                val attachments = (fileAttachments + previewAttachments).distinct()
-                val transportResult = if (fileAttachments.isNotEmpty()) stripAttachments(result) else result
-                val processed = toolOutputStore.process(name, toolCall.id, transportResult)
-                ToolRunResult(processed.toTransportString(), processed is ToolResult.Error, attachments, images)
+                prepareToolResult(tool.executeWithContext(toolCall.arguments, context), toolCall, context)
             }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             ToolRunResult(ToolResult.Error("工具执行失败: ${e.message}", "TOOL_EXECUTION_FAILED").toTransportString(), true)
         }
+    }
+
+    private suspend fun prepareToolResult(result: ToolResult, call: ToolCall, context: AgentContext): ToolRunResult {
+        val fileAttachments = if (call.name == "sendFile" || call.name == "generateImage") extractAttachments(result) else emptyList()
+        val images = if (result is ToolResult.Success) result.images else emptyList()
+        val previewAttachments = if (fileAttachments.isEmpty() && images.isNotEmpty()) runCatching {
+            ToolPreviewImageCache(java.io.File(appContext.cacheDir.canonicalFile, ToolPreviewImageCache.DIRECTORY))
+                .store(context.sessionId, call.id, call.name, images)
+        }.getOrDefault(emptyList()) else emptyList()
+        val transformed = pluginHooks.afterTool(context, call, result)
+        val transport = if (call.name == "sendFile" || call.name == "generateImage") stripAttachments(transformed) else transformed
+        val processed = toolOutputStore.process(call.name, call.id, transport)
+        return ToolRunResult(processed.toTransportString(), processed is ToolResult.Error, (fileAttachments + previewAttachments).distinct(), images)
     }
 
     private suspend fun activeModelSupportsVision(sessionId: String?): Boolean {
@@ -1366,13 +1365,7 @@ class StatefulAgentWorkflow @Inject constructor(
                     }
                 }
                 val result = finalResult ?: ToolResult.Error("流式工具未返回结果", "MISSING_STREAM_RESULT")
-                val processed = toolOutputStore.process(toolCall.name, toolCall.id, result)
-                val images = if (result is ToolResult.Success) result.images else emptyList()
-                val attachments = if (images.isNotEmpty()) runCatching {
-                    ToolPreviewImageCache(java.io.File(appContext.cacheDir.canonicalFile, ToolPreviewImageCache.DIRECTORY))
-                        .store(context.sessionId, toolCall.id, toolCall.name, images)
-                }.getOrDefault(emptyList()) else emptyList()
-                ToolRunResult(processed.toTransportString(), processed is ToolResult.Error, attachments.distinct(), images)
+                prepareToolResult(result, toolCall, context)
             }
         } catch (e: CancellationException) {
             throw e
@@ -1460,7 +1453,7 @@ class StatefulAgentWorkflow @Inject constructor(
             this["files"] = JsonArray(strippedFiles)
             this["files_attached"] = JsonPrimitive(true)
         }
-        return ToolResult.Success(JsonObject(strippedData))
+        return success.copy(data = JsonObject(strippedData))
     }
 
     private suspend fun requestPermissionIfNeeded(
@@ -1468,8 +1461,9 @@ class StatefulAgentWorkflow @Inject constructor(
         callId: String,
         arguments: Map<String, JsonElement>,
         argsPreview: String,
-        sessionId: String?
+        context: AgentContext
     ): PermissionCheckResult {
+        val sessionId = context.sessionId
         if (tool == null) {
             return PermissionCheckResult(true)
         }
@@ -1481,9 +1475,12 @@ class StatefulAgentWorkflow @Inject constructor(
         }
 
         return when (eval.verdict) {
-            ToolPermissionPolicyEngine.Verdict.ALLOW -> PermissionCheckResult(true)
+            ToolPermissionPolicyEngine.Verdict.ALLOW -> issueExecutionPermit(eval, arguments, sessionId)
             ToolPermissionPolicyEngine.Verdict.DENY -> PermissionCheckResult(false)
             ToolPermissionPolicyEngine.Verdict.ASK -> {
+                pluginHooks.observe(PluginHookEvents.AGENT_PERMISSION_REVIEW, context, buildJsonObject {
+                    put("callId", callId); put("toolName", tool.name); put("requiresNativeApproval", true)
+                })
                 val base = tool.buildPermissionRequest(callId, arguments, argsPreview)
                 val request = base.copy(
                     // 提供商的 tool call ID 可能跨会话重复，审批 ID 必须独立。
@@ -1493,14 +1490,22 @@ class StatefulAgentWorkflow @Inject constructor(
                     sessionGrant = eval.sessionGrant,
                     sessionId = sessionId.orEmpty()
                 )
-                val choice = if (eval.rootGeneration == null) {
+                val choice = if (eval.rootGeneration == null && eval.shizukuIdentity == null) {
                     permissionManager.awaitApproval(request)
                 } else coroutineScope {
                     val decision = async(start = CoroutineStart.UNDISPATCHED) { permissionManager.awaitApproval(request) }
                     val revocation = launch(start = CoroutineStart.UNDISPATCHED) {
-                        rootCommandManager.accessState.collect { state ->
-                            if (!state.enabled || state.generation != eval.rootGeneration) {
-                                permissionManager.resolve(request.id, PermissionChoice.REJECT)
+                        if (eval.rootGeneration != null) {
+                            rootCommandManager.accessState.collect { state ->
+                                if (!state.enabled || state.generation != eval.rootGeneration || state.authorityId != eval.rootAuthorityId) {
+                                    permissionManager.resolve(request.id, PermissionChoice.REJECT)
+                                }
+                            }
+                        } else {
+                            shizukuManager.identity.collect { identity ->
+                                if (identity != eval.shizukuIdentity) {
+                                    permissionManager.resolve(request.id, PermissionChoice.REJECT)
+                                }
                             }
                         }
                     }
@@ -1513,19 +1518,40 @@ class StatefulAgentWorkflow @Inject constructor(
                 when (choice) {
                     PermissionChoice.REJECT -> PermissionCheckResult(false, "用户拒绝执行该工具", "USER_REJECTED")
                     PermissionChoice.ONCE, PermissionChoice.ALWAYS_SESSION -> {
-                        if (eval.rootGeneration == null) {
-                            PermissionCheckResult(true)
-                        } else if (choice != PermissionChoice.ONCE || sessionId.isNullOrBlank()) {
-                            PermissionCheckResult(false, appContext.getString(R.string.root_approval_required), "ROOT_APPROVAL_REQUIRED")
+                        if (choice == PermissionChoice.ALWAYS_SESSION && eval.sessionGrant == null) {
+                            PermissionCheckResult(false, appContext.getString(R.string.tool_permission_invalid_choice), "INVALID_APPROVAL_CHOICE")
                         } else {
-                            val command = (arguments["command"] as? JsonPrimitive)?.content.orEmpty()
-                            val permit = rootCommandManager.authorize(sessionId, command, eval.rootGeneration)
-                            if (permit == null) PermissionCheckResult(false, appContext.getString(R.string.root_access_disabled), "ROOT_ACCESS_CHANGED")
-                            else PermissionCheckResult(true, rootApprovalId = permit)
+                            issueExecutionPermit(eval, arguments, sessionId)
                         }
                     }
                 }
             }
         }
+    }
+
+    private suspend fun issueExecutionPermit(
+        eval: ToolPermissionPolicyEngine.EvalResult,
+        arguments: Map<String, JsonElement>,
+        sessionId: String?
+    ): PermissionCheckResult {
+        if (eval.rootGeneration != null) {
+            if (sessionId.isNullOrBlank() || eval.rootAuthorityId.isNullOrBlank()) {
+                return PermissionCheckResult(false, appContext.getString(R.string.root_approval_required), "ROOT_APPROVAL_REQUIRED")
+            }
+            val command = (arguments["command"] as? JsonPrimitive)?.content.orEmpty()
+            val permit = rootCommandManager.authorize(sessionId, command, eval.rootGeneration, eval.rootAuthorityId)
+            return if (permit == null) PermissionCheckResult(false, appContext.getString(R.string.root_access_disabled), "ROOT_ACCESS_CHANGED")
+                else PermissionCheckResult(true, rootApprovalId = permit)
+        }
+        if (eval.shizukuIdentity != null) {
+            if (sessionId.isNullOrBlank()) {
+                return PermissionCheckResult(false, appContext.getString(R.string.shizuku_approval_required), "SHIZUKU_APPROVAL_REQUIRED")
+            }
+            val command = (arguments["command"] as? JsonPrimitive)?.content.orEmpty()
+            val permit = shizukuManager.authorize(sessionId, command, eval.shizukuIdentity)
+            return if (permit == null) PermissionCheckResult(false, appContext.getString(R.string.shizuku_identity_changed), "SHIZUKU_IDENTITY_CHANGED")
+                else PermissionCheckResult(true, shizukuApprovalId = permit)
+        }
+        return PermissionCheckResult(true)
     }
 }

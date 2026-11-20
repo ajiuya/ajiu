@@ -75,7 +75,10 @@ class RemoteSftpFingerprintTest {
             afterRead()
             count
         }
-        access = RemoteSftpFileAccess(connection, workspace)
+        access = RemoteSftpFileAccess(connection, workspace, mockk<RemoteAgentConfigCache>(relaxed = true) {
+            every { captureProfile() } returns RemoteAgentConfigProfile("fixture", 0)
+            every { invalidation(any()) } returns {}
+        })
     }
 
     @Test fun streamingHashMatchesTheContentFingerprintUsingOneBoundedBufferAndAPrivateCapturedChannel() {
