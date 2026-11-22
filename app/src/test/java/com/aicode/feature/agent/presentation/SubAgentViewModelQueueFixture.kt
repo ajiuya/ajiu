@@ -24,6 +24,7 @@ import com.aicode.feature.agent.domain.recovery.RecoveryRepository
 import com.aicode.feature.agent.domain.recovery.RecoveryRequest
 import com.aicode.feature.agent.domain.recovery.RecoveryRequestPayload
 import com.aicode.feature.agent.domain.recovery.RecoveryRun
+import com.aicode.feature.agent.domain.recovery.RecoveryScope
 import com.aicode.feature.agent.domain.recovery.RecoveryStatus
 import com.aicode.feature.agent.domain.recovery.RecoveryStep
 import com.aicode.feature.agent.domain.root.RootAccessState
@@ -102,6 +103,7 @@ internal class SubAgentViewModelQueueFixture(
     val messages = mockk<AgentMessageDao>(relaxed = true)
     val commands = mockk<SlashCommandRegistry>(relaxed = true)
     val journal = mockk<SubAgentInteractionJournal>(relaxed = true)
+    val interactionReader = mockk<SubAgentInteractionReader>(relaxed = true)
     val events = SubAgentEventBus(journal)
     val notifications = AgentNotificationCenter()
     val plans = PlanApprovalManager()
@@ -166,7 +168,8 @@ internal class SubAgentViewModelQueueFixture(
             val requests = mutableMapOf<String, RecoveryRequest>()
             val payloads = mutableMapOf<String, RecoveryRequestPayload>()
             val runs = mutableMapOf<String, RecoveryRun>()
-            every { recoveryRepository.observePending(any()) } returns flowOf(emptyList())
+            every { recoveryRepository.observePending(any<String>()) } returns flowOf(emptyList())
+            every { recoveryRepository.observePending(any<RecoveryScope>()) } returns flowOf(emptyList())
             coEvery { recoveryRepository.initialize() } returns Unit
             coEvery { recoveryRepository.enqueue(any(), any(), any(), any(), any()) } answers {
                 val sessionId = firstArg<String>()
@@ -319,7 +322,7 @@ internal class SubAgentViewModelQueueFixture(
         containerOsDetector = osDetector,
         generalSettingsRepository = generalSettings,
         sessionSelectionStore = selectionStore,
-        subAgentInteractionReader = mockk(relaxed = true),
+        subAgentInteractionReader = interactionReader,
         subAgentInstructionGateway = SubAgentInstructionGateway(sessions, events),
         agentNotificationCenter = notifications,
         todoItemDao = dependencies.todoItemDao,

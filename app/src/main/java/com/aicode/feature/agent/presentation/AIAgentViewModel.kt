@@ -33,9 +33,10 @@ import com.aicode.feature.agent.domain.model.TodoItem
 import com.aicode.feature.agent.domain.permission.PermissionChoice
 import com.aicode.feature.agent.domain.notification.AgentNotificationCenter
 import com.aicode.feature.agent.domain.notification.AgentNotificationTimelineEntry
+import com.aicode.feature.agent.domain.recovery.PendingRecoveryTarget
 import com.aicode.feature.agent.domain.recovery.RecoveryRepository
 import com.aicode.feature.agent.domain.recovery.RecoveryRun
-import com.aicode.feature.agent.domain.recovery.RecoveryStatus
+import com.aicode.feature.agent.domain.recovery.RecoveryScope
 import com.aicode.feature.agent.domain.session.MessagePersistenceUseCase
 import com.aicode.feature.agent.domain.session.SessionSelectionStore
 import com.aicode.feature.agent.domain.session.SessionUseCase
@@ -45,7 +46,6 @@ import com.aicode.feature.agent.domain.tool.question.UserQuestionAnswer
 import com.aicode.feature.agent.domain.workflow.AgentEvent
 import com.aicode.feature.agent.presentation.component.ReasoningScrollStateStore
 import com.aicode.feature.agent.presentation.component.RewindOption
-import com.aicode.feature.agent.presentation.component.SessionRecoveryItemUi
 import com.aicode.feature.agent.presentation.filebrowse.FileBrowseController
 import com.aicode.feature.agent.presentation.filebrowse.FileBrowseScope
 import com.aicode.feature.agent.presentation.preview.PreparingToolPreviewSnapshot
@@ -110,6 +110,18 @@ data class ChatNotificationTimelineEvent(
     val sourceMessageId: String?,
 )
 
+internal data class RecoveryBubbleItem(val target: PendingRecoveryTarget, val environmentMatches: Boolean)
+
+internal data class RecoveryBubbleUi(
+    val scope: RecoveryScope? = null,
+    val items: List<RecoveryBubbleItem> = emptyList(),
+    val runningSessions: Set<String> = emptySet(),
+    val busy: Boolean = false
+) {
+    val batch = items.distinctBy { it.target.sessionId }
+    val continueTargets = batch.filter { it.environmentMatches && it.target.sessionId !in runningSessions }.map { it.target }
+}
+
 @OptIn(ExperimentalCoroutinesApi::class, FlowPreview::class)
 @HiltViewModel
 class AIAgentViewModel @Inject constructor(
@@ -150,23 +162,6 @@ class AIAgentViewModel @Inject constructor(
 
     private val recoveryCodec = Json { ignoreUnknownKeys = true }
     val recovering: StateFlow<Boolean> = agentRunManager.recovering
-    private fun _recoveryItemsFlow(): Flow<Pair<String?, List<SessionRecoveryItemUi>>> =
-        currentSessionId.flatMapLatest { sid ->
-            if (sid == null) flowOf(null to emptyList()) else combine(
-                recoveryRepository.observePending(sid),
-                projectMemoryIdentityResolver.environmentChanges.onStart { emit(Unit) }
-            ) { items, _ ->
-                val environment = runCatching {
-                    projectMemoryIdentityResolver.capture(_currentWorkspace.value)?.identity?.let { recoveryCodec.encodeToString(it) }
-                }.getOrNull()
-                sid to items.filter { it.request.status in setOf(RecoveryStatus.AWAITING_CONFIRMATION, RecoveryStatus.INTERRUPTED, RecoveryStatus.FAILED) }.map { item ->
-                    SessionRecoveryItemUi(item.request.id, item.payload.request, item.draft?.text.orEmpty(),
-                        (item.unknownTools + item.pendingTools).map { it.toolName }.distinct(), item.holdReason ?: "process_interrupted",
-                        environment == item.request.environment && item.holdReason != "PLAN_REJECTED",
-                        stage = item.stage)
-                }
-            }.flowOn(Dispatchers.IO)
-        }
 
     private val _currentSessionId = MutableStateFlow<String?>(null)
     private var sessionSelectionRevision = 0L
@@ -181,9 +176,6 @@ class AIAgentViewModel @Inject constructor(
         val workspace = _currentWorkspace.value
         if (id != null && workspace.isNotBlank()) sessionSelections.trySend(workspace to id)
     }
-    val recoveryItems: StateFlow<Pair<String?, List<SessionRecoveryItemUi>>> = _recoveryItemsFlow()
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null to emptyList())
-
     val chatNotificationTimeline: StateFlow<Pair<String?, List<ChatNotificationTimelineEvent>>> = currentSessionId
         .flatMapLatest { sessionId ->
             if (sessionId.isNullOrBlank()) flowOf(null to emptyList()) else combine(
@@ -359,6 +351,44 @@ class AIAgentViewModel @Inject constructor(
     val containerInit: StateFlow<ContainerInitState> = containerEngine.initProgress
 
     private val _currentWorkspace = MutableStateFlow<String>("")
+    private val scopedRecovery = combine(_currentWorkspace, currentSessionId, ::Pair).flatMapLatest { (workspace, sid) ->
+        flow {
+            emit(RecoveryBubbleUi())
+            if (sid == null || workspace.isBlank() || !agentRunManager.awaitReady()) return@flow
+            emitAll(chatSessionDao.getByIdFlow(sid).map { session ->
+                session?.takeIf { it.workspacePath == workspace }?.let { RecoveryScope(it.id, workspace, it.executionGeneration) }
+            }.distinctUntilChanged().flatMapLatest { scope ->
+                if (scope == null) {
+                    flowOf(RecoveryBubbleUi())
+                } else {
+                    combine(recoveryRepository.observePending(scope), projectMemoryIdentityResolver.environmentChanges.onStart { emit(Unit) }) { items, _ ->
+                        val environment = if (items.isEmpty()) null else runCatching {
+                            projectMemoryIdentityResolver.capture(workspace)?.identity?.let { recoveryCodec.encodeToString(it) }
+                        }.getOrNull()
+                        RecoveryBubbleUi(scope, items.map { item ->
+                            RecoveryBubbleItem(
+                                item.pendingTarget(), environment == item.request.environment &&
+                                    item.payload.projectRoot == workspace && item.holdReason != "PLAN_REJECTED"
+                            )
+                        })
+                    }.flowOn(Dispatchers.IO)
+                }
+            })
+        }
+    }
+    internal val recoveryBubble: StateFlow<RecoveryBubbleUi> = combine(
+        scopedRecovery, agentRunManager.recoveryBusySessions, agentRunManager.agentStates,
+        agentRunManager.compactingSessions, agentRunManager.runningCommandSessions
+    ) { snapshot, preparing, states, compacting, commands ->
+        val sessions = snapshot.batch.map { it.target.sessionId }
+        snapshot.copy(
+            busy = sessions.any { it in preparing },
+            runningSessions = sessions.filterTo(mutableSetOf()) { sid ->
+                sid in compacting || sid in commands || states[sid] == AgentUIState.Loading || states[sid] == AgentUIState.Streaming
+            }
+        )
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), RecoveryBubbleUi())
+
     fun setWorkspace(path: String) {
         if (path.isBlank() || _currentWorkspace.value == path) return
         selectionLoadedWorkspace.value = null
@@ -848,12 +878,13 @@ class AIAgentViewModel @Inject constructor(
         )
     }.distinctUntilChanged()
 
+    // 页面回来时保留同一会话的快照。伪空摘要会被正文投影当作子代理已移除，导致列表暂时卸载。
     val subAgentInteractionSummaries: StateFlow<Pair<String?, Map<String, SubAgentInteractionSummary>>> = _currentSessionId
         .flatMapLatest { parentId ->
             if (parentId == null) flowOf(null to emptyMap())
             else combine(subAgentInteractionReader.summaryFacts(parentId), subAgentInteractionRuntime) { facts, runtime ->
                 parentId to projectSubAgentInteractionSummaries(facts, runtime)
-            }.flowOn(Dispatchers.Default).onStart { emit(parentId to emptyMap()) }
+            }.flowOn(Dispatchers.Default)
         }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null to emptyMap())
 
     val subAgentInteractionEvents: StateFlow<Pair<String?, List<com.aicode.feature.agent.data.local.dao.SubAgentInteractionMetadata>>> =
@@ -862,7 +893,6 @@ class AIAgentViewModel @Inject constructor(
             else subAgentInteractionReader.summaryFacts(parentId)
                 .map { facts -> parentId to facts.metadata.filter { it.kind == "MESSAGE_FROM_PARENT" } }
                 .flowOn(Dispatchers.Default)
-                .onStart { emit(parentId to emptyList()) }
         }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null to emptyList())
 
     fun subAgentConversation(parentId: String, childId: String): Flow<SubAgentInteractionPage> =
@@ -1112,14 +1142,16 @@ class AIAgentViewModel @Inject constructor(
         }
     }
 
-    fun continueRecovery(requestId: String) {
-        val sid = _currentSessionId.value ?: return
-        agentRunManager.continueRecovery(sid, _currentWorkspace.value, requestId)
+    internal fun continueRecovery(snapshot: RecoveryBubbleUi, unknownToolsVerified: Boolean = false) {
+        val scope = snapshot.scope ?: return
+        if (snapshot.busy || scope.sessionId != _currentSessionId.value || scope.workspacePath != _currentWorkspace.value) return
+        agentRunManager.continueRecovery(scope, snapshot.continueTargets, unknownToolsVerified)
     }
 
-    fun abandonRecovery(requestId: String) {
-        val sid = _currentSessionId.value ?: return
-        agentRunManager.abandonRecovery(sid, requestId)
+    internal fun abandonRecovery(snapshot: RecoveryBubbleUi) {
+        val scope = snapshot.scope ?: return
+        if (snapshot.busy || scope.sessionId != _currentSessionId.value || scope.workspacePath != _currentWorkspace.value) return
+        agentRunManager.abandonRecovery(scope, snapshot.batch.map { it.target })
     }
 
     fun enqueueAgentRequest(

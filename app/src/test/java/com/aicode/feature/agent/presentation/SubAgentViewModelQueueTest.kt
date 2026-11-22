@@ -3,6 +3,7 @@ package com.aicode.feature.agent.presentation
 import android.app.Application
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
+import com.aicode.feature.agent.data.local.dao.SubAgentInteractionMetadata
 import com.aicode.feature.agent.data.local.entity.SubAgentInteractionEntity
 import com.aicode.feature.agent.domain.command.SlashCommandContext
 import com.aicode.feature.agent.domain.notification.AgentNotificationKind
@@ -30,9 +31,13 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -82,6 +87,44 @@ class SubAgentViewModelQueueTest {
             unmockkObject(TaskKeepaliveController)
             Dispatchers.resetMain()
         }
+    }
+
+    @Test
+    fun resubscribingToTheSameChatRetainsSummariesAndEventsUntilFreshFactsArrive() = runTest(dispatcher) {
+        val vm = fixture.viewModel
+        val event = SubAgentInteractionMetadata(
+            id = "instruction", parentSessionId = PARENT, subSessionId = CHILD, kind = "MESSAGE_FROM_PARENT",
+            timestamp = 2, origin = "USER", sourceMessageId = null, title = null, model = null, preview = "Check the list"
+        )
+        val stored = SubAgentInteractionFacts(listOf(event), listOf(fixture.sessionRows.getValue(CHILD)), emptyList())
+        val releaseRefresh = CompletableDeferred<SubAgentInteractionFacts>()
+        val refreshStarted = Channel<Unit>(Channel.UNLIMITED)
+        every { fixture.interactionReader.summaryFacts(PARENT) } returns flowOf(stored)
+        vm.selectSession(PARENT)
+        val summaries = vm.subAgentInteractionSummaries
+        val events = vm.subAgentInteractionEvents
+        assertEquals(setOf(CHILD), summaries.first { CHILD in it.second }.second.keys)
+        assertEquals(listOf(event), events.first { it.second.isNotEmpty() }.second)
+
+        advanceTimeBy(5_001)
+        runCurrent()
+        every { fixture.interactionReader.summaryFacts(PARENT) } returns flow {
+            refreshStarted.send(Unit)
+            emit(releaseRefresh.await())
+        }
+        val summaryCollector = backgroundScope.launch(start = CoroutineStart.UNDISPATCHED) { summaries.collect {} }
+        val eventCollector = backgroundScope.launch(start = CoroutineStart.UNDISPATCHED) { events.collect {} }
+        repeat(2) { refreshStarted.receive() }
+        runCurrent()
+
+        assertEquals(PARENT, summaries.value.first)
+        assertEquals(setOf(CHILD), summaries.value.second.keys)
+        assertEquals(PARENT to listOf(event), events.value)
+        releaseRefresh.complete(SubAgentInteractionFacts(emptyList(), emptyList(), emptyList()))
+        summaries.first { it.first == PARENT && it.second.isEmpty() }
+        events.first { it.first == PARENT && it.second.isEmpty() }
+        summaryCollector.cancel()
+        eventCollector.cancel()
     }
 
     @Test

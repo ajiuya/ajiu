@@ -1,8 +1,11 @@
 package com.aicode.feature.agent.data.local.dao
 
 import com.aicode.feature.agent.data.local.entity.AgentMessageEntity
+import com.aicode.feature.agent.data.local.entity.ChatSessionEntity
 import com.aicode.feature.agent.data.local.entity.RecoveryRunEntity
+import com.aicode.feature.agent.domain.recovery.PendingRecoveryTarget
 import com.aicode.feature.agent.domain.recovery.RecoveryResumeSnapshot
+import com.aicode.feature.agent.domain.recovery.RecoveryScope
 import com.aicode.feature.agent.domain.recovery.RecoveryStage
 import com.aicode.feature.agent.domain.recovery.RecoveryStep
 import com.aicode.feature.agent.domain.recovery.RecoveryToolCall
@@ -157,6 +160,84 @@ class AgentRecoveryDaoTest {
         assertNull(dao.ownedRunning(run.id, "owner"))
         assertEquals(1, fixture.runs.size)
         assertEquals(1, fixture.messages.size)
+    }
+
+    @Test
+    fun scopedClaimAndAbandonRejectAStaleQueueHeadWhenAnEarlierRunIsInterruptedAgain() = runTest {
+        val workspace = "/work"
+        fixture.putSession(ChatSessionEntity("parent", "Parent", 1, 1, workspacePath = workspace))
+        fixture.putSession(ChatSessionEntity("session", "Child", 1, 1, workspacePath = workspace, parentId = "parent"))
+        val scope = RecoveryScope("parent", workspace, 0)
+        val firstRun = ready()
+        val second = fixture.enqueue("second")
+        assertTrue(dao.awaitRecoveryConfirmation(second.id, 3_000))
+        assertEquals(second.id, dao.firstPendingRequestId(second.sessionId, second.generation))
+        val secondTarget = PendingRecoveryTarget(second.id, second.sessionId, second.generation, null, emptySet())
+
+        assertTrue(dao.finishRecoveryRun(firstRun.id, "owner", "INTERRUPTED", null, 4_000))
+        val writes = fixture.writes.toList()
+        assertNull(dao.claimPendingRecovery(scope, secondTarget, "local", false, "out-of-order", "owner", 5_000))
+        assertFalse(dao.abandonScopedRecovery(scope, secondTarget, 5_000))
+        assertEquals(writes, fixture.writes)
+        assertEquals("AWAITING_CONFIRMATION", fixture.requests.getValue(second.id).status)
+
+        val firstTarget = PendingRecoveryTarget(firstRun.requestId, firstRun.sessionId, firstRun.generation, firstRun.id, emptySet())
+        assertTrue(dao.abandonScopedRecovery(scope, firstTarget, 6_000))
+        val resumed = checkNotNull(dao.claimPendingRecovery(scope, secondTarget, "local", false, "resumed", "owner", 7_000))
+        assertEquals(second.id, resumed.requestId)
+        assertEquals("ABANDONED", fixture.requests.getValue(firstRun.requestId).status)
+        assertEquals("RUNNING", fixture.requests.getValue(second.id).status)
+    }
+
+    @Test
+    fun scopedClaimRequiresExplicitVerificationOfTheExactUnknownToolCallsBeforeClearingAHold() = runTest {
+        val workspace = "/work"
+        fixture.putSession(ChatSessionEntity("session", "Session", 1, 1, workspacePath = workspace))
+        val old = runningTool()
+        assertTrue(dao.holdRecoverySession(old.sessionId, "process_interrupted", 6_000))
+        val scope = RecoveryScope(old.sessionId, workspace, old.generation)
+        val target = PendingRecoveryTarget(old.requestId, old.sessionId, old.generation, old.id,
+            setOf(RecoveryToolCall(call.id, call.name)))
+        val differentCall = target.copy(unknownTools = setOf(RecoveryToolCall("stale-call", call.name)))
+        val writes = fixture.writes.toList()
+
+        assertNull(dao.claimPendingRecovery(scope, target, "local", false, "unverified", "new-owner", 7_000))
+        assertNull(dao.claimPendingRecovery(scope, differentCall, "local", true, "stale", "new-owner", 7_000))
+        assertNull(dao.claimPendingRecovery(scope, target.copy(unknownTools = emptySet()), "local", true, "missing", "new-owner", 7_000))
+        assertEquals(writes, fixture.writes)
+        assertEquals("process_interrupted", fixture.sessions.getValue(old.sessionId).autoDispatchBlockedReason)
+        assertEquals("UNKNOWN", fixture.tools.getValue(old.id to call.id).status)
+        assertEquals(setOf(old.id), fixture.runs.keys)
+
+        val resumed = checkNotNull(dao.claimPendingRecovery(scope, target, "local", true, "verified", "new-owner", 8_000))
+        assertEquals(old.id, snapshot(resumed).sourceRunId)
+        assertEquals(RecoveryStage.TOOLS_UNKNOWN, snapshot(resumed).stage)
+        assertNull(fixture.sessions.getValue(old.sessionId).autoDispatchBlockedReason)
+        assertEquals(resumed.id, fixture.requests.getValue(old.requestId).activeRunId)
+    }
+
+    @Test
+    fun claimedChildCannotCommitRecoveredToolResultsAfterParentGenerationChanges() = runTest {
+        val workspace = "/work"
+        val parent = ChatSessionEntity("parent", "Parent", 1, 1, workspacePath = workspace)
+        fixture.putSession(parent)
+        fixture.putSession(ChatSessionEntity("session", "Child", 1, 1, workspacePath = workspace, parentId = parent.id))
+        val old = runningTool()
+        assertTrue(dao.finishRecoveryRun(old.id, "owner", "INTERRUPTED", null, 6_000))
+        val scope = RecoveryScope(parent.id, workspace, parent.executionGeneration)
+        val target = PendingRecoveryTarget(old.requestId, old.sessionId, old.generation, old.id,
+            setOf(RecoveryToolCall(call.id, call.name)))
+        val claimed = checkNotNull(dao.claimPendingRecovery(scope, target, "local", true, "resumed", "new-owner", 7_000))
+        assertEquals(claimed, dao.ownedRunning(claimed.id, "new-owner"))
+        fixture.putSession(parent.copy(executionGeneration = 1))
+        val writes = fixture.writes.toList()
+        val results = listOf(toolResult().copy(isError = true, content = "Verify external effects"))
+
+        assertFalse(dao.commitScopedRecoveryToolResults(scope, target, claimed.id, "new-owner", results, 8_000))
+        assertEquals(writes, fixture.writes)
+        assertNull(fixture.messages[results.single().id])
+        assertEquals("UNKNOWN", fixture.tools.getValue(old.id to call.id).status)
+        assertEquals(claimed, dao.ownedRunning(claimed.id, "new-owner"))
     }
 
     @Test

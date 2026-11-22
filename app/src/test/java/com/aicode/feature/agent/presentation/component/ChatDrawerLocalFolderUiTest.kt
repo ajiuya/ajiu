@@ -24,6 +24,7 @@ import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.unit.Density
 import com.aicode.R
 import com.aicode.core.theme.AIEditorTheme
+import com.aicode.feature.agent.domain.model.ChatSession
 import com.aicode.feature.agent.presentation.BrowseClipboard
 import com.aicode.feature.agent.presentation.ChatSearchState
 import com.aicode.feature.agent.presentation.FileBrowseState
@@ -206,6 +207,46 @@ class ChatDrawerLocalFolderUiTest {
         assertTrue(mutations.isEmpty())
     }
 
+    @Test(timeout = 30_000)
+    fun updatingSelectedRootSessionKeepsTheVisibleScrollAnchor() = render(openFiles = false) {
+        val newestUpdate = 1_700_000_000_000L
+        sessions = List(80) { index ->
+            ChatSession(
+                id = "session-$index",
+                title = "Session $index",
+                createdAt = 0L,
+                updatedAt = newestUpdate - index
+            )
+        }
+        pump(12)
+        val atTop = visibleSessionRows()
+        val rowStride = atTop[2].offsetY - atTop[1].offsetY
+        scrollSessionsBy(atTop[1].offsetY + 32 * rowStride + rowStride / 3)
+        val scrolled = visibleSessionRows()
+        assertTrue("The newest session must be outside the viewport after scrolling", scrolled.none {
+            it.title == atTop.first().title
+        })
+
+        val selected = sessions.single { it.title == scrolled[1].title }
+        clickText(hostRoot(), selected.title)
+        assertEquals(selected.id, currentSessionId)
+        val before = visibleSessionRows().first()
+        assertEquals(scrolled.first().title, before.title)
+        assertTrue("The anchor row must be clipped at the top of the viewport", before.offsetY < -0.5f)
+
+        sessions = sessions.map { session ->
+            if (session.id == selected.id) session.copy(updatedAt = newestUpdate + 1) else session
+        }.sortedByDescending { it.updatedAt }
+        pump(12)
+
+        val after = visibleSessionRows()
+        assertEquals("The first visible session changed after reordering", before.title, after.first().title)
+        assertEquals("The visible anchor's vertical offset changed", before.offsetY, after.first().offsetY, 0.5f)
+        assertTrue("The updated session must have moved above the visible anchor", after.none { it.title == selected.title })
+    }
+
+    private data class SessionAnchor(val title: String, val offsetY: Float)
+
     private class DrawerUi(
         private val activity: ComponentActivity,
         private val view: ComposeView,
@@ -218,6 +259,8 @@ class ChatDrawerLocalFolderUiTest {
             node(CHILD_NAME, CHILD_PATH, depth = 1),
             node(FILE_NAME, "$LOCAL_PATH/$FILE_NAME", depth = 1, directory = false)
         )))
+        var sessions by mutableStateOf<List<ChatSession>>(emptyList())
+        var currentSessionId by mutableStateOf<String?>(null)
         var transferActive by mutableStateOf(false)
         var clipboard by mutableStateOf<BrowseClipboard?>(null)
         val removedGrants = mutableListOf<String>()
@@ -257,6 +300,29 @@ class ChatDrawerLocalFolderUiTest {
                 it.config.getOrNull(SemanticsActions.OnClick) != null &&
                     it.config.getOrNull(SemanticsProperties.ContentDescription)?.contains(text) == true
             }
+        private fun sessionList(): SemanticsNode = hostRoot().semanticsOwner
+            .getAllSemanticsNodes(mergingEnabled = true).single {
+                it.config.contains(SemanticsProperties.VerticalScrollAxisRange) &&
+                    it.config.getOrNull(SemanticsActions.ScrollBy)?.action != null
+            }
+        fun scrollSessionsBy(pixels: Float) {
+            val scroll = requireNotNull(sessionList().config[SemanticsActions.ScrollBy].action)
+            assertTrue(scroll.invoke(0f, pixels))
+            pump(60)
+        }
+        fun visibleSessionRows(): List<SessionAnchor> {
+            val list = sessionList()
+            val viewport = list.boundsInRoot
+            val viewportTop = list.positionInRoot.y
+            return list.children.mapNotNull { row ->
+                val bounds = row.boundsInRoot
+                if (bounds.isEmpty || !bounds.overlaps(viewport) ||
+                    !row.config.contains(SemanticsActions.OnClick)) return@mapNotNull null
+                val title = row.config.getOrNull(SemanticsProperties.Text)?.firstOrNull()?.text
+                    ?: return@mapNotNull null
+                SessionAnchor(title, row.positionInRoot.y - viewportTop)
+            }.sortedBy { it.offsetY }
+        }
         fun assertEnabled(node: SemanticsNode) {
             assertFalse(node.config.contains(SemanticsProperties.Disabled))
             assertTrue(node.config.getOrNull(SemanticsActions.OnClick)?.action != null)
@@ -298,7 +364,7 @@ class ChatDrawerLocalFolderUiTest {
         }
     }
 
-    private fun render(inspect: DrawerUi.() -> Unit) = runTest(timeout = 20.seconds) {
+    private fun render(openFiles: Boolean = true, inspect: DrawerUi.() -> Unit) = runTest(timeout = 20.seconds) {
         val controller = Robolectric.buildActivity(ComponentActivity::class.java).setup().visible()
         val activity = controller.get()
         val view = ComposeView(activity)
@@ -331,8 +397,9 @@ class ChatDrawerLocalFolderUiTest {
                 CompositionLocalProvider(LocalDensity provides Density(1f)) {
                     AIEditorTheme(darkTheme = false) {
                         ChatDrawerContent(
-                            sessions = emptyList(), currentSessionId = null, agentStates = emptyMap(),
-                            onSelect = {}, onDelete = {}, onRename = { _, _ -> }, onTogglePin = {}, onExport = {},
+                            sessions = ui.sessions, currentSessionId = ui.currentSessionId, agentStates = emptyMap(),
+                            onSelect = { ui.currentSessionId = it.id },
+                            onDelete = {}, onRename = { _, _ -> }, onTogglePin = {}, onExport = {},
                             browseStateFlow = ui.browseState, sidebarVisible = true, expandedPaths = emptySet(),
                             transferActive = ui.transferActive, clipboard = ui.clipboard,
                             onToggleExpand = { ui.expanded += it }, onOpenFile = { ui.mutations += "open:$it" },
@@ -360,8 +427,10 @@ class ChatDrawerLocalFolderUiTest {
             }
             activity.setContentView(view)
             ui.pump(12)
-            ui.clickText(ui.hostRoot(), ui.text(R.string.drawer_tab_files))
-            ui.pump(12)
+            if (openFiles) {
+                ui.clickText(ui.hostRoot(), ui.text(R.string.drawer_tab_files))
+                ui.pump(12)
+            }
             ui.inspect()
         } finally {
             view.disposeComposition()

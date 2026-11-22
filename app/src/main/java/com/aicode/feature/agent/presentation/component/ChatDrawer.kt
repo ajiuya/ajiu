@@ -246,18 +246,6 @@ fun ChatDrawerContent(
         selectedSessionIds.clear()
     }
 
-    // 点击会话/重开侧边栏保持原滚动位置；仅当同一会话的最后回复时间变化（发消息/收到回复）时滚回顶部。
-    var lastTouched by remember { mutableStateOf<Pair<String?, Long?>?>(null) }
-    val currentUpdatedAt = sessions.firstOrNull { it.id == currentSessionId }?.updatedAt
-    LaunchedEffect(currentSessionId, currentUpdatedAt) {
-        val cur = currentSessionId to currentUpdatedAt
-        val prev = lastTouched
-        lastTouched = cur
-        if (prev != null && prev.first == cur.first && prev.second != cur.second) {
-            listState.scrollToItem(0)
-        }
-    }
-
     val imeInset = rememberImeBottomInset()
     Column(
         modifier = modifier

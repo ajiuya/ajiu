@@ -8,15 +8,17 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.test.core.app.ApplicationProvider
 import com.aicode.feature.agent.data.local.dao.RecoveryDaoFixture
-import com.aicode.feature.agent.data.local.dao.RecoverySessionGate
 import com.aicode.feature.agent.data.local.entity.AgentMessageEntity
 import com.aicode.feature.agent.domain.command.SlashCommandContext
 import com.aicode.feature.agent.domain.memory.ProjectMemoryCapture
 import com.aicode.feature.agent.domain.model.AgentContext
 import com.aicode.feature.agent.domain.permission.PermissionChoice
 import com.aicode.feature.agent.domain.permission.SessionPermissionGrantRepository
+import com.aicode.feature.agent.domain.recovery.PendingRecoveryTarget
 import com.aicode.feature.agent.domain.recovery.RecoveryRepository
 import com.aicode.feature.agent.domain.recovery.RecoveryRequestPayload
+import com.aicode.feature.agent.domain.recovery.RecoveryScope
+import com.aicode.feature.agent.domain.recovery.RecoveryToolCall
 import com.aicode.feature.agent.domain.session.SessionUseCase
 import com.aicode.feature.agent.domain.subagent.SubAgentEvent
 import com.aicode.feature.agent.domain.subagent.SubAgentEventType
@@ -59,6 +61,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestDispatcher
@@ -268,7 +271,15 @@ class AgentRunLifecycleTest {
         val compactionSession = "compaction-gate"
         val recoverySession = "recovery-gate"
         val queueSession = "queue-gate"
+        val scope = RecoveryScope(recoverySession, WORKSPACE, 0)
+        val target = PendingRecoveryTarget("missing-request", recoverySession, 0, null, emptySet())
+        val scopeObserved = CompletableDeferred<Unit>()
         val recoveryObserved = CompletableDeferred<Unit>()
+        every { fixture.recoveryRepository.observePending(scope) } answers {
+            assertTrue(release.isCompleted)
+            scopeObserved.complete(Unit)
+            flowOf(emptyList())
+        }
         var recoverySubscriptions = 0
         every { fixture.recoveryRepository.observePending(recoverySession) } returns flow {
             assertTrue(release.isCompleted)
@@ -294,7 +305,8 @@ class AgentRunLifecycleTest {
         vm.compactSession(compactionSession)
         vm.enqueueAgentRequest("queued before startup cleanup", targetSessionId = queueSession)
         vm.selectSession(recoverySession)
-        vm.continueRecovery("missing-request")
+        observe(vm.recoveryBubble)
+        fixture.manager.continueRecovery(scope, listOf(target))
         fixture.terminalEvents.emit(terminalEvent("gated-terminal"))
         runCurrent()
         assertFalse(submit.isCompleted)
@@ -304,7 +316,9 @@ class AgentRunLifecycleTest {
         coVerify(exactly = 0) { fixture.workflow.compactSession(any(), any(), any(), any()) }
         assertEquals(0, recoverySubscriptions)
         verify(exactly = 0) { fixture.recoveryRepository.observePending(recoverySession) }
+        verify(exactly = 0) { fixture.recoveryRepository.observePending(any<RecoveryScope>()) }
         coVerify(exactly = 0) { fixture.recoveryRepository.claim("missing-request", any(), any()) }
+        coVerify(exactly = 0) { fixture.recoveryRepository.claimPending(any(), any(), any(), any()) }
         coVerify(exactly = 0) { fixture.recoveryRepository.enqueue(any(), any(), any(), any(), any()) }
         assertTrue(fixture.notifications.peek(PARENT).isEmpty())
         coVerify(exactly = 0) { fixture.messages.markPendingToolsInterrupted(any(), any(), any()) }
@@ -316,12 +330,15 @@ class AgentRunLifecycleTest {
         slash.join()
         fixture.jobs[compactionSession]?.join()
         recoveryObserved.await()
+        scopeObserved.await()
         runCurrent()
         verify(exactly = 1) { command.execute(any(), "") }
         coVerify(exactly = 1) { fixture.workflow.compactSession(compactionSession, any(), any(), any()) }
         assertEquals(1, recoverySubscriptions)
         verify(exactly = 1) { fixture.recoveryRepository.observePending(recoverySession) }
+        verify(exactly = 1) { fixture.recoveryRepository.observePending(scope) }
         coVerify(exactly = 0) { fixture.recoveryRepository.claim("missing-request", any(), any()) }
+        coVerify(exactly = 0) { fixture.recoveryRepository.claimPending(any(), any(), any(), any()) }
         coVerify(exactly = 1) { fixture.recoveryRepository.initialize() }
         coVerify(exactly = 1) { fixture.messages.markPendingToolsInterrupted("TOOL", "${SessionUseCase.PENDING_TOOL_MARKER}%", SessionUseCase.INTERRUPTED_TOOL_TEXT) }
         coVerify(exactly = 1) { fixture.messages.markPendingToolsInterrupted("TOOL", "${SessionUseCase.LEGACY_PENDING_TOOL_MARKER}%", SessionUseCase.INTERRUPTED_TOOL_TEXT) }
@@ -347,7 +364,10 @@ class AgentRunLifecycleTest {
         val command = fixture.installCommand("/blocked")
         vm.executeAgentRequestStream("/blocked", targetSessionId = CHILD).join()
         vm.compactSession(CHILD)
-        vm.continueRecovery("blocked-recovery")
+        observe(vm.recoveryBubble)
+        val scope = RecoveryScope(PARENT, WORKSPACE, 0)
+        val target = PendingRecoveryTarget("blocked-recovery", PARENT, 0, null, emptySet())
+        fixture.manager.continueRecovery(scope, listOf(target))
         fixture.terminalEvents.emit(terminalEvent("blocked-notification"))
         fixture.events.emit(completedEvent("blocked-subagent"))
         runCurrent()
@@ -356,8 +376,10 @@ class AgentRunLifecycleTest {
         verify(exactly = 0) { command.execute(any(), any()) }
         verify(exactly = 0) { fixture.workflow.executeEvents(any(), any(), any()) }
         coVerify(exactly = 0) { fixture.workflow.compactSession(any(), any(), any(), any()) }
-        verify(exactly = 0) { fixture.recoveryRepository.observePending(any()) }
+        verify(exactly = 0) { fixture.recoveryRepository.observePending(any<String>()) }
+        verify(exactly = 0) { fixture.recoveryRepository.observePending(any<RecoveryScope>()) }
         coVerify(exactly = 0) { fixture.recoveryRepository.claim("blocked-recovery", any(), any()) }
+        coVerify(exactly = 0) { fixture.recoveryRepository.claimPending(any(), any(), any(), any()) }
         coVerify(exactly = 0) { fixture.recoveryRepository.enqueue(any(), any(), any(), any(), any()) }
         coVerify(exactly = 1) { fixture.recoveryRepository.initialize() }
         coVerify(exactly = 0) { fixture.messages.markPendingToolsInterrupted(any(), any(), any()) }
@@ -434,7 +456,7 @@ class AgentRunLifecycleTest {
         fixture.closeUi()
         fixture.closeProcessOwner().join()
         val ledger = RecoveryDaoFixture()
-        ledger.sessions[PARENT] = RecoverySessionGate(PARENT, 0, null)
+        ledger.putSession(fixture.sessionRows.getValue(PARENT))
         val previous = RecoveryRepository(ledger.dao)
         val request = previous.enqueue(PARENT, RecoveryRequestPayload("Interrupted process request", WORKSPACE),
             Json.encodeToString(fixture.projectIdentity), requestId = "process-request", inputMessageId = "process-input")
@@ -446,7 +468,7 @@ class AgentRunLifecycleTest {
             MessageRole.ASSISTANT.name, "Proposed tool", 2,
             toolCallsJson = Json.encodeToString(listOf(ToolCall("unknown-tool", "Bash", emptyMap()))))))
         assertTrue(previous.markToolStarted(previousRun.id, "unknown-tool"))
-        ledger.sessions[CHILD] = RecoverySessionGate(CHILD, 0, null)
+        ledger.putSession(fixture.sessionRows.getValue(CHILD))
         val draftRequest = previous.enqueue(CHILD, RecoveryRequestPayload("Interrupted draft request", WORKSPACE),
             request.environment, requestId = "draft-request", inputMessageId = "draft-input")
         val draftRun = checkNotNull(previous.claim(draftRequest.id, draftRequest.environment))
@@ -456,23 +478,27 @@ class AgentRunLifecycleTest {
         val next = RecoveryRepository(ledger.dao)
         fixture = SubAgentViewModelQueueFixture(context, recovery = next)
         openSession()
-        observe(vm.recoveryItems)
-        val card = vm.recoveryItems.first { (sid, items) -> sid == PARENT && items.any { it.requestId == request.id } }
-            .second.single()
-        runCurrent()
-        assertEquals("Interrupted process request", card.request)
-        assertEquals("", card.draft)
-        assertEquals(listOf("Bash"), card.unknownTools)
-        assertTrue(card.environmentMatches)
+        ledger.refreshPendingScopeRows()
+        val parentScope = RecoveryScope(PARENT, WORKSPACE, 0)
+        val parentBubble = vm.recoveryBubble.first { it.scope == parentScope && it.items.isNotEmpty() }
+        assertEquals(listOf(request.id, draftRequest.id), parentBubble.items.map { it.target.requestId })
+        val parentItem = parentBubble.items.first()
+        val detail = next.observePending(PARENT).first().single()
+        assertEquals("Interrupted process request", detail.payload.request)
+        assertEquals("", detail.draft?.text.orEmpty())
+        assertEquals(setOf(RecoveryToolCall("unknown-tool", "Bash")), parentItem.target.unknownTools)
+        assertTrue(parentItem.environmentMatches)
         assertEquals("INTERRUPTED", ledger.requests.getValue(request.id).status)
         assertEquals("INTERRUPTED", ledger.runs.getValue(previousRun.id).status)
         assertEquals("UNKNOWN", ledger.tools.getValue(previousRun.id to "unknown-tool").status)
         assertEquals(setOf(previousRun.id, draftRun.id), ledger.runs.keys)
         vm.selectSession(CHILD)
-        val draftCard = vm.recoveryItems.first { (sid, items) -> sid == CHILD && items.any { it.requestId == draftRequest.id } }
-            .second.single()
-        assertEquals("Interrupted draft request", draftCard.request)
-        assertEquals("Unverified process draft", draftCard.draft)
+        val childScope = RecoveryScope(CHILD, WORKSPACE, 0)
+        val childBubble = vm.recoveryBubble.first { it.scope == childScope && it.items.isNotEmpty() }
+        assertEquals(draftRequest.id, childBubble.items.single().target.requestId)
+        val draftDetail = next.observePending(CHILD).first().single()
+        assertEquals("Interrupted draft request", draftDetail.payload.request)
+        assertEquals("Unverified process draft", draftDetail.draft?.text)
         assertEquals("INTERRUPTED", ledger.runs.getValue(draftRun.id).status)
         assertEquals(originalMessages, ledger.messages)
         assertFalse(next.isCurrent(previousRun.id))

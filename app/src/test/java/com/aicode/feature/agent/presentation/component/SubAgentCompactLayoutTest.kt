@@ -141,21 +141,9 @@ class SubAgentCompactLayoutTest {
             assertTrue(hasText(formatToolDuration(3_000L)))
             assertFalse(hasText(names))
             assertTrue(hasText(activity.getString(R.string.subagent_group_total_count, 8)))
-            val compactStatusSummary = buildList {
-                add("● 2 ${activity.getString(R.string.subagent_group_compact_running)}")
-                add("● 1 ${activity.getString(R.string.subagent_group_compact_completed)}")
-                add("● 1 ${activity.getString(R.string.subagent_group_compact_waiting)}")
-                SubAgentInteractionStatus.entries
-                    .filter { it !in setOf(
-                        SubAgentInteractionStatus.QUEUED,
-                        SubAgentInteractionStatus.RUNNING,
-                        SubAgentInteractionStatus.COMPLETED,
-                        SubAgentInteractionStatus.AWAITING_CONFIRMATION,
-                    ) }
-                    .filter { status -> summaries.any { it.status == status } }
-                    .forEach { status -> add("● 1 ${labels.getValue(status)}") }
-            }.joinToString(" · ")
-            assertTrue(hasText(compactStatusSummary))
+            assertEquals(5, nodes().count { "A" in it.texts() })
+            assertTrue(hasText("+3"))
+            assertFalse(SubAgentInteractionStatus.entries.any { hasText("● 1 ${labels.getValue(it)}") })
             val group = clickNode(activity.getString(R.string.subagent_group_title))
             assertTrue(group.boundsInRoot.height <= 72f)
             val description = group.config.getOrNull(SemanticsProperties.StateDescription).orEmpty()
@@ -170,7 +158,10 @@ class SubAgentCompactLayoutTest {
             assertFalse(hasText(activity.getString(R.string.subagent_interaction_counts, 2, 5)))
             assertEquals(0, sourceReads)
             clickText(activity.getString(R.string.subagent_group_title))
-            awaitUi { hasText(compactStatusSummary) && summaries.none { hasText("${it.title} · ${labels.getValue(it.status)}") } }
+            awaitUi {
+                hasText("+3") && nodes().count { "A" in it.texts() } == 5 &&
+                    summaries.none { hasText("${it.title} · ${labels.getValue(it.status)}") }
+            }
         }
     }
 

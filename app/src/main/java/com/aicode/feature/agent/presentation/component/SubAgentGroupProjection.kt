@@ -13,6 +13,8 @@ internal data class SubAgentTurnGroup(
     val carrierMessageIds: Set<String>,
 )
 
+internal const val CHAT_ACTIVE_TAIL_KEY = "__active__"
+
 internal data class SubAgentGroupProjection(
     val bodyItems: List<ChatRenderItem>,
     val footerItems: List<ChatRenderItem>,
@@ -25,6 +27,18 @@ internal data class SubAgentGroupProjection(
     val items: List<ChatRenderItem> = if (footerItems.isEmpty()) bodyItems else bodyItems + footerItems
     // 主列表在 body 与 footer 之间始终保留一个 __active__ 槽位。
     val expectedLazyItemCount: Int get() = bodyItems.size + 1 + footerItems.size
+
+    fun lazyKeyAt(index: Int): String? = when {
+        index < bodyItems.size -> bodyItems.getOrNull(index)?.key
+        index == bodyItems.size -> CHAT_ACTIVE_TAIL_KEY
+        else -> footerItems.getOrNull(index - bodyItems.size - 1)?.key
+    }
+
+    fun lazyIndexOfKey(key: Any): Int {
+        if (key == CHAT_ACTIVE_TAIL_KEY) return bodyItems.size
+        val index = items.indexOfFirst { it.key == key }
+        return if (index >= bodyItems.size) index + 1 else index
+    }
 }
 
 internal fun projectSubAgentGroup(

@@ -333,6 +333,18 @@ class ToolGroupExpansionTest {
     }
 
     @Test
+    fun expandingSearchResultTurnRevealsAnIntermediateAssistantMessage() {
+        val messages = listOf(user("u0"), assistant("middle"), tool("t1"), assistant("final"))
+        val turnKey = "turn:u0"
+        val turnKeys = reconcileTurnKeys(messages, emptyMap(), "session")
+        val collapsed = flattenChatProcesses(buildChatItems(messages, turnKeys = turnKeys))
+        assertEquals(-1, findChatMessageIndex(collapsed, "middle"))
+
+        val expanded = flattenChatProcesses(buildChatItems(messages, mapOf(turnKey to true), turnKeys = turnKeys))
+        assertEquals("middle", expanded[findChatMessageIndex(expanded, "middle")].key)
+    }
+
+    @Test
     fun searchTargetsAnswerInsteadOfItsReasoning() {
         val answer = assistant("a1").copy(reasoning = "thinking")
         val rendered = flattenChatProcesses(items(listOf(user("u0"), answer), mapOf("turn:u0" to true)))

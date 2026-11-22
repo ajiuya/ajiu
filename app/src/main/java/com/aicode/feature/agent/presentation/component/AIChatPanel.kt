@@ -15,6 +15,9 @@ import androidx.compose.animation.scaleOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.AnimationVector1D
+import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
@@ -130,7 +133,6 @@ import compose.icons.FeatherIcons
 import compose.icons.feathericons.ArrowDown
 import java.io.File
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 
@@ -160,21 +162,37 @@ private const val AUTO_SCROLL_TOLERANCE_PX = 2
 internal fun shouldDimChatFloatingLayer(userScrollGesture: Boolean): Boolean = userScrollGesture
 
 /** 用同一次测量的留白与末项坐标校准；逐字增长不能反复重置列表的首项锚点。 */
-internal suspend fun LazyListState.followChatBottom(tolerancePx: Int = AUTO_SCROLL_TOLERANCE_PX) {
+internal suspend fun LazyListState.followChatBottom(
+    tolerancePx: Int = AUTO_SCROLL_TOLERANCE_PX,
+    smoothTailArrival: Boolean = false,
+) {
     if (!canScrollForward) return
     var layout = layoutInfo
+    var smoothOverflow = smoothTailArrival
     val lastVisible = layout.visibleItemsInfo.lastOrNull() ?: return
     if (lastVisible.index < layout.totalItemsCount - 1) {
         // 新增的末项尚未测到高度：先将其起点放到安全区下沿，再按实际高度补齐。
         val anchor = (layout.viewportEndOffset - layout.afterContentPadding)
             .coerceIn(0, (layout.viewportEndOffset - 1).coerceAtLeast(0))
-        scrollToItem(layout.totalItemsCount - 1, -anchor)
+        if (smoothTailArrival) {
+            animateScrollToItem(layout.totalItemsCount - 1, -anchor)
+            smoothOverflow = true
+        } else {
+            scrollToItem(layout.totalItemsCount - 1, -anchor)
+        }
         layout = layoutInfo
     }
     val tail = layout.visibleItemsInfo.lastOrNull() ?: return
     if (tail.index != layout.totalItemsCount - 1) return
-    val overflow = tail.offset.toLong() + tail.size - (layout.viewportEndOffset - layout.afterContentPadding)
-    if (overflow > tolerancePx && canScrollForward) scrollBy(overflow.toFloat())
+    val safeBottom = layout.viewportEndOffset - layout.afterContentPadding
+    val overflow = tail.offset.toLong() + tail.size - safeBottom
+    if (overflow > tolerancePx && canScrollForward) {
+        if (smoothOverflow) {
+            animateScrollToItem(tail.index, -(safeBottom - tail.size))
+        } else {
+            scrollBy(overflow.toFloat())
+        }
+    }
 }
 
 /** 滚动到底部按钮直径（dp）。 */
@@ -230,6 +248,10 @@ private data class ChatMetadataProjection(
     val toolsByTurn: Map<String?, List<AgentUIMessage>>,
 )
 
+private data class ChatDisplayedProjection(
+    val metadata: ChatMetadataProjection,
+    val rows: SubAgentGroupProjection,
+)
 
 /** 整轮折叠头 item 的 contentType。 */
 private const val TURN_HEADER_CONTENT_TYPE = "turn-header"
@@ -896,7 +918,7 @@ internal fun applyTypewriterContentSlices(
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
 fun AIChatPanel(
     viewModel: AIAgentViewModel,
@@ -950,9 +972,7 @@ fun AIChatPanel(
     val contextUsages by viewModel.contextUsages.collectAsStateWithLifecycle()
     val generationSpeed by viewModel.generationSpeed.collectAsStateWithLifecycle()
     val speedTier by viewModel.speedTier.collectAsStateWithLifecycle()
-    val recoverySnapshot by viewModel.recoveryItems.collectAsStateWithLifecycle()
-    val recoveryBusy by viewModel.recovering.collectAsStateWithLifecycle()
-    val recoveryItems = recoverySnapshot.takeIf { it.first == currentSessionId }?.second.orEmpty()
+    val recoverySnapshot by viewModel.recoveryBubble.collectAsStateWithLifecycle()
     val typewriterCharsPerSecond = settingsViewModel?.typewriterCharsPerSecond?.collectAsStateWithLifecycle()?.value
         ?: DEFAULT_TYPEWRITER_CHARS_PER_SECOND
     val autoExpandReasoning = settingsViewModel?.autoExpandReasoning?.collectAsStateWithLifecycle()?.value ?: false
@@ -1032,6 +1052,15 @@ fun AIChatPanel(
     var fullScreenInputVisible by remember { mutableStateOf(false) }
     var queuedEditing by remember { mutableStateOf<QueuedRequest?>(null) }
     val listState = rememberLazyListState()
+    // 窄窗切换全屏路由时聊天会被 dispose，保留跟随和定位状态才能沿用保存的阅读位置。
+    var positionedSession by rememberSaveable { mutableStateOf<String?>(null) }
+    var followBottom by rememberSaveable { mutableStateOf(true) }
+    var userScrollGesture by remember { mutableStateOf(false) }
+    var pointerDown by remember { mutableStateOf(false) }
+    var nestedFling by remember { mutableStateOf(false) }
+    val keepHistoryPosition = {
+        positionedSession == currentSessionId && !followBottom && pendingScroll?.first != currentSessionId
+    }
     // 消息未就绪时的加载提示：本地读库通常几十毫秒，立刻显示反而闪一下，等一小会儿还没就绪才提示。
     var showMessagesLoading by remember(currentSessionId) { mutableStateOf(false) }
     // 贴底滚动留白：首帧测量前用兜底值（约输入框 + 间距），实测悬浮层高度后改为动态值，
@@ -1100,7 +1129,7 @@ fun AIChatPanel(
     val chatRequest = remember(messagesState, chatItemsKey, projectionOwner, knownChildIds, messagesReady) {
         if (messagesReady) ChatItemsBuildRequest(messagesState, chatItemsKey, projectionOwner, knownChildIds) else null
     }
-    val metadataResult = rememberChatProjection(chatRequest) {
+    val projectedMetadata = rememberChatProjection(chatRequest) {
         val context = currentCoroutineContext()
         messages.forEach { message ->
             context.ensureActive()
@@ -1130,14 +1159,6 @@ fun AIChatPanel(
             actionableMessageIds = actionableChatMessageIds(messages, isBusy),
             toolsByTurn = messages.filter { it.role == MessageRole.TOOL && !it.isSystemCardInTurn() }.groupBy { resolvedKeys[it.id] },
         )
-    }
-    val metadata = metadataResult?.value
-    val metadataCurrent = metadataResult?.request?.canPublishTo(chatRequest) == true
-    SideEffect {
-        if (metadataCurrent && metadata != null) {
-            synchronized(turnKeyHistory) { turnKeyHistory.putAll(metadata.turnKeys) }
-            stableTurnKeys = metadata.turnKeys
-        }
     }
     val reasoningDurations = viewModel.reasoningDurations
     val activeModel = activeProvider?.effectiveModel.orEmpty()
@@ -1403,15 +1424,48 @@ fun AIChatPanel(
     }
     val playbackByMessageId = playbacks.filter { it.entry.messageId != null }
         .associateBy { it.entry.messageId!! }
-    val collapsedSubAgentProjection = metadata?.collapsedGroups
+    val projectedGroups = projectedMetadata?.value?.collapsedGroups
         ?: SubAgentGroupProjection(emptyList(), emptyList(), emptyList(), emptySet(), emptySet())
-    val subAgentGroupExpansion = collapsedSubAgentProjection.groups.associate { group ->
+    val projectedPlaybackContent = remember(projectedGroups, playbackByMessageId) {
+        projectedGroups.items.filter { it.message.id in playbackByMessageId }.groupBy { it.message.id }
+            .mapValues { (id, rows) ->
+                val playback = playbackByMessageId.getValue(id)
+                TypewriterContentPlan(rows, playback.entry.text) to playback.body
+            }
+    }
+    val projectedBodyItems by rememberTypewriterItemProjection(projectedGroups.bodyItems, projectedPlaybackContent)
+    val projectedFooterItems by rememberTypewriterItemProjection(projectedGroups.footerItems, projectedPlaybackContent)
+    val projectedChatRows = remember(projectedGroups, projectedBodyItems, projectedFooterItems) {
+        projectedGroups.copy(bodyItems = projectedBodyItems, footerItems = projectedFooterItems)
+    }
+    val projectedDisplay = projectedMetadata?.let {
+        ChatItemsProjection(it.request, ChatDisplayedProjection(it.value, projectedChatRows))
+    }
+    val historyPage = rememberChatHistoryPage(
+        listState,
+        projectedDisplay,
+        keepHistoryPosition,
+        { pointerDown || userScrollGesture || nestedFling || listState.isScrollInProgress },
+    ) { projection, key -> projection.rows.lazyIndexOfKey(key) }
+    val metadataResult = historyPage.visible
+    val latestHistoryProjection by rememberUpdatedState(projectedDisplay)
+    val latestKeepHistoryPosition by rememberUpdatedState(keepHistoryPosition)
+    val metadata = metadataResult?.value?.metadata
+    val metadataCurrent = metadataResult?.request?.canPublishTo(chatRequest) == true
+    SideEffect {
+        if (metadataCurrent && metadata != null) {
+            synchronized(turnKeyHistory) { turnKeyHistory.putAll(metadata.turnKeys) }
+            stableTurnKeys = metadata.turnKeys
+        }
+    }
+    val subAgentProjection = metadataResult?.value?.rows ?: projectedChatRows
+    val subAgentGroupExpansion = subAgentProjection.groups.associate { group ->
         group.key to key(group.key) {
             rememberRetainedSubAgentGroupExpansion(currentSessionId, group.key, subAgentGroupStateHolder)
         }
     }
     val displayedMetadata = metadata
-    val grouped = collapsedSubAgentProjection
+    val grouped = subAgentProjection
     val taskDurations = displayedMetadata?.taskDurations.orEmpty()
     val turnUsages = displayedMetadata?.turnUsages.orEmpty()
     val actionableMessageIds = displayedMetadata?.actionableMessageIds.orEmpty()
@@ -1426,6 +1480,23 @@ fun AIChatPanel(
     val retainedPlaybackState = playbackState.copy(entries = playbackState.entries.filterNot { it.key in completedPlaybacks })
     SideEffect { typewriterState = retainedPlaybackState }
     val displayReady = messagesReady && (messages.isEmpty() || displayedMetadata != null)
+    val capsuleEntranceTracker = remember(currentSessionId) { ChatCapsuleEntranceTracker() }
+    val capsuleEntranceAnimations = remember(currentSessionId) {
+        androidx.compose.runtime.mutableStateMapOf<String, Animatable<Float, AnimationVector1D>>()
+    }
+    val capsuleEntranceEnabled = chatAnimationsEnabled()
+    SideEffect {
+        val newlyEligible = capsuleEntranceTracker.update(
+            currentSessionId = currentSessionId,
+            ready = displayReady,
+            allowAnimation = followBottom && !userScrollGesture,
+            messageIds = messages.map { it.id },
+            projection = subAgentProjection,
+        )
+        newlyEligible.forEach { key ->
+            if (key !in capsuleEntranceAnimations) capsuleEntranceAnimations[key] = Animatable(0f)
+        }
+    }
     UiWorkEffect(currentSessionId, displayReady) {
         if (displayReady) {
             showMessagesLoading = false
@@ -1434,20 +1505,19 @@ fun AIChatPanel(
         delay(MESSAGES_LOADING_HINT_DELAY_MS)
         showMessagesLoading = true
     }
-    val playbackContent = remember(grouped, playbackByMessageId) {
-        grouped.items.filter { it.message.id in playbackByMessageId }.groupBy { it.message.id }
+    val subAgentGroupsByKey = remember(subAgentProjection.groups) { subAgentProjection.groups.associateBy { it.key } }
+    val chatItems = subAgentProjection.items
+    val playbackContent = remember(subAgentProjection, playbackByMessageId) {
+        subAgentProjection.items.filter { it.message.id in playbackByMessageId }.groupBy { it.message.id }
             .mapValues { (id, rows) ->
                 val playback = playbackByMessageId.getValue(id)
                 TypewriterContentPlan(rows, playback.entry.text) to playback.body
             }
     }
-    val bodyItems by rememberTypewriterItemProjection(grouped.bodyItems, playbackContent)
-    val footerItems by rememberTypewriterItemProjection(grouped.footerItems, playbackContent)
-    val subAgentProjection = remember(grouped, bodyItems, footerItems) {
-        grouped.copy(bodyItems = bodyItems, footerItems = footerItems)
-    }
-    val subAgentGroupsByKey = remember(subAgentProjection.groups) { subAgentProjection.groups.associateBy { it.key } }
-    val chatItems = subAgentProjection.items
+    val chatHistoryLayoutCommitted = metadataResult != null && chatHistoryLayoutReadyForPaging(
+        historyPage.state, metadataResult.request, listState.layoutInfo.totalItemsCount,
+        emptyProjection = messages.isEmpty() && chatItems.isEmpty(),
+    )
     // 异步列表尚未接到落库消息时仍留在尾巴；一旦原消息接管，这里不再渲染第二份。
     val tailPlaybacks = playbacks.filter {
         !chatPlaybackHandedOff(it.entry, displayedMessageIds)
@@ -1456,19 +1526,16 @@ fun AIChatPanel(
     val showReasoning = tailPlaybacks.any { it.entry.reasoning.hasVisibleContent() }
 
     // 自动滚动跟随
-    // 两个状态都必须 saveable：窄窗打开编辑器 / 终端 / Git / 设置都是全屏路由，聊天页整棵组合
-    // 被 dispose。用普通 remember 的话返回时 positionedSession 归 null（当成换了会话重新贴底）、
-    // followBottom 归 true（校准循环把恢复出的位置拉回底部），浏览历史的位置就丢了。
-    var positionedSession by rememberSaveable { mutableStateOf<String?>(null) }
-    var followBottom by rememberSaveable { mutableStateOf(true) }
-    var userScrollGesture by remember { mutableStateOf(false) }
-    var pointerDown by remember { mutableStateOf(false) }
-    var nestedFling by remember { mutableStateOf(false) }
     val userScrollConnection = remember(listState) {
         object : NestedScrollConnection {
             override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
                 if (source == NestedScrollSource.UserInput && available.y != 0f) {
                     userScrollGesture = true
+                    historyPage.state.deferLargeHistoryPage(
+                        listState, latestHistoryProjection?.request,
+                        latestHistoryProjection?.value?.rows,
+                        latestKeepHistoryPosition(),
+                    )
                     followBottom = false
                 }
                 return Offset.Zero
@@ -1476,6 +1543,11 @@ fun AIChatPanel(
 
             override suspend fun onPreFling(available: Velocity): Velocity {
                 nestedFling = true
+                historyPage.state.deferLargeHistoryPage(
+                    listState, latestHistoryProjection?.request,
+                    latestHistoryProjection?.value?.rows,
+                    latestKeepHistoryPosition(),
+                )
                 return Velocity.Zero
             }
 
@@ -1563,10 +1635,22 @@ fun AIChatPanel(
     // 正文接收与 Markdown 实际长高可能不在同一帧；只用已测量布局驱动一个跟随者。
     UiWorkEffect(listState, currentSessionId, displayReady) {
         if (!displayReady) return@UiWorkEffect
+        val initialLayout = listState.layoutInfo
+        var lastItemCount = initialLayout.totalItemsCount
+        var lastTailSize = initialLayout.visibleItemsInfo.firstOrNull {
+            it.index == initialLayout.totalItemsCount - 1
+        }?.size ?: 0
         snapshotFlow {
             if (followBottom && !userScrollGesture && positionedSession == currentSessionId) listState.layoutInfo else null
-        }.collectLatest { layout ->
-            if (layout != null && followBottom && !userScrollGesture) listState.followChatBottom()
+        }.collect { layout ->
+            if (layout != null && followBottom && !userScrollGesture) {
+                val tail = layout.visibleItemsInfo.lastOrNull()?.takeIf { it.index == layout.totalItemsCount - 1 }
+                val newTailContent = lastTailSize == 0 && tail?.size?.let { it > 0 } == true
+                val newTailItem = layout.totalItemsCount != lastItemCount
+                lastItemCount = layout.totalItemsCount
+                lastTailSize = tail?.size ?: lastTailSize
+                listState.followChatBottom(smoothTailArrival = newTailItem || newTailContent)
+            }
         }
     }
 
@@ -1612,6 +1696,14 @@ fun AIChatPanel(
                 listState.scrollToItem(index)
                 positionedSession = currentSessionId
                 viewModel.consumePendingScroll()
+            } else if (messages.any { it.id == pending.second }) {
+                val targetTurnKey = displayedMetadata?.turnKeys?.get(pending.second)
+                val targetIsProjected = displayedMetadata?.items?.any { it.message.id == pending.second } == true
+                if (targetTurnKey != null && turnOverrideSnapshot[targetTurnKey] != true) {
+                    viewModel.setTurnExpanded(targetTurnKey, true)
+                } else if (!messagesState.hasMore && (targetTurnKey == null || !targetIsProjected)) {
+                    viewModel.consumePendingScroll()
+                }
             } else if (!messagesState.hasMore) {
                 // 全部消息已加载仍找不到（消息可能已被删除）：放弃，避免卡在待定位态。
                 viewModel.consumePendingScroll()
@@ -1643,12 +1735,19 @@ fun AIChatPanel(
     // 触发信号里带上分页上限：消息按条数分页，一轮长过程折叠后整页补载可能一个可见项都不增加，
     // index 不再变化；只监听 index 会卡在这里，要用户上下晃动才能再触发一页。
     // 上限纳入信号后，每页补载完成都会重新判断，仍在顶部就连续补载。
-    val latestMessagesState = rememberUpdatedState(messagesState)
+    val latestMessagesState = rememberUpdatedState(messagesState.takeIf {
+        it.limit == metadataResult?.request?.source?.limit && chatHistoryLayoutCommitted
+    })
+    val latestEmptyProjection by rememberUpdatedState(messages.isEmpty() && chatItems.isEmpty())
     UiWorkEffect(listState, messagesReady) {
         if (!messagesReady) return@UiWorkEffect
         snapshotFlow {
             val ms = latestMessagesState.value
-            Triple(listState.firstVisibleItemIndex <= 3 && ms.hasMore && !ms.isLoadingMore, ms.sessionId, ms.limit)
+            Triple(
+                shouldLoadMoreChatHistory(ms, listState.firstVisibleItemIndex, latestEmptyProjection),
+                ms?.sessionId,
+                ms?.limit,
+            )
         }
             .distinctUntilChanged()
             .collect { (shouldLoad, _, _) ->
@@ -1693,7 +1792,6 @@ fun AIChatPanel(
         }
     }
 
-    // 过程始终按独立列表项组合，追加工具时不切换布局结构。
     @Composable
     fun RenderChatItem(sourceItem: ChatRenderItem) {
         val content = playbackContent[sourceItem.message.id]
@@ -1826,6 +1924,24 @@ fun AIChatPanel(
         }
     }
 
+    @Composable
+    fun RenderProjectedChatItem(item: ChatRenderItem) {
+        val animation = capsuleEntranceAnimations[item.key]
+        if (animation == null || item.contentType !in setOf(MessageRole.TOOL.name, SUB_AGENT_GROUP_CONTENT_TYPE)) {
+            RenderChatItem(item)
+        } else {
+            LaunchedEffect(currentSessionId, item.key, animation, capsuleEntranceEnabled) {
+                if (capsuleEntranceEnabled) {
+                    animation.animateTo(1f, tween(CAPSULE_ENTRANCE_DURATION_MS, easing = LinearEasing))
+                } else {
+                    animation.snapTo(1f)
+                }
+                capsuleEntranceAnimations.remove(item.key)
+            }
+            CapsuleEntrance(animation.value) { RenderChatItem(item) }
+        }
+    }
+
     CompositionLocalProvider(
         LocalUriHandler provides previewUriHandler,
         LocalChatTextScale provides chatTextScale,
@@ -1929,6 +2045,11 @@ fun AIChatPanel(
                         )
                     }
                 } else {
+                    ObserveChatHistoryLayout(listState, historyPage.state, metadataResult?.request, subAgentProjection)
+                    PreserveChatHistoryAnchor(
+                        listState, historyPage.state, metadataResult?.request, subAgentProjection,
+                        keepHistoryPosition, { pointerDown || userScrollGesture || nestedFling },
+                    )
                     LazyColumn(
                         state = listState,
                         modifier = Modifier
@@ -1938,6 +2059,12 @@ fun AIChatPanel(
                                 awaitEachGesture {
                                     awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
                                     pointerDown = true
+                                    historyPage.state.deferLargeHistoryPage(
+                                        listState, latestHistoryProjection?.request,
+                                        latestHistoryProjection?.value?.rows,
+                                        latestKeepHistoryPosition(),
+                                        cancelPendingScroll = true,
+                                    )
                                     try {
                                         do {
                                             val event = awaitPointerEvent(PointerEventPass.Final)
@@ -1955,7 +2082,7 @@ fun AIChatPanel(
                         )
                     ) {
                         itemsIndexed(subAgentProjection.bodyItems, key = { _, item -> item.key }, contentType = { _, item -> item.contentType }) { _, item ->
-                            RenderChatItem(item)
+                            RenderProjectedChatItem(item)
                         }
                         // 忙碌状态指示器：在没有正文/思考流式输出、未在压缩、未被权限弹窗或询问挂起时展示。
                         // 工具正在执行或模型正在准备工具时，文案会由 thinkingLabel 动态呈现为对应场景（如「正在读取文件」）；
@@ -1982,7 +2109,7 @@ fun AIChatPanel(
                         // firstVisibleItemIndex 向下 clamp → 视口上跳（旧症状2根因）。item 数量恒为 1，
                         // anchor 不会被 clamp：showReasoning 时渲染思考气泡（内部自带折叠），否则为空；
                         // tailKind 为 NONE 时尾巴为空 Box（0 高度）。流结束落库后跟随 effect 会把新消息贴底。
-                        item(key = "__active__", contentType = "tail") {
+                        item(key = CHAT_ACTIVE_TAIL_KEY, contentType = "tail") {
                             Column {
                                 tailPlaybacks.forEach { playback ->
                                     key(playback.entry.key) {
@@ -2038,7 +2165,7 @@ fun AIChatPanel(
                             }
                         }
                         itemsIndexed(subAgentProjection.footerItems, key = { _, item -> item.key }, contentType = { _, item -> item.contentType }) { _, item ->
-                            RenderChatItem(item)
+                            RenderProjectedChatItem(item)
                         }
                     }
                 }
@@ -2125,17 +2252,40 @@ fun AIChatPanel(
                 }
             }
 
-            if (recoveryItems.isNotEmpty()) {
-                SessionRecoveryCard(
-                    items = recoveryItems,
-                    busy = isBusy || isCompacting || recoveryBusy,
-                    onContinue = viewModel::continueRecovery,
-                    onAbandon = viewModel::abandonRecovery,
-                    modifier = Modifier.padding(horizontal = Spacing.lg, vertical = Spacing.xs)
-                )
-            }
             ChatInputBar(
                 onFullScreenInputChanged = { fullScreenInputVisible = it },
+                recoveryBubble = {
+                    val snapshot = recoverySnapshot.takeIf { it.scope?.sessionId == currentSessionId }
+                    if (snapshot != null && snapshot.items.isNotEmpty()) {
+                        val targets = snapshot.continueTargets
+                        val unknownTools = targets.flatMap { it.unknownTools }.map { it.toolName }.distinct()
+                        var confirming by remember(snapshot.scope, targets, snapshot.busy) { mutableStateOf(false) }
+                        val showingConfirmation = confirming
+                        SessionRecoveryBubble(
+                            pendingCount = snapshot.items.size,
+                            canContinue = !snapshot.busy && targets.isNotEmpty(),
+                            canAbandon = !snapshot.busy,
+                            confirming = showingConfirmation,
+                            onContinue = {
+                                if (unknownTools.isEmpty()) {
+                                    viewModel.continueRecovery(snapshot)
+                                } else if (showingConfirmation && confirming) {
+                                    confirming = false
+                                    viewModel.continueRecovery(snapshot, unknownToolsVerified = true)
+                                } else if (!showingConfirmation && !confirming) {
+                                    confirming = true
+                                    val tools = context.getString(R.string.session_recovery_unknown_summary, unknownTools.joinToString(", "))
+                                    val hint = context.getString(R.string.session_recovery_unknown_hint)
+                                    Toast.makeText(context, "$tools\n$hint", Toast.LENGTH_LONG).show()
+                                }
+                            },
+                            onAbandon = {
+                                confirming = false
+                                viewModel.abandonRecovery(snapshot)
+                            }
+                        )
+                    }
+                },
                 value = inputText,
                 onValueChange = viewModel::updateInputDraft,
                 onSend = sendMessage,

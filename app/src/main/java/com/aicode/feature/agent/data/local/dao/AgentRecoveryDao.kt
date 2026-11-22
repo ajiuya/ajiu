@@ -17,11 +17,14 @@ import com.aicode.feature.agent.data.local.entity.RecoveryRequestEntity
 import com.aicode.feature.agent.data.local.entity.RecoveryRunEntity
 import com.aicode.feature.agent.data.local.entity.RecoveryToolEntity
 import com.aicode.feature.agent.data.local.entity.TodoItemEntity
+import com.aicode.feature.agent.domain.recovery.PendingRecoveryTarget
 import com.aicode.feature.agent.domain.recovery.RecoveryResumeSnapshot
+import com.aicode.feature.agent.domain.recovery.RecoveryScope
 import com.aicode.feature.agent.domain.recovery.RecoveryStage
 import com.aicode.feature.agent.domain.recovery.RecoveryStep
 import com.aicode.feature.agent.domain.recovery.RecoveryToolCall
 import com.aicode.feature.agent.domain.tool.ToolCall
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
@@ -78,6 +81,27 @@ interface AgentRecoveryDao {
     """)
     fun observePendingRows(sessionId: String): Flow<List<RecoveryPendingRows>>
 
+    @Transaction
+    @Query("""
+        SELECT q.* FROM agent_recovery_requests q
+        JOIN chat_sessions s ON s.id = q.sessionId AND s.executionGeneration = q.generation
+        JOIN chat_sessions root ON root.id = :scopeId AND root.executionGeneration = :scopeGeneration
+        WHERE (s.id = root.id OR s.parentId = root.id)
+          AND s.workspacePath = :workspacePath AND root.workspacePath = :workspacePath
+          AND q.status IN ('AWAITING_CONFIRMATION', 'INTERRUPTED', 'FAILED')
+        ORDER BY CASE WHEN q.sessionId = :scopeId THEN 0 ELSE 1 END, q.sessionId, q.queueOrder, q.id
+    """)
+    fun observePendingScopeRows(scopeId: String, scopeGeneration: Long, workspacePath: String): Flow<List<RecoveryPendingRows>>
+
+    @Query("""
+        SELECT EXISTS(SELECT 1 FROM chat_sessions s
+            JOIN chat_sessions root ON root.id = :scopeId AND root.executionGeneration = :scopeGeneration
+            WHERE s.id = :sessionId AND s.executionGeneration = :generation
+              AND (s.id = root.id OR s.parentId = root.id)
+              AND s.workspacePath = :workspacePath AND root.workspacePath = :workspacePath)
+    """)
+    suspend fun isInRecoveryScope(scopeId: String, scopeGeneration: Long, workspacePath: String, sessionId: String, generation: Long): Boolean
+
     @Query("""
         SELECT r.* FROM agent_recovery_runs r
         JOIN agent_recovery_requests q ON q.id = r.requestId AND q.activeRunId = r.id
@@ -100,6 +124,14 @@ interface AgentRecoveryDao {
 
     @Query("SELECT * FROM agent_recovery_requests WHERE sessionId = :sessionId")
     suspend fun requestsForSession(sessionId: String): List<RecoveryRequestEntity>
+
+    @Query("""
+        SELECT id FROM agent_recovery_requests
+        WHERE sessionId = :sessionId AND generation = :generation
+          AND status IN ('AWAITING_CONFIRMATION', 'INTERRUPTED', 'FAILED')
+        ORDER BY queueOrder, id LIMIT 1
+    """)
+    suspend fun firstPendingRequestId(sessionId: String, generation: Long): String?
 
     @Query("""
         SELECT q.* FROM agent_recovery_requests q
@@ -269,6 +301,43 @@ interface AgentRecoveryDao {
         insertRunRow(run)
         updateRequestRow(request.copy(status = "RUNNING", activeRunId = run.id, updatedAt = now))
         return run
+    }
+
+    @Transaction
+    suspend fun claimPendingRecovery(
+        scope: RecoveryScope,
+        target: PendingRecoveryTarget,
+        environment: String,
+        unknownToolsVerified: Boolean,
+        runId: String,
+        ownerFence: String,
+        now: Long
+    ): RecoveryRunEntity? {
+        val request = pendingRequestInScope(scope, target) ?: return null
+        val session = sessionGate(target.sessionId) ?: return null
+        if (request.environment != environment || session.autoDispatchBlockedReason == "PLAN_REJECTED" ||
+            hasRunning(target.sessionId, target.generation)) return null
+        val unknown = toolsForRequest(request.id)
+            .filter { it.status == "UNKNOWN" || it.status == "STARTED" && it.assistantMessageId != null }
+            .mapTo(mutableSetOf()) { RecoveryToolCall(it.toolCallId, it.toolName) }
+        if (unknown != target.unknownTools || unknown.isNotEmpty() && !unknownToolsVerified) return null
+        if (session.autoDispatchBlockedReason != null) updateSessionGate(target.sessionId, null, 0)
+        return claimRequest(request.id, environment, true, runId, ownerFence, now)
+    }
+
+    private suspend fun pendingRequestInScope(scope: RecoveryScope, target: PendingRecoveryTarget): RecoveryRequestEntity? {
+        val request = requestRow(target.requestId) ?: return null
+        if (request.sessionId != target.sessionId || request.generation != target.generation ||
+            request.activeRunId != target.activeRunId || request.status !in listOf("AWAITING_CONFIRMATION", "INTERRUPTED", "FAILED")) return null
+        if (!isInRecoveryScope(scope.sessionId, scope.generation, scope.workspacePath, target.sessionId, target.generation)) return null
+        if (firstPendingRequestId(target.sessionId, target.generation) != request.id) return null
+        return request
+    }
+
+    @Transaction
+    suspend fun abandonScopedRecovery(scope: RecoveryScope, target: PendingRecoveryTarget, now: Long): Boolean {
+        val request = pendingRequestInScope(scope, target) ?: return false
+        return abandonPendingRecoveryRequest(request.id, target.sessionId, now)
     }
 
     @Transaction
@@ -538,6 +607,26 @@ interface AgentRecoveryDao {
         updateToolRow(tool.copy(status = "FINISHED", resultMessageId = message.id, updatedAt = now))
         deleteDraftRow(tool.runId)
         if (notificationSeqs.isNotEmpty()) markRecoveryNotificationsDelivered(run.sessionId, notificationSeqs, now)
+        return true
+    }
+
+    @Transaction
+    suspend fun commitScopedRecoveryToolResults(
+        scope: RecoveryScope,
+        target: PendingRecoveryTarget,
+        runId: String,
+        ownerFence: String,
+        results: List<AgentMessageEntity>,
+        now: Long
+    ): Boolean {
+        val run = ownedRunning(runId, ownerFence) ?: return false
+        if (run.requestId != target.requestId || run.sessionId != target.sessionId || run.generation != target.generation ||
+            !isInRecoveryScope(scope.sessionId, scope.generation, scope.workspacePath, target.sessionId, target.generation)) return false
+        for (result in results) {
+            if (!commitRecoveryToolResult(runId, ownerFence, result, now, emptyList())) {
+                throw CancellationException("Recovery tool result is no longer current")
+            }
+        }
         return true
     }
 

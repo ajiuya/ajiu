@@ -1,18 +1,23 @@
 package com.aicode.feature.agent.data.local.dao
 
 import com.aicode.feature.agent.data.local.entity.AgentMessageEntity
+import com.aicode.feature.agent.data.local.entity.ChatSessionEntity
 import com.aicode.feature.agent.data.local.entity.RecoveryDraftEntity
 import com.aicode.feature.agent.data.local.entity.RecoveryRequestEntity
 import com.aicode.feature.agent.data.local.entity.RecoveryRunEntity
 import com.aicode.feature.agent.data.local.entity.RecoveryToolEntity
 import com.aicode.feature.agent.data.local.entity.TodoItemEntity
+import com.aicode.feature.agent.domain.recovery.PendingRecoveryTarget
 import com.aicode.feature.agent.domain.recovery.RecoveryRequestPayload
+import com.aicode.feature.agent.domain.recovery.RecoveryScope
 import com.aicode.feature.agent.domain.recovery.RecoveryStep
 import com.aicode.feature.agent.domain.recovery.RecoveryToolCall
 import io.mockk.coEvery
 import io.mockk.every
 import io.mockk.mockk
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.map
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
@@ -29,6 +34,45 @@ internal class RecoveryDaoFixture {
     val retiredNotificationSessions = linkedSetOf<String>()
     var initializations = 0
     private val queries = mockk<AgentRecoveryDao>()
+    private data class SessionLocation(val workspacePath: String, val parentId: String?)
+    private data class ScopeRows(
+        val gates: Map<String, RecoverySessionGate>,
+        val locations: Map<String, SessionLocation>,
+        val pending: List<RecoveryPendingRows>
+    ) {
+        fun contains(scope: RecoveryScope, sessionId: String, generation: Long): Boolean {
+            val root = locations[scope.sessionId] ?: return false
+            val session = locations[sessionId] ?: return false
+            return gates[scope.sessionId]?.executionGeneration == scope.generation &&
+                gates[sessionId]?.executionGeneration == generation &&
+                root.workspacePath == scope.workspacePath && session.workspacePath == scope.workspacePath &&
+                (sessionId == scope.sessionId || session.parentId == scope.sessionId)
+        }
+    }
+
+    private val sessionLocations = mutableMapOf<String, SessionLocation>()
+    private val scopeRows = MutableStateFlow(ScopeRows(emptyMap(), emptyMap(), emptyList()))
+    private val pendingStatuses = setOf("AWAITING_CONFIRMATION", "INTERRUPTED", "FAILED")
+    private val queueOrder = compareBy<RecoveryRequestEntity>({ it.queueOrder }, { it.id })
+
+    fun putSession(session: ChatSessionEntity) {
+        sessions[session.id] = RecoverySessionGate(session.id, session.executionGeneration, session.autoDispatchBlockedReason)
+        sessionLocations[session.id] = SessionLocation(session.workspacePath, session.parentId)
+        refreshPendingScopeRows()
+    }
+
+    fun refreshPendingScopeRows() {
+        scopeRows.value = ScopeRows(
+            sessions.toMap(), sessionLocations.toMap(),
+            requests.values.filter { it.status in pendingStatuses }.map(::pendingRows)
+        )
+    }
+
+    private fun pendingRows(request: RecoveryRequestEntity) = RecoveryPendingRows(
+        request, runs.values.filter { it.requestId == request.id }.map { run ->
+            RecoveryRunRows(run, tools.values.filter { it.runId == run.id }, listOfNotNull(drafts[run.id]))
+        }, listOfNotNull(sessions[request.sessionId]), listOfNotNull(messages[request.inputMessageId]?.id)
+    )
     val dao = object : AgentRecoveryDao by queries {
         override suspend fun replaceRecoveryTodos(runId: String, ownerFence: String, items: List<TodoItemEntity>) =
             super<AgentRecoveryDao>.replaceRecoveryTodos(runId, ownerFence, items)
@@ -39,11 +83,16 @@ internal class RecoveryDaoFixture {
             super<AgentRecoveryDao>.reorderQueuedRequests(sessionId, requestIds, now)
         override suspend fun claimRequest(requestId: String, environment: String, confirmed: Boolean, runId: String, ownerFence: String, now: Long) =
             super<AgentRecoveryDao>.claimRequest(requestId, environment, confirmed, runId, ownerFence, now)
+        override suspend fun claimPendingRecovery(scope: RecoveryScope, target: PendingRecoveryTarget, environment: String, unknownToolsVerified: Boolean, runId: String, ownerFence: String, now: Long) =
+            super<AgentRecoveryDao>.claimPendingRecovery(scope, target, environment, unknownToolsVerified, runId, ownerFence, now)
+        override suspend fun abandonScopedRecovery(scope: RecoveryScope, target: PendingRecoveryTarget, now: Long) =
+            super<AgentRecoveryDao>.abandonScopedRecovery(scope, target, now)
         override suspend fun awaitRecoveryConfirmation(requestId: String, now: Long) =
             super<AgentRecoveryDao>.awaitRecoveryConfirmation(requestId, now)
         override suspend fun initializeRecovery(ownerFence: String, now: Long) {
             initializations++
             super<AgentRecoveryDao>.initializeRecovery(ownerFence, now)
+            refreshPendingScopeRows()
         }
         override suspend fun beginRecoveryStep(runId: String, ownerFence: String, now: Long) =
             super<AgentRecoveryDao>.beginRecoveryStep(runId, ownerFence, now)
@@ -71,6 +120,8 @@ internal class RecoveryDaoFixture {
             super<AgentRecoveryDao>.updateRecoveryTurnDuration(runId, ownerFence, messageId, durationMs)
         override suspend fun commitRecoveryToolResult(runId: String, ownerFence: String, message: AgentMessageEntity, now: Long, notificationSeqs: List<Long>) =
             super<AgentRecoveryDao>.commitRecoveryToolResult(runId, ownerFence, message, now, notificationSeqs)
+        override suspend fun commitScopedRecoveryToolResults(scope: RecoveryScope, target: PendingRecoveryTarget, runId: String, ownerFence: String, results: List<AgentMessageEntity>, now: Long) =
+            super<AgentRecoveryDao>.commitScopedRecoveryToolResults(scope, target, runId, ownerFence, results, now)
         override suspend fun finishRecoveryRun(runId: String, ownerFence: String, status: String, holdReason: String?, now: Long) =
             super<AgentRecoveryDao>.finishRecoveryRun(runId, ownerFence, status, holdReason, now)
         override suspend fun abandonPendingRecoveryRequest(requestId: String, sessionId: String, now: Long) =
@@ -250,16 +301,30 @@ internal class RecoveryDaoFixture {
                 1
             }
         }
+        coEvery { queries.firstPendingRequestId(any(), any()) } answers {
+            val sessionId = firstArg<String>()
+            val generation = secondArg<Long>()
+            requests.values.filter { it.sessionId == sessionId && it.generation == generation && it.status in pendingStatuses }
+                .minWithOrNull(queueOrder)?.id
+        }
+        coEvery { queries.isInRecoveryScope(any(), any(), any(), any(), any()) } answers {
+            val scope = RecoveryScope(firstArg(), thirdArg(), secondArg())
+            ScopeRows(sessions, sessionLocations, emptyList()).contains(scope, arg(3), arg(4))
+        }
+        every { queries.observePendingScopeRows(any(), any(), any()) } answers {
+            val scope = RecoveryScope(firstArg(), thirdArg(), secondArg())
+            scopeRows.map { rows ->
+                rows.pending.filter { rows.contains(scope, it.request.sessionId, it.request.generation) }
+                    .sortedWith(compareBy({ it.request.sessionId != scope.sessionId }, { it.request.sessionId },
+                        { it.request.queueOrder }, { it.request.id }))
+            }
+        }
         every { queries.observePendingRows(any()) } answers {
             val sessionId = firstArg<String>()
             flow {
                 val gate = sessions[sessionId]
                 emit(requests.values.filter { it.sessionId == sessionId && it.generation == gate?.executionGeneration &&
-                    it.status !in listOf("COMPLETED", "ABANDONED") }.sortedBy { it.queueOrder }.map { request ->
-                    RecoveryPendingRows(request, runs.values.filter { it.requestId == request.id }.map { run ->
-                        RecoveryRunRows(run, tools.values.filter { it.runId == run.id }, listOfNotNull(drafts[run.id]))
-                    }, listOfNotNull(gate), listOfNotNull(messages[request.inputMessageId]?.id))
-                })
+                    it.status !in listOf("COMPLETED", "ABANDONED") }.sortedWith(queueOrder).map(::pendingRows))
             }
         }
     }

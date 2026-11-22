@@ -25,6 +25,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.resetMain
@@ -91,28 +92,33 @@ class GenerationSpeedViewModelTest {
 
         val live = AgentEvent.GenerationSpeed(21.5, estimated = true)
         events.send(live)
-        runCurrent()
+        assertEquals(live, vm.generationSpeed.first { it == live })
+
+        events.send(AgentEvent.GenerationSpeed(0.0, estimated = true))
+        events.send(AgentEvent.Retrying(1, 3, RetryErrorInfo(RetryErrorKind.TIMEOUT)))
+        vm.retryState.first { it?.attempt == 1 }
         assertEquals(live, vm.generationSpeed.value)
-        listOf(
-            AgentEvent.GenerationSpeed(0.0, estimated = true),
-            AgentEvent.GenerationStarted,
-            AgentEvent.Retrying(1, 3, RetryErrorInfo(RetryErrorKind.TIMEOUT)),
-            AgentEvent.KeySwitched(2, 3),
-            AgentEvent.GenerationSpeed(0.0, estimated = true)
-        ).forEach { event ->
-            events.send(event)
-            runCurrent()
-            assertEquals(event.toString(), live, vm.generationSpeed.value)
-        }
+
+        events.send(AgentEvent.GenerationStarted)
+        events.send(AgentEvent.Retrying(2, 3, RetryErrorInfo(RetryErrorKind.TIMEOUT)))
+        vm.retryState.first { it?.attempt == 2 }
+        assertEquals(live, vm.generationSpeed.value)
+
+        events.send(AgentEvent.KeySwitched(2, 3))
+        vm.keySwitchState.first { it?.newIndex == 2 }
+        assertEquals(live, vm.generationSpeed.value)
+
+        events.send(AgentEvent.GenerationSpeed(0.0, estimated = true))
+        events.send(AgentEvent.Retrying(3, 3, RetryErrorInfo(RetryErrorKind.TIMEOUT)))
+        vm.retryState.first { it?.attempt == 3 }
+        assertEquals(live, vm.generationSpeed.value)
 
         val nextLive = AgentEvent.GenerationSpeed(13.0, estimated = true)
         events.send(nextLive)
-        runCurrent()
-        assertEquals(nextLive, vm.generationSpeed.value)
+        assertEquals(nextLive, vm.generationSpeed.first { it == nextLive })
         val calibrated = AgentEvent.GenerationSpeed(18.25, estimated = false)
         events.send(calibrated)
-        runCurrent()
-        assertEquals(calibrated, vm.generationSpeed.value)
+        assertEquals(calibrated, vm.generationSpeed.first { it == calibrated })
         events.send(AgentEvent.GenerationStarted)
         events.send(AgentEvent.Completed)
         events.close()
@@ -182,13 +188,17 @@ class GenerationSpeedViewModelTest {
     @Test
     fun unexpectedStreamFailureRetainsLastLiveReading() = runTest(dispatcher) {
         val live = AgentEvent.GenerationSpeed(17.0, estimated = true)
+        val releaseFailure = CompletableDeferred<Unit>()
         every { fixture.workflow.executeEvents(any(), any(), any()) } returns flow {
             emit(live)
+            releaseFailure.await()
             throw IOException("connection closed")
         }
-        vm.executeAgentRequestStream("fail", targetSessionId = PARENT).join()
-        runCurrent()
-        assertTrue(vm.agentStates.value[PARENT] is AgentUIState.Error)
+        val run = vm.executeAgentRequestStream("fail", targetSessionId = PARENT)
+        assertEquals(live, vm.generationSpeed.first { it == live })
+        releaseFailure.complete(Unit)
+        run.join()
+        vm.agentStates.first { it[PARENT] is AgentUIState.Error }
         assertEquals(live, vm.generationSpeed.value)
     }
 

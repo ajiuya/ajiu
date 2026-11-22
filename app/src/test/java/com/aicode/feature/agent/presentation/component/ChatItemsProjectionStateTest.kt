@@ -58,6 +58,80 @@ class ChatItemsProjectionStateTest {
     }
 
     @Test
+    fun historyPageIsNotCommittedUntilTheAnchorLayoutMatches() {
+        val owner = Any()
+        val first = ChatItemsBuildRequest(source.copy(limit = 30), Any(), owner)
+        val next = ChatItemsBuildRequest(source.copy(limit = 60), Any(), owner)
+        val oldPage = ChatItemsProjection(first, "old")
+        val newPage = ChatItemsProjection(next, "new")
+        val state = ChatHistoryPageState<String>()
+        val anchorRow = AgentUIMessage("visible-row", MessageRole.USER, "visible-row")
+        val oldRows = SubAgentGroupProjection(
+            listOf(ChatRenderItem(anchorRow, "visible-row", "user")), emptyList(), emptyList(), emptySet(), emptySet(),
+        )
+        val newRows = SubAgentGroupProjection(
+            (0 until 162).map { index ->
+                val message = AgentUIMessage("older-$index", MessageRole.USER, "older-$index")
+                ChatRenderItem(message, message.id, "user")
+            } + oldRows.bodyItems,
+            emptyList(), emptyList(), emptySet(), emptySet(),
+        )
+
+        state.offer(oldPage)
+        state.reportLayout(first, itemCount = 2, expectedItemCount = 2,
+            firstVisible = ChatHistoryAnchor("visible-row", 0, 11), rows = oldRows)
+        assertTrue(state.isLayoutCommitted(first, 2))
+
+        state.offer(newPage)
+        state.requireAnchor("visible-row", index = 162)
+        state.offer(ChatItemsProjection(next, "same-request-frame"))
+        assertFalse(chatHistoryLayoutReadyForPaging(state, next, itemCount = 164, emptyProjection = false))
+        assertTrue(chatHistoryLayoutReadyForPaging(state, next, itemCount = 164, emptyProjection = true))
+        state.reportLayout(next, itemCount = 164, expectedItemCount = 164,
+            firstVisible = ChatHistoryAnchor("older-0", 0, 11), rows = newRows)
+        assertFalse(state.isLayoutCommitted(next, 164))
+        state.reportLayout(next, itemCount = 164, expectedItemCount = 164,
+            firstVisible = ChatHistoryAnchor("visible-row", 2, 11), rows = newRows)
+        assertFalse(state.isLayoutCommitted(next, 164))
+
+        state.reportLayout(next, itemCount = 164, expectedItemCount = 164,
+            firstVisible = ChatHistoryAnchor("visible-row", 162, 11), rows = newRows)
+        assertTrue(state.isLayoutCommitted(next, 164))
+        assertTrue(chatHistoryLayoutReadyForPaging(state, next, itemCount = 164, emptyProjection = false))
+        assertFalse(state.isLayoutCommitted(next, 163))
+
+        val searchState = ChatHistoryPageState<String>()
+        searchState.offer(oldPage)
+        searchState.reportLayout(first, 2, 2, ChatHistoryAnchor("visible-row", 0, 11), oldRows)
+        searchState.offer(newPage)
+        searchState.requireAnchor("visible-row", 162)
+        searchState.clearRequiredAnchor()
+        searchState.reportLayout(next, 164, 164, ChatHistoryAnchor("older-0", 0, 11), newRows)
+        assertTrue(searchState.isLayoutCommitted(next, 164))
+    }
+
+    @Test
+    fun historyAnchorIsOnlyRequiredOutsideComposeNearestKeyWindow() {
+        assertFalse(requiresChatHistoryKeyAnchor(2, 129))
+        assertTrue(requiresChatHistoryKeyAnchor(2, 130))
+        assertFalse(requiresChatHistoryKeyAnchor(29, 129))
+        assertTrue(requiresChatHistoryKeyAnchor(29, 130))
+        assertFalse(requiresChatHistoryKeyAnchor(30, 159))
+        assertTrue(requiresChatHistoryKeyAnchor(30, 160))
+        assertFalse(requiresChatHistoryKeyAnchor(20, 19))
+    }
+
+    @Test
+    fun emptyFilteredProjectionCanContinuePagingWithoutAnIndexNearTheTop() {
+        val state = source.copy(hasMore = true, limit = 60)
+        assertFalse(shouldLoadMoreChatHistory(state, firstVisibleIndex = 5, emptyProjection = false))
+        assertTrue(shouldLoadMoreChatHistory(state, firstVisibleIndex = 5, emptyProjection = true))
+        assertFalse(shouldLoadMoreChatHistory(state.copy(isLoadingMore = true), 0, emptyProjection = true))
+        assertFalse(shouldLoadMoreChatHistory(state.copy(hasMore = false), 0, emptyProjection = true))
+        assertFalse(shouldLoadMoreChatHistory(null, 0, emptyProjection = true))
+    }
+
+    @Test
     fun settledPlaybackStaysInTailUntilItsActualPublishedProjectionOwnsTheMessage() {
         val owner = Any()
         val first = ChatItemsBuildRequest(source, Any(), owner)

@@ -12,6 +12,7 @@ import com.aicode.R
 import com.aicode.core.util.FileLogger
 import com.aicode.core.util.formatCostUsd
 import com.aicode.core.util.toUserMessage
+import com.aicode.feature.agent.data.local.entity.AgentMessageEntity
 import com.aicode.feature.agent.data.local.entity.ChatSessionEntity
 import com.aicode.feature.agent.domain.command.SlashCommandContext
 import com.aicode.feature.agent.domain.command.SlashCommandRegistry
@@ -211,9 +212,9 @@ class AgentRunManager internal constructor(
     private var acceptanceEpoch = 0L
     private val activeRecoveryRuns = mutableMapOf<String, String>()
     private val recoveryCodec = Json { ignoreUnknownKeys = true }
-    private val _recoveryBusyIds = MutableStateFlow<Set<String>>(emptySet())
-    val recoveryBusyIds: StateFlow<Set<String>> = _recoveryBusyIds.asStateFlow()
-    val recovering: StateFlow<Boolean> = _recoveryBusyIds.map { it.isNotEmpty() }
+    private val _recoveryBusySessions = MutableStateFlow<Set<String>>(emptySet())
+    val recoveryBusySessions: StateFlow<Set<String>> = _recoveryBusySessions.asStateFlow()
+    val recovering: StateFlow<Boolean> = _recoveryBusySessions.map { it.isNotEmpty() }
         .stateIn(managerScope, SharingStarted.Eagerly, false)
     private val planRejectedSessions = mutableSetOf<String>()
     private val goalEmptyTurnCounts = mutableMapOf<String, Int>()
@@ -430,7 +431,7 @@ class AgentRunManager internal constructor(
         }
     }
 
-    private suspend fun awaitReady(sessionId: String? = null): Boolean {
+    internal suspend fun awaitReady(sessionId: String? = null): Boolean {
         start()
         val ready = bootstrap.await()
         if (!ready && sessionId != null) {
@@ -805,12 +806,13 @@ class AgentRunManager internal constructor(
             notificationDispatch.withLock {
                 if (pendingNotificationStops > 0 || sessionId in deletedSessionIds || sessionId in planRejectedSessions || sessionId in stoppingSessions) return@withLock
                 if (!recoveryRepository.canDispatch(sessionId)) return@withLock
-                if (sessionJobs[sessionId]?.isCompleted == false || sessionId in _runningCommandSessions.value) return@withLock
+                if (!canStartRecovery(sessionId) || sessionId in _recoveryBusySessions.value) return@withLock
                 val items = agentNotificationCenter.peek(sessionId).filter {
                     recoveryRepository.notificationRequest(sessionId, it.seq) == null
                 }
                 if (items.isEmpty()) return@withLock
                 val root = sessionUseCase.getSessionById(sessionId)?.workspacePath ?: return@withLock
+                if (!canStartRecovery(sessionId) || sessionId in _recoveryBusySessions.value) return@withLock
                 executeAgentRequestStream(
                     request = AgentNotificationFormatter.buildMessage(items),
                     projectRoot = root,
@@ -821,70 +823,148 @@ class AgentRunManager internal constructor(
         }
     }
 
-    fun continueRecovery(sessionId: String, workspacePath: String, requestId: String) {
-        if (sessionId in deletedSessionIds || sessionId in stoppingSessions || sessionJobs[sessionId]?.isCompleted == false || requestId in _recoveryBusyIds.value) return
-        val epoch = acceptanceEpoch
+    private fun canStartRecovery(sessionId: String): Boolean =
+        sessionId !in deletedSessionIds && sessionId !in stoppingSessions && !isSessionRunning(sessionId) &&
+            sessionId !in _runningCommandSessions.value && sessionId !in _compactingSessions.value
+
+    fun continueRecovery(scope: RecoveryScope, targets: List<PendingRecoveryTarget>, unknownToolsVerified: Boolean = false) {
+        if (!unknownToolsVerified && targets.any { it.unknownTools.isNotEmpty() }) return
         val source = captureSource()
-        _recoveryBusyIds.value += requestId
+        runRecoveryBatch(scope, targets.filter { canStartRecovery(it.sessionId) }) { target, epoch ->
+            resumePendingRecovery(scope, target, source, epoch, unknownToolsVerified)
+        }
+    }
+
+    fun abandonRecovery(scope: RecoveryScope, targets: List<PendingRecoveryTarget>) {
+        runRecoveryBatch(scope, targets) { target, _ ->
+            val payload = recoveryRepository.payload(target.requestId)
+            if (recoveryRepository.abandonPending(scope, target)) {
+                payload?.notificationSeqs?.takeIf { it.isNotEmpty() }?.let { agentNotificationCenter.discard(target.sessionId, it) }
+            }
+        }
+    }
+
+    private fun runRecoveryBatch(
+        scope: RecoveryScope,
+        targets: List<PendingRecoveryTarget>,
+        action: suspend (PendingRecoveryTarget, Long) -> Unit
+    ) {
+        val batch = targets.distinctBy { it.sessionId }.sortedBy { it.sessionId != scope.sessionId }
+        val sessions = batch.mapTo(mutableSetOf()) { it.sessionId }
+        if (sessions.isEmpty() || sessions.any { it in _recoveryBusySessions.value }) return
+        val epoch = acceptanceEpoch
+        _recoveryBusySessions.value += sessions
         managerScope.launch {
-            var claimed: RecoveryRun? = null
-            var handedOff = false
+            var ready = false
             try {
-                if (!awaitReady(sessionId)) return@launch
+                if (!awaitReady(scope.sessionId)) return@launch
+                ready = true
                 stopAllSettled.first { it }
-                if (epoch != acceptanceEpoch || sessionId in deletedSessionIds || sessionId in stoppingSessions || sessionJobs[sessionId]?.isCompleted == false) return@launch
-                val fixedSource = source.getOrThrow()
-                checkSource(fixedSource)
-                val item = recoveryRepository.observePending(sessionId).first().firstOrNull { it.request.id == requestId } ?: return@launch
-                if (item.holdReason == "PLAN_REJECTED") return@launch
-                val capture = projectMemoryIdentityResolver.capture(item.payload.projectRoot)?.let { freezeCapture(it, fixedSource) } ?: return@launch
-                if (recoveryCodec.encodeToString(capture.identity) != item.request.environment || workspacePath != item.payload.projectRoot) return@launch
-                capture.assertCurrent()
-                recoveryRepository.clearExplicitHold(sessionId)
-                val run = recoveryRepository.claim(requestId, item.request.environment, confirmed = true) ?: return@launch
-                claimed = run
-                for (tool in (item.unknownTools + item.pendingTools).distinctBy { it.toolCallId }) {
-                    val unknown = tool.status in setOf(RecoveryToolStatus.UNKNOWN, RecoveryToolStatus.STARTED)
-                    val text = if (unknown) "Execution outcome unknown after interruption. Do not replay this call; verify current state first."
-                        else "This tool call was not executed before interruption. No previous approval is restored."
-                    messagePersistenceUseCase.persist(sessionId, MessageRole.TOOL,
-                        com.aicode.feature.agent.domain.tool.ToolResult.Error(text, if (unknown) "RESULT_UNKNOWN" else "NOT_EXECUTED").toTransportString(),
-                        id = "tool_${tool.toolCallId}", toolCallId = tool.toolCallId, toolName = tool.toolName, isError = true,
-                        recoveryRunId = run.id)
-                }
-                val resume = run.resumeSnapshot?.inputMessageExists == true
-                val images = messagePersistenceUseCase.loadAttachmentImages(item.payload.inputAttachments)
-                capture.assertCurrent()
-                if (epoch != acceptanceEpoch || sessionId in deletedSessionIds || sessionId in stoppingSessions) return@launch
-                executeAgentRequestStream(
-                    request = if (resume) context.getString(R.string.recovery_continue_request) else item.payload.request,
-                    modelRequest = item.payload.modelRequest, currentFile = item.payload.currentFile, selectedCode = item.payload.selectedCode,
-                    projectRoot = item.payload.projectRoot, inputImages = images, inputAttachments = item.payload.inputAttachments,
-                    targetSessionId = sessionId, isAutoTrigger = false, persistUserMessage = true,
-                    subAgentInstructionId = item.payload.subAgentInstructionId, acceptedRecoveryRun = run,
-                    acceptedCapture = capture, resuming = resume, notificationSeqs = item.payload.notificationSeqs)
-                handedOff = true
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (_: Exception) {
-                setAgentState(sessionId, AgentUIState.Error(context.getString(R.string.recovery_continue_failed)))
-            } finally {
-                try {
-                    if (!handedOff) withContext(NonCancellable + Dispatchers.IO) {
-                        claimed?.let { runCatching { recoveryRepository.finish(it.id, RecoveryStatus.INTERRUPTED) } }
+                for (target in batch) {
+                    if (epoch != acceptanceEpoch || scope.sessionId in deletedSessionIds) break
+                    try {
+                        action(target, epoch)
+                    } catch (cancelled: CancellationException) {
+                        currentCoroutineContext().ensureActive()
+                    } catch (failure: Exception) {
+                        FileLogger.w(TAG, "Recovery action failed for session ${target.sessionId}", failure)
+                        if (canStartRecovery(target.sessionId)) {
+                            setAgentState(target.sessionId, AgentUIState.Error(context.getString(R.string.recovery_continue_failed)))
+                        }
                     }
-                } finally {
-                    _recoveryBusyIds.value -= requestId
+                }
+            } finally {
+                _recoveryBusySessions.value -= sessions
+                if (ready && stopAllSettled.value) {
+                    for (sessionId in sessions) {
+                        processNextInQueue(sessionId)
+                        flushPendingNotifications(sessionId)
+                    }
                 }
             }
         }
     }
 
-    fun abandonRecovery(sessionId: String, requestId: String) = managerScope.launch {
-        if (!awaitReady(sessionId)) return@launch
-        val payload = recoveryRepository.payload(requestId)
-        if (recoveryRepository.abandonPending(requestId, sessionId)) {
-            payload?.notificationSeqs?.takeIf { it.isNotEmpty() }?.let { agentNotificationCenter.discard(sessionId, it) }
+    private suspend fun resumePendingRecovery(
+        scope: RecoveryScope,
+        target: PendingRecoveryTarget,
+        source: Result<RunSource>,
+        epoch: Long,
+        unknownToolsVerified: Boolean
+    ) {
+        val sessionId = target.sessionId
+        var claimed: RecoveryRun? = null
+        var releasedHold: String? = null
+        var handedOff = false
+        try {
+            if (!canStartRecovery(sessionId)) return
+            val fixedSource = source.getOrThrow()
+            checkSource(fixedSource)
+            val item = recoveryRepository.observePending(sessionId).first()
+                .firstOrNull { it.request.id == target.requestId } ?: return
+            val payload = item.payload
+            if (scope.workspacePath != payload.projectRoot || item.pendingTarget() != target) return
+            val capturedEnvironment = projectMemoryIdentityResolver.capture(payload.projectRoot)?.let { freezeCapture(it, fixedSource) } ?: return
+            val environment = recoveryCodec.encodeToString(capturedEnvironment.identity)
+            if (environment != item.request.environment) return
+            suspend fun assertScopeCurrent() {
+                capturedEnvironment.assertCurrent()
+                if (!recoveryRepository.isInScope(scope, target)) throw CancellationException("Recovery scope changed")
+            }
+            val capture = if (sessionId == scope.sessionId) capturedEnvironment else ProjectMemoryCapture(
+                capturedEnvironment.identity, capturedEnvironment.channelGeneration, ::assertScopeCurrent
+            )
+            assertScopeCurrent()
+            if (epoch != acceptanceEpoch || !canStartRecovery(sessionId)) return
+            val run = recoveryRepository.claimPending(scope, target, environment, unknownToolsVerified) ?: return
+            claimed = run
+            releasedHold = item.holdReason
+            val images = messagePersistenceUseCase.loadAttachmentImages(payload.inputAttachments)
+            assertScopeCurrent()
+            if (epoch != acceptanceEpoch || scope.sessionId in deletedSessionIds || !canStartRecovery(sessionId)) return
+            val interruptedResults = (item.unknownTools + item.pendingTools).distinctBy { it.toolCallId }.map { tool ->
+                val unknown = tool.status in setOf(RecoveryToolStatus.UNKNOWN, RecoveryToolStatus.STARTED)
+                val text = if (unknown) "Execution outcome unknown after interruption. Do not replay this call; verify current state first."
+                    else "This tool call was not executed before interruption. No previous approval is restored."
+                AgentMessageEntity(
+                    id = "tool_${tool.toolCallId}", sessionId = sessionId, role = MessageRole.TOOL.name,
+                    content = com.aicode.feature.agent.domain.tool.ToolResult.Error(text, if (unknown) "RESULT_UNKNOWN" else "NOT_EXECUTED").toTransportString(),
+                    timestamp = messagePersistenceUseCase.nextTimestamp(), toolCallId = tool.toolCallId, toolName = tool.toolName, isError = true
+                )
+            }
+            if (interruptedResults.isNotEmpty()) {
+                if (!recoveryRepository.commitScopedToolResults(scope, target, run.id, interruptedResults)) return
+                messagePersistenceUseCase.invalidateHistory(sessionId)
+            }
+            val resume = run.resumeSnapshot?.inputMessageExists == true
+            assertScopeCurrent()
+            if (epoch != acceptanceEpoch || scope.sessionId in deletedSessionIds || !canStartRecovery(sessionId)) return
+            val childEvent = if (sessionId != scope.sessionId) SubAgentEvent(
+                subSessionId = sessionId, parentSessionId = scope.sessionId, type = SubAgentEventType.STARTED,
+                generation = target.generation, parentGeneration = scope.generation
+            ) else null
+            val execution = executeAgentRequestStream(
+                request = if (resume) context.getString(R.string.recovery_continue_request) else payload.request,
+                modelRequest = payload.modelRequest, currentFile = payload.currentFile, selectedCode = payload.selectedCode,
+                projectRoot = payload.projectRoot, inputImages = images, inputAttachments = payload.inputAttachments,
+                targetSessionId = sessionId, isAutoTrigger = false, persistUserMessage = true, skipTitleUpdate = childEvent != null,
+                subAgentInstructionId = payload.subAgentInstructionId, acceptedRecoveryRun = run, acceptedCapture = capture,
+                resuming = resume, notificationSeqs = payload.notificationSeqs, expectedSubAgentEvent = childEvent
+            )
+            handedOff = true
+            // The job can exit before entering the workflow's cleanup block. Finish only if this run still owns the row.
+            execution.invokeOnCompletion {
+                managerScope.launch {
+                    if (recoveryRepository.finish(run.id, RecoveryStatus.INTERRUPTED, releasedHold)) {
+                        processNextInQueue(sessionId)
+                        flushPendingNotifications(sessionId)
+                    }
+                }
+            }
+        } finally {
+            if (!handedOff) withContext(NonCancellable + Dispatchers.IO) {
+                claimed?.let { runCatching { recoveryRepository.finish(it.id, RecoveryStatus.INTERRUPTED, releasedHold) } }
+            }
         }
     }
 
@@ -920,7 +1000,8 @@ class AgentRunManager internal constructor(
         if (sid in deletedSessionIds) return
         if (!isAutoTrigger && sid != null) planRejectedSessions.remove(sid)
         val isCurrentRunning = sid != null &&
-            (sessionJobs[sid]?.isCompleted == false || sid in _runningCommandSessions.value || sid in stoppingSessions)
+            (sessionJobs[sid]?.isCompleted == false || sid in _runningCommandSessions.value || sid in stoppingSessions ||
+                sid in _recoveryBusySessions.value)
         if (isCurrentRunning) {
             val epoch = acceptanceEpoch
             managerScope.launch {
@@ -1074,7 +1155,8 @@ class AgentRunManager internal constructor(
 
     private fun processNextInQueue(sessionId: String) {
         if (sessionId in planRejectedSessions || sessionId in stoppingSessions || sessionId in deletedSessionIds) return
-        if (sessionJobs[sessionId]?.isCompleted == false || sessionId in _runningCommandSessions.value) return
+        if (sessionJobs[sessionId]?.isCompleted == false || sessionId in _runningCommandSessions.value ||
+            sessionId in _recoveryBusySessions.value) return
         val queue = _queuedRequests.value[sessionId] ?: return
         val next = queue.firstOrNull() ?: return
         _queuedRequests.value += sessionId to queue.drop(1)
@@ -1101,22 +1183,32 @@ class AgentRunManager internal constructor(
         workspacePath: String,
         currentFile: String?,
         selectedCode: String?,
-        acceptedSource: Result<RunSource>
+        acceptedSource: Result<RunSource>,
+        acceptedRecoveryRun: RecoveryRun? = null,
+        acceptedCapture: ProjectMemoryCapture? = null
     ): Job {
         val compress = resolved is ResolvedCommand.Action && resolved.name == "compress"
         val epoch = acceptanceEpoch
         val job = managerScope.launch(start = CoroutineStart.LAZY) {
             val owner = requireNotNull(coroutineContext[Job])
             protectJob(owner)
+            var outcome = RecoveryStatus.INTERRUPTED
+            var delegated = false
             try {
                 if (!awaitReady(sessionId)) return@launch
                 stopAllSettled.first { it }
                 if (epoch != acceptanceEpoch || commandOwners[sessionId] !== owner || !owner.isActive || sessionId in deletedSessionIds) return@launch
                 val source = acceptedSource.getOrThrow()
                 checkSource(source)
-                val capture = projectMemoryIdentityResolver.capture(workspacePath)?.let { freezeCapture(it, source) } ?: return@launch
+                val capture = (acceptedCapture ?: projectMemoryIdentityResolver.capture(workspacePath))
+                    ?.let { freezeCapture(it, source) } ?: return@launch
+                val inputId = if (acceptedRecoveryRun == null) UUID.randomUUID().toString() else {
+                    if (!recoveryRepository.isCurrent(acceptedRecoveryRun.id)) return@launch
+                    recoveryRepository.request(acceptedRecoveryRun.requestId)?.inputMessageId ?: return@launch
+                }
                 capture.assertCurrent()
-                messagePersistenceUseCase.persist(sessionId, MessageRole.USER, input, requireSession = compress)
+                messagePersistenceUseCase.persist(sessionId, MessageRole.USER, input, id = inputId,
+                    requireSession = compress, recoveryRunId = acceptedRecoveryRun?.id)
                 sessionUseCase.touch(sessionId, messagePersistenceUseCase.nextTimestamp())
                 if (compress && (compressionCommandOwners[sessionId] !== owner || !owner.isActive ||
                         sessionId in deletedSessionIds || sessionId in stoppingSessions)) return@launch
@@ -1125,25 +1217,28 @@ class AgentRunManager internal constructor(
                     val invocationScope = this
                     val invocation = object : SlashCommandContext {
                         override fun compactCurrentSession() {
-                            startContextCompaction(sessionId, true, workspacePath, currentFile, selectedCode, capture)
+                            val compaction = startContextCompaction(sessionId, true, workspacePath, currentFile, selectedCode, capture)
+                            if (acceptedRecoveryRun != null && compaction != null) invocationScope.launch { compaction.join() }
                         }
                         override fun showUsage() {
                             invocationScope.launch { showUsageNow(sessionId, source) }
                         }
                         override fun initProject(prompt: String) {
                             invocationScope.launch {
+                                delegated = true
                                 executeAgentRequestStream(prompt, currentFile = currentFile, selectedCode = selectedCode,
                                     projectRoot = workspacePath, targetSessionId = sessionId, isAutoTrigger = true,
-                                    acceptedCapture = capture).join()
+                                    acceptedRecoveryRun = acceptedRecoveryRun, acceptedCapture = capture).join()
                             }
                         }
                         override fun runSkill(skill: Skill, args: String) {
                             val fixedSkill = skill.copy(requiredTools = skill.requiredTools.toList())
                             invocationScope.launch {
+                                delegated = true
                                 executeAgentRequestStream(SlashCommandRegistry.buildSkillPrompt(fixedSkill, args),
                                     currentFile = currentFile, selectedCode = selectedCode,
                                     projectRoot = workspacePath, targetSessionId = sessionId, isAutoTrigger = true,
-                                    acceptedCapture = capture).join()
+                                    acceptedRecoveryRun = acceptedRecoveryRun, acceptedCapture = capture).join()
                             }
                         }
                         override fun setSessionGoal(rawArgs: String) {
@@ -1155,11 +1250,16 @@ class AgentRunManager internal constructor(
                         is ResolvedCommand.SkillCommand -> invocation.runSkill(resolved.skill, resolved.args)
                     }
                 }
+                if (!delegated) outcome = RecoveryStatus.COMPLETED
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (failure: Exception) {
+                outcome = RecoveryStatus.FAILED
                 setAgentState(sessionId, AgentUIState.Error(failure.toUserMessage(context)))
             } finally {
+                if (acceptedRecoveryRun != null) withContext(NonCancellable + Dispatchers.IO) {
+                    runCatching { recoveryRepository.finish(acceptedRecoveryRun.id, outcome) }
+                }
                 if (commandOwners[sessionId] === owner) {
                     commandOwners.remove(sessionId)
                     if (compress && compressionCommandOwners[sessionId] === owner) compressionCommandOwners.remove(sessionId)
@@ -1203,7 +1303,8 @@ class AgentRunManager internal constructor(
         val source = recoveryRequestId?.let { queuedSources.remove(it) }?.let { Result.success(it) } ?: captureSource()
         val resolved = if (subAgentInstructionId == null && request.startsWith('/')) slashCommandRegistry.resolve(request) else null
         if (resolved != null && targetSessionId != null) {
-            return runResolvedCommand(resolved, request, targetSessionId, projectRoot, currentFile, selectedCode, source)
+            return runResolvedCommand(resolved, request, targetSessionId, projectRoot, currentFile, selectedCode, source,
+                acceptedRecoveryRun, acceptedCapture)
         }
         val epoch = acceptanceEpoch
         val job = managerScope.launch(start = CoroutineStart.LAZY) {
@@ -1283,7 +1384,7 @@ class AgentRunManager internal constructor(
                     projectMemoryJournal.sessionIdentity(sessionId) ?: inheritedProject?.identity, headless = isAutoTrigger || isSubSession)
                 val baseCapture = executionCapture?.let { freezeCapture(it, fixedSource) }
                     ?: throw IllegalStateException(context.getString(R.string.recovery_request_not_saved))
-                val frozenCapture = if (expectedSubAgentEvent == null) baseCapture else ProjectMemoryCapture(
+                val frozenCapture = if (expectedSubAgentEvent == null || acceptedRecoveryRun != null) baseCapture else ProjectMemoryCapture(
                     baseCapture.identity, baseCapture.channelGeneration
                 ) {
                     baseCapture.assertCurrent()
@@ -1325,11 +1426,15 @@ class AgentRunManager internal constructor(
                     if (!subAgentEventBus.tryMarkStarted(sessionId)) {
                         _subAgentWaitingSlots.value += sessionId
                         try {
-                            while (!subAgentEventBus.tryMarkStarted(sessionId)) delay(100)
+                            while (!subAgentEventBus.tryMarkStarted(sessionId)) {
+                                delay(100)
+                                if (acceptedRecoveryRun != null) frozenCapture.assertCurrent()
+                            }
                         } finally {
                             _subAgentWaitingSlots.value -= sessionId
                         }
                     }
+                    frozenCapture.assertCurrent()
                     subAgentEventBus.recordForDisplay(SubAgentEvent(
                         subSessionId = sessionId,
                         parentSessionId = parentId,
@@ -1640,7 +1745,8 @@ class AgentRunManager internal constructor(
                                     subAgentEventBus.emit(SubAgentEvent(
                                         subSessionId = sessionId, parentSessionId = parentId,
                                         type = SubAgentEventType.FAILED, detail = event.error,
-                                        eventId = "terminal-${ownedRun.id}", runId = ownedRun.id, generation = ownedRun.generation
+                                        eventId = "terminal-${ownedRun.id}", runId = ownedRun.id, generation = ownedRun.generation,
+                                        parentGeneration = expectedSubAgentEvent?.parentGeneration
                                     ), finish = { recoveryRepository.finish(ownedRun.id, RecoveryStatus.FAILED) })
                                     terminalInteractionRecorded = true
                                 }
@@ -1656,7 +1762,8 @@ class AgentRunManager internal constructor(
                                 subAgentEventBus.emit(SubAgentEvent(
                                     subSessionId = sessionId, parentSessionId = parentId, type = SubAgentEventType.STOPPED,
                                     detail = context.getString(R.string.plan_approval_stopped), eventId = "terminal-${ownedRun.id}",
-                                    runId = ownedRun.id, generation = ownedRun.generation
+                                    runId = ownedRun.id, generation = ownedRun.generation,
+                                    parentGeneration = expectedSubAgentEvent?.parentGeneration
                                 ), finish = { recoveryRepository.finish(ownedRun.id, RecoveryStatus.ABANDONED, "PLAN_REJECTED") })
                                 terminalInteractionRecorded = true
                             } else recoveryRepository.finish(ownedRun.id, RecoveryStatus.ABANDONED, "PLAN_REJECTED")
@@ -1680,12 +1787,14 @@ class AgentRunManager internal constructor(
                 if (sessionJobs[sessionId] !== requestJob || !requestJob.isActive || sessionId in deletedSessionIds) return@launch
                 turnSucceeded = sawCompleted && !failed && !planRejected
                 if (turnSucceeded) {
+                    if (acceptedRecoveryRun != null) frozenCapture.assertCurrent()
                     val parentId = currentSession.parentId
                     if (parentId != null) {
                         subAgentEventBus.emit(SubAgentEvent(
                             subSessionId = sessionId, parentSessionId = parentId, type = SubAgentEventType.COMPLETED,
                             eventId = "terminal-${ownedRun.id}", sourceMessageId = latestAssistantBodyId,
-                            runMessageIds = runMessageIds.toSet(), runId = ownedRun.id, generation = ownedRun.generation
+                            runMessageIds = runMessageIds.toSet(), runId = ownedRun.id, generation = ownedRun.generation,
+                            parentGeneration = expectedSubAgentEvent?.parentGeneration
                         ), finish = { recoveryRepository.finish(ownedRun.id, RecoveryStatus.COMPLETED) })
                         terminalInteractionRecorded = true
                     } else if (!recoveryRepository.finish(ownedRun.id, RecoveryStatus.COMPLETED)) {
@@ -1715,7 +1824,8 @@ class AgentRunManager internal constructor(
                                     sessionId, parentId, SubAgentEventType.STOPPED,
                                     context.getString(R.string.agent_stopped_by_user),
                                     eventId = recoveryRun?.let { "terminal-${it.id}" } ?: UUID.randomUUID().toString(),
-                                    runId = recoveryRun?.id, generation = recoveryRun?.generation
+                                    runId = recoveryRun?.id, generation = recoveryRun?.generation,
+                                    parentGeneration = expectedSubAgentEvent?.parentGeneration
                                 ), finish = { recoveryRun?.let { recoveryRepository.finish(it.id, RecoveryStatus.INTERRUPTED) } ?: true })
                             }
                         }.onFailure { FileLogger.w(TAG, "Could not record interrupted subagent", it) }
@@ -1743,7 +1853,8 @@ class AgentRunManager internal constructor(
                         subAgentEventBus.emit(SubAgentEvent(
                             subSessionId = sessionId, parentSessionId = parentId, type = SubAgentEventType.FAILED,
                             detail = e.toUserMessage(context), eventId = recoveryRun?.let { "terminal-${it.id}" } ?: UUID.randomUUID().toString(),
-                            runId = recoveryRun?.id, generation = recoveryRun?.generation
+                            runId = recoveryRun?.id, generation = recoveryRun?.generation,
+                            parentGeneration = expectedSubAgentEvent?.parentGeneration
                         ), finish = { recoveryRun?.let { recoveryRepository.finish(it.id, RecoveryStatus.FAILED) } ?: true })
                     }
                 }
@@ -1821,7 +1932,8 @@ class AgentRunManager internal constructor(
         val jobs = (sessionJobs.values + compressionCommandOwners.values + commandOwners.values).distinct().filter { !it.isCompleted }
         compressionCommandOwners.clear()
         commandOwners.clear()
-        val stoppedSessions = (sessionJobs.keys + _agentStates.value.keys + _runningCommandSessions.value + planApprovalManager.awaitingSessionIds.value).toSet()
+        val stoppedSessions = (sessionJobs.keys + _agentStates.value.keys + _runningCommandSessions.value +
+            planApprovalManager.awaitingSessionIds.value + _recoveryBusySessions.value).toSet()
         planRejectedSessions.addAll(stoppedSessions)
         pendingNotificationStops++
         stopAllSettled.value = false
@@ -2340,7 +2452,8 @@ class AgentRunManager internal constructor(
         acceptedCapture: ProjectMemoryCapture? = null
     ): Job? {
         if (sid in deletedSessionIds || sid in stoppingSessions || sid in approvalSessionIds.value ||
-            (!allowCommand && sid in _runningCommandSessions.value) || _compactingSessions.value[sid] == true || sessionJobs[sid]?.isCompleted == false) return null
+            (!allowCommand && (sid in _runningCommandSessions.value || sid in _recoveryBusySessions.value)) ||
+            _compactingSessions.value[sid] == true || sessionJobs[sid]?.isCompleted == false) return null
         val epoch = acceptanceEpoch
         val source = captureSource()
         val job = managerScope.launch(start = CoroutineStart.LAZY) {

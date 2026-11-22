@@ -1,6 +1,7 @@
 package com.aicode.feature.agent.domain.recovery
 
 import com.aicode.feature.agent.data.local.dao.AgentRecoveryDao
+import com.aicode.feature.agent.data.local.dao.RecoveryPendingRows
 import com.aicode.feature.agent.data.local.dao.currentDraft
 import com.aicode.feature.agent.data.local.dao.recoverySnapshot
 import com.aicode.feature.agent.data.local.dao.resumeSnapshot
@@ -75,8 +76,25 @@ class RecoveryRepository @Inject constructor(
     suspend fun awaitConfirmation(requestId: String): Boolean =
         recoveryDao.awaitRecoveryConfirmation(requestId, System.currentTimeMillis())
 
-    fun observePending(sessionId: String): Flow<List<RecoveryItem>> = recoveryDao.observePendingRows(sessionId)
-        .onStart { initialize() }.map { rows ->
+    suspend fun claimPending(
+        scope: RecoveryScope,
+        target: PendingRecoveryTarget,
+        environment: String,
+        unknownToolsVerified: Boolean
+    ): RecoveryRun? {
+        initialize()
+        return recoveryDao.claimPendingRecovery(
+            scope, target, environment, unknownToolsVerified, UUID.randomUUID().toString(), ownerFence, System.currentTimeMillis()
+        )?.toModel()
+    }
+
+    fun observePending(sessionId: String): Flow<List<RecoveryItem>> = pendingItems(recoveryDao.observePendingRows(sessionId))
+
+    fun observePending(scope: RecoveryScope): Flow<List<RecoveryItem>> =
+        pendingItems(recoveryDao.observePendingScopeRows(scope.sessionId, scope.generation, scope.workspacePath))
+
+    private fun pendingItems(pendingRows: Flow<List<RecoveryPendingRows>>): Flow<List<RecoveryItem>> =
+        pendingRows.onStart { initialize() }.map { rows ->
             rows.map { row ->
                 val active = row.runs.singleOrNull { it.run.id == row.request.activeRunId }
                 val tools = row.runs.flatMap { it.tools }
@@ -186,6 +204,13 @@ class RecoveryRepository @Inject constructor(
     suspend fun commitToolResult(runId: String, entity: AgentMessageEntity, notificationSeqs: List<Long> = emptyList()): Boolean =
         recoveryDao.commitRecoveryToolResult(runId, ownerFence, entity, System.currentTimeMillis(), notificationSeqs)
 
+    suspend fun commitScopedToolResults(
+        scope: RecoveryScope,
+        target: PendingRecoveryTarget,
+        runId: String,
+        results: List<AgentMessageEntity>
+    ): Boolean = recoveryDao.commitScopedRecoveryToolResults(scope, target, runId, ownerFence, results, System.currentTimeMillis())
+
     suspend fun replaceTodos(runId: String, items: List<TodoItemEntity>): Boolean =
         recoveryDao.replaceRecoveryTodos(runId, ownerFence, items)
 
@@ -194,6 +219,12 @@ class RecoveryRepository @Inject constructor(
 
     suspend fun abandonPending(requestId: String, sessionId: String): Boolean =
         recoveryDao.abandonPendingRecoveryRequest(requestId, sessionId, System.currentTimeMillis())
+
+    suspend fun abandonPending(scope: RecoveryScope, target: PendingRecoveryTarget): Boolean =
+        recoveryDao.abandonScopedRecovery(scope, target, System.currentTimeMillis())
+
+    suspend fun isInScope(scope: RecoveryScope, target: PendingRecoveryTarget): Boolean =
+        recoveryDao.isInRecoveryScope(scope.sessionId, scope.generation, scope.workspacePath, target.sessionId, target.generation)
 
     suspend fun abandon(requestId: String): Boolean =
         recoveryDao.abandonRecoveryRequest(requestId, System.currentTimeMillis())

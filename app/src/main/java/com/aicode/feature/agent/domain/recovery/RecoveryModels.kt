@@ -88,6 +88,16 @@ data class RecoveryStep(val step: Int, val revision: Long)
 @Serializable
 data class RecoveryToolCall(val toolCallId: String, val toolName: String)
 
+data class RecoveryScope(val sessionId: String, val workspacePath: String, val generation: Long)
+
+data class PendingRecoveryTarget(
+    val requestId: String,
+    val sessionId: String,
+    val generation: Long,
+    val activeRunId: String?,
+    val unknownTools: Set<RecoveryToolCall>
+)
+
 @Serializable
 data class RecoveryTool(
     val runId: String,
@@ -120,4 +130,10 @@ data class RecoveryItem(
     val pendingTools: List<RecoveryTool>,
     val holdReason: String?,
     val stage: RecoveryStage = RecoveryStage.NOT_STARTED
-)
+) {
+    fun pendingTarget(): PendingRecoveryTarget = PendingRecoveryTarget(
+        request.id, request.sessionId, request.generation, request.activeRunId,
+        (unknownTools + pendingTools.filter { it.status == RecoveryToolStatus.STARTED })
+            .mapTo(mutableSetOf()) { RecoveryToolCall(it.toolCallId, it.toolName) }
+    )
+}

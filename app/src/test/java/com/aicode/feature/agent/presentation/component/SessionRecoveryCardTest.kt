@@ -1,9 +1,10 @@
 package com.aicode.feature.agent.presentation.component
 
 import android.app.Application
-import android.content.ClipboardManager
-import android.content.Context
 import android.os.Looper
+import android.os.SystemClock
+import android.view.InputDevice
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import androidx.activity.ComponentActivity
@@ -14,19 +15,26 @@ import androidx.compose.runtime.Recomposer
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.ui.InternalComposeUiApi
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.ViewCompositionStrategy
 import androidx.compose.ui.platform.ViewRootForTest
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.semantics.SemanticsNode
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.semantics.getAllSemanticsNodes
 import androidx.compose.ui.semantics.getOrNull
-import androidx.compose.ui.state.ToggleableState
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.unit.Density
 import com.aicode.R
 import com.aicode.core.theme.AIEditorTheme
+import com.aicode.feature.agent.domain.model.ReasoningEffort
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.launch
@@ -35,7 +43,7 @@ import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
@@ -49,6 +57,12 @@ import org.robolectric.annotation.GraphicsMode
 import org.robolectric.annotation.LooperMode
 import org.robolectric.annotation.TextLayoutMode
 import org.robolectric.shadows.ShadowDialog
+
+private const val BUBBLE = "session_recovery_bubble"
+private const val CONTINUE = "session_recovery_continue"
+private const val ABANDON = "session_recovery_abandon"
+private const val COMPOSER_ROW = "chat_composer_row"
+private const val FOOTER = "recovery_test_footer"
 
 @RunWith(RobolectricTestRunner::class)
 @Config(
@@ -64,362 +78,212 @@ import org.robolectric.shadows.ShadowDialog
 @OptIn(InternalComposeUiApi::class, ExperimentalCoroutinesApi::class)
 class SessionRecoveryCardTest {
     @Test(timeout = 30_000)
-    fun emptyQueueDoesNotShowARecoveryCardOrDispatchAnything() {
+    fun emptyQueueHasNoBubbleAndMultiplePendingItemsShareOneBubble() {
+        val pendingCount = mutableStateOf(0)
+        var calls = 0
+        render({
+            SessionRecoveryBubble(pendingCount.value, true, true, false, { calls++ }, { calls++ })
+        }) {
+            assertFalse(nodes().any { it.tag() in listOf(BUBBLE, CONTINUE, ABANDON) })
+            pendingCount.value = 1
+            awaitUi("One pending request") { nodes().any { it.tag() == BUBBLE } }
+            assertNull(node(CONTINUE).config.getOrNull(SemanticsProperties.StateDescription))
+            pendingCount.value = 3
+            val count = activity.getString(R.string.session_recovery_bubble_count, 3)
+            awaitUi("Compact pending count") { count in texts() }
+            assertEquals(1, nodes().count { it.tag() == BUBBLE })
+            assertEquals(
+                activity.getString(R.string.session_recovery_pending_count, 3),
+                node(CONTINUE).config.getOrNull(SemanticsProperties.StateDescription)
+            )
+            assertFalse(hasDialog())
+            assertEquals(0, calls)
+        }
+    }
+
+    @Test(timeout = 30_000)
+    fun bubbleFitsTheExistingComposerRowAndEachHalfDispatchesImmediately() {
+        val pendingCount = mutableStateOf(0)
         val callbacks = mutableListOf<String>()
-        render({ SessionRecoveryCard(emptyList(), false, callbacks::add, callbacks::add) }) {
-            assertFalse(hostNodes().any { it.tag() == "session_recovery_card" })
+        render({
+            InputBar(value = "", onValueChange = {}, recoveryBubble = {
+                SessionRecoveryBubble(pendingCount.value, true, true, false,
+                    { callbacks += CONTINUE }, { callbacks += ABANDON })
+            })
+        }) {
+            val footerHeight = node(FOOTER).boundsInRoot.height
+            val row = node(COMPOSER_ROW).boundsInRoot
+            assertEquals(40f, row.height, 0.01f)
+            assertTrue(nodes().none { it.tag() == BUBBLE })
+
+            pendingCount.value = 2
+            awaitUi("Bubble in the existing composer row") { nodes().any { it.tag() == BUBBLE } }
+            assertEquals(footerHeight, node(FOOTER).boundsInRoot.height, 0.01f)
+            assertEquals(row, node(COMPOSER_ROW).boundsInRoot)
+            val bubble = node(BUBBLE).boundsInRoot
+            assertEquals(104f, bubble.width, 0.01f)
+            assertEquals(30f, bubble.height, 0.01f)
+            assertEquals(row.right, bubble.right, 0.01f)
+            assertTrue(bubble.top >= row.top && bubble.bottom <= row.bottom)
+            val placeholder = activity.getString(R.string.chat_input_placeholder)
+            assertTrue(nodes().single { placeholder in it.texts() }.layoutBounds().right <= bubble.left)
+            assertTrue(editor().layoutBounds().right <= bubble.left)
+
+            val continueButton = node(CONTINUE)
+            val abandonButton = node(ABANDON)
+            for (button in listOf(continueButton, abandonButton)) {
+                assertEquals(Role.Button, button.config.getOrNull(SemanticsProperties.Role))
+                assertTrue(button.config.contains(SemanticsActions.OnClick))
+            }
+            val continueBounds = continueButton.boundsInRoot
+            val abandonBounds = abandonButton.boundsInRoot
+            assertTrue(continueBounds.right < abandonBounds.left)
+            assertEquals(30f, continueBounds.height, 0.01f)
+            assertEquals(30f, abandonBounds.height, 0.01f)
+            tap(Offset(continueBounds.right - 2f, continueBounds.center.y))
+            assertEquals(listOf(CONTINUE), callbacks)
+            tap(Offset(abandonBounds.left + 2f, abandonBounds.center.y))
+            assertEquals(listOf(CONTINUE, ABANDON), callbacks)
             assertFalse(hasDialog())
+        }
+    }
+
+    @Test(timeout = 30_000)
+    fun confirmationChangesTheVisibleLabelAndAccessibleNameWhileKeepingTheContinueAction() {
+        val confirming = mutableStateOf(false)
+        var continued = 0
+        render({ SessionRecoveryBubble(1, true, true, confirming.value, { continued++ }, {}) }) {
+            assertEquals(listOf("继续"), node(CONTINUE).description())
+            confirming.value = true
+            awaitUi("Continue in confirmation state") { "确认继续" in texts() }
+            assertEquals(listOf("确认继续"), node(CONTINUE).description())
+            assertEquals(listOf("放弃"), node(ABANDON).description())
+            assertTrue(requireNotNull(node(CONTINUE).config.getOrNull(SemanticsActions.OnClick)?.action).invoke())
+            assertEquals(1, continued)
+            assertFalse(hasDialog())
+        }
+    }
+
+    @Test(timeout = 30_000)
+    fun disabledActionsNeverDispatchAndEachActionCanBeEnabledIndependently() {
+        val canContinue = mutableStateOf(false)
+        val callbacks = mutableListOf<String>()
+        render({
+            SessionRecoveryBubble(1, canContinue.value, !canContinue.value, false,
+                { callbacks += CONTINUE }, { callbacks += ABANDON })
+        }) {
+            assertTrue(node(CONTINUE).isDisabled())
+            assertFalse(node(ABANDON).isDisabled())
+            node(CONTINUE).config.getOrNull(SemanticsActions.OnClick)?.action?.invoke()
+            tap(node(CONTINUE).boundsInRoot.center)
             assertTrue(callbacks.isEmpty())
+            tap(node(ABANDON).boundsInRoot.center)
+            assertEquals(listOf(ABANDON), callbacks)
+
+            canContinue.value = true
+            awaitUi("Independent availability") { node(ABANDON).isDisabled() && !node(CONTINUE).isDisabled() }
+            node(ABANDON).config.getOrNull(SemanticsActions.OnClick)?.action?.invoke()
+            tap(node(ABANDON).boundsInRoot.center)
+            assertEquals(listOf(ABANDON), callbacks)
+            tap(node(CONTINUE).boundsInRoot.center)
+            assertEquals(listOf(ABANDON, CONTINUE), callbacks)
         }
     }
 
     @Test(timeout = 30_000)
-    fun summaryOnlyShowsTheFirstQueuedItemAndMarksTheDraftIncompleteAndUnverified() {
-        val first = item().copy(unknownTools = listOf("Bash", "writeFile"), pendingCount = 2,
-            stage = com.aicode.feature.agent.domain.recovery.RecoveryStage.TOOLS_UNKNOWN)
-        val later = item("later-request").copy(request = "Later queued request", draft = "Later visible draft")
-        render({ SessionRecoveryCard(listOf(first, later), false, {}, {}) }) {
-            val texts = hostTexts()
-            assertTrue(activity.getString(R.string.session_recovery_interrupted) in texts)
-            assertTrue(activity.getString(recoveryStageLabel(first.stage)) in texts)
-            assertTrue(activity.getString(R.string.session_recovery_pending_count, 3) in texts)
-            assertTrue("最后可见草稿（不完整、未验证）" in texts)
-            assertTrue(first.request in texts)
-            assertTrue(first.draft in texts)
-            assertTrue(activity.getString(R.string.session_recovery_unknown_summary, "Bash, writeFile") in texts)
-            assertFalse(later.request in texts)
-            assertFalse(later.draft in texts)
+    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
+    fun narrowLargeFontComposerStillEditsAndExpandsWithoutCrossingTheRecoveryTargets() {
+        val value = mutableStateOf(List(20) { "Draft line" }.joinToString("\n"))
+        val fullScreen = mutableListOf<Boolean>()
+        var abandons = 0
+        render(
+            widthPx = 240,
+            fontScale = 2.5f,
+            content = {
+                InputBar(value.value, { value.value = it }, recoveryBubble = {
+                    SessionRecoveryBubble(3, true, true, true, {}, { abandons++ })
+                }, onFullScreenInputChanged = { fullScreen += it })
+            }
+        ) {
+            val expandLabel = activity.getString(R.string.chat_input_expand)
+            awaitUi("Expand and recovery actions") {
+                nodes(merged = true).any { expandLabel in it.description() && it.config.contains(SemanticsActions.OnClick) }
+            }
+            val expand = nodes(merged = true).single { expandLabel in it.description() && it.config.contains(SemanticsActions.OnClick) }
+            val bubble = node(BUBBLE).boundsInRoot
+            val row = node(COMPOSER_ROW).boundsInRoot
+            assertEquals(row.right, bubble.right, 0.01f)
+            assertTrue(bubble.width in 1f..104f && bubble.height > 0f)
+            assertEquals(listOf(activity.getString(R.string.session_recovery_confirm_continue)), node(CONTINUE).description())
+            assertTrue(editor().layoutBounds().width >= 24f)
+            assertTrue(editor().layoutBounds().right <= expand.boundsInRoot.left)
+            assertTrue(expand.boundsInRoot.right <= bubble.left)
+
+            val updatedDraft = value.value + "\nEdited"
+            val input = editor()
+            assertTrue(requireNotNull(input.config.getOrNull(SemanticsActions.RequestFocus)?.action).invoke())
+            awaitUi("Editor focused") { editor().config.getOrNull(SemanticsProperties.Focused) == true }
+            assertTrue(requireNotNull(editor().config.getOrNull(SemanticsActions.SetText)?.action).invoke(AnnotatedString(updatedDraft)))
+            assertEquals(updatedDraft, value.value)
+            tap(node(ABANDON).boundsInRoot.center)
+            assertEquals(1, abandons)
             assertFalse(hasDialog())
+            tap(expand.boundsInRoot.center)
+            awaitUi("Full-screen editor") { hasDialog() && fullScreen.lastOrNull() == true }
+            assertEquals(1, abandons)
         }
     }
 
-    @Test(timeout = 30_000)
-    @Config(qualifiers = "en-w400dp-h1000dp")
-    fun englishSummaryAlsoMarksTheVisibleDraftIncompleteAndUnverified() {
-        render({ SessionRecoveryCard(listOf(item()), false, {}, {}) }) {
-            assertTrue("Session interrupted" in hostTexts())
-            assertTrue("Last visible draft (incomplete, unverified)" in hostTexts())
-        }
+    @Composable
+    private fun InputBar(
+        value: String,
+        onValueChange: (String) -> Unit,
+        recoveryBubble: @Composable () -> Unit,
+        onFullScreenInputChanged: (Boolean) -> Unit = {}
+    ) {
+        ChatInputBar(
+            value = value,
+            onValueChange = onValueChange,
+            onSend = {},
+            onStop = {},
+            isBusy = false,
+            workspaceViewModel = null,
+            hasRunningSessions = { false },
+            activeProvider = null,
+            providers = emptyList(),
+            modelMetadata = emptyMap(),
+            onSelectModel = { _, _ -> },
+            reasoningEffort = ReasoningEffort.MEDIUM,
+            onReasoningEffortChange = {},
+            pendingAttachments = emptyList(),
+            onRemoveAttachment = {},
+            canUploadFiles = true,
+            canUploadImages = true,
+            onUploadFile = {},
+            onUploadImage = {},
+            onTakePhoto = {},
+            modifier = Modifier.testTag(FOOTER),
+            recoveryBubble = recoveryBubble
+        ) { isFullScreen -> onFullScreenInputChanged(isFullScreen) }
     }
-
-    @Test(timeout = 30_000)
-    fun environmentMismatchDisablesContinueButStillAllowsInspectCopyAndConfirmedAbandon() {
-        val recovery = item("original/request:mismatch").copy(environmentMatches = false)
-        val continued = mutableListOf<String>()
-        val abandoned = mutableListOf<String>()
-        val inspected = mutableListOf<String>()
-        render({
-            SessionRecoveryCard(listOf(recovery), false, continued::add, abandoned::add, inspected::add)
-        }) {
-            assertDisabled(hostNode("session_recovery_continue"))
-            invokeIfPresent(hostNode("session_recovery_continue"))
-            assertTrue(continued.isEmpty())
-            assertFalse(hasDialog())
-            assertTrue(activity.getString(R.string.session_recovery_environment_mismatch) in hostTexts())
-            clickHost("session_recovery_inspect")
-            awaitSheet("session_recovery_sheet_continue")
-            assertEquals(listOf(recovery.requestId), inspected)
-            assertDisabled(sheetNode("session_recovery_sheet_continue"))
-            invokeIfPresent(sheetNode("session_recovery_sheet_continue"))
-            assertTrue(continued.isEmpty())
-            assertFalse(sheetNodes().any { it.tag() == "session_recovery_confirm_continue" })
-            clickSheet("session_recovery_copy_draft")
-            assertEquals(recovery.draft, clipboardText())
-            clickSheet("session_recovery_sheet_abandon")
-            awaitSheet("session_recovery_confirm_abandon")
-            assertTrue(abandoned.isEmpty())
-            clickSheet("session_recovery_confirm_abandon")
-            assertEquals(listOf(recovery.requestId), abandoned)
-            assertTrue(continued.isEmpty())
-        }
-    }
-
-    @Test(timeout = 30_000)
-    fun unknownResultsNeedOptInAndAConfirmedContinueDispatchesTheOriginalIdOnlyOnce() {
-        val recovery = item("original/request:unknown").copy(unknownTools = listOf("Bash", "writeFile"))
-        val busy = mutableStateOf(false)
-        val continued = mutableListOf<String>()
-        val abandoned = mutableListOf<String>()
-        render({
-            SessionRecoveryCard(listOf(recovery), busy.value, onContinue = {
-                continued += it
-                busy.value = true
-            }, onAbandon = abandoned::add)
-        }) {
-            clickHost("session_recovery_continue")
-            awaitSheet("session_recovery_confirm_continue")
-            assertTrue(continued.isEmpty())
-            assertTrue(recovery.request in sheetTexts())
-            assertTrue(recovery.draft in sheetTexts())
-            assertTrue("Bash\nwriteFile" in sheetTexts())
-            assertTrue(activity.getString(R.string.session_recovery_unknown_hint) in sheetTexts())
-            assertEquals(ToggleableState.Off, sheetNode("session_recovery_unknown_opt_in").toggleState())
-            assertDisabled(sheetNode("session_recovery_confirm_continue"))
-            invokeIfPresent(sheetNode("session_recovery_confirm_continue"))
-            assertTrue(continued.isEmpty())
-
-            clickSheet("session_recovery_unknown_opt_in")
-            awaitUi("Unknown-result acknowledgement") {
-                sheetNodeOrNull("session_recovery_confirm_continue")?.isEnabled() == true
-            }
-            assertEquals(ToggleableState.On, sheetNode("session_recovery_unknown_opt_in").toggleState())
-            val previouslyEnabledConfirm = sheetNode("session_recovery_confirm_continue").clickAction()
-            clickSheet("session_recovery_unknown_opt_in")
-            assertTrue(previouslyEnabledConfirm())
-            assertTrue(continued.isEmpty())
-            awaitUi("Opt-in revoked") {
-                sheetNodeOrNull("session_recovery_confirm_continue")?.isEnabled() == false
-            }
-            clickSheet("session_recovery_unknown_opt_in")
-            awaitUi("Opt-in reconfirmed") {
-                sheetNodeOrNull("session_recovery_confirm_continue")?.isEnabled() == true
-            }
-            val confirm = sheetNode("session_recovery_confirm_continue").clickAction()
-            assertTrue(confirm())
-            assertTrue(confirm())
-            assertEquals(listOf(recovery.requestId), continued)
-            assertTrue(abandoned.isEmpty())
-
-            awaitUi("Busy recovery card") {
-                !hostNode("session_recovery_continue").isEnabled() && !hostNode("session_recovery_abandon").isEnabled()
-            }
-            invokeIfPresent(hostNode("session_recovery_continue"))
-            invokeIfPresent(hostNode("session_recovery_abandon"))
-            assertEquals(listOf(recovery.requestId), continued)
-            assertTrue(abandoned.isEmpty())
-            clickHost("session_recovery_inspect")
-            awaitSheet("session_recovery_copy_draft")
-            assertDisabled(sheetNode("session_recovery_sheet_continue"))
-            clickSheet("session_recovery_copy_draft")
-            assertEquals(recovery.draft, clipboardText())
-        }
-    }
-
-    @Test(timeout = 30_000)
-    fun continueUsesALocalDoubleClickLockWhileTheHostBusyUpdateIsStillPending() {
-        val recovery = item("not-an-index/or-title")
-        val busy = mutableStateOf(false)
-        val continued = mutableListOf<String>()
-        render({ SessionRecoveryCard(listOf(recovery), busy.value, continued::add, {}) }) {
-            clickHost("session_recovery_continue")
-            awaitSheet("session_recovery_confirm_continue")
-            assertTrue(continued.isEmpty())
-            val confirm = sheetNode("session_recovery_confirm_continue").clickAction()
-            assertTrue(confirm())
-            assertTrue(confirm())
-            assertFalse(busy.value)
-            assertEquals(listOf(recovery.requestId), continued)
-            awaitUi("Local submission lock") { !hostNode("session_recovery_continue").isEnabled() }
-            assertDisabled(hostNode("session_recovery_abandon"))
-
-            busy.value = true
-            awaitUi("Host becomes busy") { !hostNode("session_recovery_continue").isEnabled() }
-            busy.value = false
-            awaitUi("Host finishes processing") { hostNode("session_recovery_continue").isEnabled() }
-            assertEquals(listOf(recovery.requestId), continued)
-        }
-    }
-
-    @Test(timeout = 30_000)
-    fun busyBecomingTrueDuringReviewDisablesConfirmationWithoutDispatchingARequest() {
-        val busy = mutableStateOf(false)
-        val continued = mutableListOf<String>()
-        render({ SessionRecoveryCard(listOf(item()), busy.value, continued::add, {}) }) {
-            clickHost("session_recovery_continue")
-            awaitSheet("session_recovery_confirm_continue")
-            assertEnabled(sheetNode("session_recovery_confirm_continue"))
-            busy.value = true
-            awaitUi("Review becomes busy") {
-                sheetNodeOrNull("session_recovery_confirm_continue")?.isEnabled() == false
-            }
-            invokeIfPresent(sheetNode("session_recovery_confirm_continue"))
-            assertTrue(continued.isEmpty())
-            assertTrue(activity.getString(R.string.session_recovery_busy) in sheetTexts())
-            busy.value = false
-            awaitUi("Review unlocks") {
-                sheetNodeOrNull("session_recovery_confirm_continue")?.isEnabled() == true
-            }
-            assertTrue(continued.isEmpty())
-        }
-    }
-
-    @Test(timeout = 30_000)
-    fun unknownResultOptInResetsWhenReviewReopensOrItsSnapshotChanges() {
-        val recovery = mutableStateOf(item().copy(unknownTools = listOf("originalTool")))
-        val continued = mutableListOf<String>()
-        render({ SessionRecoveryCard(listOf(recovery.value), false, continued::add, {}) }) {
-            clickHost("session_recovery_continue")
-            awaitSheet("session_recovery_unknown_opt_in")
-            clickSheet("session_recovery_unknown_opt_in")
-            awaitUi("Initial opt-in") {
-                sheetNodeOrNull("session_recovery_confirm_continue")?.isEnabled() == true
-            }
-            clickSheet("session_recovery_back")
-            awaitSheet("session_recovery_sheet_continue")
-            clickSheet("session_recovery_sheet_continue")
-            awaitSheet("session_recovery_confirm_continue")
-            assertEquals(ToggleableState.Off, sheetNode("session_recovery_unknown_opt_in").toggleState())
-            assertDisabled(sheetNode("session_recovery_confirm_continue"))
-
-            clickSheet("session_recovery_unknown_opt_in")
-            awaitUi("Second opt-in") {
-                sheetNodeOrNull("session_recovery_confirm_continue")?.isEnabled() == true
-            }
-            recovery.value = recovery.value.copy(unknownTools = listOf("differentTool"))
-            awaitUi("Updated unknown tools") {
-                "differentTool" in sheetTexts() &&
-                    sheetNodeOrNull("session_recovery_unknown_opt_in")?.toggleState() == ToggleableState.Off
-            }
-            assertDisabled(sheetNode("session_recovery_confirm_continue"))
-            clickSheet("session_recovery_unknown_opt_in")
-            awaitUi("Updated tools acknowledged") {
-                sheetNodeOrNull("session_recovery_confirm_continue")?.isEnabled() == true
-            }
-            recovery.value = recovery.value.copy(environmentMatches = false)
-            awaitUi("Environment mismatch during review") {
-                sheetNodeOrNull("session_recovery_confirm_continue")?.isEnabled() == false &&
-                    sheetNodeOrNull("session_recovery_unknown_opt_in")?.toggleState() == ToggleableState.Off
-            }
-            assertDisabled(sheetNode("session_recovery_unknown_opt_in"))
-            invokeIfPresent(sheetNode("session_recovery_confirm_continue"))
-            assertTrue(continued.isEmpty())
-        }
-    }
-
-    @Test(timeout = 30_000)
-    fun abandonRequiresConfirmationAndCancelDoesNotDiscardTheRequest() {
-        val recovery = item("abandon/original:id").copy(unknownTools = listOf("Bash"))
-        val continued = mutableListOf<String>()
-        val abandoned = mutableListOf<String>()
-        render({ SessionRecoveryCard(listOf(recovery), false, continued::add, abandoned::add) }) {
-            clickHost("session_recovery_abandon")
-            awaitSheet("session_recovery_confirm_abandon")
-            assertTrue(abandoned.isEmpty())
-            assertTrue(activity.getString(R.string.session_recovery_abandon_hint) in sheetTexts())
-            assertFalse(sheetNodes().any { it.tag() == "session_recovery_unknown_opt_in" })
-            clickSheet("session_recovery_back")
-            awaitSheet("session_recovery_sheet_abandon")
-            assertTrue(abandoned.isEmpty())
-            clickSheet("session_recovery_sheet_abandon")
-            awaitSheet("session_recovery_confirm_abandon")
-            val confirm = sheetNode("session_recovery_confirm_abandon").clickAction()
-            assertTrue(confirm())
-            assertTrue(confirm())
-            assertEquals(listOf(recovery.requestId), abandoned)
-            assertTrue(continued.isEmpty())
-            awaitUi("Abandon submission lock") { !hostNode("session_recovery_abandon").isEnabled() }
-        }
-    }
-
-    @Test(timeout = 30_000)
-    fun pagingCanReachEveryQueuedItemAndContinuesTheSelectedOriginalRequestId() {
-        val recoveries = (1..8).map { index ->
-            item("queued/original:$index").copy(request = "Public request $index", draft = "Visible draft $index")
-        }
-        val continued = mutableListOf<String>()
-        val inspected = mutableListOf<String>()
-        render({ SessionRecoveryCard(recoveries, false, continued::add, {}, inspected::add) }) {
-            clickHost("session_recovery_inspect")
-            recoveries.forEachIndexed { index, recovery ->
-                awaitUi("Recovery page ${index + 1}") { recovery.draft in sheetTexts() }
-                assertTrue(recovery.request in sheetTexts())
-                assertTrue(activity.getString(R.string.session_recovery_page, index + 1, recoveries.size) in sheetTexts())
-                if (index == 0) assertDisabled(sheetNode("session_recovery_previous"))
-                if (index < recoveries.lastIndex) clickSheet("session_recovery_next")
-            }
-            assertDisabled(sheetNode("session_recovery_next"))
-            assertEquals(listOf(recoveries.first().requestId), inspected)
-            assertTrue(continued.isEmpty())
-            clickSheet("session_recovery_sheet_continue")
-            awaitSheet("session_recovery_confirm_continue")
-            clickSheet("session_recovery_confirm_continue")
-            assertEquals(listOf(recoveries.last().requestId), continued)
-        }
-    }
-
-    @Test(timeout = 30_000)
-    fun pagingRetainsTheSelectedRequestIdentityWhenOtherQueuedItemsReorder() {
-        val first = item("first").copy(draft = "First draft")
-        val selected = item("selected").copy(draft = "Selected draft", unknownTools = listOf("selectedTool"))
-        val other = item("other").copy(draft = "Other draft")
-        val items = mutableStateOf(listOf(first, selected, other))
-        render({ SessionRecoveryCard(items.value, false, {}, {}) }) {
-            clickHost("session_recovery_inspect")
-            awaitSheet("session_recovery_next")
-            clickSheet("session_recovery_next")
-            awaitUi("Selected request") { selected.draft in sheetTexts() }
-            items.value = listOf(first, other, selected)
-            awaitUi("Selected request after reorder") {
-                selected.draft in sheetTexts() &&
-                    activity.getString(R.string.session_recovery_page, 3, 3) in sheetTexts()
-            }
-            assertTrue("selectedTool" in sheetTexts())
-            assertFalse(other.draft in sheetTexts())
-            assertDisabled(sheetNode("session_recovery_next"))
-        }
-    }
-
-    @Test(timeout = 30_000)
-    fun longVisibleDraftRemainsPlainTextCopiesInFullAndDoesNotExposeARawExceptionReason() {
-        val rawReason = "java.lang.IllegalStateException: internal diagnostic details"
-        val draft = "<b>Literal draft text, not HTML</b>\n" + (1..120).joinToString("\n") { "Visible draft line $it" }
-        val recovery = item().copy(draft = draft, reason = rawReason)
-        render({ SessionRecoveryCard(listOf(recovery), false, {}, {}) }) {
-            clickHost("session_recovery_inspect")
-            awaitSheet("session_recovery_draft_body")
-            assertTrue(draft in sheetTexts())
-            assertTrue(activity.getString(R.string.session_recovery_draft_label) in sheetTexts())
-            assertTrue(activity.getString(R.string.session_recovery_reason_interrupted) in sheetTexts())
-            assertFalse(rawReason in sheetTexts())
-            val sheet = sheetNode("session_recovery_sheet")
-            assertTrue(sheet.boundsInRoot.height > 0f)
-            assertTrue(sheet.boundsInRoot.height <= 1_000f)
-            assertFalse(sheetNodes().any { it.config.contains(SemanticsActions.SetText) })
-            clickSheet("session_recovery_copy_draft")
-            assertEquals(draft, clipboardText())
-        }
-    }
-
-    private fun item(requestId: String = "original-request-id") = SessionRecoveryItemUi(
-        requestId = requestId,
-        request = "Public original request",
-        draft = "Last public visible draft\nNot a verified result",
-        unknownTools = emptyList(),
-        reason = "process_interrupted",
-        environmentMatches = true
-    )
 
     private fun SemanticsNode.tag(): String? = config.getOrNull(SemanticsProperties.TestTag)
-    private fun SemanticsNode.toggleState(): ToggleableState? = config.getOrNull(SemanticsProperties.ToggleableState)
-    private fun SemanticsNode.isEnabled(): Boolean = !config.contains(SemanticsProperties.Disabled)
-    private fun assertDisabled(node: SemanticsNode) = assertFalse("${node.tag()} must be disabled", node.isEnabled())
-    private fun assertEnabled(node: SemanticsNode) = assertTrue("${node.tag()} must be enabled", node.isEnabled())
-
-    private fun SemanticsNode.clickAction(): () -> Boolean {
-        val action = config.getOrNull(SemanticsActions.OnClick)?.action
-        assertNotNull("${tag()} must expose a click action", action)
-        return requireNotNull(action)
+    private fun SemanticsNode.texts(): List<String> = config.getOrNull(SemanticsProperties.Text)?.map { it.text }.orEmpty()
+    private fun SemanticsNode.description(): List<String> = config.getOrNull(SemanticsProperties.ContentDescription).orEmpty()
+    private fun SemanticsNode.isDisabled(): Boolean = config.contains(SemanticsProperties.Disabled)
+    private fun SemanticsNode.layoutBounds(): Rect {
+        val layout = layoutInfo
+        return Rect(layout.coordinates.localToRoot(Offset.Zero), Size(layout.width.toFloat(), layout.height.toFloat()))
     }
 
-    private fun invokeIfPresent(node: SemanticsNode) {
-        node.config.getOrNull(SemanticsActions.OnClick)?.action?.invoke()
-    }
-
-    private fun findComposeRoot(candidate: View): ViewRootForTest? {
-        if (candidate is ViewRootForTest) return candidate
-        if (candidate is ViewGroup) {
-            repeat(candidate.childCount) { index ->
-                findComposeRoot(candidate.getChildAt(index))?.let { return it }
+    private fun findComposeRoot(view: View): ViewRootForTest? {
+        if (view is ViewRootForTest) return view
+        if (view is ViewGroup) {
+            repeat(view.childCount) { index ->
+                findComposeRoot(view.getChildAt(index))?.let { return it }
             }
         }
         return null
-    }
-
-    private fun nodes(root: ViewRootForTest?): List<SemanticsNode> =
-        root?.semanticsOwner?.getAllSemanticsNodes(mergingEnabled = false) ?: emptyList()
-
-    private fun texts(nodes: List<SemanticsNode>): List<String> = nodes.flatMap { node ->
-        node.config.getOrNull(SemanticsProperties.Text)?.map { it.text } ?: emptyList()
     }
 
     private inner class RecoveryUi(
@@ -427,94 +291,95 @@ class SessionRecoveryCardTest {
         private val view: ComposeView,
         private val advanceFrame: () -> Unit
     ) {
-        fun hostNodes(): List<SemanticsNode> = nodes(findComposeRoot(view))
-        fun sheetNodes(): List<SemanticsNode> = nodes(
-            ShadowDialog.getLatestDialog()?.takeIf { it.isShowing }?.window?.decorView?.let(::findComposeRoot)
-        )
-        fun hostTexts(): List<String> = texts(hostNodes())
-        fun sheetTexts(): List<String> = texts(sheetNodes())
-        fun hostNode(tag: String): SemanticsNode = hostNodes().single { it.tag() == tag }
-        fun sheetNode(tag: String): SemanticsNode = sheetNodes().single { it.tag() == tag }
-        fun sheetNodeOrNull(tag: String): SemanticsNode? = sheetNodes().singleOrNull { it.tag() == tag }
+        fun nodes(merged: Boolean = false): List<SemanticsNode> =
+            findComposeRoot(view)?.semanticsOwner?.getAllSemanticsNodes(mergingEnabled = merged).orEmpty()
+        fun node(tag: String): SemanticsNode = nodes().single { it.tag() == tag }
+        fun texts(): List<String> = nodes().flatMap { it.texts() }
+        fun editor(): SemanticsNode = nodes().single { it.config.contains(SemanticsActions.SetText) }
         fun hasDialog(): Boolean = ShadowDialog.getLatestDialog()?.isShowing == true
-        fun clickHost(tag: String) {
-            val node = hostNode(tag)
-            assertEnabled(node)
-            assertTrue(node.clickAction()())
+
+        fun tap(position: Offset) {
+            val root = findComposeRoot(view) as View
+            val downTime = SystemClock.uptimeMillis()
+            val pointer = MotionEvent.PointerProperties().apply { id = 0; toolType = MotionEvent.TOOL_TYPE_FINGER }
+            val coordinates = MotionEvent.PointerCoords().apply {
+                x = position.x
+                y = position.y
+                pressure = 1f
+                size = 1f
+            }
+            for (action in listOf(MotionEvent.ACTION_DOWN, MotionEvent.ACTION_UP)) {
+                val event = MotionEvent.obtain(downTime, SystemClock.uptimeMillis(), action, 1, arrayOf(pointer),
+                    arrayOf(coordinates), 0, 0, 1f, 1f, 0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0)
+                try {
+                    root.dispatchTouchEvent(event)
+                } finally {
+                    event.recycle()
+                }
+                advanceFrame()
+            }
         }
-        fun clickSheet(tag: String) {
-            val node = sheetNode(tag)
-            assertEnabled(node)
-            assertTrue(node.clickAction()())
-        }
-        fun awaitSheet(tag: String) = awaitUi("Sheet node $tag") { sheetNodeOrNull(tag) != null }
-        fun clipboardText(): String? =
-            (activity.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager)
-                .primaryClip?.getItemAt(0)?.text?.toString()
 
         fun awaitUi(message: String, condition: () -> Boolean) {
             repeat(180) {
                 advanceFrame()
                 if (condition()) return
             }
-            fail("$message did not complete within 180 controlled frames; " +
-                "hostTags=${hostNodes().mapNotNull { it.tag() }}, " +
-                "sheetTags=${sheetNodes().mapNotNull { it.tag() }}, dialog=${hasDialog()}")
+            fail("$message did not complete within 180 controlled frames; tags=${nodes().mapNotNull { it.tag() }}")
         }
     }
 
-    private fun render(content: @Composable () -> Unit, inspect: RecoveryUi.() -> Unit) =
-        runTest(timeout = 15.seconds) {
-            val controller = Robolectric.buildActivity(ComponentActivity::class.java).setup().visible()
-            val activity = controller.get()
-            val view = ComposeView(activity)
-            val clock = BroadcastFrameClock()
-            val recomposer = Recomposer(coroutineContext + clock)
-            val runner = backgroundScope.launch(UnconfinedTestDispatcher(testScheduler) + clock) {
-                recomposer.runRecomposeAndApplyChanges()
-            }
-            val looper = shadowOf(Looper.getMainLooper())
-            var frame = 0L
-            val ui = RecoveryUi(activity, view) {
-                repeat(4) { looper.runOneTask() }
-                Snapshot.sendApplyNotifications()
-                runCurrent()
-                view.measure(
-                    View.MeasureSpec.makeMeasureSpec(400, View.MeasureSpec.EXACTLY),
-                    View.MeasureSpec.makeMeasureSpec(1_000, View.MeasureSpec.EXACTLY)
-                )
-                view.layout(0, 0, view.measuredWidth, view.measuredHeight)
-                findComposeRoot(view)?.measureAndLayoutForTest()
-                ShadowDialog.getLatestDialog()?.takeIf { it.isShowing }?.window?.decorView?.let { decor ->
-                    decor.measure(
-                        View.MeasureSpec.makeMeasureSpec(400, View.MeasureSpec.EXACTLY),
-                        View.MeasureSpec.makeMeasureSpec(1_000, View.MeasureSpec.EXACTLY)
-                    )
-                    decor.layout(0, 0, decor.measuredWidth, decor.measuredHeight)
-                    findComposeRoot(decor)?.measureAndLayoutForTest()
-                }
-                if (clock.hasAwaiters) clock.sendFrame(++frame * 16_000_000L)
-                runCurrent()
-                Snapshot.sendApplyNotifications()
-            }
-            try {
-                view.setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed)
-                // Modal and switch animations advance only on bounded, explicitly supplied frames.
-                view.setParentCompositionContext(recomposer)
-                view.setContent {
-                    CompositionLocalProvider(LocalDensity provides Density(1f)) {
-                        AIEditorTheme(darkTheme = false, content = content)
-                    }
-                }
-                activity.setContentView(view)
-                ui.awaitUi("Initial composition") { findComposeRoot(view) != null }
-                ui.inspect()
-            } finally {
-                view.disposeComposition()
-                recomposer.cancel()
-                runner.cancel()
-                runCurrent()
-                controller.pause().stop().destroy()
-            }
+    private fun render(
+        content: @Composable () -> Unit,
+        widthPx: Int = 400,
+        fontScale: Float = 1f,
+        inspect: RecoveryUi.() -> Unit
+    ) = runTest(timeout = 15.seconds) {
+        val controller = Robolectric.buildActivity(ComponentActivity::class.java).setup().visible()
+        val activity = controller.get()
+        val view = ComposeView(activity)
+        val clock = BroadcastFrameClock()
+        val recomposer = Recomposer(coroutineContext + clock)
+        val runner = backgroundScope.launch(UnconfinedTestDispatcher(testScheduler) + clock) {
+            recomposer.runRecomposeAndApplyChanges()
         }
+        val looper = shadowOf(Looper.getMainLooper())
+        var frame = 0L
+        val ui = RecoveryUi(activity, view) {
+            repeat(4) { looper.runOneTask() }
+            Snapshot.sendApplyNotifications()
+            runCurrent()
+            if (clock.hasAwaiters) clock.sendFrame(++frame * 16_000_000L)
+            runCurrent()
+            Snapshot.sendApplyNotifications()
+            view.measure(
+                View.MeasureSpec.makeMeasureSpec(widthPx, View.MeasureSpec.EXACTLY),
+                View.MeasureSpec.makeMeasureSpec(1_000, View.MeasureSpec.EXACTLY)
+            )
+            view.layout(0, 0, view.measuredWidth, view.measuredHeight)
+            findComposeRoot(view)?.measureAndLayoutForTest()
+        }
+        try {
+            view.setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed)
+            view.setParentCompositionContext(recomposer)
+            view.setContent {
+                CompositionLocalProvider(LocalDensity provides Density(1f, fontScale)) {
+                    AIEditorTheme(darkTheme = false, content = content)
+                }
+            }
+            activity.setContentView(view)
+            ui.awaitUi("Initial composition") { ui.nodes().isNotEmpty() }
+            repeat(6) {
+                // Give the text measurement and editor-width update an initial frame each.
+                ui.awaitUi("Initial layout") { findComposeRoot(view) != null }
+            }
+            ui.inspect()
+        } finally {
+            view.disposeComposition()
+            recomposer.cancel()
+            runner.cancel()
+            runCurrent()
+            controller.pause().stop().destroy()
+        }
+    }
 }

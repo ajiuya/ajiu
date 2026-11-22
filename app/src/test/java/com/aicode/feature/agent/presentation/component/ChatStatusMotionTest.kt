@@ -27,6 +27,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.MotionDurationScale
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.layout
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.ViewCompositionStrategy
@@ -83,6 +84,28 @@ import org.robolectric.shadows.ShadowLegacyBitmap
 @LooperMode(LooperMode.Mode.PAUSED)
 @OptIn(InternalComposeUiApi::class, ExperimentalCoroutinesApi::class)
 class ChatStatusMotionTest {
+    @Test(timeout = 30_000)
+    fun capsuleEntranceClipsItsOwnHeightUntilTheVideoCurveCompletes() {
+        var progress by mutableStateOf(0f)
+        var capsuleHeight = -1
+        render(content = {
+            CapsuleEntrance(
+                progress = progress,
+                modifier = Modifier.onGloballyPositioned { capsuleHeight = it.size.height },
+            ) {
+                androidx.compose.foundation.layout.Box(Modifier.fillMaxWidth().size(width = 200.dp, height = 100.dp))
+            }
+        }) {
+            assertEquals(0, capsuleHeight)
+            progress = 0.5f
+            pump(2)
+            assertEquals(87, capsuleHeight)
+            progress = 1f
+            pump(2)
+            assertEquals(100, capsuleHeight)
+        }
+    }
+
     @Test(timeout = 30_000)
     fun sessionExecutionDotPulsesInItsLayerAndPermissionReplacesItWithAStaticDot() {
         var awaitingPermission by mutableStateOf(false)

@@ -7,10 +7,12 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -26,11 +28,8 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
-import androidx.compose.ui.text.SpanStyle
-import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -68,7 +67,6 @@ internal fun SubAgentGroupCapsule(
     val memberStates = members.map {
         stringResource(R.string.subagent_group_member_status, subAgentRoleLabel(it), subAgentStatusLabel(it.status))
     }.joinToString(" · ")
-    val statusSummary = compactSubAgentStatusSummary(members)
     val activeMember = members
         .filter { it.status.isActiveExecution() || it.status == SubAgentInteractionStatus.QUEUED }
         .maxByOrNull { it.lastActivityAtMs ?: it.startedAtMs ?: Long.MIN_VALUE }
@@ -124,13 +122,39 @@ internal fun SubAgentGroupCapsule(
                             color = MaterialTheme.semanticColors.subtleText,
                         )
                         if (!expanded) {
-                            Text(
-                                text = statusSummary,
+                            Row(
                                 modifier = Modifier.weight(1f),
-                                style = MaterialTheme.typography.labelSmall,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
+                                horizontalArrangement = Arrangement.spacedBy(Spacing.xs),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Spacer(Modifier.weight(1f))
+                                members.take(5).forEach { member ->
+                                    val role = subAgentRoleLabel(member)
+                                    val color = subAgentStatusColor(member.status)
+                                    Box(
+                                        modifier = Modifier.size(17.dp)
+                                            .clip(CircleShape)
+                                            .background(color.copy(alpha = 0.12f)),
+                                        contentAlignment = Alignment.Center,
+                                    ) {
+                                        Text(
+                                            text = role.take(1),
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = color,
+                                            fontWeight = FontWeight.SemiBold,
+                                            maxLines = 1,
+                                        )
+                                    }
+                                }
+                                if (members.size > 5) {
+                                    Text(
+                                        text = "+${members.size - 5}",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.semanticColors.subtleText,
+                                        maxLines = 1,
+                                    )
+                                }
+                            }
                         }
                     }
                     if (!expanded) {
@@ -206,51 +230,6 @@ internal fun SubAgentGroupCapsule(
                     }
                 }
             }
-        }
-    }
-}
-
-private data class CompactSubAgentStatus(
-    val status: SubAgentInteractionStatus,
-    val count: Int,
-    val label: String,
-)
-
-@Composable
-private fun compactSubAgentStatusSummary(members: List<SubAgentInteractionSummary>) = buildAnnotatedString {
-    val statuses = buildList {
-        val workingCount = members.count {
-            it.status == SubAgentInteractionStatus.QUEUED || it.status == SubAgentInteractionStatus.RUNNING
-        }
-        if (workingCount > 0) add(CompactSubAgentStatus(
-            SubAgentInteractionStatus.RUNNING,
-            workingCount,
-            stringResource(R.string.subagent_group_compact_running),
-        ))
-        val completedCount = members.count { it.status == SubAgentInteractionStatus.COMPLETED }
-        if (completedCount > 0) add(CompactSubAgentStatus(
-            SubAgentInteractionStatus.COMPLETED,
-            completedCount,
-            stringResource(R.string.subagent_group_compact_completed),
-        ))
-        val awaitingCount = members.count { it.status == SubAgentInteractionStatus.AWAITING_CONFIRMATION }
-        if (awaitingCount > 0) add(CompactSubAgentStatus(
-            SubAgentInteractionStatus.AWAITING_CONFIRMATION,
-            awaitingCount,
-            stringResource(R.string.subagent_group_compact_waiting),
-        ))
-        for (status in SubAgentInteractionStatus.entries) {
-            if (status == SubAgentInteractionStatus.QUEUED || status == SubAgentInteractionStatus.RUNNING ||
-                status == SubAgentInteractionStatus.COMPLETED || status == SubAgentInteractionStatus.AWAITING_CONFIRMATION
-            ) continue
-            val count = members.count { it.status == status }
-            if (count > 0) add(CompactSubAgentStatus(status, count, subAgentStatusLabel(status)))
-        }
-    }
-    statuses.forEachIndexed { index, entry ->
-        if (index > 0) append(" · ")
-        withStyle(SpanStyle(color = subAgentStatusColor(entry.status))) {
-            append("● ${entry.count} ${entry.label}")
         }
     }
 }

@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>思考槽位后的子代理收纳卡片参考</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --page: #eef2f1;
+      --surface: #ffffff;
+      --surface-soft: #f7f9f8;
+      --line: #dce4e1;
+      --text: #1e2b2c;
+      --muted: #6a7979;
+      --faint: #95a2a0;
+      --green: #26735e;
+      --green-soft: #e6f3ed;
+      --blue: #3569a7;
+      --blue-soft: #eaf1f9;
+      --amber: #946219;
+      --amber-soft: #fbf2df;
+      --red: #a84942;
+      --red-soft: #f9eae7;
+      --shadow: 0 14px 34px rgba(34, 57, 53, .12);
+      font-family: Inter, "Noto Sans SC", "Microsoft YaHei", system-ui, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { min-width: 320px; margin: 0; color: var(--text); background: var(--page); }
+    button { color: inherit; font: inherit; }
+    .page { width: min(1180px, 100%); margin: 0 auto; padding: 28px 20px 40px; }
+    .topline { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; color: var(--muted); font-size: 12px; }
+    .topline i { width: 7px; height: 7px; border-radius: 50%; background: var(--green); }
+    h1 { margin: 0; font-size: 27px; line-height: 1.2; font-weight: 740; }
+    .intro { max-width: 740px; margin: 9px 0 20px; color: var(--muted); font-size: 14px; line-height: 1.55; }
+    .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
+    .tabs { display: flex; gap: 6px; min-width: 0; padding: 4px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+    .tabs button { min-height: 36px; padding: 0 13px; border: 0; border-radius: 7px; color: var(--muted); background: transparent; cursor: pointer; font-size: 13px; white-space: nowrap; }
+    .tabs button:hover { background: var(--surface-soft); color: var(--text); }
+    .tabs button[aria-selected="true"] { color: #fff; background: var(--green); }
+    .tag { flex: 0 0 auto; padding: 6px 9px; border: 1px solid var(--line); border-radius: 7px; color: var(--muted); background: var(--surface); font-size: 11px; }
+    .layout { display: grid; grid-template-columns: minmax(0, 1fr) 292px; gap: 18px; align-items: start; }
+    .preview { min-width: 0; padding: 18px; border: 1px solid #d6e0dc; border-radius: 12px; background: #e6ece9; }
+    .phone { width: min(100%, 420px); min-height: 590px; margin: 0 auto; overflow: hidden; border: 6px solid #263232; border-radius: 24px; background: #fbfcfb; box-shadow: var(--shadow); }
+    .appbar { display: flex; align-items: center; justify-content: space-between; height: 49px; padding: 0 15px; border-bottom: 1px solid var(--line); background: #fbfcfb; }
+    .appbrand { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 700; }
+    .mark { display: grid; width: 23px; height: 23px; place-items: center; border-radius: 7px; color: #fff; background: var(--green); font-size: 11px; }
+    .actions { color: var(--muted); font-size: 17px; }
+    .chat { display: flex; min-height: 535px; flex-direction: column; padding: 17px 13px 68px; }
+    .msg { max-width: 86%; margin-bottom: 12px; padding: 9px 11px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); font-size: 12px; line-height: 1.5; }
+    .msg.user { align-self: flex-end; border-color: #d2e3dc; background: #edf6f1; }
+    .msg.ai { align-self: flex-start; }
+    .msg small { display: block; margin-bottom: 3px; color: var(--faint); font-size: 10px; font-weight: 700; }
+    .thinking { display: flex; align-items: center; gap: 8px; min-height: 34px; margin: 1px 0 6px; color: var(--muted); font-size: 12px; }
+    .thinking-icon { display: grid; width: 20px; height: 20px; place-items: center; border: 1px solid #c7d8d1; border-radius: 6px; color: var(--green); background: #eff6f2; font-size: 12px; }
+    .thinking-dots { display: flex; gap: 3px; margin-left: auto; }
+    .thinking-dots i { width: 4px; height: 4px; border-radius: 50%; background: #94a8a1; }
+    .placement { align-self: flex-start; margin: 0 0 7px 28px; color: #82908e; font-size: 10px; }
+    .agent-card { width: 100%; margin: 0 0 15px; overflow: hidden; border: 1px solid #d9e2de; border-radius: 10px; background: var(--surface); box-shadow: 0 2px 7px rgba(35, 60, 53, .045); }
+    .card-head { display: flex; align-items: center; gap: 9px; width: 100%; min-height: 38px; padding: 7px 10px; border: 0; background: transparent; cursor: pointer; text-align: left; }
+    .card-head:hover { background: #f8faf9; }
+    .glyph { display: grid; flex: 0 0 auto; width: 23px; height: 23px; place-items: center; border-radius: 7px; color: var(--green); background: var(--green-soft); font-size: 12px; font-weight: 700; }
+    .head-main { display: flex; min-width: 0; flex: 1; align-items: center; gap: 7px; }
+    .head-title { flex: 0 0 auto; font-size: 12px; font-weight: 720; }
+    .total { color: var(--muted); font-size: 10px; white-space: nowrap; }
+    .counts { display: flex; min-width: 0; align-items: center; gap: 7px; margin-left: auto; overflow: hidden; color: var(--muted); font-size: 10px; white-space: nowrap; }
+    .count-running { color: var(--blue); }
+    .count-done { color: var(--green); }
+    .count-waiting { color: var(--amber); }
+    .chevron { flex: 0 0 auto; color: #71807e; font-size: 16px; transition: transform .16s ease; }
+    .agent-card.open .chevron { transform: rotate(90deg); }
+    .focus { display: flex; align-items: center; gap: 7px; min-width: 0; padding: 0 10px 8px 42px; color: var(--muted); font-size: 10px; line-height: 1.35; }
+    .focus-dot { flex: 0 0 auto; width: 6px; height: 6px; border-radius: 50%; background: var(--blue); }
+    .focus-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .focus-text b { color: var(--text); font-weight: 700; }
+    .elapsed { flex: 0 0 auto; margin-left: auto; color: var(--faint); font-size: 10px; font-variant-numeric: tabular-nums; }
+    .member-list { display: none; padding: 0 10px 7px; }
+    .agent-card.open .member-list { display: block; }
+    .member { display: flex; align-items: center; gap: 7px; min-height: 31px; border-top: 1px solid #edf1ef; font-size: 10px; }
+    .member-name { flex: 0 0 48px; font-weight: 680; }
+    .member-activity { min-width: 0; flex: 1; overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
+    .member-state { flex: 0 0 auto; font-size: 9px; }
+    .member-state.running { color: var(--blue); }
+    .member-state.done { color: var(--green); }
+    .member-state.waiting { color: var(--amber); }
+
+    .variant-2 .glyph { display: none; }
+    .variant-2 .card-head { min-height: 32px; padding: 6px 9px 4px; }
+    .variant-2 .focus { padding-left: 9px; padding-bottom: 7px; }
+    .variant-2 .counts { gap: 6px; }
+    .variant-3 .card-head { min-height: 33px; }
+    .member-peek { display: none; align-items: center; gap: 4px; margin-left: auto; }
+    .variant-3 .member-peek { display: flex; }
+    .peek { display: grid; width: 17px; height: 17px; place-items: center; border: 1px solid #d8e1dd; border-radius: 50%; color: var(--muted); background: #f7f9f8; font-size: 8px; font-weight: 700; }
+    .peek.running { color: var(--blue); border-color: #cbdcf0; background: var(--blue-soft); }
+    .peek.done { color: var(--green); border-color: #c8e4d8; background: var(--green-soft); }
+    .peek.waiting { color: var(--amber); border-color: #ead7b3; background: var(--amber-soft); }
+    .variant-3 .counts { display: none; }
+    .variant-3 .focus { padding-top: 0; padding-bottom: 7px; }
+
+    .notes { padding: 15px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+    .notes h2 { margin: 0 0 8px; font-size: 16px; line-height: 1.35; }
+    .notes p { margin: 0 0 13px; color: var(--muted); font-size: 12px; line-height: 1.55; }
+    .notes dl { display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 9px 8px; margin: 0; font-size: 11px; line-height: 1.4; }
+    .notes dt { color: var(--muted); }
+    .notes dd { margin: 0; }
+    .tradeoff { margin-top: 14px; padding: 10px; border-left: 3px solid var(--green); border-radius: 0 7px 7px 0; color: #526360; background: #f0f6f2; font-size: 11px; line-height: 1.5; }
+    .foot { max-width: 790px; margin: 14px 0 0; color: var(--muted); font-size: 11px; line-height: 1.55; }
+    @media (max-width: 850px) {
+      .layout { grid-template-columns: minmax(0, 1fr); }
+      .notes dl { grid-template-columns: 84px minmax(0, 1fr); }
+    }
+    @media (max-width: 520px) {
+      .page { padding: 20px 12px 28px; }
+      h1 { font-size: 23px; }
+      .intro { font-size: 13px; }
+      .toolbar { align-items: flex-start; flex-direction: column; }
+      .tabs { width: 100%; overflow-x: auto; }
+      .tabs button { flex: 1 0 auto; padding: 0 10px; font-size: 12px; }
+      .preview { padding: 8px; }
+      .phone { border-width: 4px; border-radius: 18px; }
+      .chat { padding-right: 9px; padding-left: 9px; }
+      .counts { gap: 5px; font-size: 9px; }
+      .head-title { font-size: 11px; }
+      .total { font-size: 9px; }
+      .variant-3 .member-peek { gap: 2px; }
+      .variant-3 .peek { width: 15px; height: 15px; font-size: 7px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <div class="topline"><i></i><span>聊天时间线 · 位置示意</span></div>
+    <h1>思考槽位后的子代理收纳卡片</h1>
+    <p class="intro">三种紧凑排法都把分组卡放在思考状态行之后、后续助手正文之前。点击上方切换方案，点击卡片可查看成员列表；内容只作视觉参考。</p>
+
+    <div class="toolbar">
+      <nav class="tabs" aria-label="卡片方案" role="tablist">
+        <button type="button" role="tab" aria-selected="true" data-version="1">A · 双行统计</button>
+        <button type="button" role="tab" aria-selected="false" data-version="2">B · 无图标短条</button>
+        <button type="button" role="tab" aria-selected="false" data-version="3">C · 成员点列</button>
+      </nav>
+      <span class="tag">设计参考 · 不改生产界面</span>
+    </div>
+
+    <section class="layout">
+      <div class="preview" id="preview"></div>
+      <aside class="notes" id="notes" aria-live="polite"></aside>
+    </section>
+    <p class="foot">演示中的思考行和卡片沿用当前聊天的相邻层级；分组折叠仍为第一层，展开后才显示每个子代理。状态、任务和耗时均为虚构样例，不代表实时执行数据。</p>
+  </main>
+
+  <script>
+    const members = [
+      { name: '探索员', task: '梳理调用链与当前影响面', state: '运行中', kind: 'running', initial: '探' },
+      { name: '编码员', task: '检查分页锚点与手势时序', state: '运行中', kind: 'running', initial: '编' },
+      { name: '审核员', task: '核对消息定位边界', state: '已完成', kind: 'done', initial: '审' },
+      { name: '测试员', task: '等待方案确定后补验收', state: '待确认', kind: 'waiting', initial: '测' }
+    ];
+    const variants = {
+      1: {
+        name: 'A · 双行统计',
+        summary: '现有两行层级的紧凑版：首行看人数与状态，次行看当前焦点成员、动作和用时。',
+        rows: [['压缩点', '状态计数与成员活动分行，扫读顺序稳定。'], ['适合', '同时运行多个子代理，需要快速看当前执行者。'], ['取舍', '保留 23px 图标块，占位略宽；焦点任务较长时省略。'], ['建议', '延续当前卡片结构，信息增量最均衡。']],
+        render: () => ({ className: 'variant-1', head: `<span class="glyph">⌘</span><span class="head-main"><span class="head-title">子代理</span><span class="total">4 个</span><span class="counts"><span class="count-running">● 2 运行</span><span class="count-done">● 1 完成</span><span class="count-waiting">● 1 待确认</span></span></span><span class="chevron">›</span>`, focus: `<i class="focus-dot"></i><span class="focus-text"><b>编码员</b> · 检查分页锚点与手势时序</span><span class="elapsed">01:42</span>` })
+      },
+      2: {
+        name: 'B · 无图标短条',
+        summary: '去掉左侧图标块，内容整体左对齐；把有限宽度优先留给成员进度与活动文案。',
+        rows: [['压缩点', '省去图标宽度，让状态和标题获得更宽文本轨道。'], ['适合', '小屏设备，或希望卡片更像正文而不是独立面板。'], ['取舍', '视觉锚点更弱；状态数量过多时右侧统计会省略。'], ['建议', '追求最低存在感时选用，需保留清晰点击区域。']],
+        render: () => ({ className: 'variant-2', head: `<span class="head-main"><span class="head-title">子代理</span><span class="total">4</span><span class="counts"><span class="count-running">● 2 运行</span><span class="count-done">● 1 完成</span><span class="count-waiting">● 1 待确认</span></span></span><span class="chevron">›</span>`, focus: `<i class="focus-dot"></i><span class="focus-text"><b>当前：编码员</b> · 分页锚点与手势时序</span><span class="elapsed">01:42</span>` })
+      },
+      3: {
+        name: 'C · 成员点列',
+        summary: '用成员首字和状态色点代替状态统计，突出“有哪些人正在协作”；下行聚焦最新活动。',
+        rows: [['压缩点', '用 4 个小标记表示参与成员，卡头减少状态文字。'], ['适合', '角色数量少且稳定，用户更在意参与者身份。'], ['取舍', '首字可能产生重名；状态颜色需配合文字说明。'], ['建议', '只作成员提示，不用颜色作为唯一状态依据。']],
+        render: () => ({ className: 'variant-3', head: `<span class="glyph">⌘</span><span class="head-main"><span class="head-title">子代理</span><span class="total">4 个</span></span><span class="member-peek">${members.map(m => `<span class="peek ${m.kind}" aria-label="${m.name} · ${m.state}" title="${m.name} · ${m.state}">${m.initial}</span>`).join('')}</span><span class="chevron">›</span>`, focus: `<i class="focus-dot"></i><span class="focus-text"><b>编码员</b> · 检查分页锚点与手势时序</span><span class="elapsed">01:42</span>` })
+      }
+    };
+    let selected = 1;
+    let expanded = false;
+
+    function memberRows() {
+      return members.map(m => `<div class="member"><span class="member-name">${m.name}</span><span class="member-activity">${m.task}</span><span class="member-state ${m.kind}">${m.state}</span></div>`).join('');
+    }
+    function render() {
+      const option = variants[selected];
+      const card = option.render();
+      document.getElementById('preview').innerHTML = `
+        <div class="phone">
+          <div class="appbar"><div class="appbrand"><span class="mark">A</span><span>阿九工作台</span></div><span class="actions">•••</span></div>
+          <div class="chat">
+            <div class="msg user"><small>你</small>把历史分页和搜索定位再检查一遍。</div>
+            <div class="msg ai"><small>AI</small>我先并行核对实现、回归和边界。</div>
+            <div class="thinking"><span class="thinking-icon">◌</span><span>思考中</span><span class="thinking-dots"><i></i><i></i><i></i></span></div>
+            <section class="agent-card ${card.className} ${expanded ? 'open' : ''}">
+              <button class="card-head" type="button" aria-expanded="${expanded}" aria-label="${expanded ? '收起' : '展开'}子代理分组">${card.head}</button>
+              <div class="focus">${card.focus}</div>
+              <div class="member-list">${memberRows()}</div>
+            </section>
+            <div class="msg ai"><small>AI</small>我会在这里继续回复；分组展开不会改变消息时间线位置。</div>
+          </div>
+        </div>`;
+      document.getElementById('notes').innerHTML = `<h2>${option.name}</h2><p>${option.summary}</p><dl>${option.rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('')}</dl><div class="tradeoff">点击卡片标题可模拟展开。三版都保持成员详情位于第二层，不把收拢态变成可滚动的小列表。</div>`;
+      document.querySelectorAll('[data-version]').forEach(button => button.setAttribute('aria-selected', String(Number(button.dataset.version) === selected)));
+      document.querySelector('.card-head').addEventListener('click', () => { expanded = !expanded; render(); });
+    }
+    document.querySelectorAll('[data-version]').forEach(button => button.addEventListener('click', () => { selected = Number(button.dataset.version); expanded = false; render(); }));
+    render();
+  </script>
+</body>
+</html>

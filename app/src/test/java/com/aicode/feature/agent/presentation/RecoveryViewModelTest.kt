@@ -4,9 +4,9 @@ import android.app.Application
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
 import com.aicode.feature.agent.data.local.dao.RecoveryDaoFixture
-import com.aicode.feature.agent.data.local.dao.RecoverySessionGate
 import com.aicode.feature.agent.data.local.database.AgentDatabase
 import com.aicode.feature.agent.data.local.entity.AgentMessageEntity
+import com.aicode.feature.agent.data.local.entity.ChatSessionEntity
 import com.aicode.feature.agent.domain.memory.ProjectMemoryCapture
 import com.aicode.feature.agent.domain.memory.ProjectMemoryIdentity
 import com.aicode.feature.agent.domain.model.AgentContext
@@ -17,12 +17,15 @@ import com.aicode.feature.agent.domain.recovery.RecoveryRepository
 import com.aicode.feature.agent.domain.recovery.RecoveryRequest
 import com.aicode.feature.agent.domain.recovery.RecoveryRequestPayload
 import com.aicode.feature.agent.domain.recovery.RecoveryRun
+import com.aicode.feature.agent.domain.recovery.RecoveryScope
+import com.aicode.feature.agent.domain.recovery.RecoveryStatus
+import com.aicode.feature.agent.domain.recovery.RecoveryToolCall
 import com.aicode.feature.agent.domain.session.MessagePersistenceUseCase
 import com.aicode.feature.agent.domain.tool.AgentTool
 import com.aicode.feature.agent.domain.tool.ToolCall
 import com.aicode.feature.agent.domain.workflow.AgentEvent
+import com.aicode.feature.agent.presentation.SubAgentViewModelQueueFixture.Companion.CHILD
 import com.aicode.feature.agent.presentation.SubAgentViewModelQueueFixture.Companion.PARENT
-import com.aicode.feature.agent.presentation.component.SessionRecoveryItemUi
 import com.aicode.feature.terminal.domain.TaskKeepaliveController
 import io.mockk.Runs
 import io.mockk.coEvery
@@ -33,13 +36,16 @@ import io.mockk.mockk
 import io.mockk.mockkObject
 import io.mockk.unmockkObject
 import io.mockk.verify
+import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.test.StandardTestDispatcher
@@ -47,6 +53,7 @@ import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
@@ -76,7 +83,8 @@ class RecoveryViewModelTest {
     private val dispatcher = StandardTestDispatcher()
     private val ledger = RecoveryDaoFixture()
     private val backendRuns = Channel<BackendRun>(Channel.UNLIMITED)
-    private val backendCalls = mutableListOf<BackendRun>()
+    private val backendCalls = CopyOnWriteArrayList<BackendRun>()
+    private val environmentChanges = MutableSharedFlow<Unit>(replay = 1)
     private lateinit var fixture: SubAgentViewModelQueueFixture
     private lateinit var repository: RecoveryRepository
     private lateinit var context: Context
@@ -89,8 +97,6 @@ class RecoveryViewModelTest {
         every { TaskKeepaliveController.acquire(any(), any(), any(), any()) } returns false
         every { TaskKeepaliveController.release(any(), any()) } just Runs
         context = ApplicationProvider.getApplicationContext()
-        ledger.sessions[PARENT] = RecoverySessionGate(PARENT, 0, null)
-        ledger.sessions[OTHER] = RecoverySessionGate(OTHER, 0, null)
         openViewModel()
     }
 
@@ -110,12 +116,13 @@ class RecoveryViewModelTest {
         val interrupted = seedInterrupted("interrupted", draft = "Unverified partial response")
         val original = ledger.messages.toMap()
 
-        val card = card(interrupted.request.id)
+        val bubble = snapshot(interrupted.request.id)
+        val detail = repository.observePending(PARENT).first().single()
         runCurrent()
 
-        assertEquals("Request interrupted", card.request)
-        assertEquals("Unverified partial response", card.draft)
-        assertTrue(card.environmentMatches)
+        assertEquals("Request interrupted", detail.payload.request)
+        assertEquals("Unverified partial response", detail.draft?.text)
+        assertTrue(bubble.items.single().environmentMatches)
         assertEquals("INTERRUPTED", ledger.requests.getValue(interrupted.request.id).status)
         assertEquals("INTERRUPTED", ledger.runs.getValue(interrupted.run.id).status)
         assertEquals(original, ledger.messages)
@@ -130,7 +137,8 @@ class RecoveryViewModelTest {
     fun restartedQueuedRequestStaysInCardUntilExplicitConfirmation() = runTest(dispatcher, timeout = 15.seconds) {
         val request = seedQueued("queued")
 
-        assertTrue(card(request.id).environmentMatches)
+        val bubble = snapshot(request.id)
+        assertTrue(bubble.items.single().environmentMatches)
         runCurrent()
         assertEquals("AWAITING_CONFIRMATION", ledger.requests.getValue(request.id).status)
         assertTrue(ledger.runs.isEmpty())
@@ -138,7 +146,7 @@ class RecoveryViewModelTest {
         assertTrue(vm.queuedRequests.value.isEmpty())
         assertTrue(backendCalls.isEmpty())
 
-        vm.continueRecovery(request.id)
+        vm.continueRecovery(bubble)
         val run = backendRuns.receive()
         assertEquals(request.inputMessageId, run.context.inputMessageId)
         assertEquals("Request queued", ledger.messages.getValue(request.inputMessageId).content)
@@ -157,8 +165,7 @@ class RecoveryViewModelTest {
             modelRequest = notificationText, origin = com.aicode.feature.agent.domain.recovery.RecoveryOrigin.NOTIFICATION,
             notificationSeqs = listOf(7)), Json.encodeToString(fixture.projectIdentity), requestId = "notice", inputMessageId = "notice-input")
         assertTrue(previous.awaitConfirmation(request.id))
-        card(request.id)
-        vm.continueRecovery(request.id)
+        vm.continueRecovery(snapshot(request.id))
         val first = backendRuns.receive()
         assertEquals(notificationText, ledger.messages.getValue(request.inputMessageId).content)
         assertNull(ledger.messages.getValue(request.inputMessageId).modelInputSnapshotJson)
@@ -168,8 +175,7 @@ class RecoveryViewModelTest {
         fixture.closeUi()
         fixture.closeProcessOwner().join()
         openViewModel()
-        card(request.id)
-        vm.continueRecovery(request.id)
+        vm.continueRecovery(snapshot(request.id))
         val resumed = backendRuns.receive()
         assertTrue(resumed.context.history.filterIsInstance<AgentMessage.UserMessage>().any {
             it.id == request.inputMessageId && it.content == notificationText
@@ -181,13 +187,13 @@ class RecoveryViewModelTest {
     @Test
     fun staleRecoveryCardAbandonDoesNotStopTheConfirmedWorkflow() = runTest(dispatcher, timeout = 15.seconds) {
         val interrupted = seedInterrupted("late-abandon")
-        card(interrupted.request.id)
-        vm.continueRecovery(interrupted.request.id)
+        val bubble = snapshot(interrupted.request.id)
+        vm.continueRecovery(bubble)
         val run = backendRuns.receive()
         val runId = requireNotNull(run.context.recoveryRunId)
         val writes = ledger.writes.toList()
 
-        vm.abandonRecovery(interrupted.request.id)
+        vm.abandonRecovery(bubble)
         runCurrent()
 
         assertEquals(writes, ledger.writes)
@@ -201,13 +207,13 @@ class RecoveryViewModelTest {
     @Test
     fun pendingCardAbandonIsSessionScopedAndDoesNotExecuteAnything() = runTest(dispatcher, timeout = 15.seconds) {
         val interrupted = seedInterrupted("abandon")
-        card(interrupted.request.id)
+        val bubble = snapshot(interrupted.request.id)
         vm.selectSession(OTHER)
-        vm.abandonRecovery(interrupted.request.id)
+        vm.abandonRecovery(bubble)
         runCurrent()
         assertEquals("INTERRUPTED", ledger.requests.getValue(interrupted.request.id).status)
         vm.selectSession(PARENT)
-        vm.abandonRecovery(interrupted.request.id)
+        vm.abandonRecovery(snapshot(interrupted.request.id))
         runCurrent()
 
         assertEquals("ABANDONED", ledger.requests.getValue(interrupted.request.id).status)
@@ -220,12 +226,19 @@ class RecoveryViewModelTest {
     fun confirmationInDifferentProfileRefusesWorkflowAndDoesNotClearPersistentHold() = runTest(dispatcher, timeout = 15.seconds) {
         val interrupted = seedInterrupted("profile")
         assertTrue(repository.holdSession(PARENT, "process_interrupted"))
+        val matching = snapshot(interrupted.request.id)
+        assertTrue(matching.items.single().environmentMatches)
         val otherProfile = fixture.projectIdentity.copy(profileId = "different-profile")
         coEvery { fixture.projectIdentityResolver.capture(any(), any(), any()) } returns ProjectMemoryCapture(otherProfile) {}
+        environmentChanges.emit(Unit)
         val before = ledger.messages.toMap()
+        val mismatched = vm.recoveryBubble.first { bubble ->
+            bubble.scope == matching.scope && bubble.items.singleOrNull()?.environmentMatches == false
+        }
+        assertEquals(matching.items.single().target, mismatched.items.single().target)
 
-        assertFalse(card(interrupted.request.id).environmentMatches)
-        vm.continueRecovery(interrupted.request.id)
+        vm.continueRecovery(mismatched)
+        vm.continueRecovery(matching)
         runCurrent()
         vm.recovering.first { !it }
 
@@ -241,6 +254,7 @@ class RecoveryViewModelTest {
     @Test
     fun repeatedConfirmationsCreateOnlyOneNewRunAcrossPreparationExecutionAndCompletion() = runTest(dispatcher, timeout = 15.seconds) {
         val interrupted = seedInterrupted("duplicate")
+        val bubble = snapshot(interrupted.request.id)
         val loadingAttachments = CompletableDeferred<Unit>()
         val releaseAttachments = CompletableDeferred<Unit>()
         coEvery { fixture.persistence.loadAttachmentImages(any()) } coAnswers {
@@ -249,12 +263,12 @@ class RecoveryViewModelTest {
             emptyList()
         }
 
-        vm.continueRecovery(interrupted.request.id)
-        vm.continueRecovery(interrupted.request.id)
+        vm.continueRecovery(bubble)
+        vm.continueRecovery(bubble)
         loadingAttachments.await()
         runCurrent()
         assertTrue(vm.recovering.value)
-        vm.continueRecovery(interrupted.request.id)
+        vm.continueRecovery(bubble)
         runCurrent()
         assertEquals(2, ledger.runs.size)
         assertTrue(backendCalls.isEmpty())
@@ -265,12 +279,12 @@ class RecoveryViewModelTest {
         assertNotEquals(interrupted.run.id, runId)
         assertEquals(interrupted.request.id, ledger.runs.getValue(runId).requestId)
         assertSame(run.owner, fixture.jobs[PARENT])
-        vm.continueRecovery(interrupted.request.id)
+        vm.continueRecovery(bubble)
         runCurrent()
         assertEquals(2, ledger.runs.size)
         assertEquals(1, backendCalls.size)
         complete(run)
-        vm.continueRecovery(interrupted.request.id)
+        vm.continueRecovery(bubble)
         runCurrent()
         vm.recovering.first { !it }
         assertEquals(2, ledger.runs.size)
@@ -285,7 +299,7 @@ class RecoveryViewModelTest {
         val original = ledger.messages.getValue(interrupted.request.inputMessageId)
         val originalWrites = ledger.writes.count { it == "message:${original.id}" }
 
-        vm.continueRecovery(interrupted.request.id)
+        vm.continueRecovery(snapshot(interrupted.request.id))
         val run = backendRuns.receive()
         val runId = requireNotNull(run.context.recoveryRunId)
         val resumeId = "resume_$runId"
@@ -313,7 +327,7 @@ class RecoveryViewModelTest {
     fun interruptedRunWithoutCommittedUserReusesStableInputIdInsteadOfCreatingResumeInput() = runTest(dispatcher, timeout = 15.seconds) {
         val interrupted = seedInterrupted("before-input", commitInput = false)
 
-        vm.continueRecovery(interrupted.request.id)
+        vm.continueRecovery(snapshot(interrupted.request.id))
         val run = backendRuns.receive()
 
         assertEquals(interrupted.request.inputMessageId, run.context.inputMessageId)
@@ -332,7 +346,18 @@ class RecoveryViewModelTest {
         every { tool.name } returns "Bash"
         every { fixture.tools.getAvailableTools() } returns listOf(tool)
 
-        vm.continueRecovery(interrupted.request.id)
+        val bubble = snapshot(interrupted.request.id)
+        assertEquals(setOf(RecoveryToolCall("unknown-call", "Bash")), bubble.items.single().target.unknownTools)
+        val writes = ledger.writes.toList()
+        vm.continueRecovery(bubble, unknownToolsVerified = false)
+        runCurrent()
+        vm.recovering.first { !it }
+        assertEquals(writes, ledger.writes)
+        assertTrue(backendCalls.isEmpty())
+        assertTrue(fixture.jobs.isEmpty())
+        verify(exactly = 0) { fixture.workflow.executeEvents(any(), any(), any()) }
+
+        vm.continueRecovery(bubble, unknownToolsVerified = true)
         val run = backendRuns.receive()
         val expected = mapOf("unknown-call" to "RESULT_UNKNOWN", "waiting-call" to "NOT_EXECUTED", "declared-call" to "NOT_EXECUTED")
         assertEquals(listOf(tool), run.tools)
@@ -429,10 +454,10 @@ class RecoveryViewModelTest {
         fixture.closeProcessOwner().join()
         openViewModel()
 
-        val recovery = card(queuedId)
-        assertEquals("PLAN_REJECTED", recovery.reason)
-        assertFalse(recovery.environmentMatches)
-        vm.continueRecovery(queuedId)
+        val bubble = snapshot(queuedId)
+        assertEquals("PLAN_REJECTED", repository.observePending(PARENT).first().single { it.request.id == queuedId }.holdReason)
+        assertFalse(bubble.items.single().environmentMatches)
+        vm.continueRecovery(bubble)
         runCurrent()
         vm.recovering.first { !it }
         assertEquals("PLAN_REJECTED", ledger.sessions.getValue(PARENT).autoDispatchBlockedReason)
@@ -467,7 +492,7 @@ class RecoveryViewModelTest {
         assertTrue(vm.queuedRequests.value.isEmpty())
         assertTrue(fixture.jobs.isEmpty())
         assertEquals(AgentUIState.Idle, vm.agentStates.value[PARENT])
-        assertTrue(card(queuedId).environmentMatches)
+        assertTrue(snapshot(queuedId).items.single().environmentMatches)
         assertFalse(vm.recovering.value)
         assertNull(ledger.messages[ledger.requests.getValue(queuedId).inputMessageId])
         verify(exactly = 2) { fixture.workflow.executeEvents(any(), any(), any()) }
@@ -478,7 +503,7 @@ class RecoveryViewModelTest {
         val interrupted = seedInterrupted("held")
         assertTrue(repository.holdSession(PARENT, "PLAN_REJECTED"))
         val original = ledger.messages.getValue(interrupted.request.inputMessageId)
-        assertFalse(card(interrupted.request.id).environmentMatches)
+        assertFalse(snapshot(interrupted.request.id).items.single().environmentMatches)
 
         vm.enqueueAgentRequest("New explicit scope", projectRoot = WORKSPACE, targetSessionId = PARENT)
         val run = backendRuns.receive()
@@ -502,9 +527,13 @@ class RecoveryViewModelTest {
         val remoteIdentity = ProjectMemoryIdentity("remote_ssh", "example.invalid", 22, "tester", WORKSPACE)
         val remote = seedInterrupted("remote", sessionId = OTHER, identity = remoteIdentity)
         val originalLocal = ledger.messages.getValue(local.request.inputMessageId)
+        val localBubble = snapshot(local.request.id)
+        assertTrue(localBubble.items.single().environmentMatches)
         vm.selectSession(OTHER)
-        vm.continueRecovery(local.request.id)
-        vm.continueRecovery(remote.request.id)
+        val mismatched = snapshot(remote.request.id, scopeId = OTHER)
+        assertFalse(mismatched.items.single().environmentMatches)
+        vm.continueRecovery(localBubble)
+        vm.continueRecovery(mismatched)
         runCurrent()
         vm.recovering.first { !it }
         assertEquals(2, ledger.runs.size)
@@ -514,7 +543,12 @@ class RecoveryViewModelTest {
 
         coEvery { fixture.projectIdentityResolver.capture(any(), any(), any()) } returns
             ProjectMemoryCapture(remoteIdentity, "ssh-generation") {}
-        vm.continueRecovery(remote.request.id)
+        environmentChanges.emit(Unit)
+        val remoteBubble = vm.recoveryBubble.first { bubble ->
+            bubble.scope == mismatched.scope && bubble.items.singleOrNull()?.environmentMatches == true
+        }
+        assertEquals(mismatched.items.single().target, remoteBubble.items.single().target)
+        vm.continueRecovery(remoteBubble)
         val run = backendRuns.receive()
         val owned = ledger.runs.getValue(requireNotNull(run.context.recoveryRunId))
 
@@ -532,10 +566,183 @@ class RecoveryViewModelTest {
         assertEquals(1, backendCalls.size)
     }
 
+    @Test
+    fun oneConfirmationContinuesParentAndChildWithoutStartingTheirLaterRequests() = runTest(dispatcher, timeout = 15.seconds) {
+        val childFirst = seedPending("z-child-first", CHILD)
+        val parentFirst = seedPending("z-parent-first")
+        val childLater = seedPending("a-child-later", CHILD)
+        val parentLater = seedPending("a-parent-later")
+        val bubble = snapshot(parentFirst.id, parentLater.id, childFirst.id, childLater.id)
+        assertTrue(bubble.items.all { it.environmentMatches })
+
+        vm.continueRecovery(bubble)
+        val started = List(2) { backendRuns.receive() }.associateBy { it.context.sessionId }
+        val parentRun = started.getValue(PARENT)
+        val childRun = started.getValue(CHILD)
+        assertRecoveryRun(parentFirst, parentRun)
+        assertRecoveryRun(childFirst, childRun)
+        assertTrue(parentRun.owner.isActive)
+        assertTrue(childRun.owner.isActive)
+        vm.recovering.first { !it }
+        assertEquals("AWAITING_CONFIRMATION", ledger.requests.getValue(parentLater.id).status)
+        assertEquals("AWAITING_CONFIRMATION", ledger.requests.getValue(childLater.id).status)
+        assertEquals(setOf(parentFirst.id, childFirst.id), ledger.runs.values.map { it.requestId }.toSet())
+        assertEquals(2, backendCalls.size)
+
+        complete(parentRun)
+        val next = snapshot(parentLater.id, childLater.id)
+        assertEquals(setOf(CHILD), next.runningSessions)
+        assertEquals(2, backendCalls.size)
+        vm.continueRecovery(next)
+        val secondParentRun = backendRuns.receive()
+        assertRecoveryRun(parentLater, secondParentRun)
+        complete(secondParentRun)
+        assertEquals("COMPLETED", ledger.requests.getValue(parentFirst.id).status)
+        assertEquals("COMPLETED", ledger.requests.getValue(parentLater.id).status)
+        assertEquals("RUNNING", ledger.requests.getValue(childFirst.id).status)
+        assertEquals("AWAITING_CONFIRMATION", ledger.requests.getValue(childLater.id).status)
+        assertEquals(3, backendCalls.size)
+        childRun.owner.cancelAndJoin()
+    }
+
+    @Test
+    fun parentBubbleCanContinueOnlyItsChildWithoutStartingParent() = runTest(dispatcher, timeout = 15.seconds) {
+        val child = seedPending("child-only", CHILD)
+        val bubble = snapshot(child.id)
+        assertEquals(PARENT, bubble.scope?.sessionId)
+        assertEquals(CHILD, bubble.items.single().target.sessionId)
+        assertTrue(bubble.items.single().environmentMatches)
+
+        vm.continueRecovery(bubble)
+        val run = backendRuns.receive()
+        assertRecoveryRun(child, run)
+        vm.recovering.first { !it }
+        assertEquals(setOf(CHILD), fixture.jobs.keys)
+        assertEquals(setOf(child.id), ledger.requests.keys)
+        assertEquals(1, ledger.runs.size)
+        assertEquals(1, backendCalls.size)
+        run.owner.cancelAndJoin()
+    }
+
+    @Test
+    fun abandonAffectsOnlyDisplayedParentAndChildHeadsAndPreservesRunningAndOutOfScopeRequests() = runTest(dispatcher, timeout = 15.seconds) {
+        val root = fixture.sessionRows.getValue(PARENT)
+        val grandchild = root.copy(id = "grandchild", parentId = CHILD)
+        val foreignChild = root.copy(id = "foreign-child", parentId = PARENT, workspacePath = "/elsewhere")
+        putSession(grandchild)
+        putSession(foreignChild)
+        vm.executeAgentRequestStream("Already running", projectRoot = WORKSPACE, targetSessionId = PARENT)
+        val running = backendRuns.receive()
+        val runId = requireNotNull(running.context.recoveryRunId)
+        val runningRequest = ledger.runs.getValue(runId).requestId
+        val parent = seedPending("abandon-parent")
+        val parentLater = seedPending("keep-later-parent")
+        val child = seedPending("abandon-child", CHILD, fixture.projectIdentity.copy(profileId = "different-profile"))
+        val childLater = seedPending("keep-later-child", CHILD)
+        val other = seedPending("keep-other", OTHER)
+        val nested = seedPending("keep-grandchild", grandchild.id)
+        val foreign = seedPending("keep-foreign", foreignChild.id)
+        val bubble = snapshot(parent.id, parentLater.id, child.id, childLater.id)
+        assertTrue(bubble.items.first().environmentMatches)
+        assertFalse(bubble.items.single { it.target.requestId == child.id }.environmentMatches)
+        val unaffected = listOf(runningRequest, parentLater.id, childLater.id, other.id, nested.id, foreign.id)
+            .associateWith { ledger.requests.getValue(it) }
+        val messages = ledger.messages.toMap()
+
+        vm.abandonRecovery(bubble)
+        runCurrent()
+        vm.recovering.first { !it }
+
+        assertEquals("ABANDONED", ledger.requests.getValue(parent.id).status)
+        assertEquals("ABANDONED", ledger.requests.getValue(child.id).status)
+        assertEquals(unaffected, unaffected.keys.associateWith { ledger.requests.getValue(it) })
+        assertEquals("RUNNING", ledger.runs.getValue(runId).status)
+        assertTrue(repository.isCurrent(runId))
+        assertSame(running.owner, fixture.jobs[PARENT])
+        assertEquals(messages, ledger.messages)
+        verify(exactly = 1) { fixture.workflow.executeEvents(any(), any(), any()) }
+        complete(running)
+    }
+
+    @Test
+    fun oldParentGenerationCannotContinueOrAbandonAStillPendingChild() = runTest(dispatcher, timeout = 15.seconds) {
+        val parentRows = MutableStateFlow(fixture.sessionRows.getValue(PARENT))
+        every { fixture.chatSessions.getByIdFlow(PARENT) } returns parentRows
+        val child = seedPending("parent-generation-changed", CHILD)
+        val stale = snapshot(child.id)
+
+        assertTrue(repository.invalidateSession(PARENT, "restore"))
+        val newParent = parentRows.value.copy(executionGeneration = ledger.sessions.getValue(PARENT).executionGeneration)
+        fixture.sessionRows[PARENT] = newParent
+        parentRows.value = newParent
+        val current = snapshot(child.id)
+        assertEquals(RecoveryScope(PARENT, WORKSPACE, 0), stale.scope)
+        assertEquals(RecoveryScope(PARENT, WORKSPACE, 1), current.scope)
+        assertEquals(stale.items, current.items)
+        val writes = ledger.writes.toList()
+
+        vm.continueRecovery(stale)
+        runCurrent()
+        vm.recovering.first { !it }
+        vm.abandonRecovery(stale)
+        runCurrent()
+        vm.recovering.first { !it }
+
+        assertEquals(writes, ledger.writes)
+        assertEquals("AWAITING_CONFIRMATION", ledger.requests.getValue(child.id).status)
+        assertTrue(ledger.runs.isEmpty())
+        assertTrue(ledger.messages.isEmpty())
+        assertTrue(fixture.jobs.isEmpty())
+        verify(exactly = 0) { fixture.workflow.executeEvents(any(), any(), any()) }
+        vm.continueRecovery(current)
+        val run = backendRuns.receive()
+        assertRecoveryRun(child, run)
+        run.owner.cancelAndJoin()
+    }
+
+    @Test
+    fun verificationForAnOldRunCannotContinueOrAbandonANewerInterruptionOfTheSameRequest() = runTest(dispatcher, timeout = 15.seconds) {
+        val interrupted = seedInterrupted("new-active-run", toolCalls = true)
+        val request = interrupted.request
+        val stale = snapshot(request.id)
+        val staleTarget = stale.items.single().target
+        val replacement = checkNotNull(repository.claimPending(requireNotNull(stale.scope), staleTarget, request.environment,
+            unknownToolsVerified = true))
+        assertTrue(repository.finish(replacement.id, RecoveryStatus.INTERRUPTED))
+        ledger.refreshPendingScopeRows()
+        val current = vm.recoveryBubble.first { bubble ->
+            bubble.scope == stale.scope && bubble.items.singleOrNull()?.target?.activeRunId == replacement.id
+        }
+        assertEquals(interrupted.run.id, staleTarget.activeRunId)
+        assertEquals(staleTarget.copy(activeRunId = replacement.id), current.items.single().target)
+        assertEquals(setOf(RecoveryToolCall("unknown-call", "Bash")), staleTarget.unknownTools)
+        val writes = ledger.writes.toList()
+
+        vm.continueRecovery(stale, unknownToolsVerified = true)
+        runCurrent()
+        vm.recovering.first { !it }
+        vm.abandonRecovery(stale)
+        runCurrent()
+        vm.recovering.first { !it }
+
+        assertEquals(writes, ledger.writes)
+        assertEquals("INTERRUPTED", ledger.requests.getValue(request.id).status)
+        assertEquals(replacement.id, ledger.requests.getValue(request.id).activeRunId)
+        assertEquals(setOf(interrupted.run.id, replacement.id), ledger.runs.keys)
+        assertTrue(fixture.jobs.isEmpty())
+        verify(exactly = 0) { fixture.workflow.executeEvents(any(), any(), any()) }
+        vm.abandonRecovery(current)
+        runCurrent()
+        vm.recovering.first { !it }
+        assertEquals("ABANDONED", ledger.requests.getValue(request.id).status)
+    }
+
     private fun openViewModel() {
         repository = RecoveryRepository(ledger.dao)
         fixture = SubAgentViewModelQueueFixture(context, recovery = repository)
         fixture.sessionRows[OTHER] = fixture.sessionRows.getValue(PARENT).copy(id = OTHER, title = "Other")
+        fixture.sessionRows.values.forEach { if (it.id !in ledger.sessions) ledger.putSession(it) }
+        every { fixture.projectIdentityResolver.environmentChanges } returns environmentChanges
         coEvery { fixture.sessions.getMostRecentSessionOfWorkspace(WORKSPACE) } returns fixture.sessionRows.getValue(PARENT)
         coEvery { fixture.sessions.isSessionEmpty(any()) } returns true
         coEvery { fixture.sessions.updateGoalStatus(any(), any()) } answers {
@@ -544,14 +751,17 @@ class RecoveryViewModelTest {
             fixture.sessionRows[sessionId] = fixture.sessionRows.getValue(sessionId).copy(goalStatus = status.name)
         }
         coEvery { fixture.messages.getMessageById(any()) } answers { ledger.messages[firstArg<String>()] }
-        coEvery { fixture.messages.getMessagesBySessionOnce(any()) } answers {
+        coEvery { fixture.messages.getMessagesBySessionOnce(any()) } coAnswers {
             val sessionId = firstArg<String>()
-            ledger.messages.values.filter { it.sessionId == sessionId }.sortedBy { it.timestamp }
+            withContext(Dispatchers.Main) {
+                ledger.messages.values.filter { it.sessionId == sessionId }.sortedBy { it.timestamp }
+            }
         }
         val persistence = MessagePersistenceUseCase(fixture.messages, mockk<AgentDatabase>(relaxed = true), repository)
         coEvery { fixture.persistence.buildHistory(any(), any()) } coAnswers {
             persistence.buildHistory(firstArg(), secondArg())
         }
+        every { fixture.persistence.nextTimestamp() } answers { persistence.nextTimestamp() }
         every { fixture.persistence.invalidateHistory(any()) } answers { persistence.invalidateHistory(firstArg()) }
         coEvery { fixture.persistence.loadAttachmentImages(any()) } coAnswers { persistence.loadAttachmentImages(firstArg()) }
         coEvery {
@@ -581,8 +791,9 @@ class RecoveryViewModelTest {
             val request = firstArg<String>()
             val snapshot = secondArg<AgentContext>()
             val tools = thirdArg<List<AgentTool>>()
+            val owner = fixture.jobs.getValue(requireNotNull(snapshot.sessionId))
             flow {
-                val run = BackendRun(request, snapshot, tools, requireNotNull(currentCoroutineContext()[Job]))
+                val run = BackendRun(request, snapshot, tools, owner)
                 backendCalls += run
                 backendRuns.send(run)
                 for (delivery in run.events) {
@@ -595,6 +806,34 @@ class RecoveryViewModelTest {
         dispatcher.scheduler.runCurrent()
         vm.selectSession(PARENT)
         dispatcher.scheduler.runCurrent()
+    }
+
+    private fun putSession(session: ChatSessionEntity) {
+        fixture.sessionRows[session.id] = session
+        ledger.putSession(session)
+    }
+
+    private suspend fun seedPending(
+        id: String,
+        sessionId: String = PARENT,
+        identity: ProjectMemoryIdentity = fixture.projectIdentity
+    ): RecoveryRequest {
+        val workspace = fixture.sessionRows.getValue(sessionId).workspacePath
+        val request = repository.enqueue(sessionId, RecoveryRequestPayload("Request $id", workspace), Json.encodeToString(identity),
+            requestId = id, inputMessageId = "input-$id")
+        assertTrue(repository.awaitConfirmation(request.id))
+        return request
+    }
+
+    private fun assertRecoveryRun(request: RecoveryRequest, run: BackendRun) {
+        val stored = ledger.runs.getValue(requireNotNull(run.context.recoveryRunId))
+        assertEquals(request.id, stored.requestId)
+        assertEquals(request.sessionId, stored.sessionId)
+        assertEquals(request.sessionId, run.context.sessionId)
+        assertEquals(request.inputMessageId, run.context.inputMessageId)
+        assertEquals(request.sessionId, ledger.messages.getValue(request.inputMessageId).sessionId)
+        assertEquals("Request ${request.id}", run.request)
+        assertSame(run.owner, fixture.jobs[request.sessionId])
     }
 
     private suspend fun seedQueued(id: String): RecoveryRequest = RecoveryRepository(ledger.dao).enqueue(
@@ -640,9 +879,13 @@ class RecoveryViewModelTest {
         return Interrupted(request, run)
     }
 
-    private suspend fun card(requestId: String): SessionRecoveryItemUi = vm.recoveryItems.first { (sid, items) ->
-        sid == vm.currentSessionId.value && items.any { it.requestId == requestId }
-    }.second.single { it.requestId == requestId }
+    private suspend fun snapshot(vararg requestIds: String, scopeId: String = PARENT): RecoveryBubbleUi {
+        val scope = RecoveryScope(scopeId, WORKSPACE, fixture.sessionRows.getValue(scopeId).executionGeneration)
+        ledger.refreshPendingScopeRows()
+        return vm.recoveryBubble.first { bubble ->
+            bubble.scope == scope && bubble.items.map { it.target.requestId } == requestIds.toList()
+        }
+    }
 
     private suspend fun complete(run: BackendRun) {
         run.send(AgentEvent.Completed)

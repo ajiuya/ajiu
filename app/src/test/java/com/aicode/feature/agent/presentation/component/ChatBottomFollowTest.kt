@@ -4,6 +4,7 @@ import android.app.Application
 import android.view.View
 import android.view.ViewGroup
 import androidx.activity.ComponentActivity
+import androidx.compose.foundation.MutatePriority
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -15,6 +16,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material3.Scaffold
 import androidx.compose.runtime.BroadcastFrameClock
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -41,11 +43,17 @@ import com.aicode.feature.agent.domain.notification.AgentNotificationTimelineEnt
 import com.aicode.feature.agent.domain.notification.NotificationOutcome
 import com.aicode.feature.agent.domain.notification.PendingNotification
 import com.aicode.feature.agent.presentation.AgentUIMessage
+import com.aicode.feature.agent.presentation.ChatMessagesState
 import com.aicode.feature.agent.presentation.ChatNotificationTimelineEvent
 import com.aicode.feature.agent.presentation.MessageRole
 import kotlin.math.roundToInt
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
@@ -340,6 +348,154 @@ class ChatBottomFollowTest {
     }
 
     @Test
+    fun prependedHistoryBeyondComposeKeyRangePreservesTheVisibleRow() {
+        val recent = List(20) { historyRow("recent-$it") }
+        val older = List(160) { historyRow("older-$it") }
+        val owner = Any()
+        var page by mutableStateOf(historyPage(recent, 30, owner))
+        var dragging by mutableStateOf(false)
+        lateinit var pageState: ChatHistoryPageState<SubAgentGroupProjection>
+        withList(content = { state ->
+            val presentation = rememberChatHistoryPage(state, page, keepPosition = { true },
+                scrolling = { dragging || state.isScrollInProgress }, indexOfKey = { projection, key -> projection.lazyIndexOfKey(key) })
+            pageState = presentation.state
+            val shown = presentation.visible!!
+            ObserveChatHistoryLayout(state, presentation.state, shown.request, shown.value)
+            Scaffold { _ ->
+                PreserveChatHistoryAnchor(state, presentation.state, shown.request, shown.value,
+                    { true }, { dragging || state.isScrollInProgress })
+                HistoryTestList(state) {
+                    items(shown.value.bodyItems, key = { it.key }) { PixelRow(40) }
+                    item(key = CHAT_ACTIVE_TAIL_KEY) { PixelRow(0) }
+                }
+            }
+        }) {
+            state.scrollToItem(2, 11)
+            settle()
+            assertEquals("recent-2", info.visibleItemsInfo.single { it.index == position.first }.key)
+
+            page = historyPage(older + recent, 60, owner)
+            dragging = true
+            assertTrue(pageState.deferLargeHistoryPage(state, page.request, page.value, keepPosition = true))
+            settle()
+            assertEquals(recent.size + 1, info.totalItemsCount)
+            assertEquals("recent-2", info.visibleItemsInfo.single { it.index == position.first }.key)
+            state.scrollBy(50f)
+            settle()
+            val before = position
+            val anchor = info.visibleItemsInfo.single { it.index == before.first }
+            assertEquals("recent-3", anchor.key)
+
+            dragging = false
+            settle()
+            val first = info.visibleItemsInfo.single { it.index == position.first }
+            assertEquals(older.size + recent.size + 1, info.totalItemsCount)
+            assertEquals(anchor.key, first.key)
+            assertEquals(anchor.offset, first.offset)
+            assertEquals((older.size + before.first) to before.second, position)
+            assertTrue(pageState.isLayoutCommitted(page.request, info.totalItemsCount))
+        }
+    }
+
+    @Test
+    fun gestureAfterPageOfferBeforeMeasurementKeepsTheVisibleKey() {
+        val recent = List(20) { historyRow("recent-$it") }
+        val older = List(160) { historyRow("older-$it") }
+        val owner = Any()
+        val oldPage = historyPage(recent, 30, owner)
+        val nextPage = historyPage(older + recent, 60, owner)
+        val pageState = ChatHistoryPageState<SubAgentGroupProjection>()
+        withList(rows = {
+            items(recent, key = { it.key }) { PixelRow(40) }
+            item(key = CHAT_ACTIVE_TAIL_KEY) { PixelRow(0) }
+        }) {
+            state.scrollToItem(2, 11)
+            settle()
+            assertEquals(2 to 11, position)
+            val savedOffset = state.firstVisibleItemScrollOffset
+            pageState.offer(oldPage)
+            pageState.reportLayout(
+                oldPage.request, info.totalItemsCount, oldPage.value.expectedLazyItemCount,
+                ChatHistoryAnchor("recent-2", state.firstVisibleItemIndex, savedOffset), oldPage.value,
+            )
+            pageState.recordAnchor(ChatHistoryAnchor("recent-2", state.firstVisibleItemIndex, savedOffset))
+            pageState.offer(nextPage)
+            pageState.requireAnchor("recent-2", 162)
+            pageState.markAnchorRequested(nextPage.request)
+
+            val scrollStarted = CompletableDeferred<Unit>()
+            val allowScroll = CompletableDeferred<Unit>()
+            val activeScroll = launchInBackground {
+                state.scroll(MutatePriority.UserInput) {
+                    scrollStarted.complete(Unit)
+                    allowScroll.await()
+                    scrollBy(-1f)
+                    awaitCancellation()
+                }
+            }
+            runCurrentTasks()
+            scrollStarted.await()
+            assertTrue(state.isScrollInProgress)
+            state.requestScrollToItem(162, savedOffset)
+            assertTrue(pageState.deferLargeHistoryPage(
+                state, nextPage.request, nextPage.value, keepPosition = true, cancelPendingScroll = true,
+            ))
+            allowScroll.complete(Unit)
+            runCurrentTasks()
+            settle()
+            assertEquals("recent-2", info.visibleItemsInfo.single { it.index == position.first }.key)
+            assertEquals(savedOffset - 1, position.second)
+            assertEquals(recent.size + 1, info.totalItemsCount)
+            assertEquals(nextPage.request, pageState.deferredRequest)
+            assertFalse(pageState.hasRequestedAnchor(nextPage.request))
+            activeScroll.cancelAndJoin()
+        }
+    }
+
+    @Test
+    fun smallHistoryPageAppearsDuringDraggingWithoutWaitingForTheGestureToEnd() {
+        val recent = List(20) { historyRow("recent-$it") }
+        val owner = Any()
+        var page by mutableStateOf(historyPage(recent, 30, owner))
+        var dragging by mutableStateOf(false)
+        withList(content = { state ->
+            val presentation = rememberChatHistoryPage(state, page, keepPosition = { true },
+                scrolling = { dragging || state.isScrollInProgress }, indexOfKey = { projection, key -> projection.lazyIndexOfKey(key) })
+            val shown = presentation.visible!!
+            ObserveChatHistoryLayout(state, presentation.state, shown.request, shown.value)
+            Scaffold {
+                PreserveChatHistoryAnchor(state, presentation.state, shown.request, shown.value,
+                    { true }, { dragging || state.isScrollInProgress })
+                HistoryTestList(state) {
+                    items(shown.value.bodyItems, key = { it.key }) { PixelRow(40) }
+                    item(key = CHAT_ACTIVE_TAIL_KEY) { PixelRow(0) }
+                }
+            }
+        }) {
+            state.scrollToItem(2, 11)
+            settle()
+            dragging = true
+            page = historyPage(listOf(historyRow("older-single")) + recent, 31, owner)
+            settle()
+            assertEquals(recent.size + 2, info.totalItemsCount)
+            assertEquals("recent-2", info.visibleItemsInfo.single { it.index == position.first }.key)
+        }
+    }
+
+    private fun assertSmoothOffsets(offsets: List<Int>) {
+        val deltas = offsets.zipWithNext { before, after -> before - after }.filter { it != 0 }
+        assertTrue("Anchor offsets: $offsets", deltas.isNotEmpty())
+        assertTrue("Anchor offsets: $offsets", deltas.all { it in 1..40 })
+    }
+
+    private fun historyRow(key: String) = ChatRenderItem(AgentUIMessage(key, MessageRole.USER, key), key, "user")
+
+    private fun historyPage(rows: List<ChatRenderItem>, limit: Int, owner: Any) = ChatItemsProjection(
+        ChatItemsBuildRequest(ChatMessagesState("session", rows.map { it.message }, loaded = true, limit = limit), Any(), owner),
+        SubAgentGroupProjection(rows, emptyList(), emptyList(), emptySet(), emptySet()),
+    )
+
+    @Test
     fun shrinkingToAZeroHeightTailAddsNoScrollAfterTheListClampsItself() {
         var streamPx by mutableIntStateOf(80)
         withList(rows = {
@@ -383,8 +539,18 @@ class ChatBottomFollowTest {
         Spacer(modifier.fillMaxWidth().height(with(LocalDensity.current) { heightPx.toDp() }))
     }
 
-    private class ListUi(val state: LazyListState, val settle: () -> Unit) {
+    private class ListUi(
+        val state: LazyListState,
+        private val backgroundScope: CoroutineScope,
+        private val runCurrentAction: () -> Unit,
+        private val settleAction: () -> Unit,
+        private val composeAction: () -> Unit,
+    ) {
         val info get() = state.layoutInfo
+        fun launchInBackground(block: suspend CoroutineScope.() -> Unit): Job = backgroundScope.launch(block = block)
+        fun runCurrentTasks() = runCurrentAction()
+        fun settle() = settleAction()
+        fun composeOnly() = composeAction()
         val position get() = state.firstVisibleItemIndex to state.firstVisibleItemScrollOffset
         val last get() = info.visibleItemsInfo.single { it.index == info.totalItemsCount - 1 }
         val overflow get() = last.offset + last.size - (info.viewportEndOffset - info.afterContentPadding)
@@ -404,6 +570,21 @@ class ChatBottomFollowTest {
         effect: @Composable (LazyListState) -> Unit = {},
         rows: LazyListScope.() -> Unit,
         inspect: suspend ListUi.() -> Unit,
+    ) = withList(content = { state ->
+        effect(state)
+        HistoryTestList(state, rows)
+    }, inspect = inspect)
+
+    @Composable
+    private fun HistoryTestList(state: LazyListState, rows: LazyListScope.() -> Unit) {
+        LazyColumn(Modifier.fillMaxSize(), state = state,
+            contentPadding = PaddingValues(top = 8.dp, bottom = 24.dp), content = rows)
+    }
+
+
+    private fun withList(
+        content: @Composable (LazyListState) -> Unit,
+        inspect: suspend ListUi.() -> Unit,
     ) = runTest(timeout = 15.seconds) {
         val controller = Robolectric.buildActivity(ComponentActivity::class.java).setup().visible()
         val activity = controller.get()
@@ -417,7 +598,7 @@ class ChatBottomFollowTest {
         val widthPx = 320
         val heightPx = 240
         var frame = 0L
-        val ui = ListUi(state) {
+        val ui = ListUi(state, backgroundScope, { runCurrent() }, {
             repeat(3) {
                 Snapshot.sendApplyNotifications()
                 runCurrent()
@@ -429,15 +610,19 @@ class ChatBottomFollowTest {
                 view.layout(0, 0, view.measuredWidth, view.measuredHeight)
                 (view.getChildAt(0) as ViewRootForTest).measureAndLayoutForTest()
             }
-        }
+        }, {
+            repeat(2) {
+                Snapshot.sendApplyNotifications()
+                runCurrent()
+                if (clock.hasAwaiters) clock.sendFrame(++frame * 16_000_000L)
+                runCurrent()
+                Snapshot.sendApplyNotifications()
+            }
+        })
         try {
             view.setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed)
             view.setParentCompositionContext(recomposer)
-            view.setContent {
-                effect(state)
-                LazyColumn(Modifier.fillMaxSize(), state = state,
-                    contentPadding = PaddingValues(top = 8.dp, bottom = 24.dp), content = rows)
-            }
+            view.setContent { content(state) }
             activity.setContentView(view, ViewGroup.LayoutParams(widthPx, heightPx))
             ui.settle()
             ui.inspect()

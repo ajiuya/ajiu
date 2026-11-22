@@ -29,6 +29,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -69,6 +70,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -145,6 +147,8 @@ private val INPUT_FIELD_MIN_HEIGHT = 40.dp
 private val INPUT_FIELD_MAX_HEIGHT = 120.dp
 private val INPUT_FIELD_HORIZONTAL_PADDING = Spacing.lg
 private val INPUT_FIELD_VERTICAL_PADDING = 6.dp
+private val INPUT_FIELD_EXPAND_BUTTON_SIZE = 32.dp
+private val INPUT_FIELD_MIN_EDITABLE_WIDTH = Spacing.xl
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -204,6 +208,7 @@ internal fun ChatInputBar(
     onRunModelTest: (suspend (AIProviderConfig, String) -> ModelTestResult)? = null,
     modifier: Modifier = Modifier,
     generationSpeed: AgentEvent.GenerationSpeed? = null,
+    recoveryBubble: @Composable () -> Unit = {},
     onFullScreenInputChanged: (Boolean) -> Unit = {}
 ) {
     val hasContent = value.isNotBlank() || pendingAttachments.isNotEmpty()
@@ -285,6 +290,13 @@ internal fun ChatInputBar(
             modifier = Modifier.fillMaxWidth()
         ) {
             val dashboardBodyMaxHeight = (maxHeight - imeInset - Spacing.md).coerceAtLeast(0.dp) * 0.4f
+            val composerWidth = (maxWidth - (Spacing.lg + Spacing.sm) * 2).coerceAtLeast(0.dp)
+            val expandButtonWidth = if (inputOverflows) INPUT_FIELD_EXPAND_BUTTON_SIZE else 0.dp
+            val editorMinWidth = INPUT_FIELD_HORIZONTAL_PADDING * 2 + INPUT_FIELD_MIN_EDITABLE_WIDTH
+            val recoveryBubbleMaxWidth = minOf(
+                composerWidth / 2,
+                (composerWidth - expandButtonWidth - editorMinWidth).coerceAtLeast(0.dp)
+            )
             // 半透明渐变蒙版：盖住输入框区域 + 导航栏（手势小白条）区域，滚动内容滑入时被遮罩
             // （能看见但看不清）；高度含 IME inset 随键盘上移，渐变在 INPUT_BAR_MASK_HEIGHT 内完成，
             // 之下为纯色。注意 IME padding 不能加在外层 Box 上——align(BottomCenter) 的子项
@@ -496,7 +508,7 @@ internal fun ChatInputBar(
                 )
 
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth().testTag("chat_composer_row"),
                     verticalAlignment = Alignment.Top
                 ) {
                     ChatComposerTextField(
@@ -516,7 +528,7 @@ internal fun ChatInputBar(
                     if (inputOverflows) {
                         IconButton(
                             onClick = { showFullScreenInput = true },
-                            modifier = Modifier.size(32.dp)
+                            modifier = Modifier.size(INPUT_FIELD_EXPAND_BUTTON_SIZE)
                         ) {
                             Icon(
                                 FeatherIcons.Maximize,
@@ -525,6 +537,14 @@ internal fun ChatInputBar(
                                 modifier = Modifier.size(18.dp)
                             )
                         }
+                    }
+                    Box(
+                        modifier = Modifier
+                            .widthIn(max = recoveryBubbleMaxWidth)
+                            .heightIn(max = INPUT_FIELD_MIN_HEIGHT)
+                            .padding(top = Spacing.xs)
+                    ) {
+                        recoveryBubble()
                     }
                 }
 
@@ -662,7 +682,9 @@ internal fun ChatComposerTextField(
             Text(
                 text = placeholder,
                 style = textStyle,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
             )
         }
         BasicTextField(
