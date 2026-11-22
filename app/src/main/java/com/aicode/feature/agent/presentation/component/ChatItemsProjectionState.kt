@@ -1,6 +1,7 @@
 package com.aicode.feature.agent.presentation.component
 
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -17,30 +18,41 @@ internal class ChatItemsBuildRequest(
     val source: ChatMessagesState,
     val inputVersion: Any,
     val ownership: Any,
+    val knownChildIds: Set<String> = emptySet(),
 ) {
-    fun sameOwner(current: ChatItemsBuildRequest?): Boolean = current != null && source.loaded && current.source.loaded &&
+    private fun sameOwner(current: ChatItemsBuildRequest): Boolean = source.loaded && current.source.loaded &&
         source.sessionId == current.source.sessionId && ownership === current.ownership
 
+    fun canRetainFor(current: ChatItemsBuildRequest?): Boolean = current != null && sameOwner(current) &&
+        current.knownChildIds.containsAll(knownChildIds)
+
     fun canPublishTo(current: ChatItemsBuildRequest?): Boolean = current != null && sameOwner(current) &&
-        inputVersion === current.inputVersion && source.messages === current.source.messages
+        knownChildIds == current.knownChildIds && inputVersion === current.inputVersion &&
+        source.messages === current.source.messages
 }
 
 internal class ChatItemsProjection<T>(val request: ChatItemsBuildRequest, val value: T) {
-    fun retainedFor(current: ChatItemsBuildRequest?): T? = value.takeIf { request.sameOwner(current) }
+    fun retainedFor(current: ChatItemsBuildRequest?): T? = value.takeIf { request.canRetainFor(current) }
 }
 
 @Composable
 internal fun <T> rememberChatProjection(
     request: ChatItemsBuildRequest?,
+    buildReady: Boolean = true,
     calculate: suspend () -> T,
 ): ChatItemsProjection<T>? {
     var result by remember { mutableStateOf<ChatItemsProjection<T>?>(null) }
     val currentRequest by rememberUpdatedState(request)
-    UiWorkEffect(request) {
-        if (request == null) return@UiWorkEffect
+    UiWorkEffect(request, buildReady) {
+        if (request == null || !buildReady) return@UiWorkEffect
         val built = withContext(Dispatchers.Default) { calculate() }
         currentCoroutineContext().ensureActive()
         if (request.canPublishTo(currentRequest)) result = ChatItemsProjection(request, built)
     }
-    return result?.takeIf { it.request.sameOwner(request) }
+    val previous = result
+    val retained = previous?.takeIf { it.request.canRetainFor(request) }
+    if (previous != null && retained == null) {
+        SideEffect { if (result === previous) result = null }
+    }
+    return retained
 }

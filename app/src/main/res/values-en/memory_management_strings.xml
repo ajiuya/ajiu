@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="memory_management_title">Memory management</string>
+    <string name="memory_management_title">Memory</string>
     <string name="memory_management_add">New memory</string>
     <string name="memory_management_refresh">Refresh memories</string>
     <string name="memory_management_global">Global memories</string>
@@ -10,12 +10,12 @@
     <string name="memory_management_empty">No memories in this scope</string>
     <string name="memory_management_name">Name</string>
     <string name="memory_management_name_hint">Use letters, numbers, hyphens or underscores, matching the memory tool namespace.</string>
-    <string name="memory_management_description">Summary</string>
-    <string name="memory_management_no_description">No summary</string>
-    <string name="memory_management_body">Body (Markdown)</string>
+    <string name="memory_management_description">Description</string>
+    <string name="memory_management_no_description">No description</string>
+    <string name="memory_management_body">Body</string>
     <string name="memory_management_scope">Scope</string>
-    <string name="memory_management_file">File</string>
-    <string name="memory_management_copy_body">Copy body</string>
+    <string name="memory_management_file">File name</string>
+    <string name="memory_management_copy_body">Copy full text</string>
     <string name="memory_management_create">Create</string>
     <string name="memory_management_creating">Creating…</string>
     <string name="memory_management_delete_title">Delete memory</string>

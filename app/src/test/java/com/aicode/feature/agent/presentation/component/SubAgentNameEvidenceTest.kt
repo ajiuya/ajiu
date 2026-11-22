@@ -247,8 +247,8 @@ class SubAgentNameEvidenceTest {
                 subAgentGroupStatusRanks(listOf(item(named)), summary))
             assertEquals(summarizeSubAgentGroup(listOf(unnamed.capsule), summary),
                 summarizeSubAgentGroup(listOf(named.capsule), summary))
-            val namedGroup = projectSubAgentGroup(listOf(item(named)), parent, expanded = true)
-            val unnamedGroup = projectSubAgentGroup(listOf(item(unnamed)), parent, expanded = true)
+            val namedGroup = projectSubAgentGroup(listOf(item(named)), parent)
+            val unnamedGroup = projectSubAgentGroup(listOf(item(unnamed)), parent)
             assertEquals(unnamedGroup.groups.map { it.key }, namedGroup.groups.map { it.key })
             assertEquals(unnamedGroup.items.map { it.key }, namedGroup.items.map { it.key })
             assertEquals(unnamedGroup.representedChildIds, namedGroup.representedChildIds)

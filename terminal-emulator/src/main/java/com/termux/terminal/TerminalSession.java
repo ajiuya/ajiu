@@ -8,6 +8,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * A terminal session, consisting of a process (or remote stream) coupled to a terminal interface.
@@ -24,6 +25,7 @@ public final class TerminalSession extends TerminalOutput {
 
     private static final int MSG_NEW_INPUT = 1;
     private static final int MSG_PROCESS_EXITED = 4;
+    private static final int MAX_INPUT_DRAIN_BYTES = 64 * 1024;
 
     public final String mHandle = UUID.randomUUID().toString();
 
@@ -45,6 +47,16 @@ public final class TerminalSession extends TerminalOutput {
     /** Callback which gets notified when a session finishes or changes title. */
     TerminalSessionClient mClient;
 
+    public interface RawOutputListener {
+        void onOutput(TerminalSession session, byte[] data, int length);
+    }
+
+    private RawOutputListener mRawOutputListener;
+
+    public void setRawOutputListener(RawOutputListener listener) {
+        mRawOutputListener = listener;
+    }
+
     /** The pid of the shell process. 0 if not started and -1 if finished running. -2 for non-subprocess backends. */
     int mShellPid;
 
@@ -55,6 +67,8 @@ public final class TerminalSession extends TerminalOutput {
     public String mSessionName;
 
     final Handler mMainThreadHandler = new MainThreadHandler();
+    /** Coalesce reader wakeups so a burst of small reads cannot enqueue one Message per chunk. */
+    private final AtomicBoolean mInputMessagePending = new AtomicBoolean(false);
 
     private final Integer mTranscriptRows;
 
@@ -213,7 +227,7 @@ public final class TerminalSession extends TerminalOutput {
                             return;
                         }
                         if (!mProcessToTerminalIOQueue.write(buffer, 0, read)) return;
-                        mMainThreadHandler.sendEmptyMessage(MSG_NEW_INPUT);
+                        scheduleInputMessage();
                     }
                 } catch (Exception e) {
                     mClient.logWarn(LOG_TAG, "PTY 读取异常(pid=" + mShellPid + "): " + e);
@@ -237,6 +251,13 @@ public final class TerminalSession extends TerminalOutput {
                 }
             }
         }.start();
+    }
+
+    private void scheduleInputMessage() {
+        if (mInputMessagePending.compareAndSet(false, true) &&
+            !mMainThreadHandler.sendEmptyMessage(MSG_NEW_INPUT)) {
+            mInputMessagePending.set(false);
+        }
     }
 
     /** Write data to the shell process / remote shell. */
@@ -381,15 +402,40 @@ public final class TerminalSession extends TerminalOutput {
 
         final byte[] mReceiveBuffer = new byte[4 * 1024];
 
-        @Override
-        public void handleMessage(Message msg) {
-            int bytesRead = mProcessToTerminalIOQueue.read(mReceiveBuffer, false);
-            if (bytesRead > 0) {
+        private boolean drainInput() {
+            int drained = 0;
+            int bytesRead;
+            while (drained < MAX_INPUT_DRAIN_BYTES &&
+                (bytesRead = mProcessToTerminalIOQueue.read(mReceiveBuffer, false)) > 0) {
+                RawOutputListener listener = mRawOutputListener;
+                if (listener != null) listener.onOutput(TerminalSession.this, mReceiveBuffer, bytesRead);
                 mEmulator.append(mReceiveBuffer, bytesRead);
                 notifyScreenUpdate();
+                drained += bytesRead;
+            }
+            return mProcessToTerminalIOQueue.hasData();
+        }
+
+        @Override
+        public void handleMessage(Message msg) {
+            final boolean hasMoreInput = drainInput();
+            if (msg.what == MSG_NEW_INPUT) {
+                mInputMessagePending.set(false);
+                if (hasMoreInput) scheduleInputMessage();
+                return;
             }
 
             if (msg.what == MSG_PROCESS_EXITED) {
+                if (hasMoreInput) {
+                    // Drain the remaining final output in bounded slices so a noisy process cannot
+                    // monopolize the main Looper before its completion callback is delivered.
+                    mMainThreadHandler.sendMessage(
+                        mMainThreadHandler.obtainMessage(MSG_PROCESS_EXITED, msg.obj)
+                    );
+                    return;
+                }
+                mInputMessagePending.set(false);
+                removeMessages(MSG_NEW_INPUT);
                 int exitCode = (Integer) msg.obj;
                 mClient.logInfo(LOG_TAG, "PTY 子进程退出: pid=" + mShellPid + " exit=" + exitCode);
                 cleanupResources(exitCode);

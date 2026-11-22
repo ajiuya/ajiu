@@ -82,6 +82,7 @@ import com.aicode.feature.agent.domain.mcp.McpServerStatus
 import com.aicode.feature.agent.presentation.component.MarkdownContent
 import com.aicode.feature.agent.presentation.component.MarkdownRenderCache
 import com.aicode.feature.backup.presentation.BackupScreen
+import com.aicode.feature.plugin.presentation.PluginsSection
 import com.aicode.feature.settings.data.repository.AppThemeMode
 import com.aicode.feature.settings.data.repository.BackgroundSettingsRepository
 import com.aicode.feature.settings.domain.model.AIProviderConfig
@@ -151,6 +152,8 @@ internal enum class SettingsSection(@param:StringRes val titleRes: Int) {
     ProviderEditor(R.string.settings_provider_editor),
     DefaultModels(R.string.settings_default_models),
     Mcp(R.string.settings_mcp),
+    Plugins(R.string.plugin_title),
+    PluginDetail(R.string.plugin_details),
     Skills(R.string.settings_skills),
     Memory(R.string.memory_management_title),
     ProjectProgress(R.string.project_progress_title),
@@ -192,6 +195,7 @@ private fun SettingsSection.depth(): Int = when (this) {
     SettingsSection.ProviderEditor,
     SettingsSection.PromptDetail,
     SettingsSection.SkillDetail,
+    SettingsSection.PluginDetail,
     SettingsSection.SubAgentDetail,
     SettingsSection.ContainerDownloads,
     SettingsSection.Log -> 2
@@ -241,6 +245,7 @@ fun SettingsScreen(
     val maxNetworkRetries by viewModel.maxNetworkRetries.collectAsStateWithLifecycle()
     val enterToSend by viewModel.enterToSend.collectAsStateWithLifecycle()
     val typewriterCharsPerSecond by viewModel.typewriterCharsPerSecond.collectAsStateWithLifecycle()
+    val autoExpandReasoning by viewModel.autoExpandReasoning.collectAsStateWithLifecycle()
     val rootAccessState by viewModel.rootAccessState.collectAsStateWithLifecycle()
     val rootAccessChanging by viewModel.rootAccessChanging.collectAsStateWithLifecycle()
     val rootAccessError by viewModel.rootAccessError.collectAsStateWithLifecycle()
@@ -426,6 +431,7 @@ fun SettingsScreen(
         SettingsSection.ProviderEditor -> SettingsSection.Providers
         SettingsSection.Log -> logReturnSection.takeUnless { expanded && it == SettingsSection.Menu }
         SettingsSection.SkillDetail -> SettingsSection.Skills
+        SettingsSection.PluginDetail -> SettingsSection.Plugins
         SettingsSection.PromptEditor -> promptEditorReturn
         SettingsSection.PromptDetail -> SettingsSection.Prompts
         SettingsSection.SkillEditor -> skillEditorReturn
@@ -575,12 +581,14 @@ fun SettingsScreen(
                 }
             )
 
-            current == SettingsSection.Memory -> MemorySettingsRoute(
-                viewModel = androidx.hilt.navigation.compose.hiltViewModel(),
-                showBack = !expanded,
-                onNavigateBack = { section = SettingsSection.Menu },
-                onOpenProjectProgress = { section = SettingsSection.ProjectProgress }
-            )
+            current == SettingsSection.Memory -> sectionStateHolder.SaveableStateProvider("Memory") {
+                MemorySettingsRoute(
+                    viewModel = androidx.hilt.navigation.compose.hiltViewModel(),
+                    showBack = !expanded,
+                    onNavigateBack = { section = SettingsSection.Menu },
+                    onOpenProjectProgress = { section = SettingsSection.ProjectProgress }
+                )
+            }
 
             current == SettingsSection.ProjectProgress -> ProjectProgressSettingsRoute(
                 sessionId = currentSessionId,
@@ -664,10 +672,14 @@ fun SettingsScreen(
             else -> {
             // 用分区名接住本页内部的滚动位置等 rememberSaveable 状态，返回时原样恢复（详见 sectionStateHolder）。
             // 详情页要带上条目身份：换成另一个技能 / 子代理 / 提示词进来，不能继承上一条的滚动位置。
+            val pluginViewModel: com.aicode.feature.plugin.presentation.NativePluginViewModel? =
+                if (current == SettingsSection.Plugins || current == SettingsSection.PluginDetail) androidx.hilt.navigation.compose.hiltViewModel() else null
+            val pluginSelectedId = pluginViewModel?.let { it.state.collectAsStateWithLifecycle().value.selectedId }
             val stateKey: String = when (current) {
                 SettingsSection.SkillDetail -> "SkillDetail:${selectedSkill?.name.orEmpty()}"
                 SettingsSection.SubAgentDetail -> "SubAgentDetail:${selectedSubAgent?.name.orEmpty()}"
                 SettingsSection.PromptDetail -> "PromptDetail:${selectedPrompt?.number ?: 0}"
+                SettingsSection.PluginDetail -> "PluginDetail:${pluginSelectedId.orEmpty()}"
                 else -> current.name
             }
             sectionStateHolder.SaveableStateProvider(stateKey) {
@@ -722,6 +734,14 @@ fun SettingsScreen(
                                 modifier = Modifier.onboardingTarget(OnboardingStep.PROVIDER_ADD)
                             ) {
                                 Icon(FeatherIcons.Plus, contentDescription = stringResource(R.string.settings_add_provider))
+                            }
+                        }
+                        SettingsSection.Plugins -> {
+                            IconButton(onClick = { pluginViewModel?.showManagement(com.aicode.feature.plugin.presentation.PluginManagementPanel.IMPORT) }) {
+                                Icon(FeatherIcons.Plus, contentDescription = stringResource(R.string.plugin_center_add))
+                            }
+                            TextButton(onClick = { pluginViewModel?.showManagement(com.aicode.feature.plugin.presentation.PluginManagementPanel.MANAGE) }) {
+                                Text(stringResource(R.string.plugin_center_manage))
                             }
                         }
                         SettingsSection.Mcp -> {
@@ -951,6 +971,8 @@ fun SettingsScreen(
                     onSetMaxNetworkRetries = { viewModel.setMaxNetworkRetries(it) },
                     enterToSend = enterToSend,
                     onToggleEnterToSend = { viewModel.setEnterToSend(it) },
+                    autoExpandReasoning = autoExpandReasoning,
+                    onToggleAutoExpandReasoning = { viewModel.setAutoExpandReasoning(it) },
                     typewriterCharsPerSecond = typewriterCharsPerSecond,
                     onSetTypewriterCharsPerSecond = viewModel::setTypewriterCharsPerSecond,
                     compactionThresholdPercent = compactionThresholdPercent,
@@ -1021,6 +1043,11 @@ fun SettingsScreen(
                     onClearImageGenModel = { viewModel.clearImageGenModel() },
                     onSelectSubagentTierModel = { tier, pid, m -> viewModel.setSubagentTierModel(tier, pid, m) },
                     onClearSubagentTierModel = { tier -> viewModel.clearSubagentTier(tier) }
+                )
+                SettingsSection.Plugins, SettingsSection.PluginDetail -> PluginsSection(
+                    showDetail = current == SettingsSection.PluginDetail,
+                    onOpenDetail = { section = SettingsSection.PluginDetail },
+                    viewModel = requireNotNull(pluginViewModel)
                 )
                 SettingsSection.Mcp -> McpSection(
                     entries = mcpEntries,
@@ -1756,6 +1783,7 @@ internal fun SettingsMenu(
         }
 
         // ── AI 配置 ──
+        com.aicode.feature.plugin.presentation.PluginSlotContent(com.aicode.feature.plugin.domain.PluginUiSlots.SETTINGS_GENERAL)
         SettingsGroupHeader(text = stringResource(R.string.settings_category_ai))
         SettingsGroup {
             SettingsRow(
@@ -1775,6 +1803,12 @@ internal fun SettingsMenu(
                 icon = FeatherIcons.Box,
                 title = stringResource(SettingsSection.Mcp.titleRes),
                 onClick = { onOpen(SettingsSection.Mcp) }
+            )
+            SettingsDivider()
+            SettingsRow(
+                icon = FeatherIcons.Box,
+                title = stringResource(SettingsSection.Plugins.titleRes),
+                onClick = { onOpen(SettingsSection.Plugins) }
             )
             SettingsDivider()
             SettingsRow(
@@ -1803,6 +1837,7 @@ internal fun SettingsMenu(
         }
 
         // ── 运行环境 ──
+        com.aicode.feature.plugin.presentation.PluginSlotContent(com.aicode.feature.plugin.domain.PluginUiSlots.SETTINGS_AI)
         SettingsGroupHeader(text = stringResource(R.string.settings_category_environment))
         SettingsGroup {
             SettingsRow(
@@ -1825,6 +1860,7 @@ internal fun SettingsMenu(
         }
 
         // ── 权限与后台 ──
+        com.aicode.feature.plugin.presentation.PluginSlotContent(com.aicode.feature.plugin.domain.PluginUiSlots.SETTINGS_ENVIRONMENT)
         SettingsGroupHeader(text = stringResource(R.string.settings_category_permissions))
         SettingsGroup {
             SettingsRow(
@@ -1847,6 +1883,7 @@ internal fun SettingsMenu(
         }
 
         // ── 数据与诊断 ──
+        com.aicode.feature.plugin.presentation.PluginSlotContent(com.aicode.feature.plugin.domain.PluginUiSlots.SETTINGS_PERMISSIONS)
         SettingsGroupHeader(text = stringResource(R.string.settings_category_data))
         SettingsGroup {
             SettingsRow(
@@ -1875,6 +1912,7 @@ internal fun SettingsMenu(
         }
 
         // ── 帮助与关于 ──
+        com.aicode.feature.plugin.presentation.PluginSlotContent(com.aicode.feature.plugin.domain.PluginUiSlots.SETTINGS_DATA)
         SettingsGroupHeader(text = stringResource(R.string.settings_category_help))
         SettingsGroup {
             SettingsRow(
@@ -1895,6 +1933,7 @@ internal fun SettingsMenu(
                 onClick = { onOpen(SettingsSection.About) }
             )
         }
+        com.aicode.feature.plugin.presentation.PluginSlotContent(com.aicode.feature.plugin.domain.PluginUiSlots.SETTINGS_HELP)
     }
 
 }

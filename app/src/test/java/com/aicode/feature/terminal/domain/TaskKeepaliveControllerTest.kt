@@ -174,6 +174,28 @@ class TaskKeepaliveControllerTest {
         verify(exactly = 1) { service.reconcileTasks() }
     }
 
+    @Test
+    fun readonlyStateReportsConfirmedProtectionAndTaskRemovalWithoutRequestingStarts() {
+        assertFalse(TaskKeepaliveController.states is kotlinx.coroutines.flow.MutableStateFlow<*>)
+        assertEquals(TaskKeepaliveController.snapshot(), TaskKeepaliveController.states.value)
+        TaskKeepaliveController.acquire(context, owner, cpu = true, network = true)
+        assertFalse(TaskKeepaliveController.states.value.protected)
+        TaskKeepaliveController.attach(service)
+        assertTrue(TaskKeepaliveController.states.value.protected)
+        TaskKeepaliveController.foregroundFailed(service, IllegalStateException("Foreground unavailable"))
+        assertFalse(TaskKeepaliveController.states.value.protected)
+        TaskKeepaliveController.release(context, owner)
+        val starts = context.starts
+        TaskKeepaliveController.onTaskRemoved(context)
+        assertTrue(TaskKeepaliveController.states.value.suspended)
+        assertFalse(TaskKeepaliveController.states.value.protected)
+        assertEquals(starts, context.starts)
+        assertEquals(TaskKeepaliveController.snapshot(), TaskKeepaliveController.states.value)
+        TaskKeepaliveController.onAppVisible(context)
+        assertFalse(TaskKeepaliveController.states.value.suspended)
+        assertEquals(starts, context.starts)
+    }
+
     private class StartingContext(base: Context) : ContextWrapper(base) {
         var starts = 0
         var reject = false

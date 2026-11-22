@@ -27,6 +27,10 @@ import com.aicode.feature.backup.domain.BackupDecryptionException
 import com.aicode.feature.backup.domain.BackupManager
 import com.aicode.feature.backup.domain.BackupMetadata
 import com.aicode.feature.backup.domain.BackupOptions
+import com.aicode.feature.backup.domain.BackupContentKind
+import com.aicode.feature.backup.domain.BackupContentRestoreSelection
+import com.aicode.feature.backup.domain.PluginBackupSectionResult
+import com.aicode.feature.backup.domain.PluginBackupSectionStatus
 import com.aicode.feature.backup.domain.BackupSnapshot
 import com.aicode.feature.backup.domain.ChatSessionDto
 import com.aicode.feature.backup.domain.ImportPreview
@@ -37,6 +41,12 @@ import com.aicode.feature.backup.domain.RestoreStats
 import com.aicode.feature.backup.domain.SubAgentInteractionDto
 import com.aicode.feature.backup.domain.TodoItemDto
 import com.aicode.feature.backup.domain.WorkspaceBackupMeta
+import com.aicode.feature.backup.domain.PluginBackupSectionMeta
+import com.aicode.feature.plugin.runtime.PluginBackupArchiveService
+import com.aicode.feature.plugin.runtime.PluginBackupArchiveException
+import kotlinx.coroutines.CancellationException
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import com.aicode.feature.backup.domain.toMetadata
 import com.aicode.feature.settings.data.local.dao.AIProviderDao
 import com.aicode.feature.settings.data.local.entity.AIProviderEntity
@@ -73,6 +83,7 @@ import kotlinx.serialization.json.jsonObject
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
 import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream
+import org.apache.commons.compress.archivers.tar.TarConstants
 import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream
 import org.apache.commons.compress.compressors.gzip.GzipCompressorOutputStream
 import java.io.BufferedInputStream
@@ -114,7 +125,9 @@ class BackupManagerImpl @Inject constructor(
     private val subAgentInteractionDao: SubAgentInteractionDao,
     private val projectMemoryJournal: ProjectMemoryJournal,
     private val recoveryRepository: RecoveryRepository,
-    private val agentDatabase: AgentDatabase
+    private val agentDatabase: AgentDatabase,
+    private val pluginArchives: PluginBackupArchiveService,
+    private val backupContent: BackupContentService
 ) : BackupManager {
 
     private val json = Json {
@@ -228,17 +241,32 @@ class BackupManagerImpl @Inject constructor(
         }
     }
 
+    override suspend fun availablePluginSections(): List<PluginBackupSectionMeta> = pluginArchives.available()
+
     override suspend fun import(
         input: InputStream,
         password: CharArray?,
-        selectedWorkspaces: Set<String>?
+        selectedWorkspaces: Set<String>?,
+        selectedPluginIds: Set<String>,
+        contentSelection: BackupContentRestoreSelection
     ): Result<RestoreStats> {
         val pw = password?.takeIf { it.isNotEmpty() }
         return withContext(Dispatchers.IO) {
             FileLogger.i(TAG, "导入备份开始（${if (pw != null) "加密" else "明文"}${if (selectedWorkspaces != null) "，勾选工作区=${selectedWorkspaces.size}个" else "，全量"}）")
             runCatching {
-                openTar(input, pw).use { source ->
-                    restoreFromTar(source.tar, selectedWorkspaces)
+                val prepared = prepareImport(input, pw)
+                var checkedContent: ContentPreflight? = null
+                try {
+                    val validatedContent = preflightContent(prepared, contentSelection)
+                    checkedContent = validatedContent
+                    FileInputStream(prepared).buffered().use { verified ->
+                        openTar(verified, null).use { source ->
+                            restoreFromTar(source.tar, selectedWorkspaces, selectedPluginIds, contentSelection, validatedContent)
+                        }
+                    }
+                } finally {
+                    backupContent.cleanupImport(checkedContent?.sections)
+                    prepared.delete()
                 }
             }
             .onSuccess { FileLogger.i(TAG, "导入备份完成：$it") }
@@ -255,19 +283,36 @@ class BackupManagerImpl @Inject constructor(
                 openTar(input, pw).use { source ->
                     val tar = source.tar
                     var workspaces: List<WorkspaceBackupMeta> = emptyList()
+                    var pluginSections: List<PluginBackupSectionMeta> = emptyList()
+                    var legacy = false
+                    var entries = 0
                     var entry = tar.nextEntry
                     while (entry != null) {
                         if (entry.name == FILE_METADATA) {
-                            val plain = tar.readBytes()
+                            require(!legacy)
+                            val plain = readMetadata(tar, entry)
                             val metadata = json.decodeFromString(BackupMetadata.serializer(), String(plain, Charsets.UTF_8))
                             checkVersion(metadata.schemaVersion)
-                            workspaces = metadata.workspaces
-                            // 导出时 metadata.json 为首个条目，读到即可停，避免遍历大段 jsonl
-                            break
+                            backupContent.validateMetadata(metadata.contentFormatVersion, metadata.contentSections)
+                            val hasRemote = metadata.contentSections.any {
+                                it.location == com.aicode.feature.backup.domain.BackupContentLocation.SSH_GLOBAL ||
+                                    it.location == com.aicode.feature.backup.domain.BackupContentLocation.SSH_PROJECT
+                            }
+                            return@use ImportPreview(metadata.workspaces, metadata.pluginSections, metadata.contentSections,
+                                if (hasRemote) backupContent.currentRemoteTarget() else null)
                         }
+                        if (entry.name == FILE_LEGACY_SNAPSHOT) {
+                            require(entries == 0 && !legacy)
+                            readLegacySnapshot(tar, entry)
+                            legacy = true
+                        } else if (legacy) {
+                            throw IllegalArgumentException("Legacy snapshots cannot contain other entries")
+                        }
+                        entries++
                         entry = tar.nextEntry
                     }
-                    ImportPreview(workspaces)
+                    require(legacy) { "Backup metadata is missing" }
+                    ImportPreview(workspaces, pluginSections)
                 }
             }
             .onSuccess { FileLogger.i(TAG, "导入预览完成：${it.workspaces.size} 个工作区") }
@@ -279,6 +324,8 @@ class BackupManagerImpl @Inject constructor(
     /** 把导入异常映射为用户可读的 IllegalArgumentException（解密异常原样抛出）。 */
     private fun mapImportError(e: Throwable, pw: CharArray?): Nothing {
         when (e) {
+            is CancellationException -> throw e
+            is PluginBackupArchiveException -> throw e
             is BackupDecryptionException -> throw e
             is IllegalStateException -> throw e
             else -> throw IllegalArgumentException(
@@ -318,6 +365,13 @@ class BackupManagerImpl @Inject constructor(
     // ── 导出辅助 ──────────────────────────────────────────────
 
     private suspend fun writeTarGz(output: OutputStream, options: BackupOptions) {
+        val pluginSections = pluginArchives.prepareExport(options.pluginIds)
+        var contentExport: BackupContentService.Export? = null
+        try {
+        val preparedContent = if (options.memories || options.skills || options.prompts || options.plugins) {
+            backupContent.prepareExport(options)
+        } else null
+        contentExport = preparedContent
         val stream = object : FilterOutputStream(output) {
             override fun write(bytes: ByteArray, offset: Int, length: Int) {
                 out.write(bytes, offset, length)
@@ -331,7 +385,12 @@ class BackupManagerImpl @Inject constructor(
             GzipCompressorOutputStream(fos).use { gz ->
                 TarArchiveOutputStream(gz).use { tar ->
                     tar.setLongFileMode(TarArchiveOutputStream.LONGFILE_GNU)
-                    writeMetadataEntry(tar, buildMetadata(options))
+                    writeMetadataEntry(tar, buildMetadata(options).copy(
+                        pluginSections = pluginSections.map { it.metadata },
+                        contentSections = preparedContent?.sections?.map { it.metadata }.orEmpty()
+                    ))
+                    pluginSections.forEach { pluginArchives.writeExport(tar, it) }
+                    preparedContent?.let { backupContent.writeExport(tar, it) }
                     if (options.workspaceFiles) {
                         writeWorkspaceEntries(tar)
                     }
@@ -385,6 +444,10 @@ class BackupManagerImpl @Inject constructor(
                 }
             }
         }
+        } finally {
+            backupContent.cleanupExport(contentExport)
+            pluginArchives.cleanup(pluginSections)
+        }
     }
 
     private suspend fun buildMetadata(options: BackupOptions): BackupMetadata = BackupMetadata(
@@ -424,9 +487,78 @@ class BackupManagerImpl @Inject constructor(
         chatTextScale = if (options.appSettings) themeSettingsRepository.chatTextScaleSnapshot() else null,
         chatBackgroundAlpha = if (options.appSettings) backgroundSettingsRepository.chatAlphaSnapshot() else null,
         typewriterCharsPerSecond = if (options.appSettings) generalSettingsRepository.typewriterCharsPerSecond() else null,
+        autoExpandReasoning = if (options.appSettings) generalSettingsRepository.autoExpandReasoning() else null,
         userChatBubbleStyleId = if (options.appSettings) chatBubbleSettingsRepository.userStyleSnapshot().id else null,
         assistantChatBubbleStyleId = if (options.appSettings) chatBubbleSettingsRepository.assistantStyleSnapshot().id else null
     )
+
+    private data class ContentPreflight(val metadata: BackupMetadata?, val sections: BackupContentService.Import?)
+
+    private fun readMetadata(tar: TarArchiveInputStream, entry: TarArchiveEntry): ByteArray {
+        require(regularTarFile(entry) && entry.size in 1L..16L * 1024 * 1024)
+        return tar.readBytes().also { require(it.size.toLong() == entry.size) }
+    }
+
+    private fun preflightContent(prepared: File, selection: BackupContentRestoreSelection): ContentPreflight {
+        var metadata: BackupMetadata? = null
+        var sections: BackupContentService.Import? = null
+        var legacy = false
+        var entries = 0
+        try {
+            FileInputStream(prepared).buffered().use { input ->
+                openTar(input, null).use { source ->
+                    var entry = source.tar.nextEntry
+                    while (entry != null) {
+                        require(!legacy) { "Legacy snapshots cannot contain other entries" }
+                        if (entry.name == FILE_METADATA) {
+                            require(metadata == null && !legacy)
+                            val parsed = json.decodeFromString(BackupMetadata.serializer(), String(readMetadata(source.tar, entry), Charsets.UTF_8))
+                            metadata = parsed
+                            checkVersion(parsed.schemaVersion)
+                            backupContent.validateMetadata(parsed.contentFormatVersion, parsed.contentSections)
+                            if (parsed.contentSections.isNotEmpty()) {
+                                sections = backupContent.prepareImport(parsed.contentSections, selection)
+                            } else {
+                                require(selection.sectionIds.isEmpty())
+                            }
+                        } else if (entry.name == FILE_LEGACY_SNAPSHOT) {
+                            require(entries == 0 && metadata == null && selection.sectionIds.isEmpty())
+                            readLegacySnapshot(source.tar, entry)
+                            legacy = true
+                        } else if (entry.name.startsWith(BackupContentArchive.PREFIX)) {
+                            backupContent.readImport(source.tar, entry, sections ?: throw java.io.IOException("Content section is not declared"))
+                        } else if (entry.name.startsWith(WORKSPACE_PREFIX)) {
+                            val parts = entry.name.removePrefix(WORKSPACE_PREFIX).split('/', limit = 2)
+                            require(regularTarFile(entry) && parts.size == 2 && BackupContentArchive.validPart(parts[0]) && BackupContentArchive.validRelative(parts[1]))
+                        }
+                        entries++
+                        entry = source.tar.nextEntry
+                    }
+                }
+            }
+            require(metadata != null || legacy) { "Backup metadata is missing" }
+            sections?.let(backupContent::validateImport)
+            return ContentPreflight(metadata, sections)
+        } catch (failure: Throwable) {
+            backupContent.cleanupImport(sections)
+            throw failure
+        }
+    }
+
+    private fun regularTarFile(entry: TarArchiveEntry): Boolean = !entry.isSparse && !entry.isLink && !entry.isSymbolicLink &&
+        (entry.linkFlag == TarConstants.LF_NORMAL || entry.linkFlag == TarConstants.LF_OLDNORM)
+
+    private fun readLegacySnapshot(tar: TarArchiveInputStream, entry: TarArchiveEntry): BackupSnapshot {
+        require(regularTarFile(entry) && entry.size in 1L..128L * 1024 * 1024)
+        val document = json.parseToJsonElement(String(tar.readBytes(), Charsets.UTF_8)).jsonObject
+        val snapshot = json.decodeFromJsonElement(BackupSnapshot.serializer(), JsonObject(document - "subAgentInteractions"))
+        checkVersion(snapshot.schemaVersion)
+        val interactions = (document["subAgentInteractions"] as? JsonArray)?.mapNotNull { item ->
+            try { json.decodeFromJsonElement(SubAgentInteractionDto.serializer(), item) }
+            catch (_: SerializationException) { null }
+        }.orEmpty()
+        return snapshot.copy(subAgentInteractions = interactions)
+    }
 
     private fun writeMetadataEntry(tar: TarArchiveOutputStream, metadata: BackupMetadata) {
         val content = json.encodeToString(BackupMetadata.serializer(), metadata).toByteArray(Charsets.UTF_8)
@@ -534,9 +666,18 @@ class BackupManagerImpl @Inject constructor(
 
     // ── 导入辅助 ──────────────────────────────────────────────
 
-    private suspend fun restoreFromTar(tar: TarArchiveInputStream, selectedWorkspaces: Set<String>?): RestoreStats {
+    private suspend fun restoreFromTar(
+        tar: TarArchiveInputStream,
+        selectedWorkspaces: Set<String>?,
+        selectedPluginIds: Set<String>,
+        contentSelection: BackupContentRestoreSelection,
+        checkedContent: ContentPreflight
+    ): RestoreStats {
         val restoreMapping = mutableMapOf<String, Workspace>()
         var metadata: BackupMetadata? = null
+        var pluginImport: PluginBackupArchiveService.ImportSections? = null
+        val contentImport = checkedContent.sections
+        val blockedPluginExtensions = arrayListOf<PluginBackupSectionResult>()
         var stats = RestoreStats()
         val restoredSessionIds = mutableSetOf<String>()
         val restoredSessionGates = mutableMapOf<String, RecoverySessionGate>()
@@ -547,23 +688,22 @@ class BackupManagerImpl @Inject constructor(
             while (entry != null) {
                 when (entry.name) {
                     FILE_LEGACY_SNAPSHOT -> {
-                        val plain = tar.readBytes()
-                        val document = json.parseToJsonElement(String(plain, Charsets.UTF_8)).jsonObject
-                        val snapshot = json.decodeFromJsonElement(BackupSnapshot.serializer(), JsonObject(document - "subAgentInteractions"))
-                        checkVersion(snapshot.schemaVersion)
-                        val interactions = (document["subAgentInteractions"] as? JsonArray)?.mapNotNull { item ->
-                            try {
-                                json.decodeFromJsonElement(SubAgentInteractionDto.serializer(), item)
-                            } catch (_: SerializationException) {
-                                null
-                            }
-                        }.orEmpty()
-                        return restoreLegacy(snapshot.copy(subAgentInteractions = interactions))
+                        return restoreLegacy(readLegacySnapshot(tar, entry))
                     }
                     FILE_METADATA -> {
-                        val plain = tar.readBytes()
+                        require(metadata == null)
+                        val plain = readMetadata(tar, entry)
                         metadata = json.decodeFromString(BackupMetadata.serializer(), String(plain, Charsets.UTF_8))
                         checkVersion(metadata.schemaVersion)
+                        check(metadata == checkedContent.metadata) { "Backup metadata changed after validation" }
+                        val fullPluginIds = metadata.contentSections.filter {
+                            it.kind == BackupContentKind.PLUGIN && it.id in contentSelection.sectionIds
+                        }.mapNotNull { it.pluginId }.toSet()
+                        val blocked = selectedPluginIds.intersect(fullPluginIds)
+                        blockedPluginExtensions += blocked.map {
+                            PluginBackupSectionResult(it, PluginBackupSectionStatus.UNAVAILABLE, "FULL_PLUGIN_RESTORE_SELECTED")
+                        }
+                        pluginImport = pluginArchives.prepareImport(metadata.pluginSections, selectedPluginIds - blocked)
                     }
                     FILE_SESSIONS -> {
                         val count = restoreJsonl(tar, ChatSessionDto.serializer()) { dtos ->
@@ -607,7 +747,11 @@ class BackupManagerImpl @Inject constructor(
                         }
                     }
                     else -> {
-                        if (entry.name.startsWith(WORKSPACE_PREFIX)) {
+                        if (entry.name.startsWith(BackupContentArchive.PREFIX)) {
+                            require(contentImport != null) { "Content sections require metadata before entries" }
+                        } else if (entry.name.startsWith(PluginBackupArchiveService.PREFIX)) {
+                            pluginArchives.readImport(tar, entry, pluginImport ?: throw java.io.IOException("Plugin sections require metadata before entries"))
+                        } else if (entry.name.startsWith(WORKSPACE_PREFIX)) {
                             stats += restoreWorkspaceEntry(tar, entry.name, selectedWorkspaces, restoreMapping)
                         }
                     }
@@ -630,8 +774,15 @@ class BackupManagerImpl @Inject constructor(
             }
             projectHistory?.let { (text, version) -> projectMemoryJournal.importHistory(text, version) }
             FileLogger.i(TAG, "tar 解析完成，开始还原元数据段")
-            return stats + restoreMeta(meta)
+            val restored = stats + restoreMeta(meta)
+            val pluginResults = pluginImport?.let { batch -> pluginArchives.finishImport(batch, buildJsonObject {
+                put("chatSessions", restored.chatSessions); put("agentMessages", restored.agentMessages); put("workspaceFiles", restored.workspaceFiles)
+            }) }.orEmpty()
+            val contentResults = contentImport?.let { backupContent.finishImport(it) }.orEmpty()
+            val extensionResults = pluginResults.filterNot { result -> blockedPluginExtensions.any { it.pluginId == result.pluginId } } + blockedPluginExtensions
+            return restored + RestoreStats(pluginSections = extensionResults, contentSections = contentResults)
         } finally {
+            pluginArchives.cleanupImport(pluginImport)
             interactionsFile?.delete()
         }
     }
@@ -859,6 +1010,7 @@ class BackupManagerImpl @Inject constructor(
             meta.chatTextScale?.let { themeSettingsRepository.setChatTextScale(it) }
             meta.chatBackgroundAlpha?.let { backgroundSettingsRepository.setChatBackgroundAlpha(it) }
             meta.typewriterCharsPerSecond?.let { generalSettingsRepository.setTypewriterCharsPerSecond(it) }
+            meta.autoExpandReasoning?.let { generalSettingsRepository.setAutoExpandReasoning(it) }
             if (meta.userChatBubbleStyleId != null || meta.assistantChatBubbleStyleId != null) {
                 chatBubbleSettingsRepository.restore(meta.userChatBubbleStyleId, meta.assistantChatBubbleStyleId)
             }
@@ -915,9 +1067,14 @@ class BackupManagerImpl @Inject constructor(
 
         val wsDir = File(ws.path)
         if (!isPathInsideWorkspace(wsDir, segments[2])) return RestoreStats()
-        val target = File(wsDir, segments[2])
-        target.parentFile?.mkdirs()
-        FileOutputStream(target).use { out -> tar.copyTo(out) }
+        val target = BackupContentArchive.safeFile(wsDir, segments[2])
+        target.parentFile?.let { parent ->
+            if (!parent.isDirectory) check(parent.mkdirs())
+            BackupContentArchive.checkDirectory(parent)
+        }
+        java.nio.file.Files.newOutputStream(target.toPath(), java.nio.file.StandardOpenOption.CREATE,
+            java.nio.file.StandardOpenOption.TRUNCATE_EXISTING, java.nio.file.StandardOpenOption.WRITE,
+            java.nio.file.LinkOption.NOFOLLOW_LINKS).use { out -> tar.copyTo(out) }
         FileLogger.i(TAG, "恢复工作区文件：${ws.name}/${segments[2]}")
         return RestoreStats(workspaceFiles = 1)
     }
@@ -930,15 +1087,28 @@ class BackupManagerImpl @Inject constructor(
         wsName: String,
         restoreMapping: MutableMap<String, Workspace>
     ): Workspace? {
+        require(BackupContentArchive.validPart(wsName))
         restoreMapping[wsName]?.let { return it }
         val reservedNames = restoreMapping.values.map { it.name }.toSet()
-        val existing = workspaceRepository.workspaces.value.firstOrNull {
-            it.name == wsName && it.type == WorkspaceType.INTERNAL && it.name !in reservedNames
+        val locals = workspaceRepository.captureBackupLocalWorkspaces()
+        val existing = locals.firstOrNull {
+            it.workspace.name == wsName && it.workspace.type == WorkspaceType.INTERNAL && it.workspace.name !in reservedNames
         }
-        val resolved = existing ?: run {
-            val occupied = workspaceRepository.workspaces.value.map { it.name }.toSet() + reservedNames
+        val resolved = existing?.let {
+            it.checkCurrent()
+            it.workspace
+        } ?: run {
+            val root = File(context.filesDir.canonicalFile, "projects")
+            BackupContentArchive.checkDirectory(root.parentFile)
+            if (!java.nio.file.Files.exists(root.toPath(), java.nio.file.LinkOption.NOFOLLOW_LINKS)) check(root.mkdir())
+            BackupContentArchive.checkDirectory(root)
+            val children = root.listFiles() ?: throw java.io.IOException("Local workspace list unavailable")
+            val occupied = locals.map { it.workspace.name }.toSet() + children.map { it.name } + reservedNames
             val targetName = WorkspaceRepository.uniqueName(wsName, occupied)
-            workspaceRepository.createWorkspace(targetName) ?: return null
+            require(BackupContentArchive.validPart(targetName))
+            val target = File(root, targetName)
+            java.nio.file.Files.createDirectory(target.toPath())
+            Workspace(targetName, target.path, WorkspaceType.INTERNAL)
         }
         restoreMapping[wsName] = resolved
         FileLogger.i(TAG, "导入会话目标工作区：${resolved.name} -> ${resolved.path}")

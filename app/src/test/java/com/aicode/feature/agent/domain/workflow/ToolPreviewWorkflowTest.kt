@@ -102,18 +102,26 @@ class ToolPreviewWorkflowTest {
         }
         coEvery { policy.evaluate(any(), any(), any()) } returns ToolPermissionPolicyEngine.EvalResult(ToolPermissionPolicyEngine.Verdict.ALLOW)
         every { outputStore.process(any(), any(), any()) } answers { thirdArg<ToolResult>() }
+        val hooks = mockk<com.aicode.feature.plugin.runtime.PluginHookDispatcher>(relaxed = true)
+        coEvery { hooks.beforeTool(any(), any(), any()) } answers { com.aicode.feature.plugin.runtime.PluginBeforeTool(thirdArg()) }
+        coEvery { hooks.afterTool(any(), any(), any()) } answers { thirdArg() }
         workflow = StatefulAgentWorkflow(
-            toolRegistry = registry, aiProviderRepository = providers, openAIApi = mockk(), anthropicApi = mockk(), geminiApi = mockk(),
+            toolRegistry = registry, aiProviderRepository = providers,
+            providerFactory = com.aicode.feature.agent.domain.provider.ProviderInstanceFactory(
+                mockk(), mockk(), mockk(), metadata, mockk(relaxed = true),
+                mockk { every { activeKey(any(), any()) } returns "test-key" }
+            ),
             promptProvider = prompts, permissionManager = permissions, policyEngine = policy, contextCompactor = compactor,
             toolOutputStore = outputStore, modelMetadataService = metadata, compactionModelSettingsRepository = compactionSettings,
             titleModelSettingsRepository = mockk(), defaultModelSettingsRepository = defaultSettings,
             generalSettingsRepository = mockk(relaxed = true),
             sessionUseCase = mockk { coEvery { getSessionById(any()) } returns null }, messagePersistenceUseCase = mockk(),
             checkpointManager = mockk(relaxed = true), llmCallRecordDao = mockk(relaxed = true),
-            keyRotator = mockk { every { activeKey(any(), any()) } returns "test-key" },
             agentNotificationCenter = AgentNotificationCenter(), eventInjector = mockk<AgentEventInjector>(),
             fileAccess = files, appContext = app, rootCommandManager = mockk(),
+            shizukuManager = mockk(),
             recoveryRepository = mockk(relaxed = true),
+            pluginHooks = hooks,
             workspaceExecutionContextFactory = mockk {
                 coEvery { freeze(any()) } returns WorkspaceExecutionContext(
                     ExecutionMode.LOCAL_PROOT, "preview-test", files, null, null

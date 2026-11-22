@@ -1,11 +1,10 @@
 package com.aicode.feature.agent.presentation.component
 
+import android.os.SystemClock
 import androidx.annotation.StringRes
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -39,6 +38,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.key
 import androidx.compose.runtime.produceState
@@ -88,10 +88,10 @@ import compose.icons.feathericons.Search
 import compose.icons.feathericons.Terminal
 import compose.icons.feathericons.Tool
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -159,7 +159,6 @@ internal fun ToolMessageBody(
                     subAgent = if (message.toolName == "task" && !message.isError) {
                         parseSubAgentDispatch(message.toolArgs, message.content)
                     } else null,
-                    notifications = if (!running) parseToolNotifications(message.content) else emptyList(),
                     hasResult = !running && hasToolResult(message.content)
                 )
             }
@@ -174,13 +173,9 @@ internal fun ToolMessageBody(
     val todoData = metadata?.todo
     val actionTitle = message.toolActionTitle?.takeIf { it.isNotBlank() }
         ?: stringResource(toolActionPlaceholderRes(message.toolName))
-    val representedIds = LocalRepresentedSubAgentIds.current
-    val notifications = metadata?.notifications.orEmpty().filterNot { it.subSessionId in representedIds }
-
     val hasLiveOutput = !liveOutput.isNullOrBlank()
     val expandable = running || metadata == null || hasArguments == null ||
-        metadata?.hasResult == true || hasArguments == true ||
-        metadata?.subAgent != null || notifications.isNotEmpty()
+        metadata?.hasResult == true || hasArguments == true || metadata?.subAgent != null
     val effectiveExpanded = expandedOverride == true
 
     Column(modifier = Modifier.fillMaxWidth().padding(horizontal = Spacing.xs)) {
@@ -347,10 +342,6 @@ internal fun ToolMessageBody(
                 Spacer(Modifier.height(Spacing.xs))
                 SubAgentDispatchCard(dispatch = dispatch)
             }
-            if (notifications.isNotEmpty()) {
-                Spacer(Modifier.height(Spacing.sm))
-                notifications.forEach { ToolNotificationRow(it) }
-            }
         }
         // 文件列表：工具结束后常显在消息底部，一行一个文件，点击用系统 app 打开。
         if (!running && message.attachments.isNotEmpty()) {
@@ -368,7 +359,6 @@ private data class ToolMessageMetadata(
     val todo: ParsedTodoResult?,
     val webSearch: ParsedWebSearchResult?,
     val subAgent: ParsedSubAgentDispatch?,
-    val notifications: List<ToolNotificationInfo>,
     val hasResult: Boolean
 )
 
@@ -378,62 +368,6 @@ private data class ToolMessageDetails(
     val webSearch: ParsedWebSearchResult?,
     val diffCopyText: String?
 )
-
-internal data class ToolNotificationInfo(val summary: String, val succeeded: Boolean, val isMessage: Boolean = false, val subSessionId: String? = null)
-
-/**
- * 从工具结果 transport JSON 顶层的 `notifications` 字段提取搭车通知（后台任务/子代理完成）。
- * 该字段由 [com.aicode.feature.agent.domain.workflow.StatefulAgentWorkflow] 在 AI 忙碌时注入。
- */
-internal fun parseToolNotifications(raw: String): List<ToolNotificationInfo> {
-    val array = parseToolTransport(raw.withoutToolStatusPrefix())?.get("notifications") as? JsonArray
-        ?: return emptyList()
-    val identities = parseSubAgentNotificationMetadata(raw, toolResult = true).associateBy { it.ordinal }
-    return array.mapIndexedNotNull { index, element ->
-        val obj = element as? JsonObject ?: return@mapIndexedNotNull null
-        val summary = (obj["summary"] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }
-            ?: return@mapIndexedNotNull null
-        val status = (obj["status"] as? JsonPrimitive)?.contentOrNull
-        ToolNotificationInfo(
-            summary = summary,
-            succeeded = status == "completed",
-            isMessage = status == "message",
-            subSessionId = identities[index]?.subSessionId
-        )
-    }
-}
-
-/** 工具卡片底部的搭车通知提示条：状态点 + 摘要。 */
-@Composable
-private fun ToolNotificationRow(info: ToolNotificationInfo) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(top = Spacing.xs),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(Spacing.sm)
-    ) {
-        Box(
-            modifier = Modifier
-                .size(6.dp)
-                .clip(CircleShape)
-                .background(
-                    when {
-                        info.isMessage -> MaterialTheme.colorScheme.primary
-                        info.succeeded -> MaterialTheme.semanticColors.success
-                        else -> MaterialTheme.colorScheme.error
-                    }
-                )
-        )
-        Text(
-            text = info.summary,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            style = MaterialTheme.typography.bodySmall,
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis
-        )
-    }
-}
 
 private fun String.takeLastLines(maxLines: Int): String {
     if (maxLines <= 0 || isEmpty()) return ""
@@ -494,17 +428,13 @@ internal fun ToolStatusIcon(running: Boolean, isError: Boolean, toolName: String
         ToolExecutionState.FAILED -> MaterialTheme.colorScheme.error
         ToolExecutionState.SUCCEEDED -> MaterialTheme.semanticColors.success
     }
-    val pulseAlpha = if (running) {
-        val transition = rememberInfiniteTransition(label = "tool-status-pulse")
-        transition.animateFloat(
-            initialValue = 1f,
-            targetValue = 0.35f,
-            animationSpec = infiniteRepeatable(animation = tween(650), repeatMode = RepeatMode.Reverse),
-            label = "tool-status-pulse-alpha"
-        ).value
-    } else {
-        1f
-    }
+    val pulseAlpha = rememberChatInfiniteFloat(
+        initialValue = 1f,
+        targetValue = 0.35f,
+        animationSpec = infiniteRepeatable(animation = tween(650), repeatMode = RepeatMode.Reverse),
+        label = "tool-status-pulse-alpha",
+        enabled = running
+    )
     val statusLabel = stringResource(
         when (state) {
             ToolExecutionState.RUNNING -> R.string.chat_tool_running
@@ -520,7 +450,7 @@ internal fun ToolStatusIcon(running: Boolean, isError: Boolean, toolName: String
             modifier = Modifier
                 // 与思考行同一格宽：两行的图标中心与后续文字左边缘才对得齐
                 .size(ChatStyle.rowIconSize)
-                .graphicsLayer { alpha = pulseAlpha }
+                .graphicsLayer { alpha = pulseAlpha.value }
         )
     }
 }
@@ -603,6 +533,25 @@ internal fun toolElapsedMs(message: AgentUIMessage, startElapsedMs: Long?, nowEl
     message.toolDurationMs ?: startElapsedMs?.takeIf { message.isToolRunning(null) }?.let {
         (nowElapsedMs - it).coerceAtLeast(0L)
     }
+
+@Composable
+internal fun rememberToolElapsedClock(
+    message: AgentUIMessage,
+    liveOutput: String?,
+    startElapsedMs: Long?,
+): Long {
+    var nowElapsedMs by remember(message.id) { mutableLongStateOf(SystemClock.elapsedRealtime()) }
+    val running = message.isToolRunning(liveOutput) && startElapsedMs != null
+    LaunchedEffect(message.id, running, startElapsedMs) {
+        if (!running) return@LaunchedEffect
+        nowElapsedMs = SystemClock.elapsedRealtime()
+        while (true) {
+            delay(250)
+            nowElapsedMs = SystemClock.elapsedRealtime()
+        }
+    }
+    return nowElapsedMs
+}
 
 internal fun toolGroupSummary(
     messages: List<AgentUIMessage>,

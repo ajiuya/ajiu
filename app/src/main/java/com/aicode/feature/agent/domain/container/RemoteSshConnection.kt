@@ -11,6 +11,7 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.InternalCoroutinesApi
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -26,8 +27,11 @@ import net.schmizz.sshj.connection.channel.direct.Session
 import net.schmizz.sshj.sftp.SFTPClient
 import net.schmizz.sshj.sftp.OpenMode
 import net.schmizz.sshj.sftp.RenameFlags
+import java.net.InetAddress
+import java.net.Socket
 import java.util.EnumSet
 import java.util.UUID
+import javax.net.SocketFactory
 import net.schmizz.sshj.transport.DisconnectListener
 import net.schmizz.sshj.userauth.UserAuthException
 import com.hierynomus.sshj.common.KeyDecryptionFailedException
@@ -71,6 +75,7 @@ class RemoteSshConnection @Inject constructor(
     private val sftpLock = Mutex()
     private val credentialSyncMutex = Mutex()
     private val builtinDefinitionMutex = Mutex()
+    private val builtinDocsMutex = Mutex()
     internal val sftpOperationMutex = Mutex()
 
     private val _connectionState = MutableStateFlow(ConnectionState.DISCONNECTED)
@@ -86,8 +91,23 @@ class RemoteSshConnection @Inject constructor(
     var remoteHome: String? = null
         private set
 
+    private val _identityState = MutableStateFlow<RemoteConnectionIdentity?>(null)
+    val identityState: StateFlow<RemoteConnectionIdentity?> = _identityState.asStateFlow()
+
     @Volatile
     private var activeIdentity: RemoteConnectionIdentity? = null
+        set(value) {
+            field = value
+            _identityState.value = value
+        }
+
+    private data class GitCredentialScope(val identity: RemoteConnectionIdentity, val workspaceRoot: String)
+
+    @Volatile
+    private var gitCredentialScope: GitCredentialScope? = null
+
+    internal val gitCredentialWorkspaceRoot: String?
+        get() = gitCredentialScope?.takeIf { it.identity === activeIdentity && isConnected() }?.workspaceRoot
 
     /** 当前连接配置快照，供重连与路径映射使用。 */
     @Volatile
@@ -116,6 +136,7 @@ class RemoteSshConnection @Inject constructor(
                         FileLogger.w(TAG, "SSH 连接断开: $reason, $info")
                         if (sshClient === client) {
                             activeIdentity = null
+                            gitCredentialScope = null
                             _connectionState.value = ConnectionState.DISCONNECTED
                         }
                     }
@@ -159,6 +180,7 @@ class RemoteSshConnection @Inject constructor(
 
     private fun disconnectInternal() {
         activeIdentity = null
+        gitCredentialScope = null
         remoteHome = null
         closeSftpInternal()
         runCatching { sshClient?.disconnect() }
@@ -175,7 +197,11 @@ class RemoteSshConnection @Inject constructor(
     }
 
     /** 建立一条 SSH transport 并完成认证与保活（exec 与 SFTP 各建一条）。 */
-    private fun newSshClient(config: RemoteConnectionConfig): SSHClient = withSshSetup(SSHClient()) { client ->
+    private fun newSshClient(
+        config: RemoteConnectionConfig,
+        setupOwner: ((SSHClient) -> Unit)? = null
+    ): SSHClient = withSshSetup(SSHClient()) { client ->
+        setupOwner?.invoke(client)
         client.apply {
             addHostKeyVerifier(hostKeyVerifier)
             connect(config.host, config.port)
@@ -253,6 +279,104 @@ class RemoteSshConnection @Inject constructor(
     fun checkIdentity(identity: RemoteConnectionIdentity) {
         if (activeIdentity !== identity || sshClient !== identity.owner || remoteHome != identity.home || !isConnected()) {
             throw CancellationException("SSH connection identity changed")
+        }
+    }
+
+    @OptIn(InternalCoroutinesApi::class)
+    internal suspend fun openForwardingClient(
+        identity: RemoteConnectionIdentity,
+        checkCurrent: () -> Unit,
+        onDisconnected: () -> Unit
+    ): SSHClient {
+        val frozenConfig = mutex.withLock {
+            currentCoroutineContext().ensureActive()
+            checkIdentity(identity)
+            checkCurrent()
+            config ?: throw CancellationException("SSH configuration changed")
+        }
+        val owner = ForwardingSetupOwner()
+        val context = currentCoroutineContext()
+        val cancellation = context[Job]?.invokeOnCompletion(onCancelling = true, invokeImmediately = true) { cause ->
+            if (cause != null) owner.close()
+        }
+        var delivered = false
+        try {
+            val client = acquireSshResource(close = { _: SSHClient -> owner.close() }) {
+                withSshSetup(newSshClient(frozenConfig) { client ->
+                    owner.attach(client)
+                    context.ensureActive()
+                    checkIdentity(identity)
+                    checkCurrent()
+                }) { client ->
+                    context.ensureActive()
+                    checkIdentity(identity)
+                    checkCurrent()
+                    if (config != frozenConfig) throw CancellationException("SSH configuration changed")
+                    client.transport.setDisconnectListener { _, _ -> onDisconnected() }
+                    client
+                }
+            }
+            context.ensureActive()
+            checkIdentity(identity)
+            checkCurrent()
+            if (config != frozenConfig) throw CancellationException("SSH configuration changed")
+            delivered = true
+            return client
+        } catch (failure: Exception) {
+            context.ensureActive()
+            throw failure
+        } finally {
+            cancellation?.dispose()
+            if (!delivered) owner.close()
+        }
+    }
+
+    private class ForwardingSetupOwner : AutoCloseable {
+        private val lock = Any()
+        private var closed = false
+        private var client: SSHClient? = null
+        private val sockets = mutableSetOf<Socket>()
+
+        fun attach(client: SSHClient) {
+            synchronized(lock) {
+                if (closed) {
+                    runCatching { client.close() }
+                    throw CancellationException("SSH forwarding setup cancelled")
+                }
+                this.client = client
+            }
+            val delegate = client.socketFactory
+            client.socketFactory = object : SocketFactory() {
+                override fun createSocket(): Socket = own(delegate.createSocket())
+                override fun createSocket(host: String, port: Int): Socket = own(delegate.createSocket(host, port))
+                override fun createSocket(host: String, port: Int, local: InetAddress, localPort: Int): Socket =
+                    own(delegate.createSocket(host, port, local, localPort))
+                override fun createSocket(host: InetAddress, port: Int): Socket = own(delegate.createSocket(host, port))
+                override fun createSocket(host: InetAddress, port: Int, local: InetAddress, localPort: Int): Socket =
+                    own(delegate.createSocket(host, port, local, localPort))
+            }
+        }
+
+        private fun own(socket: Socket): Socket = synchronized(lock) {
+            if (closed) {
+                runCatching { socket.close() }
+                throw CancellationException("SSH forwarding setup cancelled")
+            }
+            sockets += socket
+            socket
+        }
+
+        override fun close() {
+            val owned = synchronized(lock) {
+                if (closed) return
+                closed = true
+                sockets.toList() to client.also { client = null; sockets.clear() }
+            }
+            owned.first.forEach { runCatching { it.close() } }
+            owned.second?.let {
+                runCatching { it.socket?.close() }
+                runCatching { it.close() }
+            }
         }
     }
 
@@ -362,34 +486,30 @@ class RemoteSshConnection @Inject constructor(
         }
     }
 
-    /**
-     * 把内置文档同步到远程 ~/.aicode/docs/，让远程模式下 AI 也能像本地模式一样
-     * 查阅 ~/.aicode/docs/ 下的设置说明文档。每次连接/重连后全量覆盖，使 App 升级后
-     * 远程文档随之更新。正文通过 SFTP 写入并替换。
-     *
-     * @param docs 相对 docs/ 的路径（可含子目录，如 guide/terminal.md）→ 文件内容。
-     */
-    suspend fun uploadDocs(docs: Map<String, String>) {
+    /** Same assets leave remote edits and deletions untouched; changed assets are reconciled with verified backups. */
+    suspend fun uploadDocs(docs: Map<String, String>, identity: RemoteConnectionIdentity? = null) {
         if (docs.isEmpty()) return
-        val client = sshClient ?: return
-        val home = remoteHome ?: return
-        val destDir = home.trimEnd('/') + "/.aicode/docs"
-        withContext(Dispatchers.IO) {
-            runCatching {
-                // 先建全部子目录并清掉旧 .md：版本间调整文档分类会改变路径，只覆盖不清理会让旧文件残留
-                val subDirs = docs.keys.mapNotNull { key ->
-                    key.substringBeforeLast('/', "").takeIf { it.isNotEmpty() }
-                }.distinct()
-                val mkdirArgs = (listOf(destDir) + subDirs.map { "$destDir/$it" }).joinToString(" ") { "'$it'" }
-                val prepSession = client.startSession()
-                prepSession.exec("mkdir -p $mkdirArgs; find '$destDir' -type f -name '*.md' -delete").join()
-                prepSession.close()
-                for ((name, content) in docs) {
-                    val dest = "$destDir/$name"
-                    writeRemoteFile(dest, content.toByteArray(Charsets.UTF_8))
+        val target = identity ?: captureIdentity()
+        val snapshot = BuiltinDocsSync.snapshot(docs)
+        val result = builtinDocsMutex.withLock {
+            currentCoroutineContext().ensureActive()
+            checkIdentity(target)
+            withContext(Dispatchers.IO) {
+                val channel = openReadChannel(target)
+                val syncContext = currentCoroutineContext()
+                val checkCurrent = {
+                    syncContext.ensureActive()
+                    checkIdentity(target)
                 }
-                FileLogger.i(TAG, "已同步 ${docs.size} 个文档到远程 $destDir")
-            }.onFailure { FileLogger.w(TAG, "同步文档到远程失败", it) }
+                withBuiltinDocsChannel(channel) {
+                    BuiltinDocsSync(RemoteBuiltinDocsStore(channel, target.home, checkCurrent), checkCurrent).sync(snapshot)
+                }
+            }
+        }
+        currentCoroutineContext().ensureActive()
+        checkIdentity(target)
+        if (result.changed) {
+            FileLogger.i(TAG, "内置文档增量同步完成：上传 ${result.uploaded}，删除 ${result.deleted}")
         }
     }
 
@@ -448,80 +568,87 @@ class RemoteSshConnection @Inject constructor(
     }
 
     /**
-     * 把 App 的 git 凭据注入远程服务器（仅当用户开启「自动注入」时调用）：
-     * 写 `~/.aicode/git-credentials`（store 格式）+ `~/.aicode/gitconfig` + `~/.aicode/gitconfig.credential`。
-     *
-     * 生效机制：[RemoteSshEngine] 执行命令时注入 `GIT_CONFIG_GLOBAL=$HOME/.aicode/gitconfig`，其中
-     * `[include] path=~/.gitconfig` 保留服务器用户自己的全局配置（署名等），`[includeIf "gitdir:<工作区根>/"]`
-     * 限定只有工作区根目录下的仓库才加载 store helper——不影响用户在服务器上手动 git，也不影响其它目录的仓库。
-     *
-     * @param credentials 要注入的凭据列表（每 host 一条）。
-     * @param workspaceRoot 远程工作区根路径（AI 的 ~/workspace 映射目录），限定注入范围。
+     * 凭据只经当前连接、当前工作区的条件 include 注入，不接管服务器的全局 Git 配置。
+     * 旧版 `~/.aicode/gitconfig` 可能存有用户的署名或代理设置，因此既不重写也不删除。
      */
-    suspend fun uploadGitCredentialConfig(credentials: List<GitCredential>, workspaceRoot: String) = credentialSyncMutex.withLock {
-        val client = sshClient ?: return@withLock
-        val home = remoteHome ?: return@withLock
-        val aicodeDir = home.trimEnd('/') + "/.aicode"
-        val wsRoot = workspaceRoot.trimEnd('/').ifEmpty { return@withLock }
-        withContext(Dispatchers.IO) {
-            runCatching {
-                sftpOperationMutex.withLock { sftp().mkdirs(aicodeDir) }
-
-                val creds = credentials.joinToString("\n") { c ->
-                    "https://${enc(c.username)}:${enc(c.token)}@${c.host}"
-                }.let { if (it.isNotEmpty()) "$it\n" else "" }
-
-
-                // 上传 credential helper 脚本（本地由 ContainerInstaller 提取），配置为唯一 helper；
-                // 服务器上没有 App，用 AICODE_CRED_NO_PROMPT 让未命中时直接空退出而非等待弹窗。
-                containerInstaller.extractCredentialHelper()
-                val helperScript = java.io.File(containerInstaller.aicodeDir, "git-credential-aicode").readText()
-                check(helperScript.isNotBlank()) { "Git credential helper is empty" }
-                val remoteHelperScript = helperScript.replaceFirst(
-                    "#!/bin/sh\n",
-                    "#!/bin/sh\nexport AICODE_CRED_NO_PROMPT=1\n"
-                )
-                writeRemoteFile("$aicodeDir/git-credential-aicode", remoteHelperScript.toByteArray(Charsets.UTF_8), executable = true)
-                writeRemoteFile("$aicodeDir/git-credentials", encodeCreds(creds).toByteArray(Charsets.UTF_8))
-
-
-                val gitconfig = buildString {
-                    append("[include]\n")
-                    append("    path = ~/.gitconfig\n")
-                    append("[includeIf \"gitdir:${gitConfigValue(wsRoot)}/\"]\n")
-                    append("    path = ~/.aicode/gitconfig.credential\n")
+    suspend fun uploadGitCredentialConfig(credentials: List<GitCredential>, workspaceRoot: String) {
+        if (!isConnected() || remoteHome == null) return
+        // 排队期间可能切换服务器，不能在取得锁后重新选择写入目标。
+        val identity = captureIdentity()
+        credentialSyncMutex.withLock {
+            checkIdentity(identity)
+            gitCredentialScope = null
+            val aicodeDir = identity.home.trimEnd('/') + "/.aicode"
+            val wsRoot = workspaceRoot.trimEnd('/').ifEmpty { return@withLock }
+            try {
+                withContext(Dispatchers.IO) {
+                    openReadChannel(identity).use { channel ->
+                        val installContext = currentCoroutineContext()
+                        val checkCurrent = {
+                            installContext.ensureActive()
+                            checkIdentity(identity)
+                        }
+                        checkCurrent()
+                        channel.mkdirs(aicodeDir)
+                        val creds = credentials.joinToString("\n") { c ->
+                            "https://${enc(c.username)}:${enc(c.token)}@${c.host}"
+                        }.let { if (it.isNotEmpty()) "$it\n" else "" }
+                        containerInstaller.extractCredentialHelper()
+                        val helperScript = java.io.File(containerInstaller.aicodeDir, "git-credential-aicode").readText()
+                        check(helperScript.isNotBlank()) { "Git credential helper is empty" }
+                        val remoteHelperScript = helperScript.replaceFirst(
+                            "#!/bin/sh\n",
+                            "#!/bin/sh\nexport AICODE_CRED_NO_PROMPT=1\n"
+                        )
+                        checkCurrent()
+                        writeRemoteFile(channel, "$aicodeDir/git-credential-aicode", remoteHelperScript.toByteArray(Charsets.UTF_8), executable = true)
+                        checkCurrent()
+                        writeRemoteFile(channel, "$aicodeDir/git-credentials", encodeCreds(creds).toByteArray(Charsets.UTF_8))
+                        val helper = "!AICODE_CRED_NO_PROMPT=1 ${shellQuote("$aicodeDir/git-credential-aicode")}"
+                        val credentialConfig = "[credential]\n    helper = \"${gitConfigValue(helper)}\"\n"
+                        checkCurrent()
+                        writeRemoteFile(channel, "$aicodeDir/gitconfig.credential", credentialConfig.toByteArray(Charsets.UTF_8))
+                        checkCurrent()
+                        gitCredentialScope = GitCredentialScope(identity, wsRoot)
+                        FileLogger.i(TAG, "已注入 git 凭据到远程 $aicodeDir（限定 $wsRoot/）")
+                    }
                 }
-                writeRemoteFile("$aicodeDir/gitconfig", gitconfig.toByteArray(Charsets.UTF_8))
-
-                val credentialConfig = buildString {
-                    append("[credential]\n")
-                    append("    helper = !AICODE_CRED_NO_PROMPT=1 $aicodeDir/git-credential-aicode\n")
-                }
-                writeRemoteFile("$aicodeDir/gitconfig.credential", credentialConfig.toByteArray(Charsets.UTF_8))
-                FileLogger.i(TAG, "已注入 git 凭据到远程 $aicodeDir（限定 $wsRoot/）")
-            }.onFailure { FileLogger.w(TAG, "注入 git 凭据到远程失败", it) }
+            } catch (e: CancellationException) {
+                gitCredentialScope = null
+                throw e
+            } catch (e: Exception) {
+                gitCredentialScope = null
+                currentCoroutineContext().ensureActive()
+                FileLogger.w(TAG, "注入 git 凭据到远程失败", e)
+            }
         }
     }
 
-    /**
-     * 撤销远程注入：删除 App 管理的三个配置/凭据文件。
-     * `GIT_CONFIG_GLOBAL` 指向不存在的文件时 git 静默跳过，注入即失效，服务器用户配置不受影响。
-     */
-    suspend fun removeGitCredentialConfig() = credentialSyncMutex.withLock {
-        val client = sshClient ?: return@withLock
-        val home = remoteHome ?: return@withLock
-        val aicodeDir = home.trimEnd('/') + "/.aicode"
-        withContext(Dispatchers.IO) {
-            runCatching {
-                sftpOperationMutex.withLock {
-                    val sftp = sftp()
-                    listOf("gitconfig", "gitconfig.credential", "git-credentials", "git-credential-aicode").forEach { name ->
-                        val path = "$aicodeDir/$name"
-                        if (sftp.statExistence(path) != null) sftp.rm(path)
+    suspend fun removeGitCredentialConfig() {
+        if (!isConnected() || remoteHome == null) return
+        val identity = captureIdentity()
+        credentialSyncMutex.withLock {
+            checkIdentity(identity)
+            gitCredentialScope = null
+            val aicodeDir = identity.home.trimEnd('/') + "/.aicode"
+            try {
+                withContext(Dispatchers.IO) {
+                    openReadChannel(identity).use { channel ->
+                        for (name in listOf("gitconfig.credential", "git-credentials", "git-credential-aicode")) {
+                            currentCoroutineContext().ensureActive()
+                            checkIdentity(identity)
+                            val path = "$aicodeDir/$name"
+                            if (channel.statExistence(path) != null) channel.rm(path)
+                        }
                     }
+                    FileLogger.i(TAG, "已撤销远程 git 凭据注入")
                 }
-                FileLogger.i(TAG, "已撤销远程 git 凭据注入")
-            }.onFailure { FileLogger.w(TAG, "撤销远程 git 凭据注入失败", it) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                currentCoroutineContext().ensureActive()
+                FileLogger.w(TAG, "撤销远程 git 凭据注入失败", e)
+            }
         }
     }
 
@@ -531,7 +658,16 @@ class RemoteSshConnection @Inject constructor(
         executable: Boolean = false,
         overwrite: Boolean = true
     ) = sftpOperationMutex.withLock {
-        val client = sftp()
+        writeRemoteFile(sftp(), dest, bytes, executable, overwrite)
+    }
+
+    private fun writeRemoteFile(
+        client: SFTPClient,
+        dest: String,
+        bytes: ByteArray,
+        executable: Boolean = false,
+        overwrite: Boolean = true
+    ) {
         val temporary = "$dest.tmp.${UUID.randomUUID()}"
         try {
             client.open(temporary, EnumSet.of(OpenMode.WRITE, OpenMode.CREAT, OpenMode.EXCL)).use { file ->
@@ -554,9 +690,9 @@ class RemoteSshConnection @Inject constructor(
         }
     }
 
-    /** gitconfig 值转义：转义反斜杠与双引号并去换行，避免工作区路径注入结构性配置项。 */
     private fun gitConfigValue(value: String): String =
-        value.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "").replace("\r", "")
+        value.replace("\\", "\\\\").replace("\"", "\\\"")
+            .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
 
     private fun enc(part: String): String = java.net.URLEncoder.encode(part, "UTF-8")
 

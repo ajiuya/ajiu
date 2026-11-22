@@ -102,6 +102,14 @@ interface AgentRecoveryDao {
     suspend fun requestsForSession(sessionId: String): List<RecoveryRequestEntity>
 
     @Query("""
+        SELECT q.* FROM agent_recovery_requests q
+        JOIN chat_sessions s ON s.id = q.sessionId AND s.executionGeneration = q.generation
+        WHERE q.sessionId = :sessionId
+        ORDER BY q.queueOrder, q.id
+    """)
+    fun observeRequestsForSession(sessionId: String): Flow<List<RecoveryRequestEntity>>
+
+    @Query("""
         UPDATE agent_messages SET toolStartedAtMs = COALESCE(toolStartedAtMs, :startedAtMs),
             toolDurationMs = COALESCE(toolDurationMs, :durationMs)
         WHERE sessionId = :sessionId AND id = 'tool_' || :callId AND toolCallId = :callId AND role = 'TOOL'

@@ -40,7 +40,8 @@ data class MemoryUiState(
     val saving: Boolean = false,
     val pendingDelete: MemoryEntry? = null,
     val deleting: Boolean = false,
-    val error: MemoryManagementError? = null
+    val error: MemoryManagementError? = null,
+    val createdScope: MemoryScope? = null
 )
 
 @HiltViewModel
@@ -142,6 +143,10 @@ class MemoryViewModel internal constructor(
         _state.update { it.copy(selectedEntry = null, document = null, detailLoading = false, error = null) }
     }
 
+    fun consumeCreatedScope() {
+        _state.update { it.copy(createdScope = null) }
+    }
+
     fun startCreate() {
         val captured = page ?: return
         if (isCurrent(captured)) _state.update { it.copy(creating = true, error = null) }
@@ -165,7 +170,7 @@ class MemoryViewModel internal constructor(
             if (!isCurrent(captured)) return@launch
             when (result) {
                 is MemoryManagementResult.Success -> {
-                    _state.update { it.copy(saving = false, creating = false) }
+                    _state.update { it.copy(saving = false, creating = false, createdScope = scope) }
                     refresh(captured)
                 }
                 is MemoryManagementResult.Failure -> _state.update { it.copy(saving = false, error = result.error) }

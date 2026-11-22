@@ -4,6 +4,8 @@ import android.content.Context
 import com.aicode.R
 import com.aicode.feature.agent.domain.permission.ShellCommandParser.BlockerKind
 import com.aicode.feature.agent.domain.root.RootCommandManager
+import com.aicode.feature.agent.domain.shizuku.ShizukuIdentity
+import com.aicode.feature.agent.domain.shizuku.ShizukuManager
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonPrimitive
@@ -16,7 +18,8 @@ class ToolPermissionPolicyEngine @Inject constructor(
     private val rulesRepo: PermissionRulesRepository,
     private val sessionPermissionGrants: SessionPermissionGrantRepository,
     @param:ApplicationContext private val appContext: Context,
-    private val rootCommandManager: RootCommandManager
+    private val rootCommandManager: RootCommandManager,
+    private val shizukuManager: ShizukuManager
 ) {
     private companion object {
         const val SHIZUKU_TOOL = "Shizuku"
@@ -46,7 +49,9 @@ class ToolPermissionPolicyEngine @Inject constructor(
         val approvalNote: String? = null,
         val sessionGrant: String? = null,
         val askTitle: String? = null,
-        val rootGeneration: Long? = null
+        val rootGeneration: Long? = null,
+        val rootAuthorityId: String? = null,
+        val shizukuIdentity: ShizukuIdentity? = null
     )
 
     suspend fun evaluate(toolName: String, args: Map<String, JsonElement>, sessionId: String? = null): EvalResult {
@@ -58,7 +63,7 @@ class ToolPermissionPolicyEngine @Inject constructor(
         }
         val action = (args["action"] as? JsonPrimitive)?.content?.trim()?.lowercase()
         val rootState = if (toolName == ROOT_TOOL) rootCommandManager.accessSnapshot() else null
-        if (rootState != null && !rootState.enabled) {
+        if (rootState != null && (!rootState.enabled || rootState.authorityId.isBlank())) {
             return EvalResult(Verdict.DENY, denyReason = appContext.getString(R.string.root_access_disabled))
         }
         val shellTool = toolName == "Bash" || toolName == SHIZUKU_TOOL || toolName == ROOT_TOOL ||
@@ -67,7 +72,11 @@ class ToolPermissionPolicyEngine @Inject constructor(
 
         val commandKey = if (toolName == TERMINAL_TOOL && action == "send") "input" else "command"
         val command = (args[commandKey] as? JsonPrimitive)?.content ?: return EvalResult(Verdict.ALLOW)
-        if (toolName == SHIZUKU_TOOL &&
+        val shizukuIdentity = if (toolName == SHIZUKU_TOOL) {
+            shizukuManager.accessSnapshot()
+                ?: return EvalResult(Verdict.DENY, denyReason = appContext.getString(R.string.shizuku_identity_unavailable))
+        } else null
+        if (toolName == SHIZUKU_TOOL && shizukuIdentity?.uid != 0 &&
             (ShellCommandParser.requiresRootApproval(command) || HOST_ROOT_REFERENCE.containsMatchIn(command))
         ) {
             return EvalResult(Verdict.DENY, denyReason = appContext.getString(R.string.root_shizuku_use_root_tool))
@@ -89,7 +98,7 @@ class ToolPermissionPolicyEngine @Inject constructor(
             )
         }
 
-        val safetyReason = checkCatastrophicRm(executableSegments, hostRoot = toolName == ROOT_TOOL) ?: if (!analysis.analyzable && looksDestructive(command, analysis, executableSegments)) {
+        val safetyReason = checkCatastrophicRm(executableSegments, hostRoot = toolName == ROOT_TOOL || shizukuIdentity?.uid == 0) ?: if (!analysis.analyzable && looksDestructive(command, analysis, executableSegments)) {
             val constructs = analysis.blockers.joinToString("\n") { blocker ->
                 val resource = when (blocker.kind) {
                     BlockerKind.COMMAND_SUBSTITUTION -> R.string.tool_safety_blocker_command_substitution
@@ -118,7 +127,8 @@ class ToolPermissionPolicyEngine @Inject constructor(
                     denyReason = appContext.getString(R.string.tool_safety_denied_with_elevation, safetyReason)
                 )
             }
-            if (rootState != null) return rootApproval(rootState.generation)
+            if (rootState != null) return rootApproval(sessionId, rootState.generation, rootState.authorityId, forceOnce = true)
+            if (shizukuIdentity != null) return shizukuApproval(sessionId, shizukuIdentity, forceOnce = true)
             return approval(
                 sessionId,
                 "elevate:$command",
@@ -128,13 +138,8 @@ class ToolPermissionPolicyEngine @Inject constructor(
         }
 
         return when {
-            rootState != null -> rootApproval(rootState.generation)
-            toolName == SHIZUKU_TOOL -> approval(
-                sessionId,
-                "tool:$SHIZUKU_TOOL",
-                null,
-                appContext.getString(R.string.tool_shizuku_confirmation_reason)
-            )
+            rootState != null -> rootApproval(sessionId, rootState.generation, rootState.authorityId)
+            shizukuIdentity != null -> shizukuApproval(sessionId, shizukuIdentity)
             ShellCommandParser.requiresRootApproval(command) -> approval(
                 sessionId,
                 "root:$command",
@@ -145,12 +150,25 @@ class ToolPermissionPolicyEngine @Inject constructor(
         }
     }
 
-    private fun rootApproval(generation: Long): EvalResult = EvalResult(
-        Verdict.ASK,
-        askTitle = appContext.getString(R.string.root_confirmation_title),
-        approvalNote = appContext.getString(R.string.root_confirmation_reason),
-        rootGeneration = generation
-    )
+    private suspend fun rootApproval(
+        sessionId: String?, generation: Long, authorityId: String, forceOnce: Boolean = false
+    ): EvalResult {
+        val title = appContext.getString(R.string.root_confirmation_title)
+        val note = appContext.getString(R.string.root_confirmation_reason)
+        val result = if (forceOnce) EvalResult(Verdict.ASK, askTitle = title, approvalNote = note)
+            else approval(sessionId, "tool:Root:$authorityId:$generation", title, note)
+        return result.copy(rootGeneration = generation, rootAuthorityId = authorityId)
+    }
+
+    private suspend fun shizukuApproval(
+        sessionId: String?, identity: ShizukuIdentity, forceOnce: Boolean = false
+    ): EvalResult {
+        val title = if (identity.uid == 0) appContext.getString(R.string.shizuku_root_confirmation_title) else null
+        val note = appContext.getString(if (identity.uid == 0) R.string.shizuku_root_confirmation_reason else R.string.tool_shizuku_confirmation_reason)
+        val result = if (forceOnce) EvalResult(Verdict.ASK, askTitle = title, approvalNote = note)
+            else approval(sessionId, "tool:Shizuku:${identity.uid}:${identity.connectionId}", title, note)
+        return result.copy(shizukuIdentity = identity)
+    }
 
     private suspend fun approval(sessionId: String?, grant: String, title: String?, note: String): EvalResult {
         if (!sessionId.isNullOrBlank() && sessionPermissionGrants.isAllowed(sessionId, grant)) {
@@ -180,6 +198,9 @@ class ToolPermissionPolicyEngine @Inject constructor(
             for (path in info.targetPaths) {
                 if (hostRoot) {
                     val normalized = normalizePath(path.trim())
+                    if (!normalized.startsWith('/')) {
+                        return appContext.getString(R.string.root_safety_relative_delete)
+                    }
                     val androidPaths = setOf("/data", "/storage", "/sdcard", "/system", "/vendor", "/product", "/odm", "/metadata", "/persist")
                     if (androidPaths.any { normalized == it || normalized.startsWith("$it/") || normalized.startsWith("$it*") }) {
                         return appContext.getString(R.string.root_safety_android_delete)

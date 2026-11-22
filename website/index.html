@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>阿九工作台 — Android 上的 AI 开发工作台</title>
+  <meta name="description" content="阿九工作台，基于开源 AiCode 独立修改的 Android AI 开发工作台。支持 Linux 容器、远程 SSH、终端、Git 与插件，采用普通授权与独立计划。本页面不代表 AiCode 官方。" />
+  <link rel="icon" type="image/png" href="/assets/ajiu-icon.png" />
+  <link href="https://cdn.jsdelivr.net/npm/remixicon@4.2.0/fonts/remixicon.css" rel="stylesheet" />
+  <script>
+    // 首屏渲染前恢复主题，避免明暗闪烁
+    (function () {
+      try {
+        var theme = localStorage.getItem("ajiu-site-theme");
+        if (theme !== "light" && theme !== "dark") {
+          theme =
+            window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches
+              ? "dark"
+              : "light";
+        }
+        document.documentElement.setAttribute("data-theme", theme);
+      } catch (error) {
+        document.documentElement.setAttribute("data-theme", "light");
+      }
+    })();
+  </script>
+</head>
+<body>
+  <div id="app"></div>
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>

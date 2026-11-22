@@ -39,6 +39,25 @@ class ChatItemsProjectionStateTest {
     }
 
     @Test
+    fun childAdditionRetainsRowsButPublicationAndChildRemovalUseExactOwnership() {
+        val owner = Any()
+        val version = Any()
+        val first = ChatItemsBuildRequest(source, version, owner, setOf("a"))
+        val rows = listOf("tool", "chat-notification:notice", "child-a")
+        val displayed = ChatItemsProjection(first, rows)
+        val added = ChatItemsBuildRequest(source, version, owner, setOf("a", "b"))
+        val replaced = ChatItemsBuildRequest(source, version, owner, setOf("b"))
+
+        assertSame(rows, displayed.retainedFor(added))
+        assertFalse(first.canPublishTo(added))
+        assertTrue(added.canPublishTo(ChatItemsBuildRequest(source, version, owner, setOf("b", "a"))))
+        assertNull(displayed.retainedFor(replaced))
+        assertNull(displayed.retainedFor(ChatItemsBuildRequest(source, version, owner, emptySet())))
+        assertNull(displayed.retainedFor(ChatItemsBuildRequest(source, version, Any(), added.knownChildIds)))
+        assertNull(displayed.retainedFor(ChatItemsBuildRequest(source.copy(sessionId = "other"), version, owner, added.knownChildIds)))
+    }
+
+    @Test
     fun settledPlaybackStaysInTailUntilItsActualPublishedProjectionOwnsTheMessage() {
         val owner = Any()
         val first = ChatItemsBuildRequest(source, Any(), owner)

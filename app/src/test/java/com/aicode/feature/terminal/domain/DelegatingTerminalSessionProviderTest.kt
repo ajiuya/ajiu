@@ -50,7 +50,7 @@ class DelegatingTerminalSessionProviderTest {
     }
 
     @Test
-    fun bothBackendsStaySubscribedAcrossModesWithoutSyntheticOrDuplicateEvents() = runBlocking {
+    fun bothBackendsStaySubscribedAcrossModesWithoutSyntheticOrDuplicateEvents() = runBlocking<Unit> {
         val received = Channel<TabFinishedEvent>(Channel.UNLIMITED)
         val collector = launch(start = CoroutineStart.UNDISPATCHED) {
             provider.tabFinishedEvents.collect { received.send(it) }
@@ -82,7 +82,23 @@ class DelegatingTerminalSessionProviderTest {
     }
 
     @Test
-    fun commandAndInputRoutingStillFollowCurrentMode() = runBlocking {
+    fun ownedTerminalLookupAndCleanupStayWithOriginalBackendAfterModeSwitch() = runBlocking<Unit> {
+        val owner = TerminalResourceOwner("fixture.plugin", "resource-uuid")
+        every { local.pluginTabStatus("term-1", owner) } returns TerminalTabStatus(true, null)
+        every { remote.pluginTabStatus("term-1", owner) } returns null
+        every { local.writePluginInput("term-1", owner, "input", false) } returns true
+        coEvery { local.closePluginTab("term-1", owner) } returns true
+        holder.setMode(ExecutionMode.REMOTE_SSH)
+        assertTrue(provider.writePluginInput("term-1", owner, "input", false))
+        assertTrue(provider.closePluginTab("term-1", owner))
+        verify(exactly = 1) { local.writePluginInput("term-1", owner, "input", false) }
+        coVerify(exactly = 1) { local.closePluginTab("term-1", owner) }
+        coVerify(exactly = 0) { remote.closePluginTab(any(), any()) }
+        verify(exactly = 0) { remote.writePluginInput(any(), any(), any(), any()) }
+    }
+
+    @Test
+    fun commandAndInputRoutingStillFollowCurrentMode() = runBlocking<Unit> {
         coEvery { local.startBackgroundCommand("local", "Local", true, "session-1") } returns "term-local"
         coEvery { remote.startBackgroundCommand("remote", "Remote", true, "session-2") } returns "term-remote"
         every { local.sendInput("term-local", "input", false) } returns true

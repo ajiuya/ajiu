@@ -8,7 +8,10 @@ import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
+import android.os.RemoteException
 import com.aicode.R
 import com.aicode.core.util.FileLogger
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -21,7 +24,9 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import moe.shizuku.server.IShizukuService
 import rikka.shizuku.Shizuku
+import java.util.UUID
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -38,21 +43,20 @@ enum class ShizukuState {
 
     SHELL_REQUIRED,
 
-    /** 就绪，可执行命令。 */
-    READY
+    IDENTITY_UNAVAILABLE,
+
+    /** adb shell 身份已就绪。 */
+    READY,
+
+    READY_ROOT
 }
+
+data class ShizukuIdentity(val uid: Int, val connectionId: String)
 
 /** 一次 Shizuku 命令执行结果。[exitCode] 为负值表示超时或启动异常。 */
 data class ShizukuCommandResult(val output: String, val exitCode: Int)
 
-/**
- * Shizuku 后端：以 adb shell（uid 2000）身份执行命令。
- *
- * 通过 UserService（[ShizukuShellService]）而非已弃用的 `Shizuku#newProcess` 执行命令：
- * App 绑定一个运行在 shell 进程的服务，调用其 AIDL 接口代执行，进程间只传命令与结果。
- *
- * 状态由 Shizuku 的 binder 存活/死亡与授权结果驱动，[state] 变化时设置页与工具据此响应。
- */
+/** 通过 UserService 执行命令；聊天许可绑定本次连接身份，插件入口仅使用 adb shell。 */
 @Singleton
 class ShizukuManager @Inject constructor(
     @param:ApplicationContext private val context: Context
@@ -73,7 +77,7 @@ class ShizukuManager @Inject constructor(
         const val PERMISSION_REQUEST_CODE = 1001
 
         /** 服务身份 tag：不设时用类名，类名经 R8 混淆后不稳定，故显式固定。 */
-        const val SERVICE_TAG = "shizuku_shell"
+        const val SERVICE_TAG = "shizuku_command_v2"
 
         /** 绑定 UserService 的等待上限（毫秒）。Shizuku 启动服务自身超时为 30 秒。 */
         const val BIND_TIMEOUT_MS = 30_000L
@@ -81,47 +85,53 @@ class ShizukuManager @Inject constructor(
         /** 命令超时上限（毫秒），与 [com.aicode.feature.agent.domain.container.CommandEngine.MAX_TIMEOUT_MS] 对齐。 */
         const val MAX_TIMEOUT_MS = 1_800_000L
 
+        /** 命令结束后 UserService 的空闲保留时间；到期解绑以释放独立 ART 进程。 */
+        const val USER_SERVICE_IDLE_RELEASE_MS = 15_000L
+
         const val DOWNLOAD_URL = "https://shizuku.rikka.app/download/"
     }
 
     private val _state = MutableStateFlow(ShizukuState.NOT_INSTALLED)
     val state: StateFlow<ShizukuState> = _state.asStateFlow()
 
+    private val _identity = MutableStateFlow<ShizukuIdentity?>(null)
+    val identity: StateFlow<ShizukuIdentity?> = _identity.asStateFlow()
+
+    private data class CommandPermit(
+        val sessionId: String,
+        val command: String,
+        val identity: ShizukuIdentity
+    )
+
+    private val gate = Any()
     private val bindMutex = Mutex()
-
-    @Volatile
+    private val permits = mutableMapOf<String, CommandPermit>()
+    private var shizukuBinder: IBinder? = null
     private var shellService: IShizukuShellService? = null
-
-    @Volatile
+    private var shellServiceBinder: IBinder? = null
+    private var shellServiceIdentity: ShizukuIdentity? = null
+    private var shellServiceDeathRecipient: IBinder.DeathRecipient? = null
     private var pendingBind: CompletableDeferred<IShizukuShellService>? = null
+    private var serviceConnection: ServiceConnection? = null
+    private var activeExecCount = 0
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val releaseIdleService = Runnable {
+        synchronized(gate) {
+            if (activeExecCount == 0) releaseUserServiceLocked()
+        }
+    }
 
     private val binderReceivedListener = Shizuku.OnBinderReceivedListener { refreshState() }
 
     private val binderDeadListener = Shizuku.OnBinderDeadListener {
-        shellService = null
-        pendingBind?.completeExceptionally(IllegalStateException("Shizuku 服务已断开"))
-        pendingBind = null
-        refreshState()
+        synchronized(gate) {
+            invalidateIdentityLocked()
+            refreshStateLocked()
+        }
     }
 
     private val permissionResultListener = Shizuku.OnRequestPermissionResultListener { _, _ ->
         refreshState()
-    }
-
-    private val serviceConnection = object : ServiceConnection {
-        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
-            val bound = IShizukuShellService.Stub.asInterface(service)
-            shellService = bound
-            pendingBind?.complete(bound)
-            pendingBind = null
-        }
-
-        override fun onServiceDisconnected(name: ComponentName?) {
-            shellService = null
-            pendingBind?.completeExceptionally(IllegalStateException("Shizuku UserService 已断开"))
-            pendingBind = null
-            refreshState()
-        }
     }
 
     private val userServiceArgs: Shizuku.UserServiceArgs by lazy {
@@ -162,24 +172,94 @@ class ShizukuManager @Inject constructor(
         refreshState()
     }
 
-    /** 重新计算并发布当前状态。 */
     fun refreshState() {
-        _state.value = computeState()
+        accessSnapshot()
     }
 
-    private fun computeState(): ShizukuState {
-        // pingBinder 与实现包名无关：任何兼容 Shizuku 协议的服务端（含改了包名的第三方分叉）
-        // 只要服务在运行都能 ping 通，故先看 binder，避免被包名检查抢先判成未安装。
-        if (runCatching { Shizuku.pingBinder() }.getOrDefault(false)) {
-            // pre-v11 无 UserService，等同不可用。
-            if (runCatching { Shizuku.isPreV11() }.getOrDefault(false)) return ShizukuState.NOT_RUNNING
-            if (runCatching { Shizuku.getUid() }.getOrNull() != 2000) return ShizukuState.SHELL_REQUIRED
-            val granted = runCatching {
-                Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
-            }.getOrDefault(false)
-            return if (granted) ShizukuState.READY else ShizukuState.PERMISSION_DENIED
+    fun accessSnapshot(): ShizukuIdentity? = synchronized(gate) {
+        refreshStateLocked()
+    }
+
+    private fun refreshStateLocked(): ShizukuIdentity? {
+        if (!runCatching { Shizuku.pingBinder() }.getOrDefault(false)) {
+            return unavailableLocked(
+                if (isShizukuInstalled()) ShizukuState.NOT_RUNNING else ShizukuState.NOT_INSTALLED
+            )
         }
-        return if (isShizukuInstalled()) ShizukuState.NOT_RUNNING else ShizukuState.NOT_INSTALLED
+        if (runCatching { Shizuku.isPreV11() }.getOrDefault(false)) {
+            return unavailableLocked(ShizukuState.NOT_RUNNING)
+        }
+        val binder = runCatching { Shizuku.getBinder() }.getOrNull()
+        val granted = runCatching {
+            Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+        }.getOrDefault(false)
+        if (!granted) return unavailableLocked(ShizukuState.PERMISSION_DENIED)
+        if (binder == null) return unavailableLocked(ShizukuState.IDENTITY_UNAVAILABLE)
+        val remote = runCatching { IShizukuService.Stub.asInterface(binder) }.getOrNull()
+            ?: return unavailableLocked(ShizukuState.IDENTITY_UNAVAILABLE)
+        // SDK 会缓存授权与 UID，执行边界必须重新向当前服务端核实。
+        if (!runCatching { remote.checkSelfPermission() }.getOrDefault(false)) {
+            return unavailableLocked(ShizukuState.PERMISSION_DENIED)
+        }
+        val uid = runCatching { remote.getUid() }.getOrNull()
+        if (uid == null || uid < 0 ||
+            runCatching { Shizuku.getBinder() }.getOrNull() !== binder
+        ) {
+            return unavailableLocked(ShizukuState.IDENTITY_UNAVAILABLE)
+        }
+        if (uid != 0 && uid != 2000) return unavailableLocked(ShizukuState.SHELL_REQUIRED)
+
+        val current = _identity.value
+        val cacheInvalid = shellService != null && (
+            shellServiceIdentity != current || shellServiceBinder == null ||
+                !runCatching {
+                    shellService?.asBinder() === shellServiceBinder && shellServiceBinder?.pingBinder() == true
+                }.getOrDefault(false)
+            )
+        if (current?.uid != uid || shizukuBinder !== binder || cacheInvalid) {
+            invalidateIdentityLocked()
+            shizukuBinder = binder
+            _identity.value = ShizukuIdentity(uid, UUID.randomUUID().toString())
+        }
+        _state.value = if (uid == 0) ShizukuState.READY_ROOT else ShizukuState.READY
+        return _identity.value
+    }
+
+    private fun unavailableLocked(state: ShizukuState): ShizukuIdentity? {
+        invalidateIdentityLocked()
+        _state.value = state
+        return null
+    }
+
+    private fun invalidateIdentityLocked() {
+        mainHandler.removeCallbacks(releaseIdleService)
+        shellServiceDeathRecipient?.let { recipient ->
+            runCatching { shellServiceBinder?.unlinkToDeath(recipient, 0) }
+        }
+        val connection = serviceConnection
+        shellServiceDeathRecipient = null
+        shellService = null
+        shellServiceBinder = null
+        shellServiceIdentity = null
+        serviceConnection = null
+        pendingBind?.completeExceptionally(identityChanged())
+        pendingBind = null
+        connection?.let(::unbindUserService)
+        activeExecCount = 0
+        permits.clear()
+        shizukuBinder = null
+        _identity.value = null
+    }
+
+    /** UserService 是独立进程；只清空本地 binder 引用不会结束它，会把整套 ART/堆内存留在应用 UID 下。 */
+    private fun unbindUserService(connection: ServiceConnection) {
+        val release = {
+            runCatching { Shizuku.unbindUserService(userServiceArgs, connection, true) }
+                .onFailure { FileLogger.w(TAG, "解绑 Shizuku UserService 失败: ${it.message}") }
+            Unit
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) release()
+        else Handler(Looper.getMainLooper()).post(release)
     }
 
     /**
@@ -203,7 +283,8 @@ class ShizukuManager @Inject constructor(
 
     /** 申请 Shizuku 授权。需在主线程调用（Shizuku 内部要求）。 */
     fun requestPermission() {
-        if (computeState() != ShizukuState.PERMISSION_DENIED) return
+        refreshState()
+        if (_state.value != ShizukuState.PERMISSION_DENIED) return
         runCatching { Shizuku.requestPermission(PERMISSION_REQUEST_CODE) }
             .onFailure { FileLogger.w(TAG, "申请 Shizuku 授权失败: ${it.message}") }
     }
@@ -226,50 +307,235 @@ class ShizukuManager @Inject constructor(
         }.onFailure { FileLogger.w(TAG, "打开 Shizuku 失败: ${it.message}") }
     }
 
-    /** 执行 shell 命令。未就绪或绑定失败时抛异常，由调用方转成工具错误。 */
+    fun authorize(sessionId: String, command: String, expectedIdentity: ShizukuIdentity): String? {
+        if (sessionId.isBlank() || command.isBlank()) return null
+        return synchronized(gate) {
+            if (refreshStateLocked() != expectedIdentity) return@synchronized null
+            val permitId = UUID.randomUUID().toString()
+            permits[permitId] = CommandPermit(sessionId, command, expectedIdentity)
+            permitId
+        }
+    }
+
+    fun revokePermit(permitId: String) {
+        synchronized(gate) {
+            permits.remove(permitId)
+        }
+    }
+
+    suspend fun runApprovedCommand(
+        command: String,
+        timeoutMs: Long,
+        sessionId: String,
+        permitId: String?
+    ): ShizukuCommandResult {
+        val expectedIdentity = synchronized(gate) {
+            val permit = permitId?.let { permits.remove(it) } ?: throw approvalRequired()
+            if (sessionId.isBlank() || command.isBlank() ||
+                permit.sessionId != sessionId || permit.command != command
+            ) {
+                throw approvalRequired()
+            }
+            requireIdentityLocked(permit.identity)
+            permit.identity
+        }
+        return executeCommand(command, timeoutMs, expectedIdentity)
+    }
+
+    /** 插件入口只开放 adb shell，不继承聊天会话的 Root 授权。 */
     suspend fun runCommand(command: String, timeoutMs: Long): ShizukuCommandResult {
-        val service = ensureBound()
+        val expectedIdentity = synchronized(gate) {
+            val current = refreshStateLocked() ?: throw unavailableError()
+            if (current.uid != 2000) throw approvalRequired()
+            current
+        }
+        return executeCommand(command, timeoutMs, expectedIdentity)
+    }
+
+    private suspend fun executeCommand(
+        command: String,
+        timeoutMs: Long,
+        expectedIdentity: ShizukuIdentity
+    ): ShizukuCommandResult {
+        val service = ensureBound(expectedIdentity)
         val timeout = timeoutMs.coerceIn(1_000L, MAX_TIMEOUT_MS).toInt()
-        return withContext(Dispatchers.IO) {
-            requireShellIdentity()
-            val bundle = service.exec(command, timeout)
-            if (bundle.getInt(ShizukuShellService.KEY_EXIT_CODE) == ShizukuShellService.EXIT_SHELL_REQUIRED) {
-                shellService = null
-                _state.value = ShizukuState.SHELL_REQUIRED
-                throw IllegalStateException(context.getString(R.string.shizuku_shell_required))
+        synchronized(gate) {
+            requireIdentityLocked(expectedIdentity)
+            if (shellService !== service || shellServiceIdentity != expectedIdentity) throw identityChanged()
+            activeExecCount++
+            mainHandler.removeCallbacks(releaseIdleService)
+        }
+        return try {
+            withContext(Dispatchers.IO) {
+                val bundle = try {
+                    service.exec(command, timeout, expectedIdentity.uid)
+                } catch (e: RemoteException) {
+                    invalidateService(service)
+                    throw identityChanged()
+                }
+                val exitCode = bundle.getInt(ShizukuShellService.KEY_EXIT_CODE, ShizukuShellService.EXIT_FAILURE)
+                if (exitCode == ShizukuShellService.EXIT_SHELL_REQUIRED) {
+                    invalidateService(service)
+                    throw identityChanged()
+                }
+                ShizukuCommandResult(
+                    output = bundle.getString(ShizukuShellService.KEY_OUTPUT).orEmpty(),
+                    exitCode = exitCode
+                )
             }
-            ShizukuCommandResult(
-                output = bundle.getString(ShizukuShellService.KEY_OUTPUT).orEmpty(),
-                exitCode = bundle.getInt(ShizukuShellService.KEY_EXIT_CODE, ShizukuShellService.EXIT_FAILURE)
-            )
+        } finally {
+            synchronized(gate) {
+                activeExecCount = (activeExecCount - 1).coerceAtLeast(0)
+                if (activeExecCount == 0 && shellService === service) {
+                    mainHandler.postDelayed(releaseIdleService, USER_SERVICE_IDLE_RELEASE_MS)
+                }
+            }
         }
     }
 
-    private fun requireShellIdentity() {
-        if (runCatching { Shizuku.getUid() }.getOrNull() != 2000) {
-            shellService = null
-            refreshState()
-            throw IllegalStateException(context.getString(R.string.shizuku_shell_required))
+    private fun releaseUserServiceLocked() {
+        val connection = serviceConnection ?: return
+        mainHandler.removeCallbacks(releaseIdleService)
+        shellServiceDeathRecipient?.let { recipient ->
+            runCatching { shellServiceBinder?.unlinkToDeath(recipient, 0) }
+        }
+        shellServiceDeathRecipient = null
+        shellService = null
+        shellServiceBinder = null
+        shellServiceIdentity = null
+        serviceConnection = null
+        unbindUserService(connection)
+    }
+
+    private fun invalidateService(service: IShizukuShellService) {
+        synchronized(gate) {
+            if (shellService === service) {
+                invalidateIdentityLocked()
+                refreshStateLocked()
+            }
         }
     }
 
-    /** 幂等绑定 UserService，返回可用的 AIDL 代理。 */
-    private suspend fun ensureBound(): IShizukuShellService {
-        requireShellIdentity()
-        shellService?.let { return it }
+    private fun requireIdentityLocked(expectedIdentity: ShizukuIdentity) {
+        val current = refreshStateLocked() ?: throw unavailableError()
+        if (current != expectedIdentity) throw identityChanged()
+    }
+
+    private fun identityChanged() = IllegalStateException(context.getString(R.string.shizuku_identity_changed))
+
+    private fun approvalRequired() = IllegalStateException(context.getString(R.string.shizuku_approval_required))
+
+    private fun unavailableError(): IllegalStateException {
+        val message = when (_state.value) {
+            ShizukuState.READY, ShizukuState.READY_ROOT -> R.string.shizuku_identity_changed
+            ShizukuState.NOT_INSTALLED -> R.string.settings_shizuku_hint_not_installed
+            ShizukuState.NOT_RUNNING -> R.string.settings_shizuku_hint_not_running
+            ShizukuState.PERMISSION_DENIED -> R.string.settings_shizuku_hint_denied
+            ShizukuState.SHELL_REQUIRED -> R.string.shizuku_shell_required
+            ShizukuState.IDENTITY_UNAVAILABLE -> R.string.shizuku_identity_unavailable
+        }
+        return IllegalStateException(context.getString(message))
+    }
+
+    private fun createServiceConnection(expectedIdentity: ShizukuIdentity): ServiceConnection =
+        object : ServiceConnection {
+            override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+                synchronized(gate) {
+                    if (serviceConnection !== this) return
+                    if (refreshStateLocked() != expectedIdentity || serviceConnection !== this) return
+                    if (service == null || !runCatching { service.pingBinder() }.getOrDefault(false) ||
+                        (shellServiceBinder != null && shellServiceBinder !== service)
+                    ) {
+                        invalidateIdentityLocked()
+                        refreshStateLocked()
+                        return
+                    }
+                    if (shellServiceBinder === service) return
+                    val bound = IShizukuShellService.Stub.asInterface(service)
+                    if (bound == null) {
+                        invalidateIdentityLocked()
+                        refreshStateLocked()
+                        return
+                    }
+                    val recipient = IBinder.DeathRecipient {
+                        synchronized(gate) {
+                            if (shellServiceBinder === service) {
+                                invalidateIdentityLocked()
+                                refreshStateLocked()
+                            }
+                        }
+                    }
+                    shellService = bound
+                    shellServiceBinder = service
+                    shellServiceIdentity = expectedIdentity
+                    shellServiceDeathRecipient = recipient
+                    try {
+                        service.linkToDeath(recipient, 0)
+                    } catch (e: RemoteException) {
+                        invalidateIdentityLocked()
+                        refreshStateLocked()
+                        return
+                    }
+                    pendingBind?.complete(bound)
+                    pendingBind = null
+                }
+            }
+
+            override fun onServiceDisconnected(name: ComponentName?) {
+                synchronized(gate) {
+                    if (serviceConnection !== this) return
+                    invalidateIdentityLocked()
+                    refreshStateLocked()
+                }
+            }
+
+            override fun onBindingDied(name: ComponentName?) {
+                onServiceDisconnected(name)
+            }
+
+            override fun onNullBinding(name: ComponentName?) {
+                onServiceDisconnected(name)
+            }
+        }
+
+    private suspend fun ensureBound(expectedIdentity: ShizukuIdentity): IShizukuShellService {
+        synchronized(gate) {
+            requireIdentityLocked(expectedIdentity)
+            shellService?.let { return it }
+        }
         return bindMutex.withLock {
-            requireShellIdentity()
-            shellService?.let { return@withLock it }
-            if (computeState() != ShizukuState.READY) {
-                throw IllegalStateException("Shizuku 未就绪（${_state.value}）")
-            }
             val deferred = CompletableDeferred<IShizukuShellService>()
-            pendingBind = deferred
-            withContext(Dispatchers.Main) {
-                Shizuku.bindUserService(userServiceArgs, serviceConnection)
+            val connection = synchronized(gate) {
+                requireIdentityLocked(expectedIdentity)
+                shellService?.let { return@withLock it }
+                createServiceConnection(expectedIdentity).also {
+                    serviceConnection = it
+                    pendingBind = deferred
+                }
             }
-            withTimeoutOrNull(BIND_TIMEOUT_MS) { deferred.await() }
-                ?: throw IllegalStateException("绑定 Shizuku 服务超时")
+            try {
+                withContext(Dispatchers.Main) {
+                    synchronized(gate) {
+                        requireIdentityLocked(expectedIdentity)
+                        if (serviceConnection !== connection) throw identityChanged()
+                        Shizuku.bindUserService(userServiceArgs, connection)
+                    }
+                }
+                val bound = withTimeoutOrNull(BIND_TIMEOUT_MS) { deferred.await() }
+                    ?: throw IllegalStateException(context.getString(R.string.settings_shizuku_hint_not_running))
+                synchronized(gate) {
+                    requireIdentityLocked(expectedIdentity)
+                    if (shellService !== bound || shellServiceIdentity != expectedIdentity) throw identityChanged()
+                }
+                bound
+            } finally {
+                synchronized(gate) {
+                    if (pendingBind === deferred) {
+                        invalidateIdentityLocked()
+                        refreshStateLocked()
+                    }
+                }
+            }
         }
     }
 }

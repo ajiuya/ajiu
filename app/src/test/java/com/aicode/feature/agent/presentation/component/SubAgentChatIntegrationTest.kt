@@ -29,7 +29,6 @@ class SubAgentChatIntegrationTest {
         messages: List<AgentUIMessage>,
         children: Set<String>,
         activeTurnKey: String? = null,
-        expanded: Boolean = false,
         statuses: Map<String, SubAgentInteractionSummary> = emptyMap(),
         previousTurnKeys: Map<String, String> = emptyMap(),
     ): SubAgentGroupProjection {
@@ -38,7 +37,7 @@ class SubAgentChatIntegrationTest {
         val timeline = projectSubAgentTimeline(messages, children, parent)
         val cards = projectSubAgentTurnCapsules(timeline, keys, parent)
         val inserted = insertSubAgentTurnItems(items, cards, messages)
-        return projectSubAgentGroup(inserted, parent, expanded, activeTurnKey,
+        return projectSubAgentGroup(inserted, parent, activeTurnKey,
             statusRanks = subAgentGroupStatusRanks(inserted, statuses))
     }
 
@@ -52,8 +51,9 @@ class SubAgentChatIntegrationTest {
         assertTrue(result.bodyItems.none { it.contentType == SUB_AGENT_GROUP_CONTENT_TYPE })
         assertFalse(result.items.any { it.subAgentCapsule != null })
         assertEquals(result.items.size + 1, result.expectedLazyItemCount)
-        val opened = projection(messages, setOf("child"), turnKeyOf("u"), expanded = true)
-        assertEquals("child", opened.footerItems.last().subAgentCapsule?.subSessionId)
+        val opened = projection(messages, setOf("child"), turnKeyOf("u"))
+        assertEquals(SUB_AGENT_GROUP_CONTENT_TYPE, opened.footerItems.single().contentType)
+        assertEquals("child", opened.groups.single().capsules.single().subSessionId)
         assertTrue(findSubAgentGroupMessageIndex(opened, "d") in 0 until opened.expectedLazyItemCount)
     }
 
@@ -77,24 +77,24 @@ class SubAgentChatIntegrationTest {
         val messages = listOf(user("u")) + (1..8).map { dispatch("d$it", "c$it") } + answer("a")
         val summaries = (1..8).associate { id -> "c$id" to SubAgentInteractionSummary("c$id",
             status = if (id % 2 == 0) SubAgentInteractionStatus.COMPLETED else SubAgentInteractionStatus.RUNNING) }
-        val result = projection(messages, summaries.keys, expanded = true, statuses = summaries)
-        assertEquals(8, result.groups.single().childItems.size)
+        val result = projection(messages, summaries.keys, statuses = summaries)
+        assertEquals(8, result.groups.single().capsules.size)
         assertEquals(listOf("c2", "c4", "c6", "c8", "c1", "c3", "c5", "c7"),
             result.groups.single().capsules.map { it.subSessionId })
-        assertEquals(8, result.items.count { it.subAgentCapsule != null })
+        assertTrue(result.items.none { it.subAgentCapsule != null })
     }
 
     @Test
     fun repeatedChildDeduplicatesWithinTurnButRealLaterSendGetsItsOwnStableCard() {
         val messages = listOf(user("u1"), dispatch("d1", "same"), dispatch("d2", "same", true), answer("a1"),
             user("u2"), dispatch("d3", "same", true), answer("a2"))
-        val result = projection(messages, setOf("same"), expanded = true)
+        val result = projection(messages, setOf("same"))
         assertEquals(2, result.groups.size)
-        val cards = result.items.filter { it.subAgentCapsule != null }
-        assertEquals(listOf("d2", "d3"), cards.map { it.subAgentCapsule?.anchorMessageId })
-        assertNotEquals(cards.first().key, cards.last().key)
-        assertEquals(setOf("d1", "d2"), cards.first().subAgentCarrierMessageIds)
+        assertEquals(listOf("d2", "d3"), result.groups.map { it.capsules.single().anchorMessageId })
+        assertNotEquals(result.groups.first().key, result.groups.last().key)
+        assertEquals(setOf("d1", "d2"), result.groups.first().carrierMessageIds)
         assertEquals(setOf("same"), result.representedChildIds)
+        assertTrue(result.items.none { it.subAgentCapsule != null })
     }
 
     @Test
@@ -103,7 +103,7 @@ class SubAgentChatIntegrationTest {
             BACKGROUND_NOTIFICATION_PREFIX + "<subagent-notification><subagent-id>old</subagent-id><status>completed</status></subagent-notification>",
             timestamp = 5L, isBackgroundNotification = true)
         val messages = listOf(user("u1"), dispatch("d1", "old"), answer("a1"), user("u2"), notice, answer("a2"))
-        val result = projection(messages, setOf("old"), turnKeyOf("u2"), expanded = true)
+        val result = projection(messages, setOf("old"), turnKeyOf("u2"))
         assertEquals(1, result.groups.size)
         assertEquals(turnKeyOf("u1"), result.groups.single().turnKey)
         assertTrue(result.footerItems.isEmpty())
@@ -115,10 +115,10 @@ class SubAgentChatIntegrationTest {
     fun prependingUserToLeadingPagePreservesGroupAndChildIdentity() {
         val tail = listOf(dispatch("d", "child"), answer("a"))
         val oldKeys = reconcileTurnKeys(tail, emptyMap(), parent)
-        val old = projection(tail, setOf("child"), expanded = true, previousTurnKeys = oldKeys)
-        val full = projection(listOf(user("u")) + tail, setOf("child"), expanded = true, previousTurnKeys = oldKeys)
+        val old = projection(tail, setOf("child"), previousTurnKeys = oldKeys)
+        val full = projection(listOf(user("u")) + tail, setOf("child"), previousTurnKeys = oldKeys)
         assertEquals(old.groups.single().key, full.groups.single().key)
-        assertEquals(old.groups.single().childItems.single().key, full.groups.single().childItems.single().key)
+        assertEquals(old.groups.single().capsules.map { it.subSessionId }, full.groups.single().capsules.map { it.subSessionId })
     }
 
     @Test

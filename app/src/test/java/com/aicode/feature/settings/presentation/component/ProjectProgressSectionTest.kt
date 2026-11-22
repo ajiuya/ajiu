@@ -306,6 +306,8 @@ class ProjectProgressSectionTest {
                 clickText(root, header)
                 awaitUi(root) { capacityLabel in texts(root) }
                 assertTrue(activity.getString(R.string.project_progress_bind) in texts(root))
+                clickText(root, activity.getString(R.string.project_settings_capacity_details))
+                awaitUi(root) { activity.getString(R.string.project_progress_capacity_value, 2000, 2048, 12, 1_000_000, 16_777_216) in texts(root) }
                 assertTrue(activity.getString(R.string.project_progress_capacity_value, 2000, 2048, 12, 1_000_000, 16_777_216) in texts(root))
                 assertTrue(warning in texts(root))
                 assertTrue(operations.isEmpty())

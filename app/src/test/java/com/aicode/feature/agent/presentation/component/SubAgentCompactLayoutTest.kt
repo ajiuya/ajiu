@@ -112,9 +112,13 @@ class SubAgentCompactLayoutTest {
     }
 
     @Test
-    fun collapsedGroupReportsEveryRealStateAndAllNamesThenExpandsEveryChild() {
+    fun collapsedGroupExpandsToCompactMemberRowsInsideTheSameCard() {
         val summaries = SubAgentInteractionStatus.entries.map { status ->
-            SubAgentInteractionSummary(status.name, agentName = "Agent ${status.ordinal}", title = "Task ${status.ordinal}", status = status)
+            SubAgentInteractionSummary(
+                status.name, agentName = "Agent ${status.ordinal}", title = "Task ${status.ordinal}", status = status,
+                latestPreview = "Public summary ${status.ordinal}", currentToolTitle = "Inspect source ${status.ordinal}",
+                startedAtMs = 1_000, finishedAtMs = 4_000, lastActivityAtMs = status.ordinal.toLong(),
+            )
         }
         val capsules = summaries.map { SubAgentTimelineCapsule(it.subSessionId, null, it.title, fallbackAgentName = it.agentName) }
         val labels = mutableMapOf<SubAgentInteractionStatus, String>()
@@ -129,30 +133,44 @@ class SubAgentCompactLayoutTest {
                 summaries.forEach { labels[it.status] = subAgentStatusLabel(it.status) }
                 Column(verticalArrangement = Arrangement.spacedBy(Spacing.sm)) {
                     SubAgentGroupCapsule(capsules + capsules.first(), expansion.expanded, expansion::toggle)
-                    if (expansion.expanded) summaries.forEach { summary ->
-                        key(summary.subSessionId) { SubAgentInteractionCapsule(summary.subSessionId, fallbackAgentName = summary.agentName) }
-                    }
                 }
             }
         }) {
             val names = summaries.joinToString(" · ") { it.agentName!! }
-            assertTrue(hasText(names))
+            assertTrue(hasText("Agent 2 · Inspect source 2"))
+            assertTrue(hasText(formatToolDuration(3_000L)))
+            assertFalse(hasText(names))
             assertTrue(hasText(activity.getString(R.string.subagent_group_total_count, 8)))
-            summaries.forEach { summary ->
-                assertTrue(hasText(activity.getString(R.string.subagent_group_status_count, labels.getValue(summary.status), 1)))
-            }
+            val compactStatusSummary = buildList {
+                add("● 2 ${activity.getString(R.string.subagent_group_compact_running)}")
+                add("● 1 ${activity.getString(R.string.subagent_group_compact_completed)}")
+                add("● 1 ${activity.getString(R.string.subagent_group_compact_waiting)}")
+                SubAgentInteractionStatus.entries
+                    .filter { it !in setOf(
+                        SubAgentInteractionStatus.QUEUED,
+                        SubAgentInteractionStatus.RUNNING,
+                        SubAgentInteractionStatus.COMPLETED,
+                        SubAgentInteractionStatus.AWAITING_CONFIRMATION,
+                    ) }
+                    .filter { status -> summaries.any { it.status == status } }
+                    .forEach { status -> add("● 1 ${labels.getValue(status)}") }
+            }.joinToString(" · ")
+            assertTrue(hasText(compactStatusSummary))
             val group = clickNode(activity.getString(R.string.subagent_group_title))
+            assertTrue(group.boundsInRoot.height <= 72f)
             val description = group.config.getOrNull(SemanticsProperties.StateDescription).orEmpty()
             summaries.forEach { summary ->
                 assertTrue(description.contains(activity.getString(R.string.subagent_group_member_status, summary.agentName, labels.getValue(summary.status))))
             }
             assertEquals(0, sourceReads)
             click(group)
-            awaitUi { summaries.all { hasText(it.title) } }
+            awaitUi { summaries.all { hasText("${it.title} · ${labels.getValue(it.status)}") } }
             assertEquals(8, summaries.count { hasText(it.agentName!!) })
+            assertTrue(nodes().none { it.config.contains(SemanticsProperties.ProgressBarRangeInfo) })
+            assertFalse(hasText(activity.getString(R.string.subagent_interaction_counts, 2, 5)))
             assertEquals(0, sourceReads)
             clickText(activity.getString(R.string.subagent_group_title))
-            awaitUi { hasText(names) && summaries.none { hasText(it.title) } }
+            awaitUi { hasText(compactStatusSummary) && summaries.none { hasText("${it.title} · ${labels.getValue(it.status)}") } }
         }
     }
 

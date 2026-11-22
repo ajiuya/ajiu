@@ -13,6 +13,9 @@ import com.aicode.feature.settings.data.repository.ExecutionModeHolder
 import com.aicode.feature.workspace.data.repository.WorkspaceRepository
 import com.aicode.feature.workspace.domain.FileAccessProvider
 import com.aicode.feature.workspace.domain.LocalFileAccess
+import com.aicode.feature.workspace.domain.LocalFolderGrantRepository
+import com.aicode.feature.workspace.domain.WorkspaceExecutionContextFactory
+import com.aicode.feature.workspace.domain.isLocalFolderPath
 import dagger.hilt.android.qualifiers.ApplicationContext
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -22,13 +25,17 @@ import java.security.MessageDigest
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.mapLatest
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.onStart
 
 @Singleton
+@OptIn(ExperimentalCoroutinesApi::class)
 class ToolPreviewFileAccessAdapter @Inject constructor(
     private val access: FileAccessProvider,
     private val local: LocalFileAccess,
@@ -36,15 +43,46 @@ class ToolPreviewFileAccessAdapter @Inject constructor(
     connection: RemoteSshConnection,
     workspaces: WorkspaceRepository,
     settings: ContainerSettingsRepository,
+    localFolders: LocalFolderGrantRepository,
+    executionFactory: WorkspaceExecutionContextFactory,
     @param:ApplicationContext context: Context,
 ) {
     private val images = File(context.cacheDir.canonicalFile, ToolPreviewImageCache.DIRECTORY)
     private val imageAliases = listOf(File(context.cacheDir, ToolPreviewImageCache.DIRECTORY).absolutePath)
 
-    val readers: Flow<PreviewFileReader?> = combine(
-        mode.mode, connection.connectionState, workspaces.current, settings.activeProfileIdFlow
-    ) { _, _, _, _ -> captureToolPreviewFileReader(access, local, images, imageAliases) }
-        .onStart { emit(null) }.flowOn(Dispatchers.IO)
+    private val executionChanges = combine(
+        mode.mode, connection.connectionState, workspaces.current,
+        settings.activeProfileIdFlow, settings.activeProfileSelectionRevisions
+    ) { _, _, _, _, _ -> Unit }
+
+    val readers: Flow<PreviewFileReader?> = combine(executionChanges, localFolders.snapshots) { _, _ -> Unit }
+        .mapLatest {
+            try {
+                val execution = executionFactory.freeze()
+                val roots = execution.localFolderSnapshot
+                val reader = execution.useCaptured {
+                    captureToolPreviewFileReader(access, local, images, imageAliases,
+                        sourceSuffix = ":local-roots:${roots.revision}",
+                        capturedIsCurrent = { path ->
+                            try {
+                                execution.checkCurrent()
+                                if (isLocalFolderPath(path)) roots.rootFor(path)
+                                true
+                            } catch (_: CancellationException) {
+                                false
+                            }
+                        })
+                }
+                reader?.let { captured ->
+                    PreviewFileReader(captured.source) { path -> execution.useCaptured { captured.readVersionedFile(path) } }
+                }
+            } catch (cancelled: CancellationException) {
+                kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                null
+            } catch (_: Exception) {
+                null
+            }
+        }.onStart { emit(null) }.flowOn(Dispatchers.IO)
 }
 
 internal fun captureToolPreviewFileReader(
@@ -52,6 +90,8 @@ internal fun captureToolPreviewFileReader(
     local: FileAccessProvider?,
     privateImages: File,
     privateAliases: List<String> = emptyList(),
+    sourceSuffix: String = "",
+    capturedIsCurrent: (String) -> Boolean = { true },
 ): PreviewFileReader? {
     val source = try {
         access.cacheIdentity()
@@ -60,22 +100,24 @@ internal fun captureToolPreviewFileReader(
     } catch (_: Exception) {
         return null
     }
-    return PreviewFileReader(source) { path ->
+    val cacheSource = source + sourceSuffix
+    return PreviewFileReader(cacheSource) { path ->
         try {
-            if (isPrivatePreviewImagePath(privateImages, path) || privateAliases.any { alias ->
+            if (!capturedIsCurrent(path)) null
+            else if (isPrivatePreviewImagePath(privateImages, path) || privateAliases.any { alias ->
                     isPrivatePreviewImagePath(File(alias), path)
                 }) {
                 readPrivatePreviewImage(privateImages, path)
             } else if (access.cacheIdentity() != source) {
                 null
-            } else if (source.startsWith("local:") && local != null && local.cacheIdentity() == source) {
+            } else if (!isLocalFolderPath(path) && source.startsWith("local:") && local != null && local.cacheIdentity() == source) {
                 val file = local.copyToLocal(path).canonicalFile
-                fun sameTarget(): Boolean = access.cacheIdentity() == source && local.cacheIdentity() == source &&
+                fun sameTarget(): Boolean = capturedIsCurrent(path) && access.cacheIdentity() == source && local.cacheIdentity() == source &&
                     local.copyToLocal(path).canonicalFile == file && access.cacheIdentity() == source
                 if (!file.isFile || file.length() !in 1..MAX_PREVIEW_FILE_BYTES.toLong() || !sameTarget()) null else {
                     val version = local.fingerprint(path)
                     if (version == null || !sameTarget()) null else PreviewImageFile(
-                        PreviewImageKey(source, path, version), file,
+                        PreviewImageKey(cacheSource, path, version), file,
                         isCurrent = { sameTarget() && local.fingerprint(path) == version && sameTarget() },
                         isSameTarget = ::sameTarget,
                     )
@@ -83,9 +125,9 @@ internal fun captureToolPreviewFileReader(
             } else {
                 access.openRead(path, source).use { stream ->
                     val bytes = readPreviewBytes(stream, MAX_PREVIEW_FILE_BYTES)
-                    if (bytes == null || access.cacheIdentity() != source) null
-                    else PreviewImageBytes(PreviewImageKey(source, path, previewBytesHash(bytes)), bytes,
-                        isCurrent = { access.cacheIdentity() == source })
+                    if (bytes == null || !capturedIsCurrent(path) || access.cacheIdentity() != source) null
+                    else PreviewImageBytes(PreviewImageKey(cacheSource, path, previewBytesHash(bytes)), bytes,
+                        isCurrent = { capturedIsCurrent(path) && access.cacheIdentity() == source })
                 }
             }
         } catch (cancelled: CancellationException) {

@@ -14,6 +14,22 @@ sealed interface RunState {
 /** 后台任务完成通知携带的终端输出行数。 */
 const val TAIL_LINES = 50
 
+/** 对外暴露的终端快照上限，避免超宽终端行或异常输出长期占用应用堆。 */
+const val MAX_TERMINAL_OUTPUT_CHARS = 256 * 1024
+
+/** 保留开头与结尾，限制终端快照的字符数。 */
+internal fun boundTerminalOutput(output: String, maxChars: Int = MAX_TERMINAL_OUTPUT_CHARS): String {
+    require(maxChars > 0)
+    if (output.length <= maxChars) return output
+    val headChars = maxChars / 2
+    val tailChars = maxChars - headChars
+    return buildString(maxChars + 64) {
+        append(output, 0, headChars)
+        append("\n\n…[terminal output truncated; head and tail kept]…\n\n")
+        append(output, output.length - tailChars, output.length)
+    }
+}
+
 /** 截取终端 transcript 的最后 n 行；null 输入返回 null。 */
 fun String?.takeTailLines(n: Int): String? =
     this?.lines()?.takeLast(n)?.joinToString("\n")
@@ -55,7 +71,9 @@ class TerminalTab(
     val client: com.termux.terminal.TerminalSessionClient? = null,
     runState: RunState,
     val sourceMode: String? = null,
-    val channelGeneration: String? = null
+    val channelGeneration: String? = null,
+    val ownerPluginId: String? = null,
+    val ownerResourceId: String? = null
 ) {
     var title: String = title
         internal set
@@ -80,7 +98,7 @@ class TerminalTab(
         val emulator = session.emulator
         val screen = emulator?.screen
         return outputState.read(screen, emulator?.mColumns ?: 0, emulator?.mRows ?: 0) {
-            screen?.transcriptText?.trimEnd('\n') ?: ""
+            boundTerminalOutput(screen?.transcriptText?.trimEnd('\n') ?: "")
         }
     }
 

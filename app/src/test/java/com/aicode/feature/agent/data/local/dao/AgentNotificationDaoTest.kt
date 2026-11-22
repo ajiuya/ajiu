@@ -15,6 +15,7 @@ import com.aicode.feature.agent.domain.notification.PendingNotification
 import com.aicode.feature.agent.domain.subagent.SubAgentEvent
 import com.aicode.feature.agent.domain.subagent.SubAgentEventType
 import com.aicode.feature.agent.domain.subagent.SubAgentInteractionJournal
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -92,6 +93,18 @@ class AgentNotificationDaoTest {
         }
         assertEquals(listOf(newer), center.peek("parent").map { it.seq })
         assertEquals(listOf(foreign), center.peek("child").map { it.seq })
+    }
+
+    @Test
+    fun timelineIncludesDeliveredRowsOnlyForTheCurrentGeneration() = runBlocking {
+        val center = AgentNotificationCenter(dao)
+        val seq = center.enqueue("parent", notification("timeline"))
+        center.ack("parent", listOf(seq))
+
+        assertEquals(listOf(seq), dao.observeTimeline("parent").first().map { it.seq })
+
+        sessions.upsert(sessions.getById("parent")!!.copy(executionGeneration = 1))
+        assertTrue(dao.observeTimeline("parent").first().isEmpty())
     }
 
     @Test

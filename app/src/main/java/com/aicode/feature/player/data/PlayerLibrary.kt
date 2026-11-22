@@ -2,8 +2,6 @@ package com.aicode.feature.player.data
 
 import com.aicode.feature.player.domain.PlayerMediaTypes
 import com.aicode.feature.workspace.domain.FileEntry
-import com.aicode.feature.workspace.domain.LocalFileAccess
-import com.aicode.feature.workspace.domain.RemoteSftpFileAccess
 import kotlinx.serialization.json.*
 import java.io.File
 import java.io.IOException
@@ -69,19 +67,13 @@ internal class PlayerLibrary(
     }
     fun checkedPath(raw: String): String = execution.run { checked(raw) }
     private fun checkRemote(path: String) {
-        (access as? RemoteSftpFileAccess)?.checkPlaybackPath(path, root, execution.identity)
+        execution.checkPlaybackPath(path, root)
     }
-    private fun displayedFile(file: File): String = when (val backend = access) {
-        is LocalFileAccess -> backend.toDisplayPath(file.canonicalFile)
-        else -> backend.toDisplayPath(file.canonicalPath)
-    }
+    private fun displayedFile(file: File): String = execution.displayedFile(file)
     private fun safeEntry(entry: FileEntry): Boolean {
         if (entry.name.isEmpty() || entry.name in setOf(".", "..") || '/' in entry.name || '\\' in entry.name || entry.name.any { it.code < 32 }) return false
         val local = entry.localFile ?: return true
-        val resolved = when (val backend = access) {
-            is LocalFileAccess -> backend.copyToLocal(backend.toDisplayPath(local))
-            else -> local
-        }
+        val resolved = execution.resolveLocalEntry(local)
         return withinRoot(containerPath(displayedFile(resolved)), root)
     }
     fun json(requestedRoot: String = root): JsonObject = execution.run {
@@ -223,8 +215,7 @@ internal class PlayerLibrary(
     }
     private fun copyRemote(path: String, flight: Flight, file: File, expected: Long, reservation: PlayerCopyBudget.Reservation) {
         checkFlight(flight)
-        val input = (access as? RemoteSftpFileAccess)?.openPlaybackRead(path, root, execution.identity)
-            ?: access.openRead(path, execution.identity)
+        val input = execution.openPlaybackRead(path, root)
         synchronized(copies) {
             if (closed || flight.cancelled) { input.close(); throw IOException("Player copy cancelled") }
             flight.stream = input

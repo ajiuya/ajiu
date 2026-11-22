@@ -17,8 +17,14 @@ import javax.inject.Singleton
 class ExecutionModeHolder @Inject constructor() {
     private val _mode = MutableStateFlow(ExecutionMode.LOCAL_PROOT)
     val mode: StateFlow<ExecutionMode> = _mode.asStateFlow()
+    private val _selectionRevisions = MutableStateFlow(0L)
+    internal val modeSelectionRevisions = _selectionRevisions.asStateFlow()
+    internal val modeSelectionRevision: Long get() = _selectionRevisions.value
 
+    @Synchronized
     fun setMode(mode: ExecutionMode) {
+        if (_mode.value == mode) return
+        _selectionRevisions.value++
         _mode.value = mode
     }
 

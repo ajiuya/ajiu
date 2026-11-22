@@ -16,6 +16,8 @@ import com.aicode.feature.settings.data.repository.ExecutionModeHolder
 import dagger.hilt.android.qualifiers.ApplicationContext
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.CancellationException
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -40,6 +42,12 @@ class SystemPromptProvider @Inject constructor(
     private val agentDefinitionRepository: AgentDefinitionRepository,
     private val executionModeHolder: ExecutionModeHolder
 ) {
+    private val restoredContentRevision = AtomicLong()
+
+    fun invalidateAfterBackupRestore() {
+        restoredContentRevision.incrementAndGet()
+    }
+
     // 抽象独立的 Source
     interface PromptSource {
         fun build(ctx: AgentContext): String?
@@ -57,17 +65,31 @@ class SystemPromptProvider @Inject constructor(
         private val cachedByKey = ConcurrentHashMap<SourceCacheKey, String>()
 
         override fun build(ctx: AgentContext): String? {
-            val key = SourceCacheKey(ctx.sessionId, ctx.projectRoot)
+            val source = try { skillRepository.sourceIdentity() } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                return null
+            }
+            val key = SourceCacheKey(ctx.sessionId, ctx.projectRoot, sourceIdentity = source,
+                restoredContentVersion = restoredContentRevision.get())
             val cached = cachedByKey[key]
-            if (cached != null) return cached.ifEmpty { null }
-            val skills = try { skillRepository.listSkills() } catch (e: Exception) { return null }
+            if (cached != null) {
+                skillRepository.checkSourceIdentity(source)
+                return cached.ifEmpty { null }
+            }
+            val skills = try { skillRepository.listSkills() } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                return null
+            }
+            skillRepository.checkSourceIdentity(source)
             if (skills.isEmpty()) {
                 cachedByKey[key] = ""
+                trimIfNeeded()
                 return null
             }
 
             val list = skills.joinToString("\n") { "- ${it.name}: ${it.description.ifBlank { "（无描述）" } }" }
             val content = list
+            skillRepository.checkSourceIdentity(source)
             cachedByKey[key] = content
             trimIfNeeded()
             return content
@@ -96,21 +118,32 @@ class SystemPromptProvider @Inject constructor(
         private val cachedByKey = ConcurrentHashMap<SourceCacheKey, String>()
 
         override fun build(ctx: AgentContext): String? {
+            val source = try { agentDefinitionRepository.sourceIdentity() } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                return null
+            }
             val key = SourceCacheKey(
                 ctx.sessionId,
                 ctx.projectRoot,
-                agentDefinitionRepository.definitionsVersion
+                agentDefinitionRepository.definitionsVersion,
+                source
             )
             val cached = cachedByKey[key]
-            if (cached != null) return cached.ifEmpty { null }
+            if (cached != null) {
+                agentDefinitionRepository.checkSourceIdentity(source)
+                return cached.ifEmpty { null }
+            }
             val entries = try {
                 agentDefinitionRepository.listEnabled()
             } catch (e: Exception) {
+                if (e is CancellationException) throw e
                 FileLogger.w(TAG, "扫描子代理定义失败: ${e.message}", e)
                 return null
             }
+            agentDefinitionRepository.checkSourceIdentity(source)
             if (entries.isEmpty()) {
                 cachedByKey[key] = ""
+                trimIfNeeded()
                 return null
             }
 
@@ -121,6 +154,7 @@ class SystemPromptProvider @Inject constructor(
                     "｜${definition.capabilitySummary()}"
             }
             val content = list
+            agentDefinitionRepository.checkSourceIdentity(source)
             cachedByKey[key] = content
             trimIfNeeded()
             return content
@@ -204,7 +238,7 @@ class SystemPromptProvider @Inject constructor(
         private val cachedByKey = ConcurrentHashMap<SourceCacheKey, MemoryLists>()
 
         fun build(ctx: AgentContext): MemoryLists {
-            val key = SourceCacheKey(ctx.sessionId, ctx.projectRoot)
+            val key = SourceCacheKey(ctx.sessionId, ctx.projectRoot, restoredContentVersion = restoredContentRevision.get())
             cachedByKey[key]?.let { return it }
             val memories = try { memoryRepository.listMemories(ctx.projectRoot) } catch (e: Exception) {
                 return MemoryLists(null, null)
@@ -235,7 +269,9 @@ class SystemPromptProvider @Inject constructor(
     private data class SourceCacheKey(
         val sessionId: String?,
         val projectRoot: String,
-        val definitionVersion: Long = 0
+        val definitionVersion: Long = 0,
+        val sourceIdentity: String = "",
+        val restoredContentVersion: Long = 0
     )
 
     private val staticRuleSource = StaticRuleSource()

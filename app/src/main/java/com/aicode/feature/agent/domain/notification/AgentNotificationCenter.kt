@@ -5,6 +5,10 @@ import com.aicode.feature.agent.data.local.entity.AgentNotificationEntity
 import java.util.UUID
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.emitAll
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.Serializable
@@ -16,7 +20,16 @@ import kotlinx.serialization.json.Json
 enum class AgentNotificationKind { BACKGROUND_TASK, SUBAGENT, AGENT_MESSAGE, USER_MESSAGE }
 
 @Serializable
+enum class AgentMessageAction { MESSAGE, ADD_INSTRUCTION, CORRECTION }
+
+@Serializable
 enum class NotificationOutcome { COMPLETED, FAILED, STOPPED }
+
+data class AgentNotificationTimelineEntry(
+    val seq: Long,
+    val createdAt: Long,
+    val notification: PendingNotification,
+)
 
 @Serializable
 data class PendingNotification(
@@ -30,6 +43,8 @@ data class PendingNotification(
     val detail: String? = null,
     val message: String? = null,
     val fromParent: Boolean = false,
+    val action: AgentMessageAction = AgentMessageAction.MESSAGE,
+    val targetTitle: String? = null,
     val resultExcerpt: String? = null,
     val changedFiles: List<String> = emptyList(),
     val seq: Long = 0,
@@ -88,6 +103,13 @@ class AgentNotificationCenter private constructor(
         return store.pending(sessionId, requiresConfirmation = true).map(::decode)
     }
 
+    fun observeTimeline(sessionId: String): Flow<List<AgentNotificationTimelineEntry>> = flow {
+        initialize()
+        emitAll(store.observeTimeline(sessionId).map { rows ->
+            rows.map { row -> AgentNotificationTimelineEntry(row.seq, row.createdAt, decode(row)) }
+        })
+    }
+
     suspend fun pendingRecipientIds(): List<String> {
         initialize()
         return store.pendingRecipientIds()
@@ -142,6 +164,7 @@ private interface AgentNotificationStore {
     suspend fun sessionGeneration(sessionId: String): Long?
     suspend fun enqueue(notification: AgentNotificationEntity): Long
     suspend fun pending(sessionId: String, requiresConfirmation: Boolean): List<AgentNotificationEntity>
+    fun observeTimeline(sessionId: String): Flow<List<AgentNotificationEntity>>
     suspend fun pendingCount(sessionId: String): Int
     suspend fun pendingRecipientIds(): List<String>
     suspend fun requirePendingConfirmation()
@@ -157,6 +180,7 @@ private class RoomAgentNotificationStore(private val dao: AgentNotificationDao) 
     override suspend fun sessionGeneration(sessionId: String) = dao.sessionGeneration(sessionId)
     override suspend fun enqueue(notification: AgentNotificationEntity) = dao.enqueue(notification)
     override suspend fun pending(sessionId: String, requiresConfirmation: Boolean) = dao.pending(sessionId, requiresConfirmation)
+    override fun observeTimeline(sessionId: String) = dao.observeTimeline(sessionId)
     override suspend fun pendingCount(sessionId: String) = dao.pendingCount(sessionId)
     override suspend fun pendingRecipientIds() = dao.pendingRecipientIds()
     override suspend fun requirePendingConfirmation() { dao.requirePendingConfirmation() }
@@ -188,6 +212,10 @@ private class InMemoryAgentNotificationStore : AgentNotificationStore {
     }
 
     private fun AgentNotificationEntity.isPending() = deliveredAt == null && retiredAt == null
+
+    override fun observeTimeline(sessionId: String): Flow<List<AgentNotificationEntity>> = flow {
+        emit(mutex.withLock { rows.filter { it.sessionId == sessionId && it.retiredAt == null }.toList() })
+    }
 
     override suspend fun pending(sessionId: String, requiresConfirmation: Boolean) = mutex.withLock {
         rows.filter { it.sessionId == sessionId && it.isPending() && it.requiresConfirmation == requiresConfirmation }

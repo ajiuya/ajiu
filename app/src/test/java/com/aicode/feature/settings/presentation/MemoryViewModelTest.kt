@@ -81,6 +81,7 @@ class MemoryViewModelTest {
         viewModel.create("entry", "", "body", MemoryScope.GLOBAL); settle()
         verify(exactly = 1) { repository.createOnly(MemoryStorageTarget(File("/global"), null), MemoryScope.GLOBAL, "entry", "", "body") }
         assertFalse(viewModel.state.value.creating)
+        assertEquals(MemoryScope.GLOBAL, viewModel.state.value.createdScope)
     }
 
     @Test fun lateListFromPreviousWorkspaceCannotPopulateThePage() {
@@ -151,6 +152,7 @@ class MemoryViewModelTest {
         verify(exactly = 1) { repository.createOnly(firstTarget, MemoryScope.PROJECT, "entry", "", "body") }
         assertTrue(viewModel.state.value.targetChanged)
         assertTrue(viewModel.state.value.entries.isEmpty())
+        assertNull(viewModel.state.value.createdScope)
     }
 
     @Test fun sameRemotePathOnADifferentServerInvalidatesThePage() {
@@ -198,6 +200,7 @@ class MemoryViewModelTest {
         assertTrue(viewModel.state.value.creating)
         assertFalse(viewModel.state.value.saving)
         assertEquals(MemoryManagementError.NAME_CONFLICT, viewModel.state.value.error)
+        assertNull(viewModel.state.value.createdScope)
     }
 
     @Test fun deleteRequiresConfirmationAndPassesTheExactVersionAndScope() {
@@ -253,6 +256,167 @@ class MemoryViewModelTest {
         assertNull(viewModel.state.value.error)
         viewModel.closeDetail()
         assertFalse(viewModel.state.value.detailLoading)
+    }
+
+    @Test fun openingAndRefreshingTheListNeverReadAnyFullMemoryBody() {
+        val global = entry.copy(scope = MemoryScope.GLOBAL, version = "global-version")
+        every { repository.listEntries(any()) } returns MemoryManagementResult.Success(listOf(global, entry))
+        viewModel.open(); settle()
+        assertEquals(listOf(global, entry), viewModel.state.value.entries)
+        assertNull(viewModel.state.value.document)
+        verify(exactly = 0) { repository.readEntry(any(), any()) }
+        viewModel.refresh(); settle()
+        val target = MemoryStorageTarget(File("/global"), File("/first/.aicode/memory"))
+        verify(exactly = 2) { repository.listEntries(target) }
+        verify(exactly = 0) { repository.readEntry(any(), any()) }
+        verify(exactly = 0) { repository.createOnly(any(), any(), any(), any(), any()) }
+        verify(exactly = 0) { repository.deleteEntry(any(), any()) }
+        assertEquals(listOf(global, entry), viewModel.state.value.entries)
+        assertNull(viewModel.state.value.createdScope)
+    }
+
+    @Test fun successfulCreatePublishesTheExactScopeAndConsumptionOnlyClearsThatEvent() {
+        viewModel.open(); settle()
+        val target = MemoryStorageTarget(File("/global"), File("/first/.aicode/memory"))
+        MemoryScope.entries.forEach { scope ->
+            viewModel.startCreate()
+            viewModel.create("new-${scope.name}", "summary", "# Markdown", scope)
+            assertTrue(viewModel.state.value.saving)
+            assertNull(viewModel.state.value.createdScope)
+            settle()
+            assertEquals(scope, viewModel.state.value.createdScope)
+            assertFalse(viewModel.state.value.creating)
+            assertFalse(viewModel.state.value.saving)
+            verify(exactly = 1) { repository.createOnly(target, scope, "new-${scope.name}", "summary", "# Markdown") }
+            val before = viewModel.state.value
+            viewModel.consumeCreatedScope()
+            assertEquals(before.copy(createdScope = null), viewModel.state.value)
+            viewModel.consumeCreatedScope()
+            assertEquals(before.copy(createdScope = null), viewModel.state.value)
+        }
+        verify(exactly = 2) { repository.createOnly(any(), any(), any(), any(), any()) }
+        verify(exactly = 0) { repository.deleteEntry(any(), any()) }
+    }
+
+    @Test fun failedCreateKeepsItsScopeAndNeverRetriesInTheOtherStorage() {
+        every { repository.createOnly(any(), any(), any(), any(), any()) } returns
+            MemoryManagementResult.Failure(MemoryManagementError.IO_FAILED)
+        viewModel.open(); settle()
+        MemoryScope.entries.forEach { scope ->
+            viewModel.startCreate()
+            viewModel.create("failed-${scope.name}", "summary", "body", scope); settle()
+            assertTrue(viewModel.state.value.creating)
+            assertFalse(viewModel.state.value.saving)
+            assertEquals(MemoryManagementError.IO_FAILED, viewModel.state.value.error)
+            assertNull(viewModel.state.value.createdScope)
+            verify(exactly = 1) { repository.createOnly(any(), scope, "failed-${scope.name}", "summary", "body") }
+            verify(exactly = 0) { repository.createOnly(any(), if (scope == MemoryScope.GLOBAL) MemoryScope.PROJECT else MemoryScope.GLOBAL,
+                "failed-${scope.name}", any(), any()) }
+        }
+        verify(exactly = 2) { repository.createOnly(any(), any(), any(), any(), any()) }
+    }
+
+    @Test fun cancelingDeleteConfirmationRetainsTheExactDocumentAndNeverDeletes() {
+        viewModel.open(); settle()
+        viewModel.openDetail(entry); settle()
+        viewModel.requestDelete(document.entry)
+        assertEquals(document.entry, viewModel.state.value.pendingDelete)
+        verify(exactly = 0) { repository.deleteEntry(any(), any()) }
+        viewModel.dismissDelete()
+        viewModel.confirmDelete(); settle()
+        assertNull(viewModel.state.value.pendingDelete)
+        assertFalse(viewModel.state.value.deleting)
+        assertEquals(document, viewModel.state.value.document)
+        assertEquals(entry, viewModel.state.value.selectedEntry)
+        verify(exactly = 0) { repository.deleteEntry(any(), any()) }
+    }
+
+    @Test fun sameNamedDetailsAndDeletesAlwaysUseTheirOwnScopeAndFreshVersion() {
+        val global = entry.copy(scope = MemoryScope.GLOBAL, version = "global-list-version")
+        val project = entry.copy(version = "project-list-version")
+        every { repository.listEntries(any()) } returns MemoryManagementResult.Success(listOf(global, project))
+        every { repository.readEntry(any(), any()) } answers {
+            val selected = secondArg<MemoryEntry>()
+            MemoryManagementResult.Success(MemoryDocument(selected.copy(version = "${selected.scope.name}-fresh"),
+                "# ${selected.scope.name}\n\n**Complete** Markdown"))
+        }
+        viewModel.open(); settle()
+        listOf(project, global).forEach { selected ->
+            viewModel.openDetail(selected); settle()
+            verify(exactly = 1) { repository.readEntry(any(), selected) }
+            val fresh = selected.copy(version = "${selected.scope.name}-fresh")
+            assertEquals(fresh, viewModel.state.value.document?.entry)
+            assertEquals(fresh, viewModel.state.value.selectedEntry)
+            viewModel.requestDelete(fresh)
+            assertEquals(fresh, viewModel.state.value.pendingDelete)
+            verify(exactly = 0) { repository.deleteEntry(any(), fresh) }
+            viewModel.confirmDelete(); settle()
+            verify(exactly = 1) { repository.deleteEntry(any(), fresh) }
+            verify(exactly = 0) { repository.deleteEntry(any(), selected) }
+            assertNull(viewModel.state.value.document)
+            assertNull(viewModel.state.value.selectedEntry)
+        }
+        verify(exactly = 2) { repository.deleteEntry(any(), any()) }
+    }
+
+    @Test fun reopeningThePageClearsAnUnconsumedCreatedScopeWithoutAnotherWrite() {
+        viewModel.open(); settle()
+        viewModel.startCreate()
+        viewModel.create("created", "summary", "body", MemoryScope.GLOBAL); settle()
+        assertEquals(MemoryScope.GLOBAL, viewModel.state.value.createdScope)
+        viewModel.close()
+        current.value = Workspace("second", "/second")
+        viewModel.open(); settle()
+        assertNull(viewModel.state.value.createdScope)
+        assertEquals("second", viewModel.state.value.projectName)
+        assertFalse(viewModel.state.value.targetChanged)
+        verify(exactly = 1) { repository.createOnly(any(), MemoryScope.GLOBAL, "created", "summary", "body") }
+        verify(exactly = 1) { repository.createOnly(any(), any(), any(), any(), any()) }
+    }
+
+    @Test fun consumingCreatedScopeCannotAuthorizeWritesAfterAnIdentityChange() {
+        viewModel.open(); settle()
+        viewModel.startCreate()
+        viewModel.create("created", "", "body", MemoryScope.GLOBAL); settle()
+        viewModel.consumeCreatedScope()
+        current.value = Workspace("second", "/second")
+        viewModel.create("blocked", "", "body", MemoryScope.PROJECT); settle()
+        assertTrue(viewModel.state.value.targetChanged)
+        assertNull(viewModel.state.value.createdScope)
+        verify(exactly = 0) { repository.createOnly(any(), any(), "blocked", any(), any()) }
+        verify(exactly = 1) { repository.createOnly(any(), any(), any(), any(), any()) }
+    }
+
+    @Test fun lateDeleteSuccessCannotLeaveOldMetadataOrACreatedScopeInTheNewEnvironment() {
+        viewModel.open(); settle()
+        viewModel.openDetail(entry); settle()
+        every { repository.deleteEntry(any(), any()) } answers {
+            current.value = Workspace("second", "/second")
+            MemoryManagementResult.Success(Unit)
+        }
+        viewModel.requestDelete(document.entry)
+        viewModel.confirmDelete(); settle()
+        verify(exactly = 1) { repository.deleteEntry(MemoryStorageTarget(File("/global"), File("/first/.aicode/memory")), entry) }
+        assertTrue(viewModel.state.value.targetChanged)
+        assertNull(viewModel.state.value.document)
+        assertNull(viewModel.state.value.selectedEntry)
+        assertNull(viewModel.state.value.pendingDelete)
+        assertNull(viewModel.state.value.createdScope)
+        assertTrue(viewModel.state.value.entries.isEmpty())
+    }
+
+    @Test fun rejectedProjectCreationPublishesNoScopeAndConsumptionDoesNotClearItsError() {
+        current.value = null
+        viewModel.open(); settle()
+        viewModel.startCreate()
+        viewModel.create("entry", "summary", "body", MemoryScope.PROJECT)
+        assertEquals(MemoryManagementError.NO_WORKSPACE, viewModel.state.value.error)
+        assertNull(viewModel.state.value.createdScope)
+        val before = viewModel.state.value
+        viewModel.consumeCreatedScope()
+        assertEquals(before, viewModel.state.value)
+        assertTrue(viewModel.state.value.creating)
+        verify(exactly = 0) { repository.createOnly(any(), any(), any(), any(), any()) }
     }
 
     private fun config(host: String, port: Int = 22, username: String = "user", root: String = "/root-path"): RemoteConnectionConfig = mockk {

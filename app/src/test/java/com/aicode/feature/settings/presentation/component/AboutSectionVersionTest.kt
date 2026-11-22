@@ -1,5 +1,9 @@
 package com.aicode.feature.settings.presentation.component
 
+import com.aicode.core.util.compareVersions
+import com.aicode.core.util.isUpToDate
+import com.aicode.core.util.parseVersionTag
+import com.aicode.core.util.splitVersion
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull

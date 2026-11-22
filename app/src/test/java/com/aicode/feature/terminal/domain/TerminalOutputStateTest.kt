@@ -13,6 +13,16 @@ import org.junit.Test
 
 class TerminalOutputStateTest {
     @Test
+    fun terminalSnapshotsKeepBothEndsWithinTheMemoryBudget() {
+        val source = "head-" + "x".repeat(MAX_TERMINAL_OUTPUT_CHARS * 2) + "-tail"
+        val bounded = boundTerminalOutput(source)
+
+        assertTrue(bounded.length <= MAX_TERMINAL_OUTPUT_CHARS + 64)
+        assertTrue(bounded.startsWith("head-"))
+        assertTrue(bounded.endsWith("-tail"))
+    }
+
+    @Test
     fun silentReadsReuseTheSameSnapshotAndSameLengthChangesInvalidateIt() {
         val state = TerminalOutputState()
         val screen = Any()

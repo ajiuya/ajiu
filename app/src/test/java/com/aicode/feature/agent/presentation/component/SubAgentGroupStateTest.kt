@@ -5,14 +5,12 @@ import androidx.compose.runtime.BroadcastFrameClock
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Composition
 import androidx.compose.runtime.CompositionLocalProvider
-import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.Recomposer
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.LocalSaveableStateRegistry
 import androidx.compose.runtime.saveable.SaveableStateRegistry
-import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshots.Snapshot
 import com.aicode.feature.agent.presentation.AgentUIMessage
@@ -98,7 +96,7 @@ class SubAgentGroupStateTest {
         Runtime(this).use { runtime ->
             runtime.setContent {
                 expansion = rememberSubAgentGroupExpansion("parent", "group:one")
-                projection = projectSubAgentGroup(raw, "parent", expanded = expansion.expanded)
+                projection = projectSubAgentGroup(raw, "parent")
             }
             SubAgentInteractionStatus.entries.forEach { status ->
                 raw = listOf(child("turn:one", status.name))
@@ -113,7 +111,7 @@ class SubAgentGroupStateTest {
             runtime.settle()
             assertSame(original, expansion)
             assertTrue(expansion.expanded)
-            assertEquals(2, projection.items.size)
+            assertEquals(1, projection.items.size)
             raw = emptyList()
             runtime.settle()
             assertTrue(expansion.expanded)
@@ -184,40 +182,29 @@ class SubAgentGroupStateTest {
     }
 
     @Test
-    fun retainedTurnExpansionAndChildDraftSurviveTemporaryOwnershipGapAndRankChange() = runTest {
+    fun retainedTurnExpansionSurvivesTemporaryGroupRemovalAndRankChange() = runTest {
         val registry = SaveableStateRegistry(null, canBeSaved = { true })
         var raw by mutableStateOf(listOf(child("turn:one"), child("turn:two")))
         var activeTurn by mutableStateOf<String?>("turn:two")
         val expansions = mutableMapOf<String, StateHolderSubAgentGroupExpansion>()
-        val drafts = mutableMapOf<String, MutableState<String>>()
         lateinit var projection: SubAgentGroupProjection
         Runtime(this).use { runtime ->
             runtime.setContent {
                 CompositionLocalProvider(LocalSaveableStateRegistry provides registry) {
-                    val holder = rememberSubAgentGroupChildStateHolder("parent")
+                    val holder = rememberSaveableStateHolder()
                     val structure = projectSubAgentGroup(raw, "parent", activeTurnKey = activeTurn)
                     val current = structure.groups.associate { group ->
                         group.key to rememberRetainedSubAgentGroupExpansion("parent", group.key, holder)
                     }
                     expansions.putAll(current)
-                    projection = projectSubAgentGroup(raw, "parent", activeTurnKey = activeTurn,
-                        expansionOverrides = current.mapValues { it.value.expanded })
-                    projection.items.forEach { item ->
-                        if (item.subAgentCapsule != null) key(item.key) {
-                            holder.SaveableStateProvider(item.key) {
-                                drafts[item.key] = rememberSaveable { mutableStateOf("") }
-                            }
-                        }
-                    }
+                    projection = structure
                 }
             }
             val groupKeys = projection.groups.map { it.key }
-            val childKeys = projection.groups.map { it.childItems.single().key }
             groupKeys.forEach { expansions.getValue(it).toggle() }
             runtime.settle()
-            drafts.getValue(childKeys[0]).value = "first turn draft"
-            drafts.getValue(childKeys[1]).value = "second turn draft"
-            runtime.settle()
+            assertEquals(2, projection.items.size)
+            assertTrue(projection.items.none { it.subAgentCapsule != null })
             raw = emptyList()
             runtime.settle()
             assertTrue(projection.groups.isEmpty())
@@ -225,12 +212,11 @@ class SubAgentGroupStateTest {
             runtime.settle()
             assertEquals(groupKeys, projection.groups.map { it.key })
             assertTrue(groupKeys.all { expansions.getValue(it).expanded })
-            assertEquals("first turn draft", drafts.getValue(childKeys[0]).value)
-            assertEquals("second turn draft", drafts.getValue(childKeys[1]).value)
+            assertEquals(listOf("same"), projection.groups.first().capsules.map { it.subSessionId })
             expansions.getValue(groupKeys[0]).toggle()
             runtime.settle()
-            assertTrue(projection.bodyItems.none { it.subAgentCapsule != null })
-            assertEquals(1, projection.footerItems.count { it.subAgentCapsule != null })
+            assertTrue(projection.items.none { it.subAgentCapsule != null })
+            assertEquals(listOf(SUB_AGENT_GROUP_CONTENT_TYPE), projection.footerItems.map { it.contentType })
             activeTurn = null
             runtime.settle()
             assertTrue(projection.footerItems.isEmpty())
@@ -238,80 +224,4 @@ class SubAgentGroupStateTest {
         }
     }
 
-    @Test
-    fun childHolderDoesNotLeakDraftWhenAnotherSessionsGroupIsOpened() = runTest {
-        var session by mutableStateOf<String?>("parent-a")
-        val registry = SaveableStateRegistry(null, canBeSaved = { true })
-        lateinit var expansion: StateHolderSubAgentGroupExpansion
-        lateinit var draft: MutableState<String>
-        Runtime(this).use { runtime ->
-            runtime.setContent {
-                CompositionLocalProvider(LocalSaveableStateRegistry provides registry) {
-                    expansion = rememberSubAgentGroupExpansion(session)
-                    val holder = rememberSubAgentGroupChildStateHolder(session)
-                    if (expansion.expanded) holder.SaveableStateProvider("same-child") {
-                        draft = rememberSaveable { mutableStateOf("") }
-                    }
-                }
-            }
-            expansion.toggle()
-            runtime.settle()
-            draft.value = "private first parent"
-            runtime.settle()
-            listOf<String?>("parent-b", null, "parent-c").forEach { next ->
-                session = next
-                runtime.settle()
-                assertFalse(expansion.expanded)
-                expansion.toggle()
-                runtime.settle()
-                assertEquals("", draft.value)
-                draft.value = "private $next"
-                runtime.settle()
-            }
-        }
-    }
-
-    @Test
-    fun savedChildDraftRestoresForSameParentButNotForAnotherParent() = runTest {
-        var session = "parent-a"
-        var registry = SaveableStateRegistry(null, canBeSaved = { true })
-        lateinit var expansion: StateHolderSubAgentGroupExpansion
-        lateinit var draft: MutableState<String>
-        val root: @Composable () -> Unit = {
-            CompositionLocalProvider(LocalSaveableStateRegistry provides registry) {
-                expansion = rememberSubAgentGroupExpansion(session)
-                val holder = rememberSubAgentGroupChildStateHolder(session)
-                if (expansion.expanded) holder.SaveableStateProvider("same-child") {
-                    draft = rememberSaveable { mutableStateOf("") }
-                }
-            }
-        }
-        val saved = Runtime(this).use { runtime ->
-            runtime.setContent(root)
-            expansion.toggle()
-            runtime.settle()
-            draft.value = "saved parent-a draft"
-            runtime.settle()
-            expansion.toggle()
-            runtime.settle()
-            registry.performSave()
-        }
-        registry = SaveableStateRegistry(saved, canBeSaved = { true })
-        Runtime(this).use { runtime ->
-            runtime.setContent(root)
-            assertFalse(expansion.expanded)
-            expansion.toggle()
-            runtime.settle()
-            assertEquals("saved parent-a draft", draft.value)
-        }
-        session = "parent-b"
-        registry = SaveableStateRegistry(saved, canBeSaved = { true })
-        Runtime(this).use { runtime ->
-            runtime.setContent(root)
-            assertFalse(expansion.expanded)
-            expansion.toggle()
-            runtime.settle()
-            assertEquals("", draft.value)
-        }
-    }
 }

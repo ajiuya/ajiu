@@ -10,11 +10,15 @@ import com.aicode.feature.agent.domain.container.ContainerProfile
 import com.aicode.feature.agent.domain.container.versionFromDownloadFileName
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
+import java.util.concurrent.atomic.AtomicLong
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -73,6 +77,11 @@ class ContainerSettingsRepository @Inject constructor(
         val json = Json { ignoreUnknownKeys = true }
     }
 
+    private val profileSelectionRevision = AtomicLong()
+    private val _profileSelectionRevisions = MutableStateFlow(0L)
+    val activeProfileSelectionRevisions = _profileSelectionRevisions.asStateFlow()
+    val activeProfileSelectionRevision: Long get() = profileSelectionRevision.get()
+
     /** 当前选中的 profile id；无值时默认内置 Alpine。 */
     val activeProfileIdFlow: Flow<String> = context.containerDataStore.data.map { prefs ->
         prefs[ACTIVE_PROFILE_ID_KEY]?.takeIf { it.isNotBlank() } ?: ContainerProfile.BUILTIN_ID
@@ -101,7 +110,12 @@ class ContainerSettingsRepository @Inject constructor(
     }
 
     suspend fun setActiveProfile(id: String) {
-        context.containerDataStore.edit { it[ACTIVE_PROFILE_ID_KEY] = id }
+        context.containerDataStore.edit { prefs ->
+            val previous = prefs[ACTIVE_PROFILE_ID_KEY]?.takeIf { it.isNotBlank() } ?: ContainerProfile.BUILTIN_ID
+            if (previous != id) profileSelectionRevision.incrementAndGet()
+            prefs[ACTIVE_PROFILE_ID_KEY] = id
+        }
+        _profileSelectionRevisions.update { maxOf(it, profileSelectionRevision.get()) }
     }
 
     suspend fun setDefaultContainerId(id: String) {

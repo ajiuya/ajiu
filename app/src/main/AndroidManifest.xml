@@ -8,6 +8,7 @@
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
@@ -102,6 +103,12 @@
             android:name=".feature.terminal.domain.TerminalKeepaliveService"
             android:enabled="true"
             android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <service
+            android:name=".feature.plugin.overlay.PluginOverlayService"
+            android:exported="false"
+            android:stopWithTask="true"
             android:foregroundServiceType="dataSync" />
 
         <!-- Shizuku：用于以 adb shell 身份执行命令（UserService）。

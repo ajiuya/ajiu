@@ -7,6 +7,7 @@ import com.aicode.feature.agent.data.local.dao.SubAgentInteractionDao
 import com.aicode.feature.agent.data.local.database.AgentDatabase
 import com.aicode.feature.agent.data.local.entity.AgentMessageEntity
 import com.aicode.feature.agent.data.local.entity.SubAgentInteractionEntity
+import com.aicode.feature.agent.domain.notification.AgentMessageAction
 import com.aicode.feature.agent.domain.notification.AgentNotificationCenter
 import com.aicode.feature.agent.domain.notification.AgentNotificationKind
 import com.aicode.feature.agent.domain.notification.NotificationOutcome
@@ -228,6 +229,11 @@ class SubAgentInteractionJournal private constructor(
                     outcome = NotificationOutcome.COMPLETED,
                     message = entry.content,
                     fromParent = fromParent,
+                    action = if (fromParent) {
+                        if (entry.origin == "USER") AgentMessageAction.ADD_INSTRUCTION else AgentMessageAction.CORRECTION
+                    } else AgentMessageAction.MESSAGE,
+                    targetTitle = child?.subagentType?.takeIf { it.isNotBlank() && it != "subagent" }
+                        ?: child?.title,
                     eventId = entry.id
                 )
             }

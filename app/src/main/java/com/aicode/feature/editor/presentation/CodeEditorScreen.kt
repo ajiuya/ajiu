@@ -134,6 +134,7 @@ fun CodeEditorScreen(
     var previewMode by remember { mutableStateOf(false) }
     var cursorLine by remember { mutableStateOf(1) }
     var cursorColumn by remember { mutableStateOf(1) }
+    var pluginSelection by remember(path) { mutableStateOf("") }
     val isMarkdown = remember(path) {
         path.substringAfterLast('.', "").lowercase() in setOf("md", "markdown")
     }
@@ -304,6 +305,16 @@ fun CodeEditorScreen(
                         }
                     }
                 )
+                if (pluginSelection.isNotBlank()) {
+                    com.aicode.feature.plugin.presentation.PluginSlotContent(
+                        com.aicode.feature.plugin.domain.PluginUiSlots.EDITOR_SELECTION_MENU,
+                        kotlinx.serialization.json.buildJsonObject {
+                            put("path", kotlinx.serialization.json.JsonPrimitive(path))
+                            put("selection", kotlinx.serialization.json.JsonPrimitive(pluginSelection))
+                            put("language", kotlinx.serialization.json.JsonPrimitive(path.substringAfterLast('.', "")))
+                        }
+                    )
+                }
                 HorizontalDivider(thickness = 0.5.dp)
                 FileTitleBar(
                     fileName = path.substringAfterLast('/'),
@@ -346,6 +357,7 @@ fun CodeEditorScreen(
                         baselineText = baselineText,
                         initialLine = initialLine,
                         onBackgroundResolved = { editorBackground = it },
+                        onSelectionChanged = { pluginSelection = it },
                         onCursorChanged = { l, c ->
                             cursorLine = l
                             cursorColumn = c
@@ -520,6 +532,7 @@ private fun EditorSurface(
     initialLine: Int = 0,
     onBackgroundResolved: (Color) -> Unit,
     onCursorChanged: (line: Int, column: Int) -> Unit,
+    onSelectionChanged: (String) -> Unit,
     onContentChanged: (canUndo: Boolean, canRedo: Boolean, dirty: Boolean) -> Unit
 ) {
     // 与实际渲染出的 Compose 主题保持一致，而非跟随系统设置——应用内可单独切换主题。
@@ -590,6 +603,7 @@ private fun EditorSurface(
                 }
                 subscribeAlways(SelectionChangeEvent::class.java) {
                     onCursorChanged(cursor.leftLine + 1, cursor.leftColumn + 1)
+                    onSelectionChanged(if (cursor.isSelected) editorView.text.subSequence(cursor.left, cursor.right).toString().take(65536) else "")
                 }
                 subscribeAlways(ScrollEvent::class.java) { event ->
                     // sora 在尺寸变化后会经 touchHandler 做一次滚动 clamp，事件 cause 同样是

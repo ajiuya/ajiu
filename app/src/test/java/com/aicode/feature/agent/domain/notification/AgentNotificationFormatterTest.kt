@@ -57,6 +57,17 @@ class AgentNotificationFormatterTest {
         message = "改用 <方案 B> & 注意兼容性"
     )
 
+    private val parentCorrection = PendingNotification(
+        kind = AgentNotificationKind.AGENT_MESSAGE,
+        sourceId = "parent-1",
+        title = "主会话",
+        outcome = NotificationOutcome.COMPLETED,
+        message = "将列宽 resize 峰值与真实泄漏分开报告",
+        fromParent = true,
+        action = AgentMessageAction.CORRECTION,
+        targetTitle = "探索员",
+    )
+
     @Test
     fun message_singleBackgroundTask_hasFenceAndFields() {
         val text = AgentNotificationFormatter.buildMessage(listOf(backgroundTask))
@@ -78,6 +89,18 @@ class AgentNotificationFormatterTest {
         assertTrue(text.contains("&lt;unresolved&gt;"))
         assertTrue(text.contains("&amp;"))
         assertFalse(text.contains("<unresolved>"))
+    }
+
+    @Test
+    fun messageEscapesTaskIdentifiersAndShellCommands() {
+        val unsafe = backgroundTask.copy(sourceId = "task<&\"", title = "build <debug>", command = "echo <x> && echo y")
+
+        val text = AgentNotificationFormatter.buildMessage(listOf(unsafe))
+
+        assertTrue(text.contains("<task-id>task&lt;&amp;\"</task-id>"))
+        assertTrue(text.contains("<title>build &lt;debug&gt;</title>"))
+        assertTrue(text.contains("<command>echo &lt;x&gt; &amp;&amp; echo y</command>"))
+        assertTrue(text.contains("<summary>后台任务「build &lt;debug&gt;」已结束（退出码 1）</summary>"))
     }
 
     @Test
@@ -147,6 +170,19 @@ class AgentNotificationFormatterTest {
         assertTrue(text.contains("<user-message>"))
         assertTrue(text.contains("改用 &lt;方案 B&gt; &amp; 注意兼容性"))
         assertFalse(text.contains("这些是后台完成事件，不是来自用户的消息"))
+    }
+
+    @Test
+    fun parentInstructionCarriesDirectionAndTargetForChatRows() {
+        val text = AgentNotificationFormatter.buildMessage(listOf(parentCorrection))
+        val json = AgentNotificationFormatter.buildJsonArray(listOf(parentCorrection))[0] as JsonObject
+
+        assertTrue(text.contains("<action>correction</action>"))
+        assertTrue(text.contains("<target-title>探索员</target-title>"))
+        assertTrue(text.contains("<summary>给探索员代理发送纠偏</summary>"))
+        assertEquals("correction", (json["action"] as JsonPrimitive).content)
+        assertEquals("探索员", (json["target_title"] as JsonPrimitive).content)
+        assertEquals("true", (json["from_parent"] as JsonPrimitive).content)
     }
 
     @Test

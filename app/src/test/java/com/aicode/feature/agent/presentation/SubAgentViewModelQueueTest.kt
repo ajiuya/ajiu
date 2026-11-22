@@ -4,6 +4,7 @@ import android.app.Application
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
 import com.aicode.feature.agent.data.local.entity.SubAgentInteractionEntity
+import com.aicode.feature.agent.domain.command.SlashCommandContext
 import com.aicode.feature.agent.domain.notification.AgentNotificationKind
 import com.aicode.feature.agent.domain.notification.NotificationOutcome
 import com.aicode.feature.agent.domain.notification.PendingNotification
@@ -19,6 +20,7 @@ import io.mockk.every
 import io.mockk.just
 import io.mockk.mockk
 import io.mockk.mockkObject
+import io.mockk.slot
 import io.mockk.unmockkObject
 import io.mockk.verify
 import kotlinx.coroutines.CompletableDeferred
@@ -176,6 +178,10 @@ class SubAgentViewModelQueueTest {
         fixture.stopping.add(CHILD)
         vm.selectSession(CHILD)
         val handler = fixture.installCommand("/drain")
+        val invocation = slot<SlashCommandContext>()
+        every { handler.execute(capture(invocation), "") } answers {
+            firstArg<SlashCommandContext>().showUsage()
+        }
         val notificationSeq = fixture.notifications.enqueue(CHILD, notification())
         coEvery { fixture.sessions.getSessionById(CHILD) } returns fixture.sessionRows.getValue(CHILD)
         vm.enqueueAgentRequest("next child run", targetSessionId = CHILD, subAgentInstructionId = "waiting")
@@ -187,7 +193,13 @@ class SubAgentViewModelQueueTest {
         command.join()
         runCurrent()
 
-        verify(exactly = 1) { handler.execute(vm, "") }
+        verify(exactly = 1) { handler.execute(invocation.captured, "") }
+        coVerify(exactly = 1) {
+            fixture.persistence.persist(CHILD, MessageRole.ASSISTANT, match { it.startsWith("| ") }, id = any(), isContextExcluded = true)
+        }
+        coVerify(exactly = 0) {
+            fixture.persistence.persist(PARENT, MessageRole.ASSISTANT, any(), id = any(), isContextExcluded = true)
+        }
         assertEquals(listOf(waiting), vm.queuedRequests.value)
         assertEquals(listOf(notificationSeq), fixture.notifications.peek(CHILD).map { it.seq })
         assertNull(fixture.jobs[CHILD])
@@ -241,6 +253,14 @@ class SubAgentViewModelQueueTest {
         fixture.jobs[CHILD] = oldJob
         val childCommand = fixture.installCommand("/compress")
         val drainCommand = fixture.installCommand("/drain")
+        val childInvocation = slot<SlashCommandContext>()
+        val drainInvocation = slot<SlashCommandContext>()
+        every { childCommand.execute(capture(childInvocation), "") } answers {
+            firstArg<SlashCommandContext>().showUsage()
+        }
+        every { drainCommand.execute(capture(drainInvocation), "") } answers {
+            firstArg<SlashCommandContext>().showUsage()
+        }
         // 验证之后的执行故意在会话查询处返回，隔离命令分流而不启动真实工作流。
         coEvery { fixture.sessions.getSessionById(CHILD) } returns fixture.sessionRows.getValue(CHILD) andThen
             fixture.sessionRows.getValue(CHILD) andThen null
@@ -252,7 +272,13 @@ class SubAgentViewModelQueueTest {
         runCurrent()
 
         assertEquals(PARENT, vm.currentSessionId.value)
-        verify(exactly = 1) { drainCommand.execute(vm, "") }
+        verify(exactly = 1) { drainCommand.execute(drainInvocation.captured, "") }
+        coVerify(exactly = 1) {
+            fixture.persistence.persist(CHILD, MessageRole.ASSISTANT, match { it.startsWith("| ") }, id = any(), isContextExcluded = true)
+        }
+        coVerify(exactly = 0) {
+            fixture.persistence.persist(PARENT, MessageRole.ASSISTANT, any(), id = any(), isContextExcluded = true)
+        }
         verify(exactly = 0) { fixture.commands.resolve("/compress") }
         verify(exactly = 0) { childCommand.execute(any(), any()) }
         coVerify(exactly = 3) { fixture.sessions.getSessionById(CHILD) }
@@ -261,7 +287,13 @@ class SubAgentViewModelQueueTest {
         val ordinary = vm.executeAgentRequestStream("/compress", targetSessionId = PARENT)
         ordinary.join()
         runCurrent()
-        verify(exactly = 1) { childCommand.execute(vm, "") }
+        verify(exactly = 1) { childCommand.execute(childInvocation.captured, "") }
+        coVerify(exactly = 1) {
+            fixture.persistence.persist(PARENT, MessageRole.ASSISTANT, match { it.startsWith("| ") }, id = any(), isContextExcluded = true)
+        }
+        coVerify(exactly = 1) {
+            fixture.persistence.persist(CHILD, MessageRole.ASSISTANT, match { it.startsWith("| ") }, id = any(), isContextExcluded = true)
+        }
         verify(exactly = 0) { fixture.workflow.executeEvents(any(), any(), any()) }
     }
 

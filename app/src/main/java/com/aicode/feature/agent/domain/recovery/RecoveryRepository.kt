@@ -114,6 +114,18 @@ class RecoveryRepository @Inject constructor(
         }?.toModel()
     }
 
+    fun observeNotificationInputMessageIds(sessionId: String): Flow<Map<Long, String>> =
+        recoveryDao.observeRequestsForSession(sessionId).map { requests ->
+            buildMap {
+                requests.forEach { request ->
+                    val seqs = runCatching {
+                        json.decodeFromString<RecoveryRequestPayload>(request.payloadJson).notificationSeqs
+                    }.getOrDefault(emptyList())
+                    seqs.forEach { seq -> put(seq, request.inputMessageId) }
+                }
+            }
+        }
+
     suspend fun payload(requestId: String): RecoveryRequestPayload? =
         recoveryDao.requestRow(requestId)?.let { json.decodeFromString(it.payloadJson) }
 

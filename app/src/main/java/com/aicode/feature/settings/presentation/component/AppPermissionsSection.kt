@@ -171,7 +171,8 @@ internal fun AppPermissionsSection(
             val shizukuAction: (() -> Unit)? = when (shizukuState) {
                 ShizukuState.NOT_INSTALLED, ShizukuState.NOT_RUNNING, ShizukuState.SHELL_REQUIRED -> onOpenShizuku
                 ShizukuState.PERMISSION_DENIED -> onRequestShizukuPermission
-                ShizukuState.READY -> null
+                ShizukuState.IDENTITY_UNAVAILABLE -> onRefreshShizuku
+                ShizukuState.READY, ShizukuState.READY_ROOT -> null
             }
             SettingsRow(
                 icon = FeatherIcons.Terminal,
@@ -366,7 +367,9 @@ private fun ShizukuState.statusRes(): Int = when (this) {
     ShizukuState.NOT_RUNNING -> R.string.settings_shizuku_status_not_running
     ShizukuState.PERMISSION_DENIED -> R.string.settings_shizuku_status_denied
     ShizukuState.SHELL_REQUIRED -> R.string.settings_shizuku_status_shell_required
+    ShizukuState.IDENTITY_UNAVAILABLE -> R.string.settings_shizuku_status_identity_unavailable
     ShizukuState.READY -> R.string.settings_shizuku_status_ready
+    ShizukuState.READY_ROOT -> R.string.settings_shizuku_status_root_ready
 }
 
 /** Shizuku 状态对应的副标题（点击提示）。 */
@@ -376,7 +379,9 @@ private fun ShizukuState.hintRes(): Int = when (this) {
     ShizukuState.NOT_RUNNING -> R.string.settings_shizuku_hint_not_running
     ShizukuState.PERMISSION_DENIED -> R.string.settings_shizuku_hint_denied
     ShizukuState.SHELL_REQUIRED -> R.string.shizuku_shell_required
+    ShizukuState.IDENTITY_UNAVAILABLE -> R.string.settings_shizuku_hint_identity_unavailable
     ShizukuState.READY -> R.string.settings_shizuku_hint_ready
+    ShizukuState.READY_ROOT -> R.string.settings_shizuku_hint_root_ready
 }
 
 /** 权限无法通过系统弹框授予时，提醒用户去系统设置手动开启。 */

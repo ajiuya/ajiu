@@ -3,6 +3,9 @@
     <string name="subagent_group_title">子代理</string>
     <string name="subagent_group_total_count">%1$d 个</string>
     <string name="subagent_group_status_count">%1$s %2$d</string>
+    <string name="subagent_group_compact_running">运行</string>
+    <string name="subagent_group_compact_completed">完成</string>
+    <string name="subagent_group_compact_waiting">待确认</string>
     <string name="subagent_group_member_status">%1$s：%2$s</string>
     <string name="subagent_group_working_count">工作中 %1$d</string>
     <string name="subagent_group_completed_count">已完成 %1$d</string>

@@ -37,3 +37,16 @@ __pycache__/
 # 容器镜像目录：由 scripts/sync-container-images.py 生成，CI 发布到 data 分支；
 # 内置兜底快照另存于 app/src/main/assets/container-images.json
 /data/container-images.json
+
+# Plugin and website build caches
+/plugins/node_modules/
+/plugins/sdk/dist/
+/plugins/samples/*/dist/
+/plugins/samples/*/pages/
+/plugins/template/node_modules/
+/plugins/template/dist/
+/plugins/template/pages/
+/plugin-packages/
+/website/node_modules/
+/website/dist/
+/website/.ssr/

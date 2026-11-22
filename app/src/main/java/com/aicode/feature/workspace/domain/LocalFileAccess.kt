@@ -8,12 +8,12 @@ import java.io.IOException
 import java.io.InputStream
 import java.nio.charset.Charset
 import java.nio.file.AtomicMoveNotSupportedException
-import java.nio.file.FileAlreadyExistsException
+import kotlin.io.FileAlreadyExistsException
 import java.nio.file.FileSystemLoopException
 import java.nio.file.FileVisitResult
 import java.nio.file.Files
 import java.nio.file.LinkOption
-import java.nio.file.NoSuchFileException
+import kotlin.io.NoSuchFileException
 import java.nio.file.Path
 import java.nio.file.SimpleFileVisitor
 import java.nio.file.StandardCopyOption
@@ -31,6 +31,8 @@ class LocalFileAccess @Inject constructor(
 ) : FileAccessProvider {
 
     internal fun captureExecutionMapping(): WorkspacePathMapper.ExecutionMapping = pathMapper.captureExecutionMapping()
+
+    internal fun transferFile(path: String, followFinal: Boolean = true): File = resolve(path, followFinal)
 
     private fun resolve(path: String, followFinalLink: Boolean = true): File {
         val execution = WorkspaceExecutionContext.current()
@@ -154,6 +156,24 @@ class LocalFileAccess @Inject constructor(
         val file = resolve(path)
         if (!file.exists()) throw NoSuchFileException(file)
         return file.readBytes()
+    }
+
+    override fun readBytes(path: String, maxBytes: Long): ByteArray {
+        require(maxBytes in 0..Int.MAX_VALUE.toLong())
+        val identity = cacheIdentity()
+        val file = resolve(path)
+        if (!file.exists()) throw NoSuchFileException(file)
+        val size = file.length()
+        if (cacheIdentity() != identity) throw java.util.concurrent.CancellationException("Local file source changed")
+        if (size > maxBytes) throw FileReadTooLargeException(maxBytes)
+        return openRead(path, identity).use { it.readBytesBounded(maxBytes) }
+    }
+
+    override fun resolvePath(path: String, followFinalLink: Boolean): String {
+        val file = resolve(path, followFinalLink)
+        if (followFinalLink) return file.canonicalPath
+        val parent = file.parentFile ?: return file.absolutePath
+        return File(parent.canonicalFile, file.name).absolutePath
     }
 
     override fun listFilesRecursive(path: String, maxDepth: Int): List<String> {
@@ -286,32 +306,20 @@ class LocalFileAccess @Inject constructor(
         val source = resolve(path)
         val target = resolve(newPath, followFinalLink = false)
         if (!source.exists()) throw NoSuchFileException(source)
-        val sourcePath = source.canonicalFile.toPath()
-        val targetPath = target.canonicalFile.toPath()
-        if (targetPath == sourcePath || (source.isDirectory && targetPath.startsWith(sourcePath))) {
-            throw IOException("destination is the source or its descendant: $newPath")
-        }
+        checkCopyMovePaths(path, newPath)
         if (entryExists(target)) {
             if (!overwrite) throw FileAlreadyExistsException(target)
             deleteTree(target)
         }
         target.parentFile?.mkdirs()
-        if (source.isDirectory) {
-            source.copyRecursively(target, overwrite = false)
-        } else {
-            source.copyTo(target, overwrite = false)
-        }
+        copyTree(source, target)
     }
 
     override fun move(path: String, newPath: String, overwrite: Boolean) {
         val source = resolve(path, followFinalLink = false)
         val target = resolve(newPath, followFinalLink = false)
         if (!entryExists(source)) throw NoSuchFileException(source)
-        val sourcePath = source.canonicalFile.toPath()
-        val targetPath = target.canonicalFile.toPath()
-        if (targetPath == sourcePath || (source.isDirectory && targetPath.startsWith(sourcePath))) {
-            throw IOException("destination is the source or its descendant: $newPath")
-        }
+        checkCopyMovePaths(path, newPath)
         if (entryExists(target)) {
             if (!overwrite) throw FileAlreadyExistsException(target)
             deleteTree(target)
@@ -330,12 +338,32 @@ class LocalFileAccess @Inject constructor(
             return
         }
         // 回退：复制后删除源（复制中断时源保留，下次重试安全）。
-        if (source.isDirectory) {
-            source.copyRecursively(target, overwrite = false)
-        } else {
-            source.copyTo(target, overwrite = false)
-        }
+        copyTree(source, target)
         deleteTree(source)
+    }
+
+    private fun checkCopyMovePaths(path: String, newPath: String) {
+        val sources = listOf(resolvePath(path, false), resolvePath(path)).map { File(it).toPath() }
+        val targets = listOf(resolvePath(newPath, false), resolvePath(newPath)).map { File(it).toPath() }
+        if (sources.any { source -> targets.any { target -> source.startsWith(target) || target.startsWith(source) } }) {
+            throw FilePathOverlapException("Source and destination overlap: $path -> $newPath")
+        }
+    }
+
+    private fun copyTree(source: File, target: File) {
+        val root = source.toPath()
+        val destination = target.toPath()
+        Files.walkFileTree(root, object : SimpleFileVisitor<Path>() {
+            override fun preVisitDirectory(dir: Path, attrs: BasicFileAttributes): FileVisitResult {
+                Files.createDirectories(destination.resolve(root.relativize(dir)))
+                return FileVisitResult.CONTINUE
+            }
+
+            override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
+                Files.copy(file, destination.resolve(root.relativize(file)), LinkOption.NOFOLLOW_LINKS)
+                return FileVisitResult.CONTINUE
+            }
+        })
     }
 
     override fun mkdirs(path: String) {

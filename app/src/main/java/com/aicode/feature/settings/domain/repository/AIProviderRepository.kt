@@ -14,6 +14,7 @@ interface AIProviderRepository {
 
     suspend fun setSelectedModel(id: String, model: String)
     suspend fun updateModels(id: String, models: List<String>)
+    suspend fun setProviderApiKey(id: String, apiKey: String)
     suspend fun setProviderEnabled(id: String, isEnabled: Boolean)
 
     /** 批量启用 / 停用（列表多选批量操作）。 */

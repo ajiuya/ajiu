@@ -1,7 +1,9 @@
 package com.aicode.feature.agent.domain.subagent
 
-/** 子代理定义的来源作用域：全局（跨项目共享）或项目级（仅当前工作区生效，可 git 追踪）。 */
-enum class AgentDefinitionScope { GLOBAL, PROJECT }
+import com.aicode.feature.agent.domain.plugin.PluginDefinitionOrigin
+
+/** 子代理定义的来源作用域。 */
+enum class AgentDefinitionScope { GLOBAL, PROJECT, PLUGIN }
 
 /**
  * 子代理系统提示词的可注入片段。省略 `inject` 时使用 [AgentDefinition.DEFAULT_INJECT]。
@@ -127,10 +129,11 @@ data class AgentDefinition(
     }
 }
 
-/** 一个生效的子代理定义条目：定义本体 + 其来源作用域，供 UI 标注「全局/项目」。 */
+/** 一个生效的子代理定义条目：定义本体及其来源。 */
 data class AgentDefinitionEntry(
     val definition: AgentDefinition,
-    val scope: AgentDefinitionScope
+    val scope: AgentDefinitionScope,
+    val pluginOrigin: PluginDefinitionOrigin? = null
 )
 
 /** 设置页新建/编辑子代理时提交的表单快照。 */
@@ -148,6 +151,8 @@ data class AgentDefinitionForm(
 
 /** 保存子代理定义失败的原因。 */
 enum class AgentSaveError {
+    READ_ONLY,
+
     /** 名称为空、过长或含不能做文件名的字符。 */
     INVALID_NAME,
 

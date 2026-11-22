@@ -1,9 +1,7 @@
 package com.aicode.feature.agent.presentation.component
 
 import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
@@ -24,7 +22,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -142,8 +139,7 @@ internal fun TodoItemRow(item: ParsedTodoItem) {
                 )
             }
             isInProgress -> {
-                val transition = rememberInfiniteTransition(label = "todo-progress-dot")
-                val alpha by transition.animateFloat(
+                val alpha = rememberChatInfiniteFloat(
                     initialValue = 1f,
                     targetValue = 0.3f,
                     animationSpec = infiniteRepeatable(
@@ -155,7 +151,7 @@ internal fun TodoItemRow(item: ParsedTodoItem) {
                 Box(
                     modifier = Modifier
                         .size(8.dp)
-                        .graphicsLayer { this.alpha = alpha }
+                        .graphicsLayer { this.alpha = alpha.value }
                         .clip(CircleShape)
                         .background(MaterialTheme.colorScheme.primary)
                 )

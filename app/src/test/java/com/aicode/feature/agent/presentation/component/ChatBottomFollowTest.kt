@@ -14,15 +14,18 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.items
 import androidx.compose.runtime.BroadcastFrameClock
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.Recomposer
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.ui.InternalComposeUiApi
 import androidx.compose.ui.Modifier
@@ -33,9 +36,17 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.ViewCompositionStrategy
 import androidx.compose.ui.platform.ViewRootForTest
 import androidx.compose.ui.unit.dp
+import com.aicode.feature.agent.domain.notification.AgentNotificationKind
+import com.aicode.feature.agent.domain.notification.AgentNotificationTimelineEntry
+import com.aicode.feature.agent.domain.notification.NotificationOutcome
+import com.aicode.feature.agent.domain.notification.PendingNotification
+import com.aicode.feature.agent.presentation.AgentUIMessage
+import com.aicode.feature.agent.presentation.ChatNotificationTimelineEvent
+import com.aicode.feature.agent.presentation.MessageRole
 import kotlin.math.roundToInt
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.runCurrent
@@ -157,6 +168,174 @@ class ChatBottomFollowTest {
             following = true
             settle()
             assertAtBottom("footer")
+        }
+    }
+
+    @Test
+    fun acceptedNotificationMovesWithActiveTailAndHistoryStaysDetached() {
+        var tailPx by mutableIntStateOf(40)
+        var following by mutableStateOf(true)
+        withList(effect = { state ->
+            LaunchedEffect(following, tailPx) { if (following) state.followChatBottom() }
+        }, rows = {
+            items(12, key = { "history-$it" }) { PixelRow(40) }
+            item(key = "notification") { PixelRow(24) }
+            item(key = "__active__") { PixelRow(tailPx) }
+        }) {
+            state.scrollToItem(info.totalItemsCount - 1)
+            settle()
+            val notice = { info.visibleItemsInfo.single { it.key == "notification" }.offset }
+            val initialOffset = notice()
+
+            tailPx += 12
+            settle()
+            follow()
+            assertEquals(initialOffset - 12, notice())
+            assertAtBottom("__active__")
+
+            following = false
+            state.scrollToItem(12)
+            settle()
+            val detachedOffset = notice()
+            tailPx += 20
+            settle()
+            assertEquals(detachedOffset, notice())
+        }
+    }
+
+    @Test
+    fun projectedNotificationsStayAboveNewToolWhileFollowingTheCollapsedGroup() {
+        val parent = "parent"
+        val user = AgentUIMessage("request", MessageRole.USER, "Review the changes", timestamp = 15L)
+        val activeTurn = turnKeyOf(user.id)
+        val dispatch = AgentUIMessage(
+            id = "dispatch", role = MessageRole.TOOL, timestamp = 20L, toolName = "task",
+            content = """{"status":"success","data":{"id":"child","state":"running"}}""",
+            toolArgs = """{"prompt":"review","description":"Review worker"}""",
+        )
+        val history = List(12) { index ->
+            val role = if (index % 2 == 0) MessageRole.USER else MessageRole.ASSISTANT
+            AgentUIMessage("history-$index", role, "history", timestamp = index.toLong())
+        }
+        val messages = history + listOf(user, dispatch)
+        val newTool = AgentUIMessage("new-tool", MessageRole.TOOL, "result", timestamp = 60L, toolName = "readFile")
+        val notifications = listOf(
+            "background" to AgentNotificationKind.BACKGROUND_TASK,
+            "agent" to AgentNotificationKind.AGENT_MESSAGE,
+            "user" to AgentNotificationKind.USER_MESSAGE,
+        ).mapIndexed { index, (id, kind) ->
+            val notice = PendingNotification(
+                kind = kind, sourceId = id, title = id, outcome = NotificationOutcome.COMPLETED,
+                message = "Accepted $id notification", eventId = id,
+            )
+            ChatNotificationTimelineEvent(
+                AgentNotificationTimelineEntry(index + 1L, 30L + index * 10L, notice),
+                sourceMessageId = null,
+            )
+        }
+        val noticeKeys = notifications.map { "chat-notification:${it.entry.notification.eventId}" }
+
+        fun project(chatMessages: List<AgentUIMessage>): SubAgentGroupProjection {
+            val turnKeys = reconcileTurnKeys(chatMessages, emptyMap(), parent)
+            val timeline = projectSubAgentTimeline(chatMessages, setOf("child"), parent)
+            val capsules = projectSubAgentTurnCapsules(timeline, turnKeys, parent)
+            val base = buildChatItems(
+                chatMessages, activeTurnKey = activeTurn, sessionId = parent, turnKeys = turnKeys,
+            )
+            val withNotices = projectChatNotificationItems(base, chatMessages, notifications, emptyList(), emptyMap())
+            val flattened = flattenChatProcesses(withNotices)
+            val withCapsules = insertSubAgentTurnItems(flattened, capsules, chatMessages)
+            return projectSubAgentGroup(withCapsules, parent, activeTurnKey = activeTurn)
+        }
+
+        var projection by mutableStateOf(project(messages))
+        val groupKey = projection.footerItems.single().key
+        var following by mutableStateOf(true)
+        var tailHeight by mutableIntStateOf(24)
+        var userScrollGesture by mutableStateOf(false)
+        var dimmedWhileFollowing = false
+        withList(effect = { state ->
+            val scrolling = state.isScrollInProgress
+            val dimFloatingLayer = shouldDimChatFloatingLayer(userScrollGesture)
+            SideEffect { if (scrolling && dimFloatingLayer) dimmedWhileFollowing = true }
+            LaunchedEffect(state) {
+                snapshotFlow { if (following) state.layoutInfo else null }.collectLatest { layout ->
+                    if (layout != null && following) state.followChatBottom()
+                }
+            }
+        }, rows = {
+            items(projection.bodyItems, key = { it.key }, contentType = { it.contentType }) { PixelRow(28) }
+            item(key = "__active__", contentType = "tail") { PixelRow(tailHeight) }
+            items(projection.footerItems, key = { it.key }, contentType = { it.contentType }) { PixelRow(28) }
+        }) {
+            fun row(key: String) = info.visibleItemsInfo.single { it.key == key }
+            fun assertActiveFooter() {
+                assertAtBottom(groupKey)
+                assertEquals(SUB_AGENT_GROUP_CONTENT_TYPE, last.contentType)
+                val reasoning = row("__active__")
+                assertEquals(last.index - 1, reasoning.index)
+                assertEquals(last.offset, reasoning.offset + reasoning.size)
+            }
+
+            state.scrollToItem(info.totalItemsCount - 1)
+            settle()
+            assertActiveFooter()
+            val initialCount = info.totalItemsCount
+            val initialOffsets = noticeKeys.associateWith { row(it).offset }
+            dimmedWhileFollowing = false
+
+            projection = project(messages + newTool)
+            settle()
+            assertEquals(initialCount + 1, info.totalItemsCount)
+            assertActiveFooter()
+            val tool = row(newTool.id)
+            noticeKeys.forEach { key ->
+                val notice = row(key)
+                assertTrue("$key should stay before ${newTool.id}", notice.index < tool.index)
+                assertEquals(key, initialOffsets.getValue(key) - tool.size, notice.offset)
+            }
+
+            tailHeight += 8
+            settle()
+            assertActiveFooter()
+            val afterGrowth = noticeKeys.associateWith { row(it).offset }
+            noticeKeys.forEach { key -> assertEquals(initialOffsets.getValue(key) - tool.size - 8, afterGrowth.getValue(key)) }
+            assertFalse("Automatic following must not dim the floating layer", dimmedWhileFollowing)
+            userScrollGesture = true
+            settle()
+            assertTrue(shouldDimChatFloatingLayer(userScrollGesture))
+            userScrollGesture = false
+            settle()
+            assertFalse(shouldDimChatFloatingLayer(userScrollGesture))
+
+            projection = project(messages + newTool)
+            settle()
+            assertAtBottom(groupKey)
+            assertEquals(row("__active__").index + 1, row(groupKey).index)
+            assertEquals(listOf(SUB_AGENT_GROUP_CONTENT_TYPE), projection.footerItems.map { it.contentType })
+            noticeKeys.forEach { key -> assertTrue(row(key).index < row(groupKey).index) }
+
+            projection = project(messages + newTool)
+            settle()
+            assertActiveFooter()
+            following = false
+            state.scrollToItem(2, 11)
+            settle()
+            val anchor = position
+            val anchorOffset = row("history-2").offset
+            assertEquals(2 to 11, anchor)
+            assertTrue(info.visibleItemsInfo.last().index < info.totalItemsCount - 1)
+
+            projection = project(messages + newTool + newTool.copy(id = "later-tool", timestamp = 70L))
+            settle()
+            assertEquals(initialCount + 2, info.totalItemsCount)
+            assertEquals(anchor, position)
+            assertEquals(anchorOffset, row("history-2").offset)
+
+            following = true
+            settle()
+            assertActiveFooter()
+            assertTrue(row(noticeKeys.last()).index < row("later-tool").index)
         }
     }
 

@@ -126,7 +126,7 @@ class ToolCapsuleLayoutTest {
 
     @Test
     @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
-    fun collapsedSubAgentGroupRendersTheRecordedNamesIncludingExplore() {
+    fun collapsedSubAgentGroupShowsCompactActivityAndCounts() {
         val summaries = listOf(
             SubAgentInteractionSummary("coder", title = "Implement layout", agentName = "编码员", status = SubAgentInteractionStatus.COMPLETED),
             SubAgentInteractionSummary("reviewer", title = "Review layout", agentName = "审核员", status = SubAgentInteractionStatus.COMPLETED),
@@ -146,9 +146,15 @@ class ToolCapsuleLayoutTest {
             }
         }
 
-        val names = texts.single { it.layout.layoutInput.text.text == "编码员 · 审核员 · Explore" }
-        assertFalse(names.layout.didOverflowHeight)
-        assertTrue(names.bounds.height > 0f)
+        val rendered = texts.map { it.layout.layoutInput.text.text }
+        val counts = texts.firstOrNull { it.layout.layoutInput.text.text.contains("3") && !it.layout.layoutInput.text.text.contains("Fallback") }
+        val activity = texts.firstOrNull { it.layout.layoutInput.text.text.contains("Implement layout") }
+        assertTrue("Expected a compact count for all three members, rendered=$rendered", counts != null)
+        assertTrue("Expected the focused member activity, rendered=$rendered", activity != null)
+        assertFalse(counts!!.layout.didOverflowHeight)
+        assertFalse(activity!!.layout.didOverflowHeight)
+        assertTrue(counts.bounds.height > 0f)
+        assertTrue(activity.bounds.height > 0f)
         assertTrue(texts.none { "Fallback" in it.layout.layoutInput.text.text })
     }
 

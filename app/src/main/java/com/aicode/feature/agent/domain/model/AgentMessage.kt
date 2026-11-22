@@ -89,6 +89,7 @@ data class AgentContext(
      */
     val agentDefinition: AgentDefinition? = null,
     val rootApprovalId: String? = null,
+    val shizukuApprovalId: String? = null,
     val projectMemoryIdentity: com.aicode.feature.agent.domain.memory.ProjectMemoryIdentity? = null,
     val projectMemoryContext: String? = null,
     val projectMemoryProjectId: String? = null,

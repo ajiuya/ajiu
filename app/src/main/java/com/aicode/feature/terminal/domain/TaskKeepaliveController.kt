@@ -7,6 +7,7 @@ import android.os.Looper
 import android.os.SystemClock
 import com.aicode.core.util.FileLogger
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeoutOrNull
 
@@ -20,6 +21,7 @@ object TaskKeepaliveController {
     private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
     private val inputExpirations = mutableMapOf<String, Runnable>()
     private val status = MutableStateFlow(registry.snapshot())
+    internal val states = status.asStateFlow()
     private var service: TerminalKeepaliveService? = null
     private var initialized = false
     private var startSequence = 0L

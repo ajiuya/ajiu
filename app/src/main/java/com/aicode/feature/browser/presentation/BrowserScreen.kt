@@ -1,6 +1,7 @@
 package com.aicode.feature.browser.presentation
 
 import android.widget.FrameLayout
+import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
@@ -61,10 +62,12 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -84,7 +87,6 @@ import com.aicode.core.ui.SwipeToDeleteRow
 import com.aicode.core.ui.dialogTextFieldColors
 import com.aicode.core.util.FileLogger
 import com.aicode.feature.agent.domain.tool.browser.BrowserDialog
-import com.aicode.feature.agent.domain.tool.browser.BrowserManager
 import com.aicode.feature.agent.domain.tool.browser.BrowserTabState
 import com.aicode.feature.agent.domain.tool.browser.BrowserUserAgentPreset
 import com.aicode.feature.settings.presentation.component.SettingsDivider
@@ -97,6 +99,7 @@ import compose.icons.feathericons.ChevronLeft
 import compose.icons.feathericons.ChevronRight
 import compose.icons.feathericons.Code
 import compose.icons.feathericons.Globe
+import compose.icons.feathericons.Link
 import compose.icons.feathericons.Menu
 import compose.icons.feathericons.Monitor
 import compose.icons.feathericons.Moon
@@ -132,11 +135,13 @@ private fun CoroutineScope.launchBrowserOp(block: suspend () -> Unit) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun BrowserScreen(
-    browserManager: BrowserManager,
+    viewModel: BrowserViewModel,
     onNavigateBack: () -> Unit,
     embedded: Boolean = false
 ) {
+    val browserManager = viewModel.browserManager
     val state by browserManager.state.collectAsStateWithLifecycle()
+    val portMappingState by viewModel.portMappingState.collectAsStateWithLifecycle()
     val activeTab = state.activeTab
     val scope = rememberCoroutineScope()
 
@@ -144,13 +149,22 @@ fun BrowserScreen(
     // 后创建的 AndroidView 会拿到仍挂在旧节点上的容器，AndroidViewHolder 构造时 addView 直接抛
     // 「The specified child already has a parent」。各持一份即可彻底避免。
     val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
     val container = remember { FrameLayout(context) }
+
+    LaunchedEffect(viewModel) {
+        viewModel.portMappingMessages.collect { message ->
+            Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+        }
+    }
 
     var showTabsSheet by rememberSaveable { mutableStateOf(false) }
     val tabsSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
     var showMenuSheet by rememberSaveable { mutableStateOf(false) }
     val menuSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+
+    var showPortMappingsSheet by rememberSaveable { mutableStateOf(false) }
 
     var showCustomUaDialog by rememberSaveable { mutableStateOf(false) }
 
@@ -375,6 +389,13 @@ fun BrowserScreen(
             userAgentPreset = state.userAgentPreset,
             customUserAgent = state.customUserAgent,
             onDismiss = { showMenuSheet = false },
+            onOpenPortMappings = {
+                scope.launch {
+                    menuSheetState.hide()
+                    showMenuSheet = false
+                    showPortMappingsSheet = true
+                }
+            },
             onToggleNightMode = { browserManager.toggleNightMode() },
             onToggleDevTools = {
                 scope.launchBrowserOp {
@@ -392,6 +413,24 @@ fun BrowserScreen(
                     showMenuSheet = false
                 }
             }
+        )
+    }
+
+    if (showPortMappingsSheet) {
+        PortMappingsSheet(
+            state = portMappingState,
+            onDismiss = { showPortMappingsSheet = false },
+            onAdd = viewModel::addPortMapping,
+            onOpen = { id ->
+                viewModel.openPortMapping(id)
+                showPortMappingsSheet = false
+            },
+            onCopy = { id ->
+                viewModel.copyPortMapping(id) { address ->
+                    clipboard.setText(AnnotatedString(address))
+                }
+            },
+            onClose = viewModel::closePortMapping
         )
     }
 
@@ -764,6 +803,7 @@ private fun BrowserMenuSheet(
     userAgentPreset: BrowserUserAgentPreset,
     customUserAgent: String,
     onDismiss: () -> Unit,
+    onOpenPortMappings: () -> Unit,
     onToggleNightMode: () -> Unit,
     onToggleDevTools: () -> Unit,
     onSelectUaPreset: (BrowserUserAgentPreset) -> Unit
@@ -870,6 +910,14 @@ private fun BrowserMenuSheet(
                             )
                         },
                         onClick = { menuLevel = 1 }
+                    )
+
+                    SettingsDivider()
+
+                    SettingsRow(
+                        icon = FeatherIcons.Link,
+                        title = stringResource(R.string.port_mapping_title),
+                        onClick = onOpenPortMappings
                     )
                 }
             } else {

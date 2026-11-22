@@ -82,7 +82,9 @@ internal fun ChatHeader(
     chosenSpeedTier: SpeedTier = SpeedTier.STANDARD,
     onSpeedTierChange: (SpeedTier) -> Unit = {},
     providerConfig: AIProviderConfig? = null,
-    onOpenMcp: () -> Unit = {}
+    onOpenMcp: () -> Unit = {},
+    onOpenProjectTools: () -> Unit = {},
+    sessionId: String? = null
 ) {
     var moreActionsExpanded by remember { mutableStateOf(false) }
     var speedTierMenuExpanded by remember { mutableStateOf(false) }
@@ -209,6 +211,11 @@ internal fun ChatHeader(
                                     moreActionsExpanded = false
                                     onNavigateToTerminal()
                                 }
+                            )
+                            ChatHeaderMenuItem(icon = FeatherIcons.Server, label = stringResource(R.string.plugin_project_tools), onClick = { moreActionsExpanded = false; onOpenProjectTools() })
+                            com.aicode.feature.plugin.presentation.PluginSlotContent(
+                                com.aicode.feature.plugin.domain.PluginUiSlots.CHAT_HEADER_MENU,
+                                kotlinx.serialization.json.buildJsonObject { sessionId?.let { put("sessionId", kotlinx.serialization.json.JsonPrimitive(it)) } }
                             )
                             SpeedTierMenuEntry(
                                 chosenSpeedTier = chosenSpeedTier,

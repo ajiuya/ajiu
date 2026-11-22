@@ -136,12 +136,14 @@ class WorkflowToolTimingTest {
     private val injector = mockk<AgentEventInjector>()
     private val modelRequests = mutableListOf<List<AgentMessage>>()
     private val context = AgentContext(null, null, "/project", null, sessionId = "session")
+    private val hooks = mockk<com.aicode.feature.plugin.runtime.PluginHookDispatcher>(relaxed = true)
     private val workflow = StatefulAgentWorkflow(
         toolRegistry = registry,
         aiProviderRepository = providers,
-        openAIApi = openAIApi,
-        anthropicApi = mockk(),
-        geminiApi = mockk(),
+        providerFactory = com.aicode.feature.agent.domain.provider.ProviderInstanceFactory(
+            openAIApi, mockk(), mockk(), metadata, mockk(relaxed = true),
+            mockk { every { activeKey(any(), any()) } returns "test-key" }
+        ),
         promptProvider = prompts,
         permissionManager = permissions,
         policyEngine = policy,
@@ -156,13 +158,14 @@ class WorkflowToolTimingTest {
         messagePersistenceUseCase = recoveryPersistence,
         checkpointManager = mockk(relaxed = true),
         llmCallRecordDao = mockk(relaxed = true),
-        keyRotator = mockk { every { activeKey(any(), any()) } returns "test-key" },
         agentNotificationCenter = notifications,
         eventInjector = injector,
         fileAccess = mockk(),
         appContext = mockk { every { getString(any()) } returns "Deferred until plan approval" },
         rootCommandManager = mockk(),
+        shizukuManager = mockk(),
         recoveryRepository = recovery,
+        pluginHooks = hooks,
         workspaceExecutionContextFactory = mockk {
             coEvery { freeze(any()) } returns WorkspaceExecutionContext(
                 ExecutionMode.LOCAL_PROOT, "timing-test", mockk(), null, null
@@ -192,6 +195,8 @@ class WorkflowToolTimingTest {
         coEvery { policy.evaluate(any(), any(), any()) } returns
             ToolPermissionPolicyEngine.EvalResult(ToolPermissionPolicyEngine.Verdict.ALLOW)
         every { outputStore.process(any(), any(), any()) } answers { thirdArg<ToolResult>() }
+        coEvery { hooks.beforeTool(any(), any(), any()) } answers { com.aicode.feature.plugin.runtime.PluginBeforeTool(thirdArg()) }
+        coEvery { hooks.afterTool(any(), any(), any()) } answers { thirdArg<ToolResult>() }
     }
 
     @After
@@ -553,7 +558,7 @@ class WorkflowToolTimingTest {
             assertEquals("Proposal body", events.filterIsInstance<AgentEvent.AssistantText>().first().content)
             assertEquals(listOf(call), events.filterIsInstance<AgentEvent.AssistantText>().first().toolCalls)
             assertEquals(listOf(call), modelRequests.last().filterIsInstance<AgentMessage.AssistantMessage>().single().toolCalls)
-            coVerify(exactly = 1) { policy.evaluate(tool.name, args - "tool_title", context.sessionId) }
+            coVerify(exactly = 2) { policy.evaluate(tool.name, args - "tool_title", context.sessionId) }
         }
     }
 
@@ -1170,6 +1175,98 @@ class WorkflowToolTimingTest {
             coVerify(exactly = 0) { policy.evaluate(unasked.name, any(), any()) }
             assertTrue(events.last() is AgentEvent.Completed)
             assertTrue(recovery.finish(runId, RecoveryStatus.COMPLETED))
+        }
+    }
+
+    @Test fun hookArgumentsAreApprovedAndExecutedExactlyWhileAiWireKeepsOriginalArguments() = runBlocking<Unit> {
+        withTimeout(10_000) {
+            val tool = GatedTool("Bash")
+            register(tool)
+            tool.release.complete(Unit)
+            val original = mapOf("command" to JsonPrimitive("echo original"))
+            val finalArgs = JsonObject(mapOf("command" to JsonPrimitive("pwd")))
+            coEvery { hooks.beforeTool(any(), any(), any()) } returns com.aicode.feature.plugin.runtime.PluginBeforeTool(finalArgs)
+            val evaluated = mutableListOf<Map<String, JsonElement>>()
+            coEvery { policy.evaluate(tool.name, any(), any()) } answers {
+                evaluated += secondArg<Map<String, JsonElement>>().toMap()
+                ToolPermissionPolicyEngine.EvalResult(ToolPermissionPolicyEngine.Verdict.ASK)
+            }
+            coEvery { permissions.awaitApproval(any()) } returns com.aicode.feature.agent.domain.permission.PermissionChoice.ONCE
+            responses(AIResponse("", listOf(ToolCall("mutated", tool.name, original))), AIResponse("done"))
+            val events = mutableListOf<AgentEvent>()
+            collect(listOf(tool), events)
+            assertEquals(finalArgs, tool.entered.await())
+            assertTrue(evaluated.size >= 2)
+            assertTrue(evaluated.all { it == finalArgs })
+            assertEquals(listOf(finalArgs), tool.permissionArguments)
+            assertEquals(original, modelRequests.last().filterIsInstance<AgentMessage.AssistantMessage>().single().toolCalls.single().arguments)
+            assertEquals(finalArgs.toString(), events.filterIsInstance<AgentEvent.ToolCallFinished>().single().argsPreview)
+            coVerify(exactly = 1) { permissions.awaitApproval(any()) }
+        }
+    }
+
+    @Test fun hookMutationStillRunsFinalDenyPolicyBeforeNativeApprovalAndCannotExecute() = runBlocking<Unit> {
+        withTimeout(10_000) {
+            val tool = GatedTool("Bash")
+            register(tool)
+            val forbidden = JsonObject(mapOf("command" to JsonPrimitive("blocked-final-command")))
+            coEvery { hooks.beforeTool(any(), any(), any()) } returns com.aicode.feature.plugin.runtime.PluginBeforeTool(forbidden)
+            coEvery { policy.evaluate(tool.name, forbidden, any()) } returns
+                ToolPermissionPolicyEngine.EvalResult(ToolPermissionPolicyEngine.Verdict.DENY, "Denied final arguments")
+            responses(AIResponse("", listOf(ToolCall("blocked", tool.name, mapOf("command" to JsonPrimitive("safe"))))), AIResponse("done"))
+            val events = mutableListOf<AgentEvent>()
+            collect(listOf(tool), events)
+            val finished = events.filterIsInstance<AgentEvent.ToolCallFinished>().single()
+            assertTrue(finished.result.contains("SYSTEM_DENIED"))
+            assertEquals(forbidden.toString(), finished.argsPreview)
+            assertFalse(tool.entered.isCompleted)
+            coVerify(exactly = 0) { permissions.awaitApproval(any()) }
+        }
+    }
+
+    @Test fun policyRevocationAfterApprovalIsCheckedAgainImmediatelyBeforeExecution() = runBlocking<Unit> {
+        withTimeout(10_000) {
+            val tool = GatedTool("Bash")
+            register(tool)
+            var checks = 0
+            coEvery { policy.evaluate(tool.name, any(), any()) } answers {
+                checks++
+                ToolPermissionPolicyEngine.EvalResult(if (checks == 1) ToolPermissionPolicyEngine.Verdict.ALLOW else ToolPermissionPolicyEngine.Verdict.DENY, "New policy denied")
+            }
+            responses(AIResponse("", listOf(ToolCall("revoked", tool.name, emptyMap()))), AIResponse("done"))
+            val events = mutableListOf<AgentEvent>()
+            collect(listOf(tool), events)
+            assertEquals(2, checks)
+            assertFalse(tool.entered.isCompleted)
+            assertTrue(events.filterIsInstance<AgentEvent.ToolCallFinished>().single().result.contains("SYSTEM_DENIED"))
+        }
+    }
+
+    @Test fun pluginDeniedRecoveryToolWaitsForPersistedAckAndThenCompletesTheOriginalBatch() = runBlocking<Unit> {
+        withTimeout(10_000) {
+            val tool = GatedTool("Bash")
+            register(tool)
+            val snapshot = startRecovery("hook-denied")
+            val runId = requireNotNull(snapshot.recoveryRunId)
+            coEvery { hooks.beforeTool(any(), any(), any()) } returns com.aicode.feature.plugin.runtime.PluginBeforeTool(JsonObject(emptyMap()), true, "Denied by plugin")
+            responses(AIResponse("", listOf(ToolCall("hook-denied-call", tool.name, emptyMap()))), AIResponse("Handled denial"))
+            val resultReady = CompletableDeferred<AgentEvent.ToolCallFinished>()
+            val release = CompletableDeferred<Unit>()
+            val job = async { collectRecovery(snapshot, listOf(tool)) { event -> resultReady.complete(event); release.await() } }
+            try {
+                val finished = resultReady.await()
+                assertTrue(finished.result.contains("PLUGIN_DENIED"))
+                assertFalse(finished.persisted!!.isCompleted)
+                assertEquals(1, modelRequests.size)
+                assertEquals("WAITING_APPROVAL", recoveryLedger.tools.getValue(runId to "hook-denied-call").status)
+                assertFalse(tool.entered.isCompleted)
+                release.complete(Unit)
+                val events = job.await()
+                assertEquals("FINISHED", recoveryLedger.tools.getValue(runId to "hook-denied-call").status)
+                assertEquals(2, modelRequests.size)
+                assertTrue(events.last() is AgentEvent.Completed)
+                coVerify(exactly = 0) { permissions.awaitApproval(any()) }
+            } finally { job.cancelAndJoin() }
         }
     }
 

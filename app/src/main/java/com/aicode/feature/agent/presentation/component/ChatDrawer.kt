@@ -12,6 +12,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
@@ -78,6 +79,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -89,6 +92,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.currentStateAsState
 import androidx.lifecycle.repeatOnLifecycle
 import com.aicode.core.theme.Radius
 import com.aicode.core.theme.Spacing
@@ -131,6 +135,8 @@ import compose.icons.feathericons.RefreshCw
 import compose.icons.feathericons.Server
 import compose.icons.feathericons.Settings
 import compose.icons.feathericons.Trash2
+import compose.icons.feathericons.Upload
+import compose.icons.feathericons.UploadCloud
 import compose.icons.feathericons.X
 import androidx.compose.ui.res.stringResource
 import com.aicode.R
@@ -151,12 +157,14 @@ internal fun rememberDrawerBrowseState(
     selectedTab: Int,
     onRefresh: () -> Unit
 ): FileBrowseState {
-    var state by remember(source) { mutableStateOf(source.value) }
     val lifecycle = LocalLifecycleOwner.current.lifecycle
+    val lifecycleState by lifecycle.currentStateAsState()
+    val collecting = sidebarVisible && selectedTab == 1 && lifecycleState.isAtLeast(Lifecycle.State.STARTED)
+    // 隐藏期间可能已经切换执行环境，激活首帧不能先复用另一范围的旧树。
+    var state by remember(source, lifecycle, collecting) { mutableStateOf(source.value) }
     val refresh by rememberUpdatedState(onRefresh)
-    val treeVisible = sidebarVisible && selectedTab == 1
-    LaunchedEffect(source, lifecycle, treeVisible) {
-        if (treeVisible) {
+    LaunchedEffect(source, lifecycle, collecting) {
+        if (collecting) {
             lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
                 // 短暂离开时上游仍在 5 秒宽限期内，远程目录没有事件也必须在回来时重读。
                 refresh()
@@ -189,6 +197,7 @@ fun ChatDrawerContent(
     expandedPaths: Set<String>,
     expandingPath: String? = null,
     fileOpPaths: Set<String> = emptySet(),
+    transferActive: Boolean = false,
     clipboard: BrowseClipboard? = null,
     pasteConflict: Pair<String, String>? = null,
     onToggleExpand: (String) -> Unit,
@@ -204,6 +213,11 @@ fun ChatDrawerContent(
     onPasteOverwrite: () -> Unit,
     onCancelPasteOverwrite: () -> Unit,
     onClearClipboard: () -> Unit,
+    onAddLocalFolder: () -> Unit,
+    onRemoveLocalFolder: (String) -> Unit,
+    onUploadFiles: (String) -> Unit,
+    onUploadDirectory: (String) -> Unit,
+    onCancelTransfer: () -> Unit,
     onNavigateToBrowser: (() -> Unit)? = null,
     onNavigateToPlayer: (() -> Unit)? = null,
     onNavigateToSettings: () -> Unit,
@@ -212,7 +226,8 @@ fun ChatDrawerContent(
     onSearchQueryChange: (String) -> Unit,
     onClearSearch: () -> Unit,
     onOpenSearchHit: (ChatSearchHit) -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    externalSessions: @Composable () -> Unit = {}
 ) {
     // tab 与展开状态进 saveable：大屏下侧栏收起后整棵子树会离开组合（见 MainActivity 的
     // SaveableStateProvider），用 remember 存会让每次回到聊天页都重置回「会话」页。
@@ -355,6 +370,7 @@ fun ChatDrawerContent(
             )
         }
 
+        if (selectedTab == 0) externalSessions()
         Box(modifier = Modifier.weight(1f)) {
             when (selectedTab) {
                 0 -> SessionListTab(
@@ -384,6 +400,7 @@ fun ChatDrawerContent(
                     expandedPaths = expandedPaths,
                     expandingPath = expandingPath,
                     fileOpPaths = fileOpPaths,
+                    transferActive = transferActive,
                     clipboard = clipboard,
                     onToggleExpand = onToggleExpand,
                     onOpenFile = onOpenFile,
@@ -395,11 +412,17 @@ fun ChatDrawerContent(
                     onCopyEntry = onCopyEntry,
                     onCutEntry = onCutEntry,
                     onPasteEntry = onPasteEntry,
-                    onClearClipboard = onClearClipboard
+                    onClearClipboard = onClearClipboard,
+                    onAddLocalFolder = onAddLocalFolder,
+                    onRemoveLocalFolder = onRemoveLocalFolder,
+                    onUploadFiles = onUploadFiles,
+                    onUploadDirectory = onUploadDirectory,
+                    onCancelTransfer = onCancelTransfer
                 )
             }
         }
 
+        com.aicode.feature.plugin.presentation.PluginSlotContent(com.aicode.feature.plugin.domain.PluginUiSlots.DRAWER_FOOTER)
         SettingsGroup {
             if (onNavigateToPlayer != null) {
                 SettingsRow(
@@ -910,6 +933,7 @@ private fun FileBrowserTab(
     expandedPaths: Set<String>,
     expandingPath: String?,
     fileOpPaths: Set<String>,
+    transferActive: Boolean,
     clipboard: BrowseClipboard?,
     onToggleExpand: (String) -> Unit,
     onOpenFile: (String) -> Unit,
@@ -921,117 +945,160 @@ private fun FileBrowserTab(
     onCopyEntry: (String, String) -> Unit,
     onCutEntry: (String, String) -> Unit,
     onPasteEntry: (String, (Boolean) -> Unit) -> Unit,
-    onClearClipboard: () -> Unit
+    onClearClipboard: () -> Unit,
+    onAddLocalFolder: () -> Unit,
+    onRemoveLocalFolder: (String) -> Unit,
+    onUploadFiles: (String) -> Unit,
+    onUploadDirectory: (String) -> Unit,
+    onCancelTransfer: () -> Unit
 ) {
     var creating by remember { mutableStateOf<CreateTarget?>(null) }
     var menuNode by remember { mutableStateOf<FileTreeNode?>(null) }
     var pendingRename by remember { mutableStateOf<FileTreeNode?>(null) }
     var pendingDelete by remember { mutableStateOf<FileTreeNode?>(null) }
+    var pendingRemoveLocalFolder by remember { mutableStateOf<FileTreeRoot.LocalFolder?>(null) }
     val hScroll = rememberScrollState()
+    val operationsEnabled = !transferActive && fileOpPaths.isEmpty()
 
-    Box(modifier = Modifier.fillMaxSize()) {
-        when (state) {
-            is FileBrowseState.Loading -> Box(
-                modifier = Modifier.fillMaxSize(),
-                contentAlignment = Alignment.Center
-            ) {
-                CircularProgressIndicator(modifier = Modifier.size(24.dp))
-            }
-
-            is FileBrowseState.Error -> Box(
-                modifier = Modifier.fillMaxSize(),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    text = state.detail ?: stringResource(R.string.file_browser_error),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.error,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.padding(horizontal = Spacing.md)
-                )
-            }
-
-            is FileBrowseState.Success -> {
-                val listState = rememberLazyListState()
-                val textMeasurer = rememberTextMeasurer()
-                val textStyle = MaterialTheme.typography.bodyMedium
-                val density = LocalDensity.current
-                // 预算最宽一行的内容宽度（固定开销 + 缩进 + 文本），供所有行取统一宽度，
-                // 以实现整棵树统一横向平移（而非每行各自滚动）。
-                // 逐个 measure 在大目录下会在组合期同步跑上千次文本测量；先按「缩进 + 字符宽度权重」
-                // 挑出最宽的那一行，只对它做一次真实测量。估算不精确，但这里只用来给横向滚动留够宽度。
-                val maxContentPx = remember(state.nodes, textStyle) {
-                    with(density) {
-                        val widest = state.nodes.maxByOrNull { node ->
-                            node.depth * 4 + node.displayName.sumOf { ch -> if (ch.code > 0x2E80) 2 else 1 }
-                        } ?: return@with 0
-                        val textW = textMeasurer.measure(widest.displayName, textStyle).size.width
-                        (FILE_TREE_ROW_OVERHEAD.toPx() + (Spacing.lg * widest.depth).toPx() + textW).toInt()
-                    }
-                }
-                BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
-                    val rowWidthPx = maxOf(constraints.maxWidth, maxContentPx)
-                    val rowWidth = with(density) { rowWidthPx.toDp() }
-                    LazyColumn(
-                        state = listState,
-                        modifier = Modifier
-                            .fillMaxHeight()
-                            .horizontalScroll(hScroll)
-                    ) {
-                        items(state.nodes, key = { it.path }) { node ->
-                            FileTreeRow(
-                                node = node,
-                                rowWidth = rowWidth,
-                                expanding = node.entry.isDirectory && node.path == expandingPath,
-                                busy = node.path in fileOpPaths,
-                                onClick = {
-                                    if (node.entry.isDirectory) onToggleExpand(node.path)
-                                    else onOpenFile(node.path)
-                                },
-                                onLongClick = { menuNode = node },
-                                modifier = Modifier.animateItem(
-                                    fadeInSpec = tween(durationMillis = 200, easing = FastOutSlowInEasing),
-                                    fadeOutSpec = tween(durationMillis = 180, easing = FastOutSlowInEasing),
-                                    placementSpec = tween(durationMillis = 200, easing = FastOutSlowInEasing)
-                                )
-                            )
-                        }
-                    }
-                }
-            }
-        }
-
-        // 右上角操作排：剪贴板指示器（有背景、有边框，与无背景的刷新图标区分）+ 刷新按钮。
+    Column(modifier = Modifier.fillMaxSize()) {
         Row(
-            modifier = Modifier
-                .align(Alignment.TopEnd)
-                .padding(Spacing.xs),
+            modifier = Modifier.fillMaxWidth().padding(Spacing.xs),
             verticalAlignment = Alignment.CenterVertically
         ) {
+            Text(
+                text = stringResource(R.string.drawer_tab_files),
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.semanticColors.subtleText,
+                modifier = Modifier.weight(1f)
+            )
             clipboard?.let { clip ->
                 ClipboardIndicator(
                     clipboard = clip,
                     onClear = onClearClipboard,
+                    enabled = operationsEnabled,
                     modifier = Modifier.padding(end = Spacing.xs)
                 )
             }
-            if (fileOpPaths.isNotEmpty()) {
+            if (transferActive || fileOpPaths.isNotEmpty()) {
+                val transferDescription = stringResource(R.string.file_browser_transfer_in_progress)
                 CircularProgressIndicator(
-                    modifier = Modifier.padding(end = Spacing.xs).size(16.dp),
+                    modifier = Modifier.padding(end = Spacing.xs).size(16.dp).semantics {
+                        if (transferActive) contentDescription = transferDescription
+                    },
                     strokeWidth = 2.dp,
                     color = MaterialTheme.colorScheme.primary
                 )
             }
+            if (transferActive) {
+                IconButton(
+                    onClick = onCancelTransfer,
+                    modifier = Modifier.size(32.dp)
+                ) {
+                    Icon(
+                        imageVector = FeatherIcons.X,
+                        contentDescription = stringResource(R.string.file_browser_cancel_transfer),
+                        modifier = Modifier.size(16.dp)
+                    )
+                }
+            }
+            IconButton(
+                onClick = onAddLocalFolder,
+                enabled = operationsEnabled,
+                modifier = Modifier.size(32.dp)
+            ) {
+                Icon(
+                    imageVector = FeatherIcons.FolderPlus,
+                    contentDescription = stringResource(R.string.file_browser_add_local_folder),
+                    modifier = Modifier.size(16.dp)
+                )
+            }
             IconButton(
                 onClick = onRefresh,
+                enabled = !transferActive,
                 modifier = Modifier.size(32.dp)
             ) {
                 Icon(
                     imageVector = FeatherIcons.RefreshCw,
                     contentDescription = stringResource(R.string.file_browser_refresh),
-                    modifier = Modifier.size(16.dp),
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                    modifier = Modifier.size(16.dp)
                 )
+            }
+        }
+        Box(modifier = Modifier.weight(1f)) {
+            when (state) {
+                is FileBrowseState.Loading -> Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center
+                ) {
+                    CircularProgressIndicator(modifier = Modifier.size(24.dp))
+                }
+
+                is FileBrowseState.Error -> Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = state.detail ?: stringResource(R.string.file_browser_error),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.padding(horizontal = Spacing.md)
+                    )
+                }
+
+                is FileBrowseState.Success -> {
+                    val listState = rememberLazyListState()
+                    val textMeasurer = rememberTextMeasurer()
+                    val textStyle = MaterialTheme.typography.bodyMedium
+                    val density = LocalDensity.current
+                    // 预算最宽一行的内容宽度（固定开销 + 缩进 + 文本），供所有行取统一宽度，
+                    // 以实现整棵树统一横向平移（而非每行各自滚动）。
+                    // 逐个 measure 在大目录下会在组合期同步跑上千次文本测量；先按「缩进 + 字符宽度权重」
+                    // 挑出最宽的那一行，只对它做一次真实测量。估算不精确，但这里只用来给横向滚动留够宽度。
+                    val maxContentPx = remember(state.nodes, textStyle) {
+                        with(density) {
+                            val widest = state.nodes.maxByOrNull { node ->
+                                node.depth * 4 + node.displayName.sumOf { ch -> if (ch.code > 0x2E80) 2 else 1 }
+                            } ?: return@with 0
+                            val textW = textMeasurer.measure(widest.displayName, textStyle).size.width
+                            (FILE_TREE_ROW_OVERHEAD.toPx() + (Spacing.lg * widest.depth).toPx() + textW).toInt()
+                        }
+                    }
+                    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+                        val rowWidthPx = maxOf(constraints.maxWidth, maxContentPx)
+                        val rowWidth = with(density) { rowWidthPx.toDp() }
+                        LazyColumn(
+                            state = listState,
+                            modifier = Modifier
+                                .fillMaxHeight()
+                                .horizontalScroll(hScroll)
+                        ) {
+                            items(state.nodes, key = { it.path }) { node ->
+                                FileTreeRow(
+                                    node = node,
+                                    rowWidth = rowWidth,
+                                    expanding = node.entry.isDirectory && node.path == expandingPath,
+                                    busy = node.path in fileOpPaths,
+                                    onClick = {
+                                        if ((node.root as? FileTreeRoot.LocalFolder)?.available == false) {
+                                            menuNode = node
+                                        } else if (node.entry.isDirectory) {
+                                            onToggleExpand(node.path)
+                                        } else {
+                                            onOpenFile(node.path)
+                                        }
+                                    },
+                                    onLongClick = { menuNode = node },
+                                    modifier = Modifier.animateItem(
+                                        fadeInSpec = tween(durationMillis = 200, easing = FastOutSlowInEasing),
+                                        fadeOutSpec = tween(durationMillis = 180, easing = FastOutSlowInEasing),
+                                        placementSpec = tween(durationMillis = 200, easing = FastOutSlowInEasing)
+                                    )
+                                )
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1044,6 +1111,7 @@ private fun FileBrowserTab(
             ),
             confirmLabel = stringResource(R.string.common_create),
             initialName = "",
+            enabled = operationsEnabled,
             onConfirm = { name ->
                 if (target.kind == CreateKind.FILE) onCreateFile(target.parent, name)
                 else onCreateFolder(target.parent, name)
@@ -1053,10 +1121,13 @@ private fun FileBrowserTab(
         )
     }
 
-    menuNode?.let { node ->
+    menuNode?.let { selectedNode ->
+        val node = (state as? FileBrowseState.Success)?.nodes?.firstOrNull { it.path == selectedNode.path }
+            ?: return@let
         FileTreeActionSheet(
             node = node,
             clipboard = clipboard,
+            busy = !operationsEnabled,
             onNewFile = {
                 menuNode = null
                 if (node.root == null && node.path !in expandedPaths) onToggleExpand(node.path)
@@ -1088,6 +1159,22 @@ private fun FileBrowserTab(
                 menuNode = null
                 onPasteEntry(target) { /* 结果由调用方决定是否提示，这里保持静默 */ }
             },
+            onUploadFiles = {
+                menuNode = null
+                onUploadFiles(node.path)
+            },
+            onUploadDirectory = {
+                menuNode = null
+                onUploadDirectory(node.path)
+            },
+            onRemoveLocalFolder = {
+                menuNode = null
+                pendingRemoveLocalFolder = node.root as? FileTreeRoot.LocalFolder
+            },
+            onReauthorizeLocalFolder = {
+                menuNode = null
+                onAddLocalFolder()
+            },
             onDismiss = { menuNode = null }
         )
     }
@@ -1097,6 +1184,7 @@ private fun FileBrowserTab(
             title = stringResource(R.string.common_rename),
             confirmLabel = stringResource(R.string.common_rename),
             initialName = node.entry.name,
+            enabled = operationsEnabled,
             onConfirm = { name ->
                 onRenameEntry(node.path, name)
                 pendingRename = null
@@ -1122,13 +1210,38 @@ private fun FileBrowserTab(
                 )
             },
             confirmButton = {
-                TextButton(onClick = {
-                    onDeleteEntry(node.path)
-                    pendingDelete = null
-                }) { Text(stringResource(R.string.common_delete), color = MaterialTheme.colorScheme.error) }
+                TextButton(
+                    onClick = {
+                        onDeleteEntry(node.path)
+                        pendingDelete = null
+                    },
+                    enabled = operationsEnabled
+                ) { Text(stringResource(R.string.common_delete), color = MaterialTheme.colorScheme.error) }
             },
             dismissButton = {
                 TextButton(onClick = { pendingDelete = null }) { Text(stringResource(R.string.common_cancel)) }
+            }
+        )
+    }
+
+    pendingRemoveLocalFolder?.let { root ->
+        AlertDialog(
+            onDismissRequest = { pendingRemoveLocalFolder = null },
+            title = { Text(stringResource(R.string.file_browser_remove_local_folder)) },
+            text = { Text(stringResource(R.string.file_browser_remove_local_folder_confirm, root.label)) },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        onRemoveLocalFolder(root.grantId)
+                        pendingRemoveLocalFolder = null
+                    },
+                    enabled = operationsEnabled
+                ) { Text(stringResource(R.string.file_browser_remove_local_folder)) }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingRemoveLocalFolder = null }) {
+                    Text(stringResource(R.string.common_cancel))
+                }
             }
         )
     }
@@ -1146,6 +1259,7 @@ private fun FileNameInputDialog(
     title: String,
     confirmLabel: String,
     initialName: String,
+    enabled: Boolean = true,
     onConfirm: (String) -> Unit,
     onDismiss: () -> Unit
 ) {
@@ -1166,7 +1280,7 @@ private fun FileNameInputDialog(
         confirmButton = {
             Button(
                 onClick = { onConfirm(name) },
-                enabled = isValidFileEntryName(name) && name.trim() != initialName
+                enabled = enabled && isValidFileEntryName(name) && name.trim() != initialName
             ) { Text(confirmLabel) }
         },
         dismissButton = {
@@ -1180,10 +1294,12 @@ private fun FileNameInputDialog(
 private fun ClipboardIndicator(
     clipboard: BrowseClipboard,
     onClear: () -> Unit,
+    enabled: Boolean = true,
     modifier: Modifier = Modifier
 ) {
     IconButton(
         onClick = onClear,
+        enabled = enabled,
         modifier = modifier.size(32.dp)
     ) {
         Icon(
@@ -1205,6 +1321,7 @@ private fun ClipboardIndicator(
 private fun FileTreeActionSheet(
     node: FileTreeNode,
     clipboard: BrowseClipboard?,
+    busy: Boolean,
     onNewFile: () -> Unit,
     onNewFolder: () -> Unit,
     onRename: () -> Unit,
@@ -1212,8 +1329,15 @@ private fun FileTreeActionSheet(
     onCopy: () -> Unit,
     onCut: () -> Unit,
     onPasteHere: () -> Unit,
+    onUploadFiles: () -> Unit,
+    onUploadDirectory: () -> Unit,
+    onRemoveLocalFolder: () -> Unit,
+    onReauthorizeLocalFolder: () -> Unit,
     onDismiss: () -> Unit
 ) {
+    val localRoot = node.root as? FileTreeRoot.LocalFolder
+    val available = localRoot?.available != false
+    val enabled = !busy && available
     AdaptiveModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = rememberModalBottomSheetState(),
@@ -1222,6 +1346,7 @@ private fun FileTreeActionSheet(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
                 .padding(bottom = Spacing.xl)
         ) {
             Text(
@@ -1234,12 +1359,35 @@ private fun FileTreeActionSheet(
                     .padding(horizontal = Spacing.lg)
                     .padding(bottom = Spacing.md)
             )
+            if (!available) {
+                Text(
+                    text = stringResource(R.string.file_browser_local_folder_unavailable),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.padding(horizontal = Spacing.lg, vertical = Spacing.sm)
+                )
+                SheetActionRow(
+                    icon = FeatherIcons.FolderPlus,
+                    label = stringResource(R.string.file_browser_reauthorize_local_folder),
+                    tint = MaterialTheme.colorScheme.primary,
+                    enabled = !busy,
+                    onClick = onReauthorizeLocalFolder
+                )
+            }
+            com.aicode.feature.plugin.presentation.PluginSlotContent(
+                com.aicode.feature.plugin.domain.PluginUiSlots.FILES_TREE_MENU,
+                kotlinx.serialization.json.buildJsonObject {
+                    put("path", kotlinx.serialization.json.JsonPrimitive(node.path))
+                    put("isDirectory", kotlinx.serialization.json.JsonPrimitive(node.entry.isDirectory))
+                }, enabled = enabled
+            )
             // 剪切板非空且当前节点是目录 / 根：优先提供「粘贴到此处」。
             if (clipboard != null && node.entry.isDirectory) {
                 SheetActionRow(
                     icon = FeatherIcons.Clipboard,
                     label = stringResource(R.string.file_browser_paste_here),
                     tint = MaterialTheme.colorScheme.primary,
+                    enabled = enabled,
                     onClick = onPasteHere
                 )
             }
@@ -1248,13 +1396,38 @@ private fun FileTreeActionSheet(
                     icon = FeatherIcons.FilePlus,
                     label = stringResource(R.string.file_browser_new_file),
                     tint = MaterialTheme.colorScheme.onSurface,
+                    enabled = enabled,
                     onClick = onNewFile
                 )
                 SheetActionRow(
                     icon = FeatherIcons.FolderPlus,
                     label = stringResource(R.string.file_browser_new_folder),
                     tint = MaterialTheme.colorScheme.onSurface,
+                    enabled = enabled,
                     onClick = onNewFolder
+                )
+                SheetActionRow(
+                    icon = FeatherIcons.Upload,
+                    label = stringResource(R.string.file_browser_upload_files),
+                    tint = MaterialTheme.colorScheme.onSurface,
+                    enabled = enabled,
+                    onClick = onUploadFiles
+                )
+                SheetActionRow(
+                    icon = FeatherIcons.UploadCloud,
+                    label = stringResource(R.string.file_browser_upload_directory),
+                    tint = MaterialTheme.colorScheme.onSurface,
+                    enabled = enabled,
+                    onClick = onUploadDirectory
+                )
+            }
+            if (localRoot != null) {
+                SheetActionRow(
+                    icon = FeatherIcons.X,
+                    label = stringResource(R.string.file_browser_remove_local_folder),
+                    tint = MaterialTheme.colorScheme.onSurface,
+                    enabled = !busy,
+                    onClick = onRemoveLocalFolder
                 )
             }
             if (node.root == null) {
@@ -1262,24 +1435,28 @@ private fun FileTreeActionSheet(
                     icon = FeatherIcons.Copy,
                     label = stringResource(R.string.common_copy),
                     tint = MaterialTheme.colorScheme.onSurface,
+                    enabled = enabled,
                     onClick = onCopy
                 )
                 SheetActionRow(
                     icon = Icons.Filled.ContentCut,
                     label = stringResource(R.string.common_cut),
                     tint = MaterialTheme.colorScheme.onSurface,
+                    enabled = enabled,
                     onClick = onCut
                 )
                 SheetActionRow(
                     icon = FeatherIcons.Edit2,
                     label = stringResource(R.string.common_rename),
                     tint = MaterialTheme.colorScheme.onSurface,
+                    enabled = enabled,
                     onClick = onRename
                 )
                 SheetActionRow(
                     icon = FeatherIcons.Trash2,
                     label = stringResource(R.string.common_delete),
                     tint = MaterialTheme.colorScheme.error,
+                    enabled = enabled,
                     onClick = onDelete
                 )
             }
@@ -1313,7 +1490,7 @@ private fun FileTreeRow(
     }
     val isDotfile = node.root == null && node.entry.name.startsWith(".")
     val decorationColor: Color? = when {
-        node.hasError -> MaterialTheme.colorScheme.error
+        node.hasError || (node.root as? FileTreeRoot.LocalFolder)?.available == false -> MaterialTheme.colorScheme.error
         node.ignored -> FileTreeIgnoredColor
         isDotfile -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.55f)
         else -> null
@@ -1455,6 +1632,10 @@ private fun SessionActionSheet(
                     .padding(horizontal = Spacing.lg)
                     .padding(bottom = Spacing.md)
             )
+            com.aicode.feature.plugin.presentation.PluginSlotContent(
+                com.aicode.feature.plugin.domain.PluginUiSlots.CHAT_SESSION_MENU,
+                kotlinx.serialization.json.buildJsonObject { put("sessionId", kotlinx.serialization.json.JsonPrimitive(session.id)) }
+            )
             SheetActionRow(
                 icon = Icons.Outlined.PushPin,
                 label = stringResource(if (session.isPinned) R.string.chat_unpin_session else R.string.chat_pin_session),
@@ -1509,9 +1690,11 @@ private fun SheetActionRow(
     icon: ImageVector,
     label: String,
     tint: Color,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    enabled: Boolean = true
 ) {
-    Surface(onClick = onClick, color = Color.Transparent) {
+    val contentTint = if (enabled) tint else tint.copy(alpha = tint.alpha * 0.38f)
+    Surface(onClick = onClick, enabled = enabled, color = Color.Transparent) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -1522,13 +1705,13 @@ private fun SheetActionRow(
                 imageVector = icon,
                 contentDescription = null,
                 modifier = Modifier.size(20.dp),
-                tint = tint
+                tint = contentTint
             )
             Spacer(Modifier.width(Spacing.lg))
             Text(
                 text = label,
                 style = MaterialTheme.typography.bodyLarge,
-                color = tint
+                color = contentTint
             )
         }
     }

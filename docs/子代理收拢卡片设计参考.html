@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>子代理收拢卡片 · UI 交互参考稿</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --page: #eef2f7;
+      --phone: #f8fafc;
+      --surface: #ffffff;
+      --surface-2: #f1f5f9;
+      --line: #d9e1ec;
+      --text: #172033;
+      --muted: #738096;
+      --primary: #5b5bd6;
+      --primary-soft: #eeedff;
+      --success: #198754;
+      --success-soft: #e8f6ee;
+      --warning: #b7791f;
+      --warning-soft: #fff6df;
+      --danger: #c64747;
+      --danger-soft: #fff0f0;
+      --running: #5b5bd6;
+      --shadow: 0 20px 50px rgba(38, 52, 77, .15);
+      font-family: Inter, "Noto Sans SC", "Microsoft YaHei", system-ui, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-width: 320px;
+      color: var(--text);
+      background: radial-gradient(circle at 50% -10%, #fff 0, var(--page) 42rem);
+    }
+    button { font: inherit; }
+    .page { max-width: 1280px; margin: 0 auto; padding: 42px 24px 64px; }
+    .hero { display: flex; align-items: end; justify-content: space-between; gap: 24px; margin-bottom: 24px; }
+    .eyebrow { margin: 0 0 8px; color: var(--primary); font-size: 12px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase; }
+    h1 { margin: 0; font-size: clamp(25px, 4vw, 40px); letter-spacing: -.04em; }
+    .intro { max-width: 670px; margin: 10px 0 0; color: var(--muted); line-height: 1.65; font-size: 15px; }
+    .notice { padding: 10px 14px; border: 1px solid #d8d5ff; border-radius: 999px; color: #4b4ba6; background: #f5f4ff; font-size: 13px; white-space: nowrap; }
+
+    .switcher { display: flex; gap: 8px; padding: 6px; margin-bottom: 22px; border: 1px solid var(--line); border-radius: 16px; background: rgba(255,255,255,.72); box-shadow: 0 8px 24px rgba(38,52,77,.06); }
+    .switcher button { flex: 1; min-height: 44px; border: 0; border-radius: 11px; color: var(--muted); background: transparent; cursor: pointer; font-weight: 750; }
+    .switcher button:hover { color: var(--text); background: #f2f4fa; }
+    .switcher button.active { color: #fff; background: var(--primary); box-shadow: 0 5px 12px rgba(91,91,214,.24); }
+
+    .board { display: grid; grid-template-columns: minmax(0, 1fr) 280px; gap: 24px; align-items: start; }
+    .stage { min-height: 790px; display: grid; place-items: center; padding: 30px 20px; border: 1px solid #dce3ef; border-radius: 28px; background: linear-gradient(145deg, #f7f9fc, #e9eef6); }
+    .phone { position: relative; width: min(100%, 390px); min-height: 720px; overflow: hidden; border: 8px solid #1d2534; border-radius: 38px; background: var(--phone); box-shadow: var(--shadow); }
+    .phone.dark-phone { border-color: #0d111c; background: #111827; }
+    .notch { position: absolute; z-index: 4; top: 0; left: 50%; width: 132px; height: 25px; transform: translateX(-50%); border-radius: 0 0 18px 18px; background: #1d2534; }
+    .statusbar { display: flex; justify-content: space-between; padding: 14px 17px 7px; color: #647087; font-size: 10px; font-weight: 750; }
+    .appbar { display: flex; align-items: center; justify-content: space-between; padding: 7px 17px 13px; border-bottom: 1px solid #e7ebf2; background: rgba(248,250,252,.96); }
+    .dark-phone .statusbar, .dark-phone .appbar { color: #aeb9cd; background: #111827; }
+    .dark-phone .appbar { border-bottom-color: #273247; }
+    .app-title { display: flex; align-items: center; gap: 8px; font-weight: 800; font-size: 14px; }
+    .app-mark { display: grid; width: 25px; height: 25px; place-items: center; border-radius: 8px; color: #fff; background: linear-gradient(135deg, #6f6be8, #4541ac); font-size: 11px; font-weight: 900; }
+    .app-actions { color: #7f8a9e; letter-spacing: 3px; }
+    .chat { min-height: 606px; padding: 16px 13px 76px; overflow: hidden; }
+    .message { max-width: 85%; margin: 0 0 13px; padding: 10px 12px; border-radius: 14px; font-size: 12px; line-height: 1.55; }
+    .message.user { margin-left: auto; border-bottom-right-radius: 5px; color: #fff; background: #5b5bd6; }
+    .message.ai { border: 1px solid #e3e8f1; border-bottom-left-radius: 5px; color: #4f5d72; background: #fff; }
+    .message .message-label { display: block; margin-bottom: 5px; color: #8b97a9; font-size: 10px; font-weight: 800; }
+    .composer { position: absolute; right: 13px; bottom: 12px; left: 13px; display: flex; align-items: center; gap: 8px; padding: 8px 9px 8px 12px; border: 1px solid #dce3ed; border-radius: 14px; color: #a1acbc; background: rgba(255,255,255,.95); font-size: 11px; }
+    .composer-send { display: grid; width: 25px; height: 25px; margin-left: auto; place-items: center; border-radius: 8px; color: #fff; background: var(--primary); font-size: 13px; }
+
+    .card { position: relative; margin: 12px 0 15px; border: 1px solid var(--line); border-radius: 18px; color: var(--text); background: var(--surface); box-shadow: 0 8px 22px rgba(44,60,89,.07); }
+    .card button { border: 0; cursor: pointer; }
+    .card-header { display: flex; align-items: center; gap: 10px; width: 100%; padding: 13px 14px; text-align: left; color: inherit; background: transparent; }
+    .card-header:hover { background: #fafbff; }
+    .cpu { display: grid; flex: 0 0 auto; width: 31px; height: 31px; place-items: center; border-radius: 10px; color: var(--primary); background: var(--primary-soft); font-size: 17px; }
+    .card-copy { min-width: 0; flex: 1; }
+    .card-title { display: flex; align-items: center; gap: 7px; font-size: 13px; font-weight: 850; }
+    .card-count { color: var(--muted); font-size: 10px; font-weight: 650; }
+    .card-subtitle { margin-top: 4px; overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+    .chevron { color: #8490a4; font-size: 18px; transition: transform .2s ease; }
+    .open .chevron { transform: rotate(90deg); }
+    .summary-line { display: flex; flex-wrap: wrap; gap: 6px 10px; padding: 0 14px 13px 55px; color: var(--muted); font-size: 10px; }
+    .summary-line strong { font-weight: 800; }
+    .dot { display: inline-block; width: 6px; height: 6px; margin-right: 4px; border-radius: 50%; vertical-align: 1px; background: currentColor; }
+    .running { color: var(--running); }
+    .done { color: var(--success); }
+    .waiting { color: var(--warning); }
+    .failed { color: var(--danger); }
+    .members { display: none; padding: 0 10px 10px; }
+    .open .members { display: block; }
+    .member-row { display: flex; align-items: center; gap: 9px; width: 100%; padding: 9px 7px; border-top: 1px solid #edf0f5; color: inherit; background: transparent; text-align: left; }
+    .member-row:hover { border-radius: 10px; background: #f7f8fc; }
+    .member-icon { display: grid; flex: 0 0 auto; width: 24px; height: 24px; place-items: center; border-radius: 8px; color: #fff; background: #6874db; font-size: 9px; font-weight: 850; }
+    .member-copy { min-width: 0; flex: 1; }
+    .member-name { font-size: 11px; font-weight: 800; }
+    .member-task { margin-top: 2px; overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+    .status { flex: 0 0 auto; padding: 3px 6px; border-radius: 999px; font-size: 9px; font-weight: 750; }
+    .status.running { background: var(--primary-soft); }
+    .status.done { background: var(--success-soft); }
+    .status.waiting { background: var(--warning-soft); }
+    .status.failed { background: var(--danger-soft); }
+    .member-more { display: block; width: 100%; padding: 8px; border-radius: 9px; color: var(--primary); background: #f5f4ff; text-align: center; font-size: 10px; font-weight: 800; }
+
+    .variant-label { margin: 0 0 10px; color: #64728a; font-size: 11px; font-weight: 850; letter-spacing: .04em; }
+    .variant-label span { color: var(--primary); }
+    .side { padding: 20px; border: 1px solid var(--line); border-radius: 20px; background: rgba(255,255,255,.8); }
+    .side h2 { margin: 0 0 10px; font-size: 16px; }
+    .side p { margin: 0 0 15px; color: var(--muted); font-size: 12px; line-height: 1.65; }
+    .side dl { margin: 0; }
+    .side dt { margin-top: 13px; color: var(--text); font-size: 12px; font-weight: 850; }
+    .side dd { margin: 4px 0 0; color: var(--muted); font-size: 12px; line-height: 1.55; }
+    .tradeoff { margin-top: 18px; padding: 12px; border-radius: 13px; color: #5b4b13; background: #fff8df; font-size: 11px; line-height: 1.55; }
+
+    /* Variant B */
+    .variant-b .card { padding-bottom: 8px; }
+    .variant-b .card-header { padding-bottom: 10px; }
+    .variant-b .group-mark { display: grid; flex: 0 0 auto; width: 31px; height: 31px; place-items: center; border-radius: 10px; color: #fff; background: linear-gradient(135deg, #6f6be8, #4c48b8); font-size: 13px; font-weight: 900; }
+    .variant-b .member-list { padding: 0 9px; }
+    .variant-b .member-row { border: 0; border-top: 1px solid #edf0f5; }
+    .variant-b .member-row.selected { border-radius: 10px; background: #f3f3ff; }
+    .variant-b .selected-detail { display: none; margin: 6px 9px 8px; padding: 10px; border-radius: 11px; color: #59677b; background: #f6f8fb; font-size: 10px; line-height: 1.55; }
+    .variant-b .selected-detail.visible { display: block; }
+    .variant-b .compact-view .member-list { display: none; }
+    .variant-b .compact-view .summary-line { padding-bottom: 12px; }
+    .variant-b .compact-view .card { padding-bottom: 0; }
+
+    /* Variant C */
+    .dark-card { overflow: hidden; border-color: #2c3952; color: #f6f8ff; background: linear-gradient(145deg, #1b2537, #121a29); box-shadow: 0 15px 28px rgba(10,17,31,.25); }
+    .dark-card .card-header:hover { background: rgba(255,255,255,.03); }
+    .dark-card .card-subtitle, .dark-card .summary-line { color: #a7b3c8; }
+    .dark-card .cpu { color: #c5c3ff; background: rgba(125,121,255,.18); }
+    .dark-card .chevron { color: #bbc5d6; }
+    .command-top { display: flex; align-items: center; gap: 11px; padding: 14px 14px 3px; }
+    .ring { display: grid; width: 50px; height: 50px; place-items: center; border-radius: 50%; background: conic-gradient(#8c88ff 0 75%, #33415c 75% 100%); }
+    .ring::after { display: grid; width: 38px; height: 38px; place-items: center; border-radius: 50%; color: #f4f5ff; background: #1b2537; content: "3/4"; font-size: 11px; font-weight: 850; }
+    .command-kicker { color: #a8b4c8; font-size: 10px; }
+    .command-title { margin-top: 3px; font-size: 14px; font-weight: 850; }
+    .command-running { margin-left: auto; padding: 5px 7px; border: 1px solid rgba(140,136,255,.35); border-radius: 999px; color: #c9c7ff; background: rgba(140,136,255,.13); font-size: 9px; font-weight: 800; }
+    .agent-strip { display: flex; gap: 8px; padding: 11px 14px 12px; }
+    .agent-chip { display: flex; align-items: center; gap: 4px; padding: 4px 6px; border: 1px solid #33415b; border-radius: 8px; color: #b8c3d8; background: #202c41; font-size: 9px; cursor: pointer; }
+    .agent-chip:hover, .agent-chip.selected { border-color: #8c88ff; color: #f6f5ff; background: #30335f; }
+    .agent-avatar { display: grid; width: 15px; height: 15px; place-items: center; border-radius: 5px; color: #fff; background: #6a70d8; font-size: 7px; font-weight: 850; }
+    .dark-card .latest { margin: 0 14px 14px; padding: 9px 10px; border-radius: 10px; color: #b8c3d8; background: rgba(255,255,255,.055); font-size: 10px; }
+    .latest b { color: #eef0ff; }
+    .command-open { width: calc(100% - 28px); margin: 0 14px 14px; padding: 9px; border: 1px solid #6b68dc; border-radius: 10px; color: #eeeefe; background: #514ec4; cursor: pointer; font-size: 10px; font-weight: 800; }
+    .command-sheet { display: none; margin: 0 9px 9px; padding: 10px; border: 1px solid #38455d; border-radius: 14px; background: #202b3f; }
+    .command-sheet.visible { display: block; }
+    .sheet-tabs { display: flex; gap: 4px; padding: 3px; border-radius: 9px; background: #151e2e; }
+    .sheet-tabs button { flex: 1; padding: 6px 3px; border: 0; border-radius: 6px; color: #9daac0; background: transparent; cursor: pointer; font-size: 10px; }
+    .sheet-tabs button.active { color: #fff; background: #5350c7; }
+    .sheet-content { padding: 11px 2px 2px; color: #b6c2d6; font-size: 10px; line-height: 1.65; }
+    .sheet-content strong { color: #f3f4ff; }
+
+    @media (max-width: 900px) {
+      .board { grid-template-columns: 1fr; }
+      .stage { min-height: 760px; }
+      .side { order: -1; }
+      .side dl { display: grid; grid-template-columns: 120px 1fr; gap: 5px 12px; }
+      .side dt { margin-top: 3px; }
+      .side dd { margin-top: 3px; }
+    }
+    @media (max-width: 560px) {
+      .page { padding: 24px 12px 40px; }
+      .hero { display: block; }
+      .notice { display: inline-block; margin-top: 16px; }
+      .stage { padding: 14px 6px; border-radius: 20px; }
+      .phone { min-height: 700px; }
+      .switcher button { padding: 0 4px; font-size: 12px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">Ajiu Workbench · Interaction Study</p>
+        <h1>子代理收拢卡片 · 三套参考稿</h1>
+        <p class="intro">基于当前的成员状态、任务标题、最新摘要、执行中工具和展开/收拢状态，做了三条不同的信息组织路线。点击卡片与成员，直接体验它们在聊天时间线中的行为。</p>
+      </div>
+      <div class="notice">参考稿 · 未修改生产 UI</div>
+    </header>
+
+    <nav class="switcher" aria-label="方案切换">
+      <button class="active" data-variant="a">A · 紧凑状态条</button>
+      <button data-variant="b">B · 成员预览卡</button>
+      <button data-variant="c">C · 任务指挥卡</button>
+    </nav>
+
+    <section class="board">
+      <div class="stage" id="stage"></div>
+      <aside class="side" id="side"></aside>
+    </section>
+  </main>
+
+  <script>
+    const agents = [
+      { name: '探索员', initial: '探', task: '梳理调用链与影响面', status: 'running', statusText: '运行中', detail: '正在阅读真实代码，确认哪些数据已经可以直接复用。' },
+      { name: '编码员', initial: '编', task: '实现卡片布局候选', status: 'running', statusText: '运行中', detail: '正在整理可复用的 Compose 状态与点击回调。' },
+      { name: '审核员', initial: '审', task: '检查交互回归风险', status: 'done', statusText: '完成', detail: '已检查折叠、展开和列表定位，不会改变聊天时间线顺序。' },
+      { name: '测试员', initial: '测', task: '准备布局验收用例', status: 'waiting', statusText: '等待确认', detail: '等待选择最终视觉方向后补充验收矩阵。' }
+    ];
+    let current = 'a';
+    let aOpen = false;
+    let bCompact = false;
+    let bSelected = -1;
+    let cSheet = false;
+    let cMember = 0;
+    let cTab = '概览';
+
+    const statusSpan = a => `<span class="${a.status}"><i class="dot"></i>${a.statusText}</span>`;
+    const memberRow = (a, i, extra = '') => `
+      <button class="member-row ${extra}" data-member="${i}">
+        <span class="member-icon">${a.initial}</span>
+        <span class="member-copy"><span class="member-name">${a.name}</span><span class="member-task">${a.task}</span></span>
+        <span class="status ${a.status}">${a.statusText}</span>
+      </button>`;
+    const statusSummary = `<span class="running"><i class="dot"></i><strong>运行中 2</strong></span><span class="done"><i class="dot"></i><strong>已完成 1</strong></span><span class="waiting"><i class="dot"></i><strong>等待确认 1</strong></span>`;
+    const chatBase = (card, dark = false) => `
+      <div class="${dark ? 'dark-phone' : ''} phone">
+        <div class="notch"></div>
+        <div class="statusbar"><span>9:41</span><span>▮▮▮　Wi‑Fi　▰</span></div>
+        <div class="appbar"><div class="app-title"><span class="app-mark">A</span>阿九工作台</div><span class="app-actions">•••</span></div>
+        <div class="chat">
+          <div class="message user"><span class="message-label">你</span>把这次任务拆给几个子代理并行处理。</div>
+          <div class="message ai"><span class="message-label">AI</span>已分派 4 个子代理。我会在这里收拢展示进度。</div>
+          ${card}
+          <div class="message ai"><span class="message-label">AI</span>完成后我会把结论汇总到当前对话，不需要你来回切换页面。</div>
+        </div>
+        <div class="composer"><span>继续输入指令…</span><span class="composer-send">↑</span></div>
+      </div>`;
+
+    function renderA() {
+      const open = aOpen ? 'open' : '';
+      const rows = agents.map((a, i) => memberRow(a, i)).join('');
+      const card = `<div class="variant-a">
+        <p class="variant-label">方案 A <span>· 默认建议</span></p>
+        <div class="card ${open}" id="a-card">
+          <button class="card-header" id="a-toggle" aria-expanded="${aOpen}">
+            <span class="cpu">⌘</span><span class="card-copy"><span class="card-title">子代理 <span class="card-count">4 个</span></span><span class="card-subtitle">${aOpen ? '点击成员可查看详情' : '并行任务已收拢到当前时间线'}</span></span><span class="chevron">›</span>
+          </button>
+          <div class="summary-line">${statusSummary}</div>
+          <div class="members">${rows}</div>
+        </div>
+      </div>`;
+      return { html: chatBase(card), side: `
+        <h2>A · 紧凑状态条</h2><p>把收拢态压成一条高信息密度的时间线节点，默认不抢聊天内容的注意力。</p>
+        <dl><dt>收拢态</dt><dd>总数、状态统计、成员名。</dd><dt>点击卡片</dt><dd>原地展开全部成员。</dd><dt>点击成员</dt><dd>展开后进入对应子代理详情。</dd><dt>自动状态</dt><dd>终态可自动回收展开内容，保持时间线紧凑。</dd></dl>
+        <div class="tradeoff"><b>优点：</b>改动最小、最不打断聊天。<br><b>代价：</b>收拢态看不到每个成员的具体任务。</div>` };
+    }
+
+    function renderB() {
+      const compact = bCompact ? 'compact-view' : '';
+      const selected = bSelected >= 0 ? agents[bSelected] : null;
+      const rows = agents.slice(0, bCompact ? 0 : 3).map((a, i) => memberRow(a, i, bSelected === i ? 'selected' : '')).join('');
+      const more = bCompact ? '' : `<button class="member-more" id="b-more">+1 个子代理</button>`;
+      const detail = selected ? `<div class="selected-detail visible"><b>${selected.name}</b> · ${selected.statusText}<br>${selected.detail}<br><span style="color:#5b5bd6;font-weight:800">点击整行进入子代理会话</span></div>` : '<div class="selected-detail">选择成员后在这里显示一句最新摘要。</div>';
+      const card = `<div class="variant-b">
+        <p class="variant-label">方案 B <span>· 扫读优先</span></p>
+        <div class="card ${compact}" id="b-card">
+          <button class="card-header" id="b-toggle" aria-expanded="${!bCompact}">
+            <span class="group-mark">4</span><span class="card-copy"><span class="card-title">子代理协作组 <span class="card-count">4 个成员</span></span><span class="card-subtitle">${bCompact ? '点击查看成员预览' : '每个成员都是独立入口'}</span></span><span class="chevron">${bCompact ? '›' : '⌄'}</span>
+          </button>
+          <div class="summary-line">${statusSummary}</div>
+          <div class="member-list">${rows}${more}</div>
+          ${detail}
+        </div>
+      </div>`;
+      return { html: chatBase(card), side: `
+        <h2>B · 成员预览卡</h2><p>收拢态仍保留每个成员的一行预览，适合需要快速判断“谁在做什么”的场景。</p>
+        <dl><dt>收拢态</dt><dd>显示前三个成员和“+1”。</dd><dt>点击成员</dt><dd>只选中该成员并显示摘要，不先撑开整段正文。</dd><dt>点击标题</dt><dd>在紧凑模式与成员预览模式间切换。</dd><dt>进入详情</dt><dd>点击选中行进入子代理会话。</dd></dl>
+        <div class="tradeoff"><b>优点：</b>信息可扫读，定位成员最快。<br><b>代价：</b>卡片高度更高，长任务列表会增加聊天滚动压力。</div>` };
+    }
+
+    function renderC() {
+      const card = `<div class="variant-c">
+        <p class="variant-label" style="color:#8e9ab1">方案 C <span style="color:#9d9aff">· 任务控制面</span></p>
+        <div class="card dark-card" id="c-card">
+          <div class="command-top"><span class="ring"></span><span><span class="command-kicker">4 个协作者</span><span class="command-title">子代理任务指挥卡</span></span><span class="command-running">运行中 2</span></div>
+          <div class="agent-strip">${agents.map((a, i) => `<button class="agent-chip ${cMember === i ? 'selected' : ''}" data-cmember="${i}"><span class="agent-avatar">${a.initial}</span>${a.name.slice(0,2)}</button>`).join('')}</div>
+          <div class="latest"><b>最新：</b>${agents[cMember].name}${agents[cMember].status === 'done' ? '已完成检查' : '正在' + agents[cMember].task}</div>
+          <button class="command-open" id="c-open">${cSheet ? '收起任务控制面' : '查看任务控制面'}</button>
+          <div class="command-sheet ${cSheet ? 'visible' : ''}">
+            <div class="sheet-tabs">${['概览','执行','结果'].map(t => `<button class="${cTab === t ? 'active' : ''}" data-ctab="${t}">${t}</button>`).join('')}</div>
+            <div class="sheet-content" id="sheet-content"></div>
+          </div>
+        </div>
+      </div>`;
+      return { html: chatBase(card, true), side: `
+        <h2>C · 任务指挥卡</h2><p>把收拢卡片做成“任务入口”，默认展示整体进度，细节放进卡片内的控制面。</p>
+        <dl><dt>收拢态</dt><dd>进度环、成员头像、最新动态。</dd><dt>点击成员</dt><dd>切换当前关注的子代理，不改变聊天滚动位置。</dd><dt>查看控制面</dt><dd>打开卡内抽屉，再切换概览/执行/结果。</dd><dt>适合场景</dt><dd>子代理数量多、需要持续监控执行过程。</dd></dl>
+        <div class="tradeoff"><b>优点：</b>扩展空间最大，适合复杂任务编排。<br><b>代价：</b>视觉重量最高，和现有卡片差异最大。</div>` };
+    }
+
+    function render() {
+      const result = current === 'a' ? renderA() : current === 'b' ? renderB() : renderC();
+      document.getElementById('stage').innerHTML = result.html;
+      document.getElementById('side').innerHTML = result.side;
+      bindEvents();
+      if (current === 'c') updateSheet();
+    }
+
+    function bindEvents() {
+      document.querySelectorAll('[data-variant]').forEach(button => button.onclick = () => { current = button.dataset.variant; document.querySelectorAll('[data-variant]').forEach(b => b.classList.toggle('active', b === button)); render(); });
+      const aToggle = document.getElementById('a-toggle');
+      if (aToggle) aToggle.onclick = () => { aOpen = !aOpen; render(); };
+      const bToggle = document.getElementById('b-toggle');
+      if (bToggle) bToggle.onclick = () => { bCompact = !bCompact; render(); };
+      document.querySelectorAll('[data-member]').forEach(row => row.onclick = () => { bSelected = Number(row.dataset.member); render(); });
+      const bMore = document.getElementById('b-more');
+      if (bMore) bMore.onclick = () => { bSelected = 3; render(); };
+      const cOpen = document.getElementById('c-open');
+      if (cOpen) cOpen.onclick = () => { cSheet = !cSheet; render(); };
+      document.querySelectorAll('[data-cmember]').forEach(chip => chip.onclick = () => { cMember = Number(chip.dataset.cmember); render(); });
+      document.querySelectorAll('[data-ctab]').forEach(tab => tab.onclick = () => { cTab = tab.dataset.ctab; updateSheet(); });
+    }
+
+    function updateSheet() {
+      const content = document.getElementById('sheet-content');
+      if (!content) return;
+      const a = agents[cMember];
+      const texts = {
+        '概览': `<strong>${a.name}</strong> · ${a.statusText}<br>${a.detail}<br>交换 6 次 · 工具调用 12 次 · 已运行 01:42`,
+        '执行': `最近工具：<strong>读取源码</strong><br>执行记录按时间倒序排列，点击记录可查看结果摘要。<br><span style="color:#8c88ff">● 当前仍有 2 个子代理在执行</span>`,
+        '结果': `<strong>已变更文件 3 个</strong><br>完成后将把结果摘要收回主对话；失败或等待确认时保留入口。`
+      };
+      content.innerHTML = texts[cTab];
+    }
+
+    render();
+  </script>
+</body>
+</html>
