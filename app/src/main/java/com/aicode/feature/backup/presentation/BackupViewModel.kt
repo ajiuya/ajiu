@@ -5,9 +5,15 @@ import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.aicode.feature.backup.data.BackupTargetRepository
+import com.aicode.feature.backup.domain.BackupContentKind
+import com.aicode.feature.backup.domain.BackupContentLocation
+import com.aicode.feature.backup.domain.BackupContentRestoreSelection
+import com.aicode.feature.backup.domain.BackupContentRestoreTarget
+import com.aicode.feature.backup.domain.BackupContentSectionMeta
 import com.aicode.feature.backup.domain.BackupDecryptionException
 import com.aicode.feature.backup.domain.BackupManager
 import com.aicode.feature.backup.domain.BackupOptions
+import com.aicode.feature.backup.domain.PluginBackupSectionMeta
 import com.aicode.feature.backup.domain.RestoreStats
 import com.aicode.feature.backup.domain.WorkspaceBackupMeta
 import com.aicode.feature.backup.domain.remote.BackupTarget
@@ -16,8 +22,13 @@ import com.aicode.core.util.FileLogger
 import dagger.hilt.android.lifecycle.HiltViewModel
 import com.aicode.R
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -39,9 +50,11 @@ sealed class BackupState {
     data object Working : BackupState()
     data object ExportDone : BackupState()
     data class ImportSuccess(val stats: RestoreStats) : BackupState()
-    /** 导入预览完成，等待选择要恢复的工作区。 */
-    data class WorkspaceSelection(
-        val workspaces: List<WorkspaceBackupMeta>
+    data class ContentSelection(
+        val workspaces: List<WorkspaceBackupMeta>,
+        val pluginSections: List<PluginBackupSectionMeta> = emptyList(),
+        val contentSections: List<BackupContentSectionMeta> = emptyList(),
+        val remoteTarget: BackupContentRestoreTarget? = null
     ) : BackupState()
     data class Error(val message: String) : BackupState()
 }
@@ -81,6 +94,8 @@ class BackupViewModel @Inject constructor(
     val targets: StateFlow<List<BackupTarget>> = targetRepository.targets
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
+    private var importJob: Job? = null
+
     @Volatile
     private var preparedImport: File? = null
 
@@ -92,10 +107,13 @@ class BackupViewModel @Inject constructor(
 
     private val _exportOptions = MutableStateFlow(loadExportOptions())
     val exportOptions: StateFlow<BackupOptions> = _exportOptions.asStateFlow()
+    private val mutablePluginSections = MutableStateFlow<List<PluginBackupSectionMeta>>(emptyList())
+    val pluginSections = mutablePluginSections.asStateFlow()
+    fun refreshPluginSections() { viewModelScope.launch { mutablePluginSections.value = backupManager.availablePluginSections() } }
 
     /** 导出数据范围：勾选即持久化，下次进入页面沿用。 */
     fun updateExportOptions(options: BackupOptions) {
-        _exportOptions.value = options
+        _exportOptions.value = options.copy(pluginIds = options.pluginIds.toSet())
         prefs.edit()
             .putBoolean(KEY_PROVIDERS, options.providers)
             .putBoolean(KEY_REMOTE_CONNECTIONS, options.remoteConnections)
@@ -104,6 +122,11 @@ class BackupViewModel @Inject constructor(
             .putBoolean(KEY_PERMISSION_RULES, options.permissionRules)
             .putBoolean(KEY_APP_SETTINGS, options.appSettings)
             .putBoolean(KEY_WORKSPACE_FILES, options.workspaceFiles)
+            .putBoolean(KEY_MEMORIES, options.memories)
+            .putBoolean(KEY_SKILLS, options.skills)
+            .putBoolean(KEY_PROMPTS, options.prompts)
+            .putBoolean(KEY_PLUGINS, options.plugins)
+            .putStringSet(KEY_PLUGIN_IDS, options.pluginIds.toSet())
             .apply()
     }
 
@@ -114,20 +137,33 @@ class BackupViewModel @Inject constructor(
         mcpServers = prefs.getBoolean(KEY_MCP_SERVERS, true),
         permissionRules = prefs.getBoolean(KEY_PERMISSION_RULES, true),
         appSettings = prefs.getBoolean(KEY_APP_SETTINGS, true),
-        workspaceFiles = prefs.getBoolean(KEY_WORKSPACE_FILES, false)
+        workspaceFiles = prefs.getBoolean(KEY_WORKSPACE_FILES, false),
+        memories = prefs.getBoolean(KEY_MEMORIES, false),
+        skills = prefs.getBoolean(KEY_SKILLS, false),
+        prompts = prefs.getBoolean(KEY_PROMPTS, false),
+        plugins = prefs.getBoolean(KEY_PLUGINS, false),
+        pluginIds = prefs.getStringSet(KEY_PLUGIN_IDS, emptySet()).orEmpty().toSet()
     )
 
     /** 流式导出到 [output]（调用方打开，本方法负责关闭）。 */
     fun export(password: String, options: BackupOptions, output: OutputStream) {
+        if (isBusy()) {
+            runCatching { output.close() }
+            return
+        }
+        val optionsSnapshot = options.copy(pluginIds = options.pluginIds.toSet())
         _state.value = BackupState.Working
         viewModelScope.launch {
             val pw = password.toCharArray().takeIf { it.isNotEmpty() }
             try {
-                backupManager.export(pw, options, output)
+                backupManager.export(pw, optionsSnapshot, output)
                 _state.value = BackupState.ExportDone
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 _state.value = BackupState.Error(e.message ?: context.getString(R.string.backup_export_failed))
             } finally {
+                pw?.fill('\u0000')
                 runCatching { output.close() }
             }
         }
@@ -157,23 +193,26 @@ class BackupViewModel @Inject constructor(
 
     /** 导出当前备份并上传到 [target]。备份默认含解密后的 API Key / SSH 凭据，禁止明文上传远端。 */
     fun uploadToTarget(target: BackupTarget, password: String) {
+        if (isBusy()) return
         if (password.isEmpty()) {
             _networkState.value = NetworkBackupState.Error(
                 context.getString(R.string.backup_net_upload_password_required)
             )
             return
         }
+        val options = _exportOptions.value
+        val optionsSnapshot = options.copy(pluginIds = options.pluginIds.toSet())
         _networkState.value = NetworkBackupState.Working
         viewModelScope.launch {
             val pw = password.toCharArray().takeIf { it.isNotEmpty() }
             var temp: File? = null
             try {
-                temp = withContext(Dispatchers.IO) {
-                    File.createTempFile("netbackup", ".tar.gz", context.cacheDir)
+                withContext(Dispatchers.IO + NonCancellable) {
+                    temp = File.createTempFile("netbackup", ".tar.gz", context.cacheDir)
                 }
-                val file = temp
+                val file = requireNotNull(temp)
                 withContext(Dispatchers.IO) {
-                    file.outputStream().buffered().use { backupManager.export(pw, _exportOptions.value, it) }
+                    file.outputStream().buffered().use { backupManager.export(pw, optionsSnapshot, it) }
                 }
                 val name = "aicode-backup-${fileTimestamp()}.tar.gz"
                 val result = withContext(Dispatchers.IO) {
@@ -186,8 +225,10 @@ class BackupViewModel @Inject constructor(
                             it.message ?: context.getString(R.string.backup_net_upload_failed)
                         )
                     }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
-                FileLogger.e(TAG, "网络备份上传失败", e)
+                FileLogger.e(TAG, "网络备份上传失败")
                 _networkState.value = NetworkBackupState.Error(e.message ?: context.getString(R.string.backup_net_upload_failed))
             } finally {
                 pw?.fill('\u0000')
@@ -199,6 +240,7 @@ class BackupViewModel @Inject constructor(
 
     /** 拉取 [target] 上的备份列表。 */
     fun loadRemoteBackups(target: BackupTarget) {
+        if (isBusy()) return
         _networkState.value = NetworkBackupState.Working
         viewModelScope.launch {
             val result = withContext(Dispatchers.IO) {
@@ -218,13 +260,17 @@ class BackupViewModel @Inject constructor(
 
     /** 删除远端某个备份后刷新列表。 */
     fun deleteRemoteBackup(target: BackupTarget, name: String) {
+        if (isBusy()) return
         _networkState.value = NetworkBackupState.Working
         viewModelScope.launch {
             val result = withContext(Dispatchers.IO) {
                 runCatching { targetRepository.storageFor(target).delete(name).getOrThrow() }
             }
             result
-                .onSuccess { loadRemoteBackups(target) }
+                .onSuccess {
+                    _networkState.value = NetworkBackupState.Idle
+                    loadRemoteBackups(target)
+                }
                 .onFailure {
                     _networkState.value = NetworkBackupState.Error(
                         it.message ?: context.getString(R.string.backup_net_delete_failed)
@@ -235,134 +281,159 @@ class BackupViewModel @Inject constructor(
 
     /** 从 [target] 下载 [name] 并进入导入流程。 */
     fun restoreFromRemote(target: BackupTarget, name: String, password: String) {
+        if (isBusy()) return
         _state.value = BackupState.Working
         _networkState.value = NetworkBackupState.Idle
-        viewModelScope.launch {
+        importJob = viewModelScope.launch {
             val pw = password.toCharArray().takeIf { it.isNotEmpty() }
+            var temp: File? = null
             try {
-                val temp = withContext(Dispatchers.IO) {
-                    File.createTempFile("netrestore", ".tar.gz", context.cacheDir)
+                withContext(Dispatchers.IO + NonCancellable) {
+                    temp = File.createTempFile("netrestore", ".tar.gz", context.cacheDir)
                 }
-                val result = withContext(Dispatchers.IO) {
-                    runCatching { targetRepository.storageFor(target).download(name, temp).getOrThrow() }
+                val file = requireNotNull(temp)
+                withContext(Dispatchers.IO) {
+                    targetRepository.storageFor(target).download(name, file).getOrThrow()
                 }
-                result
-                    // 成功时把口令所有权交给 startImport（它在自己的 finally 里清零）；
-                    // 这里不能提前清零，否则异步导入读到的会是全 NUL 口令，导致解密失败。
-                    .onSuccess { startImport(ImportSource.Local(temp), pw) }
-                    .onFailure {
-                        withContext(Dispatchers.IO + NonCancellable) { temp.delete() }
-                        pw?.fill('\u0000')
-                        _state.value = BackupState.Error(describeImportError(it))
-                    }
+                startImport(ImportSource.Local(file), pw)
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
-                FileLogger.e(TAG, "网络备份恢复失败", e)
-                pw?.fill('\u0000')
+                FileLogger.e(TAG, "网络备份恢复失败")
                 _state.value = BackupState.Error(describeImportError(e))
+            } finally {
+                pw?.fill('\u0000')
+                if (_state.value !is BackupState.ContentSelection || !isActive) {
+                    withContext(Dispatchers.IO + NonCancellable) { temp?.delete() }
+                }
             }
         }
     }
 
     fun dismissNetworkState() {
-        _networkState.value = NetworkBackupState.Idle
+        if (_networkState.value !is NetworkBackupState.Working) {
+            _networkState.value = NetworkBackupState.Idle
+        }
     }
 
     // ── 导入 ──────────────────────────────────────────────────
 
-    /** 从 SAF Uri 流式导入：先预览，备份含工作区数据时进入勾选确认，否则全量还原。 */
     fun import(uri: Uri, password: String) {
-        FileLogger.i(TAG, "导入请求：${describeUri(uri)}（${if (password.isNotEmpty()) "加密" else "明文"}）")
-        startImport(ImportSource.Saf(uri), password.toCharArray().takeIf { it.isNotEmpty() })
-    }
-
-    private fun startImport(source: ImportSource, pw: CharArray?) {
+        if (isBusy()) return
         _state.value = BackupState.Working
-        viewModelScope.launch {
-            try {
-                val preview = withContext(Dispatchers.IO + NonCancellable) {
-                    val input = openStream(source)
-                        ?: throw IllegalArgumentException(context.getString(R.string.backup_read_failed))
-                    input.use {
-                        if (pw == null) {
-                            backupManager.previewImport(it, null)
-                        } else {
-                            val file = backupManager.prepareImport(it, pw)
-                            preparedImport = file
-                            file.inputStream().use { source2 -> backupManager.previewImport(source2, null) }
-                        }
-                    }
-                }
-                preview.onSuccess { preview ->
-                    if (preview.hasWorkspaceData) {
-                        pendingSource = source
-                        _state.value = BackupState.WorkspaceSelection(preview.workspaces)
-                    } else {
-                        restoreFromSource(source, null)
-                    }
-                }.onFailure { _state.value = BackupState.Error(describeImportError(it)) }
-            } catch (e: Exception) {
-                _state.value = BackupState.Error(describeImportError(e))
-            } finally {
-                pw?.fill('\u0000')
-                if (_state.value !is BackupState.WorkspaceSelection || !isActive) {
-                    clearPreparedImport()
-                    discardLocalSource(source)
-                }
-            }
+        importJob = viewModelScope.launch {
+            startImport(ImportSource.Saf(uri), password.toCharArray().takeIf { it.isNotEmpty() })
         }
     }
 
-    /** 勾选确认后按所选工作区恢复，复用已校验的解密文件。 */
-    fun confirmImportSelection(selected: Set<String>) {
-        if (_state.value !is BackupState.WorkspaceSelection) return
-        _state.value = BackupState.Working
-        val source = pendingSource
-        viewModelScope.launch {
-            if (source != null) {
-                restoreFromSource(source, selected)
+    private suspend fun startImport(source: ImportSource, pw: CharArray?) {
+        var awaitingSelection = false
+        pendingSource = source
+        try {
+            val preview = withContext(Dispatchers.IO + NonCancellable) {
+                val input = openStream(source)
+                    ?: throw IllegalArgumentException(context.getString(R.string.backup_read_failed))
+                input.use {
+                    // SAF 内容可以变化；明文和加密备份都只从同一个本地快照预览、还原。
+                    val file = backupManager.prepareImport(it, pw)
+                    preparedImport = file
+                    file.inputStream().use { prepared -> backupManager.previewImport(prepared, null) }
+                }
+            }.getOrThrow()
+            currentCoroutineContext().ensureActive()
+            if (preview.hasWorkspaceData || preview.pluginSections.isNotEmpty() || preview.contentSections.isNotEmpty()) {
+                _state.value = BackupState.ContentSelection(
+                    preview.workspaces, preview.pluginSections, preview.contentSections, preview.remoteTarget
+                )
+                awaitingSelection = true
             } else {
-                _state.value = BackupState.Error(context.getString(R.string.backup_read_failed))
+                restorePreparedImport(null)
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            _state.value = BackupState.Error(describeImportError(e))
+        } finally {
+            pw?.fill('\u0000')
+            if (!awaitingSelection || !currentCoroutineContext().isActive) {
+                clearPreparedImport()
+                discardLocalSource(source)
+                pendingSource = null
             }
         }
     }
 
-    /** 取消工作区勾选，中止导入。 */
+    fun confirmImportSelection(
+        selected: Set<String>,
+        selectedPluginIds: Set<String> = emptySet(),
+        contentSelection: BackupContentRestoreSelection = BackupContentRestoreSelection()
+    ) {
+        val preview = _state.value as? BackupState.ContentSelection ?: return
+        if (importJob?.isActive == true) return
+        val selectedSections = preview.contentSections.filter { it.id in contentSelection.sectionIds }
+        val remoteSelected = selectedSections.any {
+            it.location == BackupContentLocation.SSH_GLOBAL || it.location == BackupContentLocation.SSH_PROJECT
+        }
+        if (remoteSelected && (preview.remoteTarget == null || contentSelection.remoteTargetIdentity != preview.remoteTarget.identity)) return
+        val fullPluginIds = selectedSections.filter { it.kind == BackupContentKind.PLUGIN }.mapNotNull { it.pluginId }.toSet()
+        val extensions = selectedPluginIds.intersect(preview.pluginSections.map { it.pluginId }.toSet()) - fullPluginIds
+        val selectionSnapshot = contentSelection.copy(
+            sectionIds = selectedSections.map { it.id }.toSet(),
+            remoteTargetIdentity = if (remoteSelected) preview.remoteTarget?.identity else null
+        )
+        val workspaceSnapshot = selected.intersect(preview.workspaces.map { it.name }.toSet())
+        val source = pendingSource
+        _state.value = BackupState.Working
+        importJob = viewModelScope.launch {
+            try {
+                restorePreparedImport(workspaceSnapshot, extensions, selectionSnapshot)
+            } finally {
+                clearPreparedImport()
+                if (source != null) discardLocalSource(source)
+                pendingSource = null
+            }
+        }
+    }
+
     fun cancelImportSelection() {
-        if (_state.value is BackupState.WorkspaceSelection) {
-            _state.value = BackupState.Idle
-            val source = pendingSource
-            pendingSource = null
-            viewModelScope.launch(Dispatchers.IO + NonCancellable) {
-                preparedImport?.delete()
-                preparedImport = null
+        if (_state.value !is BackupState.ContentSelection) return
+        val file = preparedImport
+        val source = pendingSource
+        preparedImport = null
+        pendingSource = null
+        _state.value = BackupState.Idle
+        importJob = viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            withContext(Dispatchers.IO + NonCancellable) {
+                file?.delete()
                 (source as? ImportSource.Local)?.file?.delete()
             }
         }
     }
 
-    private suspend fun restoreFromSource(source: ImportSource, selected: Set<String>?) {
+    private suspend fun restorePreparedImport(
+        selected: Set<String>?,
+        selectedPluginIds: Set<String> = emptySet(),
+        contentSelection: BackupContentRestoreSelection = BackupContentRestoreSelection()
+    ) {
         try {
-            FileLogger.i(TAG, "开始还原：${describeSource(source)}${if (selected != null) "，勾选工作区=${selected.size}个" else "，全量"}")
+            val file = preparedImport
+                ?: throw IllegalArgumentException(context.getString(R.string.backup_read_failed))
             val result = withContext(Dispatchers.IO) {
-                val input = preparedImport?.inputStream() ?: openStream(source)
-                    ?: throw IllegalArgumentException(context.getString(R.string.backup_read_failed))
-                input.use { backupManager.import(it, null, selected) }
+                file.inputStream().use {
+                    backupManager.import(it, null, selected, selectedPluginIds, contentSelection)
+                }
             }
             result.onSuccess {
-                    FileLogger.i(TAG, "还原成功：$it")
-                    _state.value = BackupState.ImportSuccess(it)
-                }
-                .onFailure {
-                    FileLogger.e(TAG, "还原失败", it)
-                    _state.value = BackupState.Error(describeImportError(it))
-                }
+                _state.value = BackupState.ImportSuccess(it)
+            }.onFailure {
+                FileLogger.e(TAG, "还原失败")
+                _state.value = BackupState.Error(describeImportError(it))
+            }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            FileLogger.e(TAG, "还原异常", e)
+            FileLogger.e(TAG, "还原异常")
             _state.value = BackupState.Error(describeImportError(e))
-        } finally {
-            clearPreparedImport()
-            discardLocalSource(source)
-            pendingSource = null
         }
     }
 
@@ -393,17 +464,6 @@ class BackupViewModel @Inject constructor(
         super.onCleared()
     }
 
-    /** 日志用 URI 摘要：只保留 scheme://authority/最后一段，避免记录完整路径。 */
-    private fun describeUri(uri: Uri): String {
-        val last = uri.lastPathSegment ?: ""
-        return "${uri.scheme}://${uri.authority}/…/$last"
-    }
-
-    private fun describeSource(source: ImportSource): String = when (source) {
-        is ImportSource.Saf -> describeUri(source.uri)
-        is ImportSource.Local -> "remote:${source.file.name}"
-    }
-
     private fun describeImportError(e: Throwable): String = when (e) {
         is BackupDecryptionException -> e.message ?: context.getString(R.string.backup_wrong_password)
         else -> buildString {
@@ -422,10 +482,14 @@ class BackupViewModel @Inject constructor(
         }
     }
 
+    private fun isBusy(): Boolean =
+        _state.value is BackupState.Working || _state.value is BackupState.ContentSelection ||
+            _networkState.value is NetworkBackupState.Working || importJob?.isActive == true
+
     fun reset() {
-        if (_state.value is BackupState.WorkspaceSelection) {
+        if (_state.value is BackupState.ContentSelection) {
             cancelImportSelection()
-        } else {
+        } else if (!isBusy()) {
             _state.value = BackupState.Idle
         }
     }
@@ -442,5 +506,10 @@ class BackupViewModel @Inject constructor(
         private const val KEY_PERMISSION_RULES = "permission_rules"
         private const val KEY_APP_SETTINGS = "app_settings"
         private const val KEY_WORKSPACE_FILES = "workspace_files"
+        private const val KEY_MEMORIES = "memories"
+        private const val KEY_SKILLS = "skills"
+        private const val KEY_PROMPTS = "prompts"
+        private const val KEY_PLUGINS = "plugins"
+        private const val KEY_PLUGIN_IDS = "plugin_ids"
     }
 }

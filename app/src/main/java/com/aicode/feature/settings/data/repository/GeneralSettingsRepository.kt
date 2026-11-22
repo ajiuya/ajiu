@@ -55,6 +55,7 @@ class GeneralSettingsRepository @Inject constructor(
         private val STREAM_IDLE_TIMEOUT_SEC_KEY = intPreferencesKey("stream_idle_timeout_sec")
         private val MAX_NETWORK_RETRIES_KEY = intPreferencesKey("max_network_retries")
         private val ENTER_TO_SEND_KEY = booleanPreferencesKey("enter_to_send")
+        private val AUTO_EXPAND_REASONING_KEY = booleanPreferencesKey("auto_expand_reasoning")
         private val COMPACTION_THRESHOLD_PERCENT_KEY = intPreferencesKey("compaction_threshold_percent")
         private val SENDFILE_MAX_SIZE_MB_KEY = intPreferencesKey("sendfile_max_size_mb")
         private val GOAL_MAX_TURNS_KEY = intPreferencesKey("goal_max_turns")
@@ -195,6 +196,15 @@ class GeneralSettingsRepository @Inject constructor(
 
     suspend fun setEnterToSend(enabled: Boolean) {
         context.generalDataStore.edit { it[ENTER_TO_SEND_KEY] = enabled }
+    }
+
+    val autoExpandReasoningFlow: Flow<Boolean> =
+        context.generalDataStore.data.map { it[AUTO_EXPAND_REASONING_KEY] ?: false }
+
+    suspend fun autoExpandReasoning(): Boolean = autoExpandReasoningFlow.first()
+
+    suspend fun setAutoExpandReasoning(enabled: Boolean) {
+        context.generalDataStore.edit { it[AUTO_EXPAND_REASONING_KEY] = enabled }
     }
 
     /** 自动压缩触发阈值（上下文窗口的百分比）；默认 90，限定 1..100。 */

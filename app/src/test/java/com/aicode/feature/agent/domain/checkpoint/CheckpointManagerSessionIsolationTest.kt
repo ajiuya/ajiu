@@ -9,6 +9,7 @@ import com.aicode.feature.agent.domain.tool.WorkspaceFileLock
 import com.aicode.feature.workspace.domain.FileAccessProvider
 import com.aicode.feature.workspace.domain.FileEntry
 import com.aicode.feature.workspace.domain.sha256Fingerprint
+import com.aicode.testutil.TestFileAccessProvider
 import kotlinx.coroutines.test.runTest
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -304,6 +305,10 @@ class CheckpointManagerSessionIsolationTest {
         override fun permissions(path: String): String = throw UnsupportedOperationException()
         override fun listFiles(path: String): List<FileEntry> = throw UnsupportedOperationException()
         override fun readBytes(path: String): ByteArray = throw UnsupportedOperationException()
+        override fun readBytes(path: String, maxBytes: Long): ByteArray =
+            TestFileAccessProvider().readBytes(path, maxBytes)
+        override fun resolvePath(path: String, followFinalLink: Boolean): String =
+            TestFileAccessProvider().resolvePath(path, followFinalLink)
         override fun writeBytes(path: String, bytes: ByteArray, overwrite: Boolean) {
             File(path).parentFile?.mkdirs()
             File(path).writeBytes(bytes)

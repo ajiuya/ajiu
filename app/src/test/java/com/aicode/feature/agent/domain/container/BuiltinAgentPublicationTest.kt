@@ -1,5 +1,6 @@
 package com.aicode.feature.agent.domain.container
 
+import com.aicode.feature.agent.domain.plugin.PluginDefinitionSource
 import com.aicode.feature.agent.domain.subagent.AgentDefinitionConfigRepository
 import com.aicode.feature.agent.domain.subagent.AgentDefinitionParser
 import com.aicode.feature.agent.domain.subagent.AgentDefinitionRepository
@@ -68,14 +69,18 @@ class BuiltinAgentPublicationTest {
         val provider = mockk<FileAccessProvider>()
         every { provider.readFile(target.path) } answers { target.readText() }
         val global = mockk<GlobalDirectoryAgentSource>()
-        every { global.listDefinitions() } answers {
+        every { provider.agentConfigSourceIdentity() } returns "local-fixture"
+        every { global.listDefinitions(any()) } answers {
             if (target.exists()) listOfNotNull(AgentDefinitionParser.parse(provider, target.path)) else emptyList()
         }
         val project = mockk<ProjectDirectoryAgentSource>()
-        every { project.listDefinitions() } returns emptyList()
+        every { project.listDefinitions(any()) } returns emptyList()
         val config = mockk<AgentDefinitionConfigRepository>()
         every { config.disabledNames() } returns setOf("编码员")
-        val repository = AgentDefinitionRepository(global, project, config, provider)
+        val pluginSource = mockk<PluginDefinitionSource>()
+        every { pluginSource.revision } returns 0
+        every { pluginSource.agents() } returns emptyList()
+        val repository = AgentDefinitionRepository(global, project, config, provider, pluginSource)
         val before = repository.definitionsVersion
         assertTrue(repository.listAll().isEmpty())
         LocalBuiltinDefinitionStore.install(root, agents)

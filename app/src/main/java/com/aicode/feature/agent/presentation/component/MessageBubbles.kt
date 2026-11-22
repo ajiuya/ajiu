@@ -1,9 +1,6 @@
 package com.aicode.feature.agent.presentation.component
 
 import android.content.ClipData
-import androidx.compose.animation.core.LinearOutSlowInEasing
-import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -22,6 +19,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.LocalTextSelectionColors
@@ -50,7 +48,6 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.LocalClipboard
@@ -90,10 +87,6 @@ import compose.icons.feathericons.Tool
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
-
-/** 工具卡片入场时长（ms）与上浮起点：略微下移再淡入到位，只走 draw 层不影响布局。 */
-private const val MESSAGE_ENTRY_ANIM_MS = 260
-private val MESSAGE_ENTRY_RISE = 10.dp
 
 /** 一轮任务的划分结果：轮起点 + 轮内所有助手消息（1 轮 n 步）+ 轮末那条。 */
 private data class AgentTurn(
@@ -273,12 +266,12 @@ internal fun AgentMessageItem(
     onToolExpandedChange: ((Boolean) -> Unit)? = null,
     reasoningExpandedOverride: Boolean? = null,
     onReasoningExpandedChange: ((Boolean) -> Unit)? = null,
+    defaultReasoningExpanded: Boolean = false,
+    reasoningScrollState: LazyListState? = null,
     /** 本轮任务总耗时（ms）：仅轮末助手消息非空，见 [computeTaskDurations]。 */
     taskDurationMs: Long? = null,
     /** 本轮任务的 token 合计（1 轮 n 步求和）：仅轮末助手消息非空，见 [computeTurnUsage]。 */
     turnUsage: TurnUsage? = null,
-    /** 新消息入场动画延迟（ms）：null 表示历史消息直接显示；非 null 时首次组合延迟后淡入展开。 */
-    entryDelayMs: Long? = null,
     /** 长消息分块渲染：非 null 时正文 MarkdownContent 只渲染该片段。
      *  分块之间气泡无缝衔接（首块带思考、末块带操作行与底部圆角），复制按钮仍复制整条 message.content。 */
     contentSlice: String? = null,
@@ -371,25 +364,6 @@ internal fun AgentMessageItem(
     val clipboard = LocalClipboard.current
     val copyScope = rememberCoroutineScope()
 
-    // 工具卡片入场：只对本次浏览期间新追加进来的消息播（entryDelayMs 非空），
-    // 历史、切页返回、item 回收重挂载都直接显示（谁该入场由 MessageEntryScheduler 定）。
-    // 入场只改 alpha 与 translationY（draw 阶段生效），卡片高度从插入那一帧就到位：
-    // 用 AnimatedVisibility 的话未入场的卡片完全不占位，每张卡片入场都让列表高度跳一次，
-    // 与贴底跟随的 scrollToItem 叠加就是一连串抖动——而那正是这个动画本来要消除的。
-    // 现在列表高度只在消息插入时变一次，之后动画全程不碰布局。
-    var entered by rememberSaveable(message.id) { mutableStateOf(entryDelayMs == null) }
-    LaunchedEffect(message.id) {
-        if (entered) return@LaunchedEffect
-        val delayMs = entryDelayMs ?: return@LaunchedEffect
-        if (delayMs > 0) delay(delayMs)
-        entered = true
-    }
-    val entryProgress by animateFloatAsState(
-        targetValue = if (entered) 1f else 0f,
-        animationSpec = tween(durationMillis = MESSAGE_ENTRY_ANIM_MS, easing = LinearOutSlowInEasing),
-        label = "tool-entry"
-    )
-
     // 超长助手消息由 AIChatPanel 拆成多条有界 item（拆块）渲染，这里不再做任何限高内滚；
     // 每条分块都视为普通消息的一段：正文按块渲染、思考只在首块、操作行只在末块。
     Column(
@@ -408,7 +382,9 @@ internal fun AgentMessageItem(
                 cache = markdownCache,
                 durationMs = reasoningDurationMs,
                 expandedOverride = reasoningExpandedOverride,
-                onExpandedChange = onReasoningExpandedChange
+                defaultExpanded = defaultReasoningExpanded,
+                onExpandedChange = onReasoningExpandedChange,
+                scrollState = reasoningScrollState ?: remember { newReasoningScrollState() }
             )
         }
         if (hasContent || hasAttachments || message.role != MessageRole.ASSISTANT) {
@@ -422,25 +398,15 @@ internal fun AgentMessageItem(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         if (message.role == MessageRole.TOOL) {
-                            // 入场动画只改 draw 层，避免高度变化干扰贴底。
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .graphicsLayer {
-                                        alpha = entryProgress
-                                        translationY = (1f - entryProgress) * MESSAGE_ENTRY_RISE.toPx()
-                                    }
-                            ) {
-                                ToolMessageBody(
-                                    message = message,
-                                    liveOutput = liveOutput,
-                                    expandedOverride = toolExpandedOverride,
-                                    onExpandedChange = onToolExpandedChange,
-                                    onToggle = onToolToggle,
-                                    durationMs = toolDurationMs,
-                                    onOpenPreview = onToolPreview
-                                )
-                            }
+                            ToolMessageBody(
+                                message = message,
+                                liveOutput = liveOutput,
+                                expandedOverride = toolExpandedOverride,
+                                onExpandedChange = onToolExpandedChange,
+                                onToggle = onToolToggle,
+                                durationMs = toolDurationMs,
+                                onOpenPreview = onToolPreview
+                            )
                         } else if (isUser) {
                             UserMessageBubble(
                                 text = message.content,
@@ -744,60 +710,21 @@ private fun MessageActionIconButton(
 }
 
 /**
- * 后台任务完成通知的轻量提示条：不作为普通用户气泡展示，仅以紧凑横条形式告知用户
- * 哪个后台命令结束了、成功与否。从通知文本里提取 <status>/<summary> 字段。
+ * 系统事件在聊天列表中的通知行：一条承载消息里的每个事件都单独显示，
+ * 保持后台任务、代理消息和代理指令的时间顺序，不再合并成一条摘要横线。
  */
 @Composable
 private fun BackgroundNotificationBar(message: AgentUIMessage) {
-    val notices = parseSubAgentNotificationMetadata(message.content)
-    val remaining = unrepresentedSubAgentNotifications(notices, LocalRepresentedSubAgentIds.current)
-    if (remaining.isEmpty()) return
-    val content = remaining.joinToString("\n") { it.raw }
-    val statuses = Regex("<status>(.*?)</status>")
-        .findAll(content).map { it.groupValues.getOrNull(1)?.trim()?.lowercase() }.filterNotNull().toList()
-    val summaries = Regex("<summary>(.*?)</summary>")
-        .findAll(content).map { it.groupValues.getOrNull(1)?.trim() }.filterNotNull().toList()
-    val dotColor = when {
-        // status 为 message 的是代理间消息（非失败），用主色；其余非 completed 视为失败。
-        statuses.any { it != "completed" && it != "message" } -> MaterialTheme.colorScheme.error
-        statuses.any { it == "message" } -> MaterialTheme.colorScheme.primary
-        else -> MaterialTheme.semanticColors.success
+    val representedIds = LocalRepresentedSubAgentIds.current
+    val notices = parseSubAgentNotificationMetadata(message.content).filterNot {
+        it.kind == "subagent" && it.subSessionId in representedIds
     }
-    val label = when {
-        summaries.size <= 1 -> summaries.firstOrNull() ?: stringResource(R.string.chat_bg_command_done)
-        else -> {
-            // 摘要原文由 domain 层生成（同一份还要喂给 AI），这里不按中文标记切字符串取任务名——
-            // 换文案或切到英文界面这段解析就废了。多条时只报数量与失败数。
-            val failedCount = statuses.count { it != "completed" }
-            if (failedCount > 0) {
-                stringResource(R.string.chat_bg_commands_partial_failed, summaries.size, failedCount)
-            } else {
-                stringResource(R.string.chat_bg_commands_done, summaries.size)
-            }
-        }
-    }
-
+    if (notices.isEmpty()) return
     Column(modifier = Modifier.fillMaxWidth().padding(vertical = Spacing.xs)) {
-        ChatHairline()
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .heightIn(min = ChatStyle.toolRowMinHeight),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(Spacing.sm)
-        ) {
-            Box(
-                modifier = Modifier
-                    .size(6.dp)
-                    .clip(CircleShape)
-                    .background(dotColor)
-            )
-            Text(
-                text = label,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                style = MaterialTheme.typography.bodySmall.scaledForChat(LocalChatTextScale.current),
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis
+        notices.forEach { notice ->
+            ChatNotificationRow(
+                model = notificationRowModel(notice, formatClockTime(message.timestamp)),
+                modifier = Modifier.padding(bottom = Spacing.sm),
             )
         }
     }

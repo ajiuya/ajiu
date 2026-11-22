@@ -118,7 +118,7 @@ class FileAccessStreamingTest {
         every { local.openRead("image", "local:one") } returns object : ByteArrayInputStream(byteArrayOf(1, 2)) {
             override fun close() { closed++ }
         }
-        val access = DelegatingFileAccess(holder, local, remote)
+        val access = DelegatingFileAccess(holder, local, remote, mockk<LocalFolderGrantRepository>())
         val input = access.openRead("image", access.cacheIdentity())
         assertEquals(1, input.read())
         holder.setMode(ExecutionMode.REMOTE_SSH)
@@ -137,6 +137,13 @@ class FileAccessStreamingTest {
         override fun cacheIdentity(): String = identity?.invoke() ?: super.cacheIdentity()
         override fun openRead(path: String): InputStream = stream?.invoke() ?: super.openRead(path)
         override fun readBytes(path: String): ByteArray { reads++; return byteArrayOf(1, 2, 3) }
+        override fun readBytes(path: String, maxBytes: Long): ByteArray {
+            require(maxBytes in 0..Int.MAX_VALUE.toLong())
+            if (3 > maxBytes) throw FileReadTooLargeException(maxBytes)
+            return openRead(path, cacheIdentity()).use { it.readBytesBounded(maxBytes) }
+        }
+        override fun resolvePath(path: String, followFinalLink: Boolean): String =
+            java.nio.file.Paths.get("/").resolve(path).normalize().toString()
         override fun readFile(path: String): String = error("unused")
         override fun readLines(path: String): Sequence<String> = error("unused")
         override fun writeFile(path: String, content: String, overwrite: Boolean, encoding: Charset): Unit = error("unused")

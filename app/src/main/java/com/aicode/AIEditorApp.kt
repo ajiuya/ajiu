@@ -16,6 +16,8 @@ import com.aicode.core.util.FileLogger
 import com.aicode.core.util.TombstoneParser
 import net.schmizz.sshj.common.SecurityUtils
 import com.aicode.feature.agent.domain.container.ContainerInstaller
+import com.aicode.feature.agent.domain.container.BuiltinDocsSync
+import com.aicode.feature.agent.domain.container.RemoteConnectionIdentity
 import com.aicode.feature.agent.domain.mcp.McpManager
 import com.aicode.feature.settings.data.repository.KeepaliveSettingsRepository
 import com.aicode.feature.settings.data.repository.LanguageSettingsRepository
@@ -24,7 +26,10 @@ import com.aicode.feature.settings.data.remote.ModelMetadataService
 import com.aicode.feature.terminal.domain.KeepaliveWorker
 import com.aicode.feature.terminal.domain.TaskKeepaliveController
 import dagger.hilt.android.HiltAndroidApp
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.SupervisorJob
@@ -35,6 +40,17 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import java.io.File
 import javax.inject.Inject
+
+internal suspend fun runRemoteConnectionSyncRound(block: suspend () -> Unit) {
+    try {
+        currentCoroutineContext().ensureActive()
+        block()
+        currentCoroutineContext().ensureActive()
+    } catch (_: CancellationException) {
+        // A stale connection cancels this round, not the still-active profile collector.
+        currentCoroutineContext().ensureActive()
+    }
+}
 
 @HiltAndroidApp
 class AIEditorApp : Application(), Configuration.Provider {
@@ -60,14 +76,15 @@ class AIEditorApp : Application(), Configuration.Provider {
         private const val MAX_CRASH_TRACE_FILES = 20
         /**
          * 无 Java 异常、只能靠 ApplicationExitInfo 补记的退出原因（API 30+）。
-         * 不包含 REASON_CRASH（Java 崩溃已由 installCrashHandler + CrashActivity 完整记录）。
+         * REASON_OTHER 用于记录系统终止描述；REASON_CRASH 已由 CrashActivity 完整记录。
          */
-        private val ABNORMAL_EXIT_REASONS = setOf(
+        internal val EXIT_REASONS_TO_REPORT = setOf(
             ApplicationExitInfo.REASON_CRASH_NATIVE,
             ApplicationExitInfo.REASON_ANR,
             ApplicationExitInfo.REASON_LOW_MEMORY,
             ApplicationExitInfo.REASON_INITIALIZATION_FAILURE,
-            ApplicationExitInfo.REASON_SIGNALED
+            ApplicationExitInfo.REASON_SIGNALED,
+            ApplicationExitInfo.REASON_OTHER
         )
         /** 10 秒内的连续崩溃视为密集崩溃。 */
         private const val CRASH_RESET_WINDOW_MS = 10_000L
@@ -236,6 +253,21 @@ class AIEditorApp : Application(), Configuration.Provider {
     @Inject
     lateinit var providerProxyRegistry: com.aicode.feature.settings.data.repository.ProviderProxyRegistry
 
+    @Inject
+    lateinit var agentRunManager: com.aicode.feature.agent.presentation.runtime.AgentRunManager
+
+    @Inject
+    lateinit var pluginTools: com.aicode.feature.plugin.runtime.PluginToolPublication
+
+    @Inject
+    lateinit var pluginHooks: com.aicode.feature.plugin.runtime.PluginHookDispatcher
+
+    @Inject
+    lateinit var pluginProviders: com.aicode.feature.plugin.runtime.PluginProviderRegistrar
+
+    @Inject
+    lateinit var pluginSessions: com.aicode.feature.plugin.runtime.PluginSessionSourceService
+
     /** 长驻作用域：持续把持久化的日志等级同步到 FileLogger。 */
     private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -259,6 +291,11 @@ class AIEditorApp : Application(), Configuration.Provider {
             registerBouncyCastle()
         }
         createNotificationChannels()
+        pluginHooks.start()
+        appScope.launch { pluginTools.observe() }
+        pluginProviders.start()
+        pluginSessions.start()
+        agentRunManager.start()
         // 启动凭据请求监听：容器内 credential helper 写来的 cred-req-* → 全局弹窗回填 → 回喂 git 续跑。
         credentialRequestBridge.start()
         // 启动即把最新的内置指南手册提取到私有配置目录
@@ -334,18 +371,30 @@ class AIEditorApp : Application(), Configuration.Provider {
                     if (executionModeHolder.currentMode() != com.aicode.feature.settings.data.repository.ExecutionMode.REMOTE_SSH) {
                         return@startSupervisor
                     }
-                    runCatching { workspaceRepository.initialize() }
-                        .onFailure { FileLogger.w(TAG, "SSH 重连后重新加载工作区失败", it) }
-                    syncDocsToRemote()
-                    releaseBuiltinAssetsToRemote()
+                    runRemoteConnectionSyncRound {
+                        val identity = remoteSshConnection.captureIdentity()
+                        runCatching { workspaceRepository.initialize() }
+                            .onFailure {
+                                if (it is CancellationException) throw it
+                                currentCoroutineContext().ensureActive()
+                                FileLogger.w(TAG, "SSH 重连后重新加载工作区失败", it)
+                            }
+                        syncDocsToRemote(identity)
+                        releaseBuiltinAssetsToRemote()
+                    }
                 }
                 if (config == remoteSshConnection.config && remoteSshConnection.isConnected()) return@collect
                 runCatching {
-                    remoteSshConnection.connect(config)
-                    // 连接成功后同步内置文档到远程 ~/.aicode/docs/，供 AI 查阅。
-                    syncDocsToRemote()
-                    releaseBuiltinAssetsToRemote()
-                }.onFailure { FileLogger.e(TAG, "SSH 连接失败，将在首次命令时重试", it) }
+                    runRemoteConnectionSyncRound {
+                        remoteSshConnection.connect(config)
+                        // 连接成功后同步内置文档到远程 ~/.aicode/docs/，供 AI 查阅。
+                        syncDocsToRemote(remoteSshConnection.captureIdentity())
+                        releaseBuiltinAssetsToRemote()
+                    }
+                }.onFailure {
+                    currentCoroutineContext().ensureActive()
+                    FileLogger.e(TAG, "SSH 连接失败，将在首次命令时重试", it)
+                }
             }
         }
         // 连接与同步的「跟随当前工作区」由 RemoteRepository 内部监听工作区变化自动执行（启动注入即就绪）：
@@ -406,17 +455,20 @@ class AIEditorApp : Application(), Configuration.Provider {
             .setWorkerFactory(workerFactory)
             .build()
 
-    /**
-     * 读取 assets/docs 下所有内置文档（含 guide/ advanced/ 等分类子目录），通过 SSH exec 同步到远程 ~/.aicode/docs/。
-     * 远程模式下 AI 查阅 ~/.aicode/docs/ 的设置说明文档时，需要这些文件存在于远程服务器。
-     * 连接成功与重连成功后调用，保证远程文档随 App 升级更新。失败仅记日志，不阻断流程。
-     */
-    private suspend fun syncDocsToRemote() {
-        runCatching {
-            val docs = linkedMapOf<String, String>()
-            collectAssetDocs("docs", "", docs)
-            remoteSshConnection.uploadDocs(docs)
-        }.onFailure { FileLogger.w(TAG, "同步内置文档到远程失败", it) }
+    private suspend fun syncDocsToRemote(identity: RemoteConnectionIdentity) {
+        try {
+            remoteSshConnection.checkIdentity(identity)
+            val docs = withContext(Dispatchers.IO) {
+                linkedMapOf<String, String>().also { collectAssetDocs("docs", "", it) }
+            }
+            remoteSshConnection.uploadDocs(docs, identity)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            currentCoroutineContext().ensureActive()
+            remoteSshConnection.checkIdentity(identity)
+            FileLogger.w(TAG, "同步内置文档到远程失败", error)
+        }
     }
 
     private suspend fun releaseBuiltinAssetsToRemote() {
@@ -439,15 +491,15 @@ class AIEditorApp : Application(), Configuration.Provider {
 
     /** 递归收集 assets 文档，key 为相对 docs/ 的路径（如 guide/terminal.md）。 */
     private fun collectAssetDocs(assetDir: String, relativePrefix: String, out: MutableMap<String, String>) {
-        val entries = assets.list(assetDir) ?: return
+        val entries = assets.list(assetDir) ?: error("Cannot enumerate built-in docs assets")
         for (entry in entries) {
             val assetPath = "$assetDir/$entry"
             val relativePath = if (relativePrefix.isEmpty()) entry else "$relativePrefix/$entry"
-            try {
-                out[relativePath] = assets.open(assetPath).bufferedReader().use { it.readText() }
-            } catch (e: java.io.IOException) {
-                // 目录项：assets.open 对目录抛 IOException，递归处理
+            BuiltinDocsSync.validateRelativePath(relativePath)
+            if (!assets.list(assetPath).isNullOrEmpty()) {
                 collectAssetDocs(assetPath, relativePath, out)
+            } else if (relativePath.endsWith(".md")) {
+                out[relativePath] = assets.open(assetPath).bufferedReader(Charsets.UTF_8).use { it.readText() }
             }
         }
     }
@@ -568,14 +620,19 @@ class AIEditorApp : Application(), Configuration.Provider {
             records.sortedBy { it.timestamp }.forEach { info ->
                 if (info.timestamp <= lastSeen) return@forEach
                 maxTimestamp = maxOf(maxTimestamp, info.timestamp)
-                if (info.reason !in ABNORMAL_EXIT_REASONS) return@forEach
+                if (info.reason !in EXIT_REASONS_TO_REPORT) return@forEach
                 // 与最近一次 Java 崩溃属同一次退出（时间窗内）时跳过，避免两条链路重复上报。
                 if (lastJavaCrash > 0 &&
                     kotlin.math.abs(info.timestamp - lastJavaCrash) < CRASH_RESET_WINDOW_MS * 3
                 ) {
                     return@forEach
                 }
-                FileLogger.e(TAG, "检测到上次异常退出：\n${describeExit(info)}", null)
+                val message = "${if (info.reason == ApplicationExitInfo.REASON_OTHER) "检测到上次系统终止" else "检测到上次异常退出"}：\n${describeExit(info)}"
+                if (info.reason == ApplicationExitInfo.REASON_OTHER) {
+                    FileLogger.i(TAG, message)
+                } else {
+                    FileLogger.e(TAG, message, null)
+                }
             }
             if (maxTimestamp != lastSeen) {
                 prefs.edit().putLong(KEY_LAST_EXIT_TIMESTAMP, maxTimestamp).apply()

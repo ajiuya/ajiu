@@ -9,11 +9,9 @@ internal const val SUB_AGENT_GROUP_CONTENT_TYPE = "subagent-group"
 internal data class SubAgentTurnGroup(
     val key: String,
     val turnKey: String,
-    val childItems: List<ChatRenderItem>,
+    val capsules: List<SubAgentTimelineCapsule>,
     val carrierMessageIds: Set<String>,
-) {
-    val capsules: List<SubAgentTimelineCapsule> = childItems.mapNotNull { it.subAgentCapsule }
-}
+)
 
 internal data class SubAgentGroupProjection(
     val bodyItems: List<ChatRenderItem>,
@@ -32,9 +30,7 @@ internal data class SubAgentGroupProjection(
 internal fun projectSubAgentGroup(
     items: List<ChatRenderItem>,
     sessionId: String?,
-    expanded: Boolean = false,
     activeTurnKey: String? = null,
-    expansionOverrides: Map<String, Boolean> = emptyMap(),
     statusRanks: Map<String, Int> = subAgentGroupStatusRanks(items),
 ): SubAgentGroupProjection {
     val childrenByTurn = items.filter { it.subAgentCapsule != null && it.chatTurnKey != null }
@@ -45,37 +41,35 @@ internal fun projectSubAgentGroup(
     }
     val groups = childrenByTurn.map { (turnKey, children) ->
         val latestByChild = children.withIndex().associate { it.value.subAgentCapsule!!.subSessionId to it.index }
-        val childItems = children.filterIndexed { index, item -> latestByChild[item.subAgentCapsule!!.subSessionId] == index }
+        val capsules = children.filterIndexed { index, item -> latestByChild[item.subAgentCapsule!!.subSessionId] == index }
             .sortedBy { statusRanks[it.key] ?: 1 }
+            .map { it.subAgentCapsule!! }
         SubAgentTurnGroup(
             key = "subagent-group:${sessionId.orEmpty().length}:${sessionId.orEmpty()}:${turnKey.length}:$turnKey",
             turnKey = turnKey,
-            childItems = childItems,
+            capsules = capsules,
             carrierMessageIds = children.flatMapTo(linkedSetOf()) { it.subAgentCarrierMessageIds + it.message.id },
         )
     }
     val groupsByTurn = groups.associateBy { it.turnKey }
     val lastIndexByTurn = items.withIndex().filter { it.value.chatTurnKey != null }
         .associate { requireNotNull(it.value.chatTurnKey) to it.index }
-    fun renderGroup(group: SubAgentTurnGroup): List<ChatRenderItem> = buildList {
-        add(ChatRenderItem(
-            message = childrenByTurn.getValue(group.turnKey).last().message,
-            key = group.key,
-            contentType = SUB_AGENT_GROUP_CONTENT_TYPE,
-            chatTurnKey = group.turnKey,
-        ))
-        if (expansionOverrides[group.key] ?: expanded) addAll(group.childItems)
-    }
+    fun renderGroup(group: SubAgentTurnGroup): ChatRenderItem = ChatRenderItem(
+        message = childrenByTurn.getValue(group.turnKey).last().message,
+        key = group.key,
+        contentType = SUB_AGENT_GROUP_CONTENT_TYPE,
+        chatTurnKey = group.turnKey,
+    )
     val bodyItems = buildList {
         items.forEachIndexed { index, item ->
             if (item.subAgentCapsule == null) add(item)
             val turnKey = item.chatTurnKey
             if (turnKey != activeTurnKey && lastIndexByTurn[turnKey] == index) {
-                groupsByTurn[turnKey]?.let { addAll(renderGroup(it)) }
+                groupsByTurn[turnKey]?.let { add(renderGroup(it)) }
             }
         }
     }
-    val footerItems = groupsByTurn[activeTurnKey]?.let(::renderGroup).orEmpty()
+    val footerItems = groupsByTurn[activeTurnKey]?.let { listOf(renderGroup(it)) }.orEmpty()
     val capsules = groups.flatMap { it.capsules }
     val groupByCarrier = buildMap {
         groups.forEach { group -> group.carrierMessageIds.forEach { putIfAbsent(it, group.key) } }

@@ -3,6 +3,7 @@ package com.aicode.feature.terminal.presentation.component
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.os.SystemClock
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.inputmethod.InputMethodManager
@@ -104,6 +105,7 @@ class AppTerminalViewClient(
     private val viewProvider: () -> TerminalView?,
     private val modifiers: TerminalKeyModifiers,
     private val currentFontSizeSp: () -> Int,
+    private val onFontSizeChange: (Int) -> Unit,
     private val onFontSizeCommit: (Int) -> Unit,
     private val onUserInput: (TerminalSession) -> Unit
 ) : TerminalViewClient {
@@ -112,30 +114,41 @@ class AppTerminalViewClient(
         const val TAG = "TerminalView"
         const val MIN_FONT_SP = 5
         const val MAX_FONT_SP = 22
+        const val FONT_RESIZE_INTERVAL_MS = 80L
     }
 
     private var baseFontSizeSp = 0
-    private var accumulatedScale = 1f
-    private var lastFontSizeSp = 0
+    private var targetFontSizeSp = 0f
+    private var appliedFontSizeSp = 0
+    private var lastFontResizeTime = 0L
 
     override fun onScaleBegin() {
         baseFontSizeSp = currentFontSizeSp()
-        accumulatedScale = 1f
-        lastFontSizeSp = baseFontSizeSp
+        targetFontSizeSp = baseFontSizeSp.toFloat()
+        appliedFontSizeSp = baseFontSizeSp
+        lastFontResizeTime = SystemClock.uptimeMillis() - FONT_RESIZE_INTERVAL_MS
     }
 
-    // 捏合：累积增量倍数得到目标字号（钳在 5–22），返回等价预览缩放倍数给视图做画布缩放。
-    // 这里不改字号、不 resize PTY（避免给 shell 连发 SIGWINCH 导致内容错乱），
-    // 手势结束在 onScaleEnd 按最终字号 resize 一次。
-    override fun onScale(scale: Float): Float {
-        accumulatedScale *= scale
-        val target = (baseFontSizeSp * accumulatedScale).roundToInt().coerceIn(MIN_FONT_SP, MAX_FONT_SP)
-        lastFontSizeSp = target
-        return if (baseFontSizeSp > 0) target.toFloat() / baseFontSizeSp else 1f
+    override fun onScale(scale: Float) {
+        // 每次增量钳在边界内，反向捏合不会先消耗上次超界的距离。
+        targetFontSizeSp = (targetFontSizeSp * scale).coerceIn(MIN_FONT_SP.toFloat(), MAX_FONT_SP.toFloat())
+        val fontSizeSp = targetFontSizeSp.roundToInt()
+        val now = SystemClock.uptimeMillis()
+        // 合并窗口调整，避免给 shell 连发 SIGWINCH 与重绘竞争。
+        if (fontSizeSp != appliedFontSizeSp && now - lastFontResizeTime >= FONT_RESIZE_INTERVAL_MS) {
+            appliedFontSizeSp = fontSizeSp
+            lastFontResizeTime = now
+            onFontSizeChange(fontSizeSp)
+        }
     }
 
     override fun onScaleEnd() {
-        if (lastFontSizeSp != baseFontSizeSp) onFontSizeCommit(lastFontSizeSp)
+        val fontSizeSp = targetFontSizeSp.roundToInt()
+        if (fontSizeSp != appliedFontSizeSp) {
+            appliedFontSizeSp = fontSizeSp
+            onFontSizeChange(fontSizeSp)
+        }
+        if (fontSizeSp != baseFontSizeSp) onFontSizeCommit(fontSizeSp)
     }
 
     override fun onSingleTapUp(e: MotionEvent?) {

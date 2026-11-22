@@ -23,7 +23,9 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -42,12 +44,14 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
-import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.clipRect
+import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.nestedscroll.nestedScroll
@@ -100,7 +104,7 @@ private const val RIPPLE_PEAK_ALPHA = 0.5f
  * 画出一条色带方块。高光默认白色（Claude Code / 主流 shimmer 的做法）；浅色主题下白色会在
  * 文字像素上把字朝背景提亮，形成一道掠过的光泽，而不是盖上一层灰。
  *
- * 性能：进度在 [drawWithContent] 的绘制阶段读取（`by` 委托在 lambda 内取值），只重绘、不重组。
+ * 渐变缓存在 [drawWithCache]，进度只在绘制阶段读取，不逐帧重建渐变或重组。
  */
 @Composable
 internal fun Modifier.rippleHighlight(
@@ -108,7 +112,7 @@ internal fun Modifier.rippleHighlight(
     bandRatio: Float = RIPPLE_BAND_RATIO,
     periodMs: Int = RIPPLE_PERIOD_MS
 ): Modifier {
-    if (!chatUiWorkActive()) return this
+    if (!chatAnimationsEnabled()) return this
     val transition = rememberInfiniteTransition(label = "ripple-highlight")
     val progress by transition.animateFloat(
         initialValue = 0f,
@@ -119,26 +123,33 @@ internal fun Modifier.rippleHighlight(
         ),
         label = "ripple-progress"
     )
-    return drawWithContent {
-        drawContent()
+    return drawWithCache {
         val band = size.width * bandRatio
-        // 起点在左侧完全移出、终点在右侧完全移出，两端各留一个带的余量做「停顿感」
-        val center = -band + progress * (size.width + 2 * band)
-        drawRect(
-            brush = Brush.linearGradient(
-                // 五档渐变：两端全透明、中间一个软峰，扫过时是「亮一下」而不是一条硬边色带
-                colors = listOf(
-                    Color.Transparent,
-                    highlight.copy(alpha = RIPPLE_EDGE_ALPHA),
-                    highlight.copy(alpha = RIPPLE_PEAK_ALPHA),
-                    highlight.copy(alpha = RIPPLE_EDGE_ALPHA),
-                    Color.Transparent
-                ),
-                start = Offset(center - band / 2f, 0f),
-                end = Offset(center + band / 2f, 0f)
+        val brush = Brush.linearGradient(
+            colors = listOf(
+                Color.Transparent,
+                highlight.copy(alpha = RIPPLE_EDGE_ALPHA),
+                highlight.copy(alpha = RIPPLE_PEAK_ALPHA),
+                highlight.copy(alpha = RIPPLE_EDGE_ALPHA),
+                Color.Transparent
             ),
-            blendMode = BlendMode.SrcAtop
+            start = Offset(-band / 2f, 0f),
+            end = Offset(band / 2f, 0f)
         )
+        onDrawWithContent {
+            drawContent()
+            val center = -band + progress * (size.width + 2 * band)
+            clipRect {
+                translate(left = center) {
+                    drawRect(
+                        brush = brush,
+                        topLeft = Offset(-band / 2f, 0f),
+                        size = Size(band, size.height),
+                        blendMode = BlendMode.SrcAtop
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -632,11 +643,17 @@ internal fun reasoningPreviewLine(raw: String, live: Boolean): String {
 /** 折叠行预览两端要剥掉的字符：空白 + Markdown 记号（标题 `#`、列表 `-` `+` `*`、引用 `>`、加粗与行内代码的 `*` `` ` ``）。 */
 private val REASONING_PREVIEW_MARKERS = charArrayOf(' ', '\t', '#', '*', '-', '>', '`', '+')
 
-/** 思考展开窗口的最大高度：超出后在窗口内滚动，不再无限撑高、拖走整页滚动。 */
-private val ReasoningWindowMaxHeight = 300.dp
+internal class ReasoningExpansionState {
+    private var manual by mutableStateOf<Boolean?>(null)
+
+    fun expanded(defaultExpanded: Boolean, expandedOverride: Boolean?): Boolean =
+        expandedOverride ?: manual ?: defaultExpanded
+
+    fun select(expanded: Boolean) { manual = expanded }
+}
 
 /**
- * 思考过程折叠行：左对齐、浅色弱化，与正式回复区分。**默认收起**，点这一行随时展开/收起。
+ * 思考过程折叠行：默认由偏好决定，手动选择优先；展开内容支持长按选区复制。
  *
  * 收起态只占一行：行首思考图标 + 一行内容预览（见 [reasoningPreviewLine]，超宽省略号截断）；
  * 展开态换成完整正文（Markdown 渲染）。两态之间没有「显示尾巴几行」的中间态。
@@ -660,14 +677,17 @@ internal fun ReasoningBubble(
     live: Boolean = false,
     /** 展开态的外部覆盖（宿主持久化，见 [AIAgentViewModel.reasoningExpansionOverrides]）；null = 用内部状态。 */
     expandedOverride: Boolean? = null,
+    defaultExpanded: Boolean = false,
     /** 手动展开/收起时回传新状态，由上层持久化。 */
-    onExpandedChange: ((Boolean) -> Unit)? = null
+    onExpandedChange: ((Boolean) -> Unit)? = null,
+    scrollState: LazyListState = remember { newReasoningScrollState() }
 ) {
-    var localExpanded by remember { mutableStateOf(false) }
-    val expanded = expandedOverride ?: localExpanded
+    val expansion = remember { ReasoningExpansionState() }
+    val expanded = expansion.expanded(defaultExpanded, expandedOverride)
     val toggleExpanded: (Boolean) -> Unit = { next ->
-        if (onExpandedChange != null) onExpandedChange(next) else localExpanded = next
+        if (onExpandedChange != null) onExpandedChange(next) else expansion.select(next)
     }
+    val latestToggleExpanded by rememberUpdatedState(toggleExpanded)
     // 存绝对起始时间戳而非累加
     // 毫秒数，切页返回或气泡滚出视口重挂载后显示的仍是真实时长；起始戳连同已见文本的长度与
     // 指纹一起进 saveable，恢复时文本若不是同一轮的延续（期间已换轮）则重新计时。
@@ -742,22 +762,25 @@ internal fun ReasoningBubble(
                 Spacer(Modifier.height(Spacing.sm))
                 // 展开态用懒渲染（LazyMarkdownSuccess）：超长思考只组合可见块，不再一次性
                 // 组合全部节点把 Compose ChangeList 撑爆（OOM 根因）。高度上限交给内层 LazyColumn 自行滚动。
-                MarkdownContent(
-                    text = renderText,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    cache = cache,
-                    compact = true,
-                    lazyScroll = true,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(max = ReasoningWindowMaxHeight)
-                        .nestedScroll(rememberBoundNestedScrollConnection())
-                        .pointerInput(text) {
-                            detectTapGestures(
-                                onDoubleTap = { toggleExpanded(false) }
-                            )
-                        }
-                )
+                SelectionContainer {
+                    MarkdownContent(
+                        text = renderText,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        cache = cache,
+                        compact = true,
+                        lazyScroll = true,
+                        lazyListState = scrollState,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = ReasoningWindowMaxHeight)
+                            .nestedScroll(rememberBoundNestedScrollConnection())
+                            .pointerInput(Unit) {
+                                detectTapGestures(
+                                    onDoubleTap = { latestToggleExpanded(false) }
+                                )
+                            }
+                    )
+                }
             }
         }
     }
@@ -778,7 +801,7 @@ internal fun TypingDots(
     /** 是否单独给读屏播报「正在生成」：嵌在 [AgentBusyIndicator] 里时由外层状态行统一播报。 */
     announce: Boolean = true
 ) {
-    val animate = chatUiWorkActive()
+    val animate = chatAnimationsEnabled()
     val transition = if (animate) rememberInfiniteTransition(label = "typing-dots") else null
     val label = stringResource(R.string.chat_status_generating)
     Row(

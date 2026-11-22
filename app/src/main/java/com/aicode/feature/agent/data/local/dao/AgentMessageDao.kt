@@ -102,6 +102,8 @@ interface AgentMessageDao {
     @Query("SELECT * FROM agent_messages WHERE sessionId = :sessionId AND role = 'TOOL' AND isCompacted = 0 ORDER BY timestamp ASC, rowid ASC")
     fun getToolMessagesBySession(sessionId: String): Flow<List<AgentMessageEntity>>
 
+    // CursorWindow 换窗可能重跑查询，事务保证并发删除时整页仍读取同一快照。
+    @Transaction
     @Query("SELECT * FROM (SELECT * FROM agent_messages WHERE sessionId = :sessionId ORDER BY timestamp DESC LIMIT :limit) ORDER BY timestamp ASC")
     fun getMessagesBySessionPaged(sessionId: String, limit: Int): Flow<List<AgentMessageEntity>>
 
@@ -160,6 +162,14 @@ interface AgentMessageDao {
         ORDER BY m.timestamp ASC, m.rowid ASC
     """)
     fun observeSubAgentExecutionMessages(parentId: String, childId: String, limit: Int): Flow<List<AgentMessageEntity>>
+
+    @Query("""
+        SELECT * FROM agent_messages WHERE sessionId = :sessionId
+          AND (:before IS NULL OR timestamp < :before)
+          AND (:after IS NULL OR timestamp > :after)
+        ORDER BY timestamp DESC, rowid DESC LIMIT :limit
+    """)
+    suspend fun getMessagesPageDescending(sessionId: String, before: Long?, after: Long?, limit: Int): List<AgentMessageEntity>
 
     /** 一次性读取（非 Flow），用于跨请求重建上下文历史。 */
     @Query("SELECT * FROM agent_messages WHERE sessionId = :sessionId ORDER BY timestamp ASC")

@@ -5,8 +5,10 @@ import com.aicode.R
 import dagger.hilt.android.qualifiers.ApplicationContext
 import com.aicode.core.util.FileLogger
 import com.aicode.feature.agent.domain.container.BoundedOutput
+import com.aicode.feature.agent.domain.model.AgentContext
 import com.aicode.feature.agent.domain.shizuku.ShizukuManager
 import com.aicode.feature.agent.domain.shizuku.ShizukuState
+import com.aicode.feature.agent.domain.shizuku.ShizukuShellService
 import com.aicode.feature.agent.domain.tool.AgentTool
 import com.aicode.feature.agent.domain.tool.ParameterType
 import com.aicode.feature.agent.domain.tool.PendingToolPermission
@@ -17,8 +19,6 @@ import com.aicode.feature.agent.domain.tool.ToolResult
 import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
 import javax.inject.Inject
 
@@ -46,7 +46,8 @@ class ShizukuTool @Inject constructor(
 
     override val description =
         "通过 Shizuku 在宿主 Android 系统上执行 pm/am/cmd 等命令，用于辅助调试。" +
-            "需已安装、运行并授权 Shizuku；默认需用户确认，可在审批弹窗选择本会话始终允许。不同会话不共享授权，显式禁止规则仍优先。"
+            "需已安装、运行并授权 Shizuku，支持 ADB shell 与 Root 启动。默认需用户确认，可选择本会话始终允许；" +
+            "授权按当前服务身份和会话隔离，不同会话不共享，显式禁止规则与高危保护仍优先。"
 
     override val permissionPolicy = ToolPermissionPolicy.ASK
     override val capabilities = setOf(ToolCapability.EXECUTE_COMMANDS)
@@ -63,11 +64,17 @@ class ShizukuTool @Inject constructor(
             type = ParameterType.INTEGER,
             description = "命令最长执行时间（秒），超时将被强制终止。默认 $DEFAULT_TIMEOUT_SECONDS 秒，上限 $MAX_TIMEOUT_SECONDS 秒。",
             required = false
+        ),
+        "elevate" to ToolParameter(
+            name = "elevate",
+            type = ParameterType.BOOLEAN,
+            description = "请求对被高危策略拦截的命令单独审批，不绕过禁止规则或系统授权。",
+            required = false
         )
     )
 
     private fun resolveTimeoutMs(args: Map<String, JsonElement>): Long {
-        val seconds = args["timeout"]?.jsonPrimitive?.longOrNull ?: DEFAULT_TIMEOUT_SECONDS
+        val seconds = (args["timeout"] as? JsonPrimitive)?.longOrNull ?: DEFAULT_TIMEOUT_SECONDS
         return seconds.coerceIn(1L, MAX_TIMEOUT_SECONDS) * 1000L
     }
 
@@ -76,47 +83,68 @@ class ShizukuTool @Inject constructor(
         args: Map<String, JsonElement>,
         argsPreview: String
     ): PendingToolPermission {
-        val command = args["command"]?.jsonPrimitive?.contentOrNull ?: "未知命令"
+        val command = command(args) ?: appContext.getString(R.string.shizuku_command_required)
         val timeoutSeconds = resolveTimeoutMs(args) / 1000L
         return PendingToolPermission(
             id = callId,
             toolName = name,
-            title = "确认执行 Shizuku 命令",
+            title = appContext.getString(R.string.shizuku_confirmation_title),
             summary = command,
-            details = "将通过 Shizuku 在 Android 系统上执行。\n超时：${timeoutSeconds} 秒",
+            details = appContext.getString(R.string.shizuku_confirmation_details, timeoutSeconds),
             argsPreview = argsPreview
         )
     }
 
-    override suspend fun execute(args: Map<String, JsonElement>): ToolResult {
-        val command = args["command"]?.jsonPrimitive?.contentOrNull
-            ?: return ToolResult.Error("缺少必需参数：command")
+    override suspend fun execute(args: Map<String, JsonElement>): ToolResult = approvalRequired()
 
+    override suspend fun executeWithContext(args: Map<String, JsonElement>, context: AgentContext): ToolResult {
+        val command = command(args)
+            ?: return ToolResult.Error(appContext.getString(R.string.shizuku_command_required), "INVALID_ARGUMENTS")
+
+        shizukuManager.refreshState()
         val state = shizukuManager.state.value
-        if (state != ShizukuState.READY) {
-            return ToolResult.Error("Shizuku 未就绪：${stateHint(state)}", code = "SHIZUKU_NOT_READY")
+        if (state != ShizukuState.READY && state != ShizukuState.READY_ROOT) {
+            return ToolResult.Error(appContext.getString(R.string.shizuku_not_ready, stateHint(state)), code = "SHIZUKU_NOT_READY")
         }
+        val sessionId = context.sessionId?.takeIf { it.isNotBlank() } ?: return approvalRequired()
+        val permitId = context.shizukuApprovalId ?: return approvalRequired()
 
         return try {
             val timeoutMs = resolveTimeoutMs(args)
             FileLogger.d(TAG, "Shizuku exec (timeout=${timeoutMs}ms): $command")
-            val result = shizukuManager.runCommand(command, timeoutMs)
+            val result = shizukuManager.runApprovedCommand(command, timeoutMs, sessionId, permitId)
             val output = BoundedOutput().apply { append(result.output) }.build()
             FileLogger.v(TAG, "Shizuku exec 完成，输出 ${result.output.length} 字符，退出码 ${result.exitCode}")
-            ToolResult.Success(JsonPrimitive(output))
+            when (result.exitCode) {
+                0 -> ToolResult.Success(JsonPrimitive(output))
+                ShizukuShellService.EXIT_TIMEOUT -> ToolResult.Error(
+                    appContext.getString(R.string.shizuku_command_timeout), "SHIZUKU_COMMAND_TIMEOUT"
+                )
+                else -> ToolResult.Error(
+                    appContext.getString(R.string.shizuku_command_exit_failed, result.exitCode, output), "SHIZUKU_COMMAND_FAILED"
+                )
+            }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             FileLogger.e(TAG, "Shizuku exec 失败: $command", e)
-            ToolResult.Error("执行 Shizuku 命令失败：${e.message}")
+            ToolResult.Error(appContext.getString(R.string.shizuku_command_failed, e.message.orEmpty()))
         }
     }
 
+    private fun command(args: Map<String, JsonElement>): String? =
+        (args["command"] as? JsonPrimitive)?.takeIf { it.isString }?.content?.takeIf { it.isNotBlank() }
+
+    private fun approvalRequired() = ToolResult.Error(
+        appContext.getString(R.string.shizuku_approval_required), "SHIZUKU_APPROVAL_REQUIRED"
+    )
+
     private fun stateHint(state: ShizukuState): String = when (state) {
-        ShizukuState.NOT_INSTALLED -> "未安装 Shizuku，请先安装并启动 Shizuku 服务"
-        ShizukuState.NOT_RUNNING -> "Shizuku 服务未运行，请在 Shizuku 应用中启动服务"
-        ShizukuState.PERMISSION_DENIED -> "本应用尚未获得 Shizuku 授权，请在设置中授予"
+        ShizukuState.NOT_INSTALLED -> appContext.getString(R.string.settings_shizuku_hint_not_installed)
+        ShizukuState.NOT_RUNNING -> appContext.getString(R.string.settings_shizuku_hint_not_running)
+        ShizukuState.PERMISSION_DENIED -> appContext.getString(R.string.settings_shizuku_hint_denied)
         ShizukuState.SHELL_REQUIRED -> appContext.getString(R.string.shizuku_shell_required)
-        ShizukuState.READY -> ""
+        ShizukuState.IDENTITY_UNAVAILABLE -> appContext.getString(R.string.shizuku_identity_unavailable)
+        ShizukuState.READY, ShizukuState.READY_ROOT -> ""
     }
 }

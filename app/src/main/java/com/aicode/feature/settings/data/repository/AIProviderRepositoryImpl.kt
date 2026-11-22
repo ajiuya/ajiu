@@ -14,6 +14,10 @@ import com.aicode.feature.settings.domain.model.ProviderType
 import com.aicode.feature.settings.domain.model.ProxyType
 import com.aicode.feature.settings.domain.model.sanitized
 import com.aicode.feature.settings.domain.repository.AIProviderRepository
+import com.aicode.feature.plugin.domain.PluginManager
+import com.aicode.feature.plugin.runtime.PluginProviderIds
+import javax.inject.Provider
+import kotlinx.coroutines.flow.combine
 import androidx.room.withTransaction
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
@@ -28,7 +32,8 @@ import javax.inject.Singleton
 @Singleton
 class AIProviderRepositoryImpl @Inject constructor(
     private val aiProviderDao: AIProviderDao,
-    private val agentDatabase: AgentDatabase
+    private val agentDatabase: AgentDatabase,
+    private val plugins: Provider<PluginManager>
 ) : AIProviderRepository {
 
     private companion object {
@@ -57,13 +62,13 @@ class AIProviderRepositoryImpl @Inject constructor(
     }
 
     override fun getAllProviders(): Flow<List<AIProviderConfig>> {
-        return aiProviderDao.getAllProviders().map { entities ->
-            entities.map { it.toDomainModel() }
+        return combine(aiProviderDao.getAllProviders(), plugins.get().snapshot) { entities, _ ->
+            entities.map { it.toDomainModel().withPluginAvailability() }
         }.flowOn(Dispatchers.IO)
     }
 
     override suspend fun getProviderById(id: String): AIProviderConfig? = withContext(Dispatchers.IO) {
-        aiProviderDao.getProviderById(id)?.toDomainModel()
+        aiProviderDao.getProviderById(id)?.toDomainModel()?.withPluginAvailability()
     }
 
     /**
@@ -75,7 +80,10 @@ class AIProviderRepositoryImpl @Inject constructor(
             val current = aiProviderDao.getProviderById(provider.id)
             val sortOrder = current?.sortOrder ?: (aiProviderDao.getMaxSortOrder() + 1)
             FileLogger.i(TAG, "保存提供商 id=${provider.id} name=${provider.name} sortOrder=$sortOrder")
-            aiProviderDao.insertProvider(provider.copy(sortOrder = sortOrder).sanitized().toEntity())
+            val enabled = if (PluginProviderIds.isPluginId(provider.id) && !isPluginAvailable(provider.id)) {
+                current?.isEnabled ?: provider.isEnabled
+            } else provider.isEnabled
+            aiProviderDao.insertProvider(provider.copy(sortOrder = sortOrder, isEnabled = enabled).sanitized().toEntity())
         }
     }
 
@@ -117,6 +125,22 @@ class AIProviderRepositoryImpl @Inject constructor(
         FileLogger.d(TAG, "更新模型列表 provider=$id 共 ${models.size} 个")
         aiProviderDao.setModels(id, models.joinToString("\n"))
     }
+
+    override suspend fun setProviderApiKey(id: String, apiKey: String): Unit = withContext(Dispatchers.IO) {
+        aiProviderDao.setProviderApiKey(id, KeystoreCipher.encryptString(apiKey), KeystoreCipher.encryptString(""))
+    }
+
+    private fun isPluginAvailable(id: String): Boolean {
+        if (!PluginProviderIds.isPluginId(id)) return true
+        val pluginId = PluginProviderIds.pluginIdOf(id) ?: return false
+        val localId = PluginProviderIds.localIdOf(id) ?: return false
+        return plugins.get().snapshot.value.plugins.any { plugin ->
+            plugin.record.id == pluginId && plugin.isActive && plugin.content.providers.any { it.localId == localId }
+        }
+    }
+
+    private fun AIProviderConfig.withPluginAvailability(): AIProviderConfig =
+        if (isEnabled && !isPluginAvailable(id)) copy(isEnabled = false) else this
 
     override suspend fun setProviderEnabled(id: String, isEnabled: Boolean) {
         FileLogger.i(TAG, "设置提供商状态 provider=$id isEnabled=$isEnabled")

@@ -50,14 +50,14 @@ import compose.icons.feathericons.Trash2
 import compose.icons.feathericons.Users
 
 /**
- * 子代理二级页：与「技能」一致的折叠分组列表——「当前项目 / 全局」两组各自可折叠，
- * 每行一个子代理（图标 + 名称 + 描述 + 模型标签），左滑删除，点击行进入详情。
+ * 子代理二级页：当前项目、全局与插件三个折叠分组。
+ * 用户定义左滑删除，点击进入详情；插件定义仅提供只读查看。
  * 新建入口在顶栏的「＋」，启用开关与编辑入口在详情页。
  *
  * 列表走 [LazyColumn] 只组合可见行：子代理数量随项目增长，一次组合全部行会明显掉帧。
  *
  * 顶栏右上角「多选」进入批量模式（[selection] 由 SettingsScreen 持有）：可批量启用 / 停用 / 删除。
- * 全选覆盖两组（含折叠起来的组）。
+ * 全选覆盖两个可编辑分组（含折叠起来的组）。
  */
 @Composable
 internal fun SubAgentsSection(
@@ -70,20 +70,23 @@ internal fun SubAgentsSection(
     onBatchDelete: (List<SubAgentUiEntry>) -> Unit,
     onBatchSetEnabled: (List<SubAgentUiEntry>, Boolean) -> Unit
 ) {
-    // 只在数据变化时分组，避免每次重组都产生两份新 List。
+
     val (projectAgents, globalAgents) = remember(entries) {
         entries.filter { it.scope == AgentDefinitionScope.PROJECT } to
             entries.filter { it.scope == AgentDefinitionScope.GLOBAL }
     }
 
+    val pluginAgents = remember(entries) { entries.filter { it.scope == AgentDefinitionScope.PLUGIN } }
+    var pluginDetail by remember(entries) { mutableStateOf<SubAgentUiEntry?>(null) }
     var showBatchDeleteConfirm by remember { mutableStateOf(false) }
-    val allKeys = remember(entries) { entries.map { subAgentSelectionKey(it) } }
-    val keyToEntry = remember(entries) { entries.associateBy { subAgentSelectionKey(it) } }
+    val editableEntries = remember(entries) { entries.filterNot { it.scope == AgentDefinitionScope.PLUGIN } }
+    val allKeys = remember(editableEntries) { editableEntries.map { subAgentSelectionKey(it) } }
+    val keyToEntry = remember(editableEntries) { editableEntries.associateBy { subAgentSelectionKey(it) } }
 
     // 列表刷新后剔除已消失的选中项；全空了就退出多选。
     LaunchedEffect(allKeys, selection.isActive) {
         selection.retainOnly(allKeys.toSet())
-        if (selection.isActive && entries.isEmpty()) selection.exit()
+        if (selection.isActive && allKeys.isEmpty()) selection.exit()
     }
 
     if (entries.isEmpty()) {
@@ -128,6 +131,7 @@ internal fun SubAgentsSection(
 
     var projectExpanded by rememberSaveable { mutableStateOf(true) }
     var globalExpanded by rememberSaveable { mutableStateOf(true) }
+    var pluginExpanded by rememberSaveable { mutableStateOf(true) }
     val allSelected = selection.selectedCount > 0 && selection.selectedCount == allKeys.size
     val selectedEntries: List<SubAgentUiEntry> = selection.selectedKeys.mapNotNull { keyToEntry[it] }
 
@@ -246,7 +250,49 @@ internal fun SubAgentsSection(
                     }
                 }
             }
+
+            if (pluginAgents.isNotEmpty()) {
+                item(key = "plugin-header", contentType = "header") {
+                    CollapsibleGroupHeader(
+                        text = stringResource(R.string.plugin_source),
+                        expanded = pluginExpanded,
+                        onToggle = { pluginExpanded = !pluginExpanded }
+                    )
+                }
+                if (pluginExpanded) {
+                    item(key = "plugin-read-only", contentType = "hint") {
+                        SettingsGroup { SubAgentEmptyHint(stringResource(R.string.plugin_definitions_read_only)) }
+                    }
+                    itemsIndexed(
+                        items = pluginAgents,
+                        key = { _, entry -> "plugin:${entry.name}" },
+                        contentType = { _, _ -> "plugin-agent-row" }
+                    ) { index, entry ->
+                        LazyGroupItem(index = index, lastIndex = pluginAgents.lastIndex) {
+                            SettingsRow(
+                                icon = FeatherIcons.Users,
+                                title = entry.name,
+                                subtitle = entry.description.ifBlank { stringResource(R.string.mcp_no_description) },
+                                trailing = {
+                                    if (entry.disabled) {
+                                        McpPill(
+                                            text = stringResource(R.string.common_disabled),
+                                            textColor = MaterialTheme.colorScheme.outline,
+                                            backgroundColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.12f)
+                                        )
+                                    }
+                                },
+                                onClick = { pluginDetail = entry }
+                            )
+                        }
+                    }
+                }
+            }
         }
+    }
+
+    pluginDetail?.let { entry ->
+        PluginDefinitionDialog(entry.name, entry.description, entry.prompt) { pluginDetail = null }
     }
 
     if (showBatchDeleteConfirm) {

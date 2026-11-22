@@ -2,6 +2,9 @@ package com.aicode.feature.player.data
 
 import com.aicode.feature.workspace.domain.FileAccessProvider
 import com.aicode.feature.workspace.domain.FileEntry
+import com.aicode.feature.workspace.domain.identityCheckedRead
+import com.aicode.feature.workspace.domain.readBytesBounded
+import com.aicode.testutil.TestFileAccessProvider
 import java.io.File
 import java.io.InputStream
 import java.lang.reflect.Proxy
@@ -40,6 +43,16 @@ internal fun playerFileAccess(
             if (args!!.size == 2 && args[1] != identity()) throw CancellationException("Fixture source changed")
             stream(args[0] as String)
         }
+        "readBytes" -> {
+            val path = args!![0] as String
+            val captured = identity()
+            val maxBytes = if (args.size == 2) args[1] as Long else null
+            if (maxBytes != null) require(maxBytes in 0..Int.MAX_VALUE.toLong())
+            identityCheckedRead(stream(path)) {
+                if (identity() != captured) throw CancellationException("Fixture source changed")
+            }.use { input -> if (maxBytes == null) input.readBytes() else input.readBytesBounded(maxBytes) }
+        }
+        "resolvePath" -> TestFileAccessProvider().resolvePath(args!![0] as String, args[1] as Boolean)
         "copyToLocal" -> copy(args!![0] as String)
         "toString" -> "PlayerFileAccessFixture"
         "hashCode" -> System.identityHashCode(proxy)

@@ -91,7 +91,9 @@ class ContextMessageRoundtripTest {
         subAgentInteractionDao = mockk(relaxed = true),
         projectMemoryJournal = projectMemoryJournal,
         recoveryRepository = recoveryRepository,
-        agentDatabase = agentDatabase
+        agentDatabase = agentDatabase,
+        pluginArchives = mockk(relaxed = true),
+        backupContent = mockk(relaxed = true)
     )
     private val noDataOptions = BackupOptions(
         providers = false,
@@ -471,6 +473,51 @@ class ContextMessageRoundtripTest {
         manager.import(ByteArrayInputStream(backup), null).getOrThrow()
 
         coVerify(exactly = 0) { generalSettings.setTypewriterCharsPerSecond(any()) }
+    }
+
+    @Test
+    fun reasoningPreferenceExportIsScopedToAppSettings() = runTest {
+        coEvery { generalSettings.autoExpandReasoning() } returns true
+        val included = ByteArrayOutputStream()
+        val excluded = ByteArrayOutputStream()
+        manager.export(null, noDataOptions.copy(appSettings = true), included)
+        manager.export(null, noDataOptions, excluded)
+        val withSettings = json.decodeFromString<BackupMetadata>(readArchive(included.toByteArray()).getValue("metadata.json"))
+        val withoutSettings = json.decodeFromString<BackupMetadata>(readArchive(excluded.toByteArray()).getValue("metadata.json"))
+        assertEquals(true, withSettings.autoExpandReasoning)
+        assertTrue(withSettings.includesAppSettings)
+        assertNull(withoutSettings.autoExpandReasoning)
+        assertFalse(withoutSettings.includesAppSettings)
+        coVerify(exactly = 1) { generalSettings.autoExpandReasoning() }
+    }
+
+    @Test
+    fun streamingAndLegacyImportsRestoreBothReasoningPreferenceValues() = runTest {
+        for (enabled in listOf(true, false)) {
+            val metadata = BackupMetadata(schemaVersion = 71, createdAt = 0,
+                includesAppSettings = true, autoExpandReasoning = enabled)
+            val snapshot = BackupSnapshot(schemaVersion = 71, createdAt = 0,
+                themeMode = "DARK", autoExpandReasoning = enabled)
+            for (backup in listOf(
+                archive("metadata.json" to json.encodeToString(BackupMetadata.serializer(), metadata)),
+                archive("snapshot.json" to json.encodeToString(BackupSnapshot.serializer(), snapshot))
+            )) manager.import(ByteArrayInputStream(backup), null).getOrThrow()
+            coVerify(exactly = 2) { generalSettings.setAutoExpandReasoning(enabled) }
+        }
+    }
+
+    @Test
+    fun missingNullOrOutOfScopeReasoningPreferenceDoesNotResetTheDevice() = runTest {
+        for (fields in listOf("", ",\"autoExpandReasoning\":null")) {
+            val content = """{"schemaVersion":71,"createdAt":0,"themeMode":"DARK"$fields}"""
+            for (backup in listOf(archive("metadata.json" to content), archive("snapshot.json" to content))) {
+                manager.import(ByteArrayInputStream(backup), null).getOrThrow()
+            }
+        }
+        val excluded = BackupMetadata(schemaVersion = 71, createdAt = 0,
+            includesAppSettings = false, autoExpandReasoning = true)
+        manager.import(ByteArrayInputStream(archive("metadata.json" to json.encodeToString(BackupMetadata.serializer(), excluded))), null).getOrThrow()
+        coVerify(exactly = 0) { generalSettings.setAutoExpandReasoning(any()) }
     }
 
     @Test

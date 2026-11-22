@@ -4,6 +4,7 @@ import com.aicode.core.util.FileLogger
 import com.aicode.feature.agent.domain.model.ReasoningEffort
 import com.aicode.feature.workspace.domain.FileAccessProvider
 import org.yaml.snakeyaml.Yaml
+import kotlinx.coroutines.CancellationException
 
 /**
  * 解析单个子代理定义文件（`agents/<name>.md`）：YAML frontmatter 为配置，正文为 agent 提示词。
@@ -16,10 +17,15 @@ object AgentDefinitionParser {
     /** 正文为空视为非法定义（agent 必须有提示词），返回 null。定义文件经 [provider] 以容器路径读取。 */
     fun parse(provider: FileAccessProvider, filePath: String): AgentDefinition? {
         val text = runCatching { BuiltinAgentPublication.read { provider.readFile(filePath) } }.getOrElse {
+            if (it is CancellationException) throw it
             FileLogger.w(TAG, "读取子代理定义失败: $filePath", it)
             return null
         }
 
+        return parseText(text, filePath)
+    }
+
+    internal fun parseText(text: String, filePath: String): AgentDefinition? {
         // frontmatter 顶层不是键值表（如写成了列表）时返回 null 跳过该文件并留痕；
         // 泛型 load 的 unchecked 转换在顶层非 map 时不会立即失败，而是拖到取值处抛
         // ClassCastException，进而连累整个目录的扫描降级为空。

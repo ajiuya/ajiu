@@ -35,7 +35,9 @@ interface BackupManager {
     suspend fun import(
         input: InputStream,
         password: CharArray?,
-        selectedWorkspaces: Set<String>? = null
+        selectedWorkspaces: Set<String>? = null,
+        selectedPluginIds: Set<String> = emptySet(),
+        contentSelection: BackupContentRestoreSelection = BackupContentRestoreSelection()
     ): Result<RestoreStats>
 
     /**
@@ -47,11 +49,16 @@ interface BackupManager {
 
     /** 准备经过完整解密校验的压缩包，调用方负责在预览和恢复结束后删除临时文件。 */
     suspend fun prepareImport(input: InputStream, password: CharArray?): File
+
+    suspend fun availablePluginSections(): List<PluginBackupSectionMeta> = emptyList()
 }
 
 /** 导入预览结果：备份中的工作区列表（供勾选）。 */
 data class ImportPreview(
-    val workspaces: List<WorkspaceBackupMeta>
+    val workspaces: List<WorkspaceBackupMeta>,
+    val pluginSections: List<PluginBackupSectionMeta> = emptyList(),
+    val contentSections: List<BackupContentSectionMeta> = emptyList(),
+    val remoteTarget: BackupContentRestoreTarget? = null
 ) {
     val hasWorkspaceData: Boolean get() = workspaces.isNotEmpty()
 }
@@ -64,8 +71,20 @@ data class BackupOptions(
     val mcpServers: Boolean = true,
     val permissionRules: Boolean = true,
     val appSettings: Boolean = true,
-    val workspaceFiles: Boolean = false
+    val workspaceFiles: Boolean = false,
+    val pluginIds: Set<String> = emptySet(),
+    val memories: Boolean = false,
+    val skills: Boolean = false,
+    val prompts: Boolean = false,
+    val plugins: Boolean = false
 )
+
+@kotlinx.serialization.Serializable
+data class PluginBackupSectionMeta(val pluginId: String, val purpose: String, val fileCount: Int = 0, val bytes: Long = 0)
+
+enum class PluginBackupSectionStatus { RESTORED, NOT_SELECTED, UNAVAILABLE, DENIED, FAILED }
+
+data class PluginBackupSectionResult(val pluginId: String, val status: PluginBackupSectionStatus, val code: String? = null)
 
 data class RestoreStats(
     val providers: Int = 0,
@@ -76,7 +95,9 @@ data class RestoreStats(
     val todoItems: Int = 0,
     val mcpServers: Int = 0,
     val globalPermissionRules: Int = 0,
-    val workspaceFiles: Int = 0
+    val workspaceFiles: Int = 0,
+    val pluginSections: List<PluginBackupSectionResult> = emptyList(),
+    val contentSections: List<BackupContentRestoreResult> = emptyList()
 ) {
     operator fun plus(other: RestoreStats) = RestoreStats(
         providers = providers + other.providers,
@@ -87,6 +108,8 @@ data class RestoreStats(
         todoItems = todoItems + other.todoItems,
         mcpServers = mcpServers + other.mcpServers,
         globalPermissionRules = globalPermissionRules + other.globalPermissionRules,
-        workspaceFiles = workspaceFiles + other.workspaceFiles
+        workspaceFiles = workspaceFiles + other.workspaceFiles,
+        pluginSections = pluginSections + other.pluginSections,
+        contentSections = contentSections + other.contentSections
     )
 }

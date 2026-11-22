@@ -397,7 +397,13 @@ fun highlightCode(code: String, language: SyntaxLanguage?, darkMode: Boolean): A
                     is ColorHighlight -> SpanStyle(color = Color(h.rgb).copy(alpha = 1f))
                     is BoldHighlight -> SpanStyle(fontWeight = FontWeight.Bold)
                 }
-                addStyle(style, h.location.start, h.location.end)
+                // 高亮引擎对部分内容会给出 start >= end 或越过长度的区间，AnnotatedString.Range
+                // 构造随即抛 "Reversed range is not supported"；本函数跑在后台协程，异常直达线程
+                // 默认处理器，调用方 try/catch 拦不住，表现为查看 diff 时整个进程闪退。
+                val start = h.location.start
+                val end = h.location.end
+                if (start < 0 || start >= end || end > code.length) return@forEach
+                addStyle(style, start, end)
             }
         }
     } catch (e: Exception) {

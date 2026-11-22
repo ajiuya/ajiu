@@ -51,6 +51,7 @@ data class BackupSnapshot(
     val chatTextScale: Float? = null,
     val chatBackgroundAlpha: Float? = null,
     val typewriterCharsPerSecond: Int? = null,
+    val autoExpandReasoning: Boolean? = null,
     val userChatBubbleStyleId: String? = null,
     val assistantChatBubbleStyleId: String? = null,
     val subAgentInteractions: List<SubAgentInteractionDto> = emptyList(),
@@ -99,8 +100,12 @@ data class BackupMetadata(
     val chatTextScale: Float? = null,
     val chatBackgroundAlpha: Float? = null,
     val typewriterCharsPerSecond: Int? = null,
+    val autoExpandReasoning: Boolean? = null,
     val userChatBubbleStyleId: String? = null,
-    val assistantChatBubbleStyleId: String? = null
+    val assistantChatBubbleStyleId: String? = null,
+    val pluginSections: List<PluginBackupSectionMeta> = emptyList(),
+    val contentFormatVersion: Int = 1,
+    val contentSections: List<BackupContentSectionMeta> = emptyList()
 )
 
 /** 备份元数据中的一个工作区段：名称 + 备份的文件数（用于导入摘要）。 */
@@ -145,6 +150,7 @@ fun BackupSnapshot.toMetadata() = BackupMetadata(
     chatTextScale = chatTextScale,
     chatBackgroundAlpha = chatBackgroundAlpha,
     typewriterCharsPerSecond = typewriterCharsPerSecond,
+    autoExpandReasoning = autoExpandReasoning,
     userChatBubbleStyleId = userChatBubbleStyleId,
     assistantChatBubbleStyleId = assistantChatBubbleStyleId
 )

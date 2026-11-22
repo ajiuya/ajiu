@@ -10,6 +10,8 @@ import java.util.Arrays;
 public final class TerminalRow {
 
     private static final float SPARE_CAPACITY_FACTOR = 1.5f;
+    /** Prevent a malformed stream of combining marks from growing one cell without bound. */
+    private static final int MAX_COMBINING_CHARACTERS = 16;
 
     /** The number of columns in this terminal row. */
     private final int mColumns;
@@ -166,13 +168,12 @@ public final class TerminalRow {
             oldCharactersUsedForColumn = mSpaceUsed - oldStartOfColumnIndex;
         }
 
-        // Find how many chars this column will need
+        // Find how many chars this column will need. Combining characters are added to the existing cell;
+        // cap that sequence so malformed output cannot grow one row without bound.
         int newCharactersUsedForColumn = Character.charCount(codePoint);
         if (newIsCombining) {
-            // Combining characters are added to the contents of the column instead of overwriting them, so that they
-            // modify the existing contents.
-            // FIXME: Put a limit of combining characters.
             // FIXME: Unassigned characters also get width=0.
+            if (oldCharactersUsedForColumn + newCharactersUsedForColumn > MAX_COMBINING_CHARACTERS + 1) return;
             newCharactersUsedForColumn += oldCharactersUsedForColumn;
         }
 

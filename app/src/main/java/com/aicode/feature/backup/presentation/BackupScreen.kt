@@ -1,6 +1,7 @@
 package com.aicode.feature.backup.presentation
 
 import android.net.Uri
+import android.text.format.Formatter
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -62,7 +63,15 @@ import com.aicode.core.ui.FloatingTabBar
 import com.aicode.core.ui.FloatingTabItem
 import com.aicode.core.ui.SwipeToDeleteRow
 import com.aicode.core.ui.dialogTextFieldColors
+import com.aicode.feature.backup.domain.BackupContentKind
+import com.aicode.feature.backup.domain.BackupContentLocation
+import com.aicode.feature.backup.domain.BackupContentRestoreSelection
+import com.aicode.feature.backup.domain.BackupContentRestoreStatus
+import com.aicode.feature.backup.domain.BackupContentRestoreTarget
+import com.aicode.feature.backup.domain.BackupContentSectionMeta
 import com.aicode.feature.backup.domain.BackupOptions
+import com.aicode.feature.backup.domain.PluginBackupSectionMeta
+import com.aicode.feature.backup.domain.PluginBackupSectionStatus
 import com.aicode.feature.backup.domain.RestoreStats
 import com.aicode.feature.backup.domain.WorkspaceBackupMeta
 import com.aicode.feature.backup.domain.remote.BackupTarget
@@ -103,6 +112,8 @@ internal fun BackupScreen(
     val scope = rememberCoroutineScope()
 
     val exportOptions by viewModel.exportOptions.collectAsStateWithLifecycle()
+    val pluginSections by viewModel.pluginSections.collectAsStateWithLifecycle()
+    LaunchedEffect(viewModel) { viewModel.refreshPluginSections() }
     val targets by viewModel.targets.collectAsStateWithLifecycle()
     val networkState by viewModel.networkState.collectAsStateWithLifecycle()
 
@@ -135,6 +146,7 @@ internal fun BackupScreen(
         if (uri != null) {
             val pw = pendingExportPassword
             val opts = pendingExportOptions
+            pendingExportPassword = ""
             scope.launch {
                 val os = withContext(Dispatchers.IO) { context.contentResolver.openOutputStream(uri) }
                 if (os != null) {
@@ -145,6 +157,7 @@ internal fun BackupScreen(
                 }
             }
         } else {
+            pendingExportPassword = ""
             viewModel.reset()
         }
     }
@@ -195,8 +208,9 @@ internal fun BackupScreen(
                     LocalBackupTab(
                         scrollState = localScrollState,
                         exportOptions = exportOptions,
+                        pluginSections = pluginSections,
                         onUpdateOptions = viewModel::updateExportOptions,
-                        working = state is BackupState.Working,
+                        working = state is BackupState.Working || networkState is NetworkBackupState.Working,
                         onExport = { pendingAction = PendingAction.ExportPassword },
                         onImport = {
                             pendingAction = PendingAction.Import
@@ -248,7 +262,7 @@ internal fun BackupScreen(
             onPasswordChange = { password = it },
             onConfirm = {
                 pendingExportPassword = password
-                pendingExportOptions = exportOptions
+                pendingExportOptions = exportOptions.copy(pluginIds = exportOptions.pluginIds.toSet())
                 password = ""
                 pendingAction = null
                 exportLauncher.launch("aicode-backup-${System.currentTimeMillis()}.tar.gz")
@@ -429,13 +443,16 @@ internal fun BackupScreen(
             onDismiss = { viewModel.reset() }
         )
         is BackupState.ImportSuccess -> ResultDialog(
-            title = stringResource(R.string.backup_import_done),
+            title = stringResource(if (current.stats.hasContentRestoreIssues()) R.string.common_done else R.string.backup_import_done),
             message = buildImportSummary(context, current.stats),
             onDismiss = { viewModel.reset() }
         )
-        is BackupState.WorkspaceSelection -> WorkspaceRestoreDialog(
+        is BackupState.ContentSelection -> ContentRestoreDialog(
             workspaces = current.workspaces,
-            onConfirm = { selected -> viewModel.confirmImportSelection(selected) },
+            pluginSections = current.pluginSections,
+            contentSections = current.contentSections,
+            remoteTarget = current.remoteTarget,
+            onConfirm = viewModel::confirmImportSelection,
             onDismiss = { viewModel.cancelImportSelection() }
         )
         else -> {}
@@ -452,7 +469,8 @@ private fun LocalBackupTab(
     onUpdateOptions: (BackupOptions) -> Unit,
     working: Boolean,
     onExport: () -> Unit,
-    onImport: () -> Unit
+    onImport: () -> Unit,
+    pluginSections: List<PluginBackupSectionMeta> = emptyList()
 ) {
     Column(
         modifier = Modifier
@@ -533,6 +551,83 @@ private fun LocalBackupTab(
                 }
             )
             WorkspaceBackupHint()
+            SettingsDivider()
+            SettingsRow(
+                title = stringResource(R.string.backup_data_memories),
+                subtitle = stringResource(R.string.backup_data_memories_hint),
+                trailing = {
+                    AppSwitch(
+                        checked = exportOptions.memories,
+                        onCheckedChange = { onUpdateOptions(exportOptions.copy(memories = it)) }
+                    )
+                }
+            )
+            SettingsDivider()
+            SettingsRow(
+                title = stringResource(R.string.backup_data_skills),
+                subtitle = stringResource(R.string.backup_data_skills_hint),
+                trailing = {
+                    AppSwitch(
+                        checked = exportOptions.skills,
+                        onCheckedChange = { onUpdateOptions(exportOptions.copy(skills = it)) }
+                    )
+                }
+            )
+            SettingsDivider()
+            SettingsRow(
+                title = stringResource(R.string.backup_data_prompts),
+                subtitle = stringResource(R.string.backup_data_prompts_hint),
+                trailing = {
+                    AppSwitch(
+                        checked = exportOptions.prompts,
+                        onCheckedChange = { onUpdateOptions(exportOptions.copy(prompts = it)) }
+                    )
+                }
+            )
+            SettingsDivider()
+            SettingsRow(
+                title = stringResource(R.string.backup_data_plugins),
+                subtitle = stringResource(R.string.backup_data_plugins_hint),
+                trailing = {
+                    AppSwitch(
+                        checked = exportOptions.plugins,
+                        onCheckedChange = { onUpdateOptions(exportOptions.copy(plugins = it)) }
+                    )
+                }
+            )
+            Text(
+                text = stringResource(R.string.backup_content_sensitive_hint),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = Spacing.lg, vertical = Spacing.sm)
+            )
+        }
+        if (pluginSections.isNotEmpty()) {
+            SettingsGroupHeader(text = stringResource(R.string.backup_restore_extensions))
+            SettingsGroup {
+                Text(
+                    text = stringResource(R.string.plugin_backup_selection_warning),
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(Spacing.lg)
+                )
+                pluginSections.forEachIndexed { index, section ->
+                    if (index > 0) SettingsDivider()
+                    SettingsRow(
+                        title = section.pluginId,
+                        subtitle = section.purpose,
+                        trailing = {
+                            AppSwitch(
+                                checked = section.pluginId in exportOptions.pluginIds,
+                                onCheckedChange = { selected ->
+                                    onUpdateOptions(exportOptions.copy(
+                                        pluginIds = if (selected) exportOptions.pluginIds + section.pluginId else exportOptions.pluginIds - section.pluginId
+                                    ))
+                                }
+                            )
+                        }
+                    )
+                }
+            }
         }
 
         SettingsGroupHeader(text = stringResource(R.string.backup_actions))
@@ -747,78 +842,230 @@ private fun WorkspaceBackupHint() {
     }
 }
 
+internal data class BackupRestoreChoices(
+    val workspaces: Set<String> = emptySet(),
+    val extensions: Set<String> = emptySet(),
+    val content: BackupContentRestoreSelection = BackupContentRestoreSelection(),
+    val remoteConfirmed: Boolean = false
+) {
+    fun selectContent(section: BackupContentSectionMeta, selected: Boolean): BackupRestoreChoices = copy(
+        content = content.copy(sectionIds = if (selected) content.sectionIds + section.id else content.sectionIds - section.id),
+        extensions = if (selected && section.kind == BackupContentKind.PLUGIN) extensions - setOfNotNull(section.pluginId) else extensions
+    )
+
+    fun fullPluginIds(sections: List<BackupContentSectionMeta>): Set<String> = sections
+        .filter { it.id in content.sectionIds && it.kind == BackupContentKind.PLUGIN }
+        .mapNotNull { it.pluginId }.toSet()
+
+    fun selectExtension(pluginId: String, selected: Boolean, sections: List<BackupContentSectionMeta>): BackupRestoreChoices =
+        if (pluginId in fullPluginIds(sections)) this
+        else copy(extensions = if (selected) extensions + pluginId else extensions - pluginId)
+
+    fun requiresRemoteConfirmation(sections: List<BackupContentSectionMeta>): Boolean = sections.any {
+        it.id in content.sectionIds && (it.location == BackupContentLocation.SSH_GLOBAL || it.location == BackupContentLocation.SSH_PROJECT)
+    }
+
+    fun canConfirm(sections: List<BackupContentSectionMeta>, target: BackupContentRestoreTarget?): Boolean =
+        !requiresRemoteConfirmation(sections) || (target != null && remoteConfirmed)
+
+    fun contentSelection(sections: List<BackupContentSectionMeta>, target: BackupContentRestoreTarget?): BackupContentRestoreSelection =
+        content.copy(remoteTargetIdentity = if (requiresRemoteConfirmation(sections) && remoteConfirmed) target?.identity else null)
+}
+
 @Composable
-private fun WorkspaceRestoreDialog(
+internal fun ContentRestoreDialog(
     workspaces: List<WorkspaceBackupMeta>,
-    onConfirm: (Set<String>) -> Unit,
+    pluginSections: List<PluginBackupSectionMeta>,
+    contentSections: List<BackupContentSectionMeta>,
+    remoteTarget: BackupContentRestoreTarget?,
+    onConfirm: (Set<String>, Set<String>, BackupContentRestoreSelection) -> Unit,
     onDismiss: () -> Unit
 ) {
-    var checked by remember { mutableStateOf(workspaces.associate { it.name to true }) }
-    val anyChecked = checked.values.any { it }
-    val allChecked = workspaces.isNotEmpty() && checked.values.all { it }
+    val context = LocalContext.current
+    var choices by remember(workspaces, pluginSections, contentSections, remoteTarget) {
+        mutableStateOf(BackupRestoreChoices(workspaces = workspaces.map { it.name }.toSet()))
+    }
+    val fullPluginIds = choices.fullPluginIds(contentSections)
+    val remoteSelected = choices.requiresRemoteConfirmation(contentSections)
+    val allChecked = workspaces.isNotEmpty() && workspaces.all { it.name in choices.workspaces }
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text(stringResource(R.string.backup_restore_workspaces_title)) },
+        title = { Text(stringResource(R.string.backup_restore_content_title)) },
         text = {
-            Column {
+            Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
                 Text(
-                    text = stringResource(R.string.backup_restore_workspaces_warning),
+                    text = stringResource(R.string.backup_restore_content_hint),
                     style = MaterialTheme.typography.bodySmall,
-                    fontWeight = FontWeight.Medium,
-                    color = MaterialTheme.colorScheme.error
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-                Spacer(Modifier.height(Spacing.md))
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Checkbox(
-                        checked = allChecked,
-                        onCheckedChange = { v -> checked = workspaces.associate { it.name to v } }
-                    )
+                if (workspaces.isNotEmpty()) {
+                    SettingsGroupHeader(text = stringResource(R.string.backup_data_workspace))
                     Text(
-                        text = stringResource(R.string.backup_restore_workspaces_select_all),
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurface
+                        text = stringResource(R.string.backup_restore_workspaces_warning),
+                        style = MaterialTheme.typography.bodySmall,
+                        fontWeight = FontWeight.Medium,
+                        color = MaterialTheme.colorScheme.error
                     )
-                }
-                workspaces.forEach { ws ->
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
                         Checkbox(
-                            checked = checked[ws.name] ?: false,
-                            onCheckedChange = { v -> checked = checked + (ws.name to v) }
+                            checked = allChecked,
+                            onCheckedChange = { selected ->
+                                choices = choices.copy(workspaces = if (selected) workspaces.map { it.name }.toSet() else emptySet())
+                            }
                         )
-                        Text(
-                            text = ws.name,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurface,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.weight(1f)
+                        Text(stringResource(R.string.backup_restore_workspaces_select_all), style = MaterialTheme.typography.bodyMedium)
+                    }
+                    workspaces.forEach { workspace ->
+                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                            Checkbox(
+                                checked = workspace.name in choices.workspaces,
+                                onCheckedChange = { selected ->
+                                    choices = choices.copy(workspaces = if (selected) choices.workspaces + workspace.name else choices.workspaces - workspace.name)
+                                }
+                            )
+                            Text(
+                                text = workspace.name,
+                                style = MaterialTheme.typography.bodyMedium,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Text(
+                                text = stringResource(R.string.backup_restore_workspaces_files, workspace.fileCount),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+                BackupContentKind.entries.forEach { kind ->
+                    val sections = contentSections.filter { it.kind == kind }
+                    if (sections.isNotEmpty()) {
+                        SettingsGroupHeader(text = stringResource(backupContentKindLabel(kind)))
+                        SettingsGroup {
+                            sections.forEachIndexed { index, section ->
+                                if (index > 0) SettingsDivider()
+                                val isRemote = section.location == BackupContentLocation.SSH_GLOBAL || section.location == BackupContentLocation.SSH_PROJECT
+                                val available = !isRemote || remoteTarget != null
+                                val location = stringResource(backupContentLocationLabel(section.location))
+                                val size = stringResource(R.string.backup_restore_content_size, section.fileCount, Formatter.formatFileSize(context, section.bytes))
+                                val details = listOfNotNull(location, section.workspaceName, section.sourceLabel, size).joinToString(" · ")
+                                SettingsRow(
+                                    title = section.label,
+                                    subtitle = if (available) details else "$details\n${stringResource(R.string.backup_restore_remote_unavailable)}",
+                                    enabled = available,
+                                    trailing = {
+                                        AppSwitch(
+                                            checked = section.id in choices.content.sectionIds,
+                                            onCheckedChange = { choices = choices.selectContent(section, it) },
+                                            enabled = available
+                                        )
+                                    }
+                                )
+                            }
+                            if (kind == BackupContentKind.PLUGIN) {
+                                Text(
+                                    text = stringResource(R.string.backup_restore_plugin_disabled),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    modifier = Modifier.padding(Spacing.lg)
+                                )
+                            }
+                        }
+                    }
+                }
+                if (contentSections.isNotEmpty()) {
+                    Spacer(Modifier.height(Spacing.md))
+                    SettingsGroup {
+                        SettingsRow(
+                            title = stringResource(R.string.backup_restore_overwrite),
+                            subtitle = stringResource(R.string.backup_restore_overwrite_hint),
+                            trailing = {
+                                AppSwitch(
+                                    checked = choices.content.overwrite,
+                                    onCheckedChange = { choices = choices.copy(content = choices.content.copy(overwrite = it)) }
+                                )
+                            }
                         )
+                    }
+                }
+                if (contentSections.any { it.location == BackupContentLocation.SSH_GLOBAL || it.location == BackupContentLocation.SSH_PROJECT }) {
+                    SettingsGroupHeader(text = stringResource(
+                        R.string.backup_restore_remote_target,
+                        remoteTarget?.label ?: stringResource(R.string.backup_content_unavailable)
+                    ))
+                    if (remoteTarget == null) {
                         Text(
-                            text = stringResource(R.string.backup_restore_workspaces_files, ws.fileCount),
+                            text = stringResource(R.string.backup_restore_remote_unavailable),
                             style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                            color = MaterialTheme.colorScheme.error
                         )
+                    } else {
+                        SettingsGroup {
+                            SettingsRow(
+                                title = stringResource(R.string.backup_restore_remote_confirm),
+                                trailing = {
+                                    AppSwitch(
+                                        checked = remoteSelected && choices.remoteConfirmed,
+                                        onCheckedChange = { choices = choices.copy(remoteConfirmed = it) },
+                                        enabled = remoteSelected
+                                    )
+                                }
+                            )
+                        }
+                    }
+                }
+                if (pluginSections.isNotEmpty()) {
+                    SettingsGroupHeader(text = stringResource(R.string.backup_restore_extensions))
+                    Text(stringResource(R.string.plugin_backup_selection_warning), style = MaterialTheme.typography.bodySmall)
+                    SettingsGroup {
+                        pluginSections.forEachIndexed { index, section ->
+                            if (index > 0) SettingsDivider()
+                            val replaced = section.pluginId in fullPluginIds
+                            SettingsRow(
+                                title = section.pluginId,
+                                subtitle = if (replaced) stringResource(R.string.backup_restore_extension_replaced)
+                                    else stringResource(R.string.plugin_backup_section_size, section.purpose, section.fileCount, section.bytes),
+                                enabled = !replaced,
+                                trailing = {
+                                    AppSwitch(
+                                        checked = !replaced && section.pluginId in choices.extensions,
+                                        onCheckedChange = { choices = choices.selectExtension(section.pluginId, it, contentSections) },
+                                        enabled = !replaced
+                                    )
+                                }
+                            )
+                        }
                     }
                 }
             }
         },
         confirmButton = {
             TextButton(
-                onClick = { onConfirm(checked.filterValues { it }.keys) },
-                enabled = anyChecked
+                onClick = { onConfirm(choices.workspaces, choices.extensions, choices.contentSelection(contentSections, remoteTarget)) },
+                enabled = choices.canConfirm(contentSections, remoteTarget)
             ) {
                 Text(stringResource(R.string.backup_restore_workspaces_confirm))
             }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text(stringResource(R.string.common_cancel)) } }
     )
+}
+
+internal fun backupContentKindLabel(kind: BackupContentKind): Int = when (kind) {
+    BackupContentKind.MEMORY -> R.string.backup_data_memories
+    BackupContentKind.SKILLS -> R.string.backup_data_skills
+    BackupContentKind.PROMPTS -> R.string.backup_data_prompts
+    BackupContentKind.PLUGIN -> R.string.backup_data_plugins
+}
+
+internal fun backupContentLocationLabel(location: BackupContentLocation): Int = when (location) {
+    BackupContentLocation.PHONE_GLOBAL -> R.string.backup_restore_phone_global
+    BackupContentLocation.PHONE_PROJECT -> R.string.backup_restore_phone_project
+    BackupContentLocation.PHONE_REMOTE_PROJECT -> R.string.backup_restore_phone_remote_project
+    BackupContentLocation.SSH_GLOBAL -> R.string.backup_restore_ssh_global
+    BackupContentLocation.SSH_PROJECT -> R.string.backup_restore_ssh_project
+    BackupContentLocation.PLUGIN -> R.string.backup_data_plugins
 }
 
 @Composable
@@ -909,12 +1156,16 @@ private fun ResultDialog(title: String, message: String, onDismiss: () -> Unit) 
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(title) },
-        text = { Text(message) },
+        text = { Text(message, modifier = Modifier.verticalScroll(rememberScrollState())) },
         confirmButton = { TextButton(onClick = onDismiss) { Text(stringResource(R.string.common_got_it)) } }
     )
 }
 
-private fun buildImportSummary(context: android.content.Context, stats: RestoreStats): String = buildString {
+internal fun RestoreStats.hasContentRestoreIssues(): Boolean =
+    contentSections.any { it.status != BackupContentRestoreStatus.RESTORED && it.status != BackupContentRestoreStatus.NOT_SELECTED } ||
+        pluginSections.any { it.status != PluginBackupSectionStatus.RESTORED && it.status != PluginBackupSectionStatus.NOT_SELECTED }
+
+internal fun buildImportSummary(context: android.content.Context, stats: RestoreStats): String = buildString {
     appendLine(context.getString(R.string.backup_restored_data))
     if (stats.providers > 0) appendLine(context.getString(R.string.backup_stat_providers, stats.providers))
     if (stats.remoteConnections > 0) appendLine(context.getString(R.string.backup_stat_remote_connections, stats.remoteConnections))
@@ -925,5 +1176,48 @@ private fun buildImportSummary(context: android.content.Context, stats: RestoreS
     if (stats.mcpServers > 0) appendLine(context.getString(R.string.backup_stat_mcp_servers, stats.mcpServers))
     if (stats.globalPermissionRules > 0) appendLine(context.getString(R.string.backup_stat_permission_rules, stats.globalPermissionRules))
     if (stats.workspaceFiles > 0) appendLine(context.getString(R.string.backup_stat_workspace_files, stats.workspaceFiles))
+    stats.pluginSections.forEach { section ->
+        val status = if (section.code == "FULL_PLUGIN_RESTORE_SELECTED") R.string.backup_restore_extension_replaced else when (section.status) {
+            PluginBackupSectionStatus.RESTORED -> R.string.plugin_backup_restored
+            PluginBackupSectionStatus.NOT_SELECTED -> R.string.plugin_backup_not_selected
+            PluginBackupSectionStatus.UNAVAILABLE -> R.string.plugin_backup_unavailable
+            PluginBackupSectionStatus.DENIED -> R.string.plugin_backup_denied
+            PluginBackupSectionStatus.FAILED -> R.string.plugin_backup_failed
+        }
+        appendLine(context.getString(R.string.plugin_backup_result, section.pluginId, context.getString(status)))
+    }
+    BackupContentKind.entries.forEach { kind ->
+        val sections = stats.contentSections.filter { it.kind == kind }
+        if (sections.isNotEmpty()) {
+            appendLine(context.getString(backupContentKindLabel(kind)))
+            sections.forEach { section ->
+                val status = when (section.status) {
+                    BackupContentRestoreStatus.RESTORED -> R.string.backup_content_restored
+                    BackupContentRestoreStatus.NOT_SELECTED -> R.string.backup_content_not_selected
+                    BackupContentRestoreStatus.CONFLICT -> R.string.backup_content_conflict
+                    BackupContentRestoreStatus.UNAVAILABLE -> R.string.backup_content_unavailable
+                    BackupContentRestoreStatus.PARTIAL -> R.string.backup_content_partial
+                    BackupContentRestoreStatus.FAILED -> R.string.backup_content_failed
+                }
+                appendLine(context.getString(
+                    R.string.backup_content_summary,
+                    section.label,
+                    context.getString(status),
+                    section.restoredFiles,
+                    section.skippedFiles,
+                    section.conflicts
+                ))
+                if (kind == BackupContentKind.PLUGIN) {
+                    val reason = when (section.code) {
+                        "PLUGIN_PACKAGE_RESTORED_DATA_FAILED", "PLUGIN_PACKAGE_RESTORED_DATA_INVALID" -> R.string.backup_content_plugin_package_data_failed
+                        "PLUGIN_PACKAGE_DATA_RESTORED_SECRETS_FAILED" -> R.string.backup_content_plugin_secrets_failed
+                        "PLUGIN_PACKAGE_RESTORED_OLD_DATA_RETAINED" -> R.string.backup_content_plugin_old_data_retained
+                        else -> if (section.status == BackupContentRestoreStatus.FAILED) R.string.backup_content_plugin_restore_blocked else null
+                    }
+                    if (reason != null) appendLine(context.getString(reason))
+                }
+            }
+        }
+    }
     append(context.getString(R.string.backup_settings_covered))
 }

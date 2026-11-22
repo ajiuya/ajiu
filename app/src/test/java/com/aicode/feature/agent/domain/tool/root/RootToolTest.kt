@@ -73,7 +73,7 @@ class RootToolTest {
         ))
         assertEquals("ROOT_APPROVAL_REQUIRED", (result as ToolResult.Error).code)
         coVerify(exactly = 0) { manager.execute(any(), any(), any(), any()) }
-        coVerify(exactly = 0) { manager.authorize(any(), any(), any()) }
+        coVerify(exactly = 0) { manager.authorize(any(), any(), any(), any()) }
     }
 
     @Test
@@ -89,7 +89,7 @@ class RootToolTest {
             assertEquals("ROOT_APPROVAL_REQUIRED", (tool.executeWithContext(args, context) as ToolResult.Error).code)
         }
         coVerify(exactly = 0) { manager.execute(any(), any(), any(), any()) }
-        coVerify(exactly = 0) { manager.authorize(any(), any(), any()) }
+        coVerify(exactly = 0) { manager.authorize(any(), any(), any(), any()) }
     }
 
     @Test
@@ -106,7 +106,7 @@ class RootToolTest {
         ), context())
         assertEquals(ToolResult.Success(JsonPrimitive("done")), result)
         coVerify(exactly = 1) { manager.execute(command, 120_000L, "s1", "trusted-permit") }
-        coVerify(exactly = 0) { manager.authorize(any(), any(), any()) }
+        coVerify(exactly = 0) { manager.authorize(any(), any(), any(), any()) }
     }
 
     @Test
@@ -167,7 +167,7 @@ class RootToolTest {
             tool.executeWithContext(mapOf("command" to JsonPrimitive("printf done")), context())
             throw AssertionError("Cancellation must propagate")
         } catch (_: CancellationException) {
-            coVerify(exactly = 0) { manager.authorize(any(), any(), any()) }
+            coVerify(exactly = 0) { manager.authorize(any(), any(), any(), any()) }
         }
     }
 

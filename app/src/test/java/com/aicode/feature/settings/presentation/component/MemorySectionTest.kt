@@ -66,14 +66,25 @@ import org.robolectric.annotation.TextLayoutMode
 @GraphicsMode(GraphicsMode.Mode.LEGACY)
 @TextLayoutMode(TextLayoutMode.Mode.LEGACY)
 @LooperMode(LooperMode.Mode.PAUSED)
-@OptIn(InternalComposeUiApi::class)
+@OptIn(InternalComposeUiApi::class, ExperimentalCoroutinesApi::class)
 class MemorySectionTest {
     @Test fun noWorkspaceShowsBothGroupsAndTheProjectUnavailableHint() {
-        render({ MemorySection(MemoryUiState(loading = false), {}, {}) }) { root, activity ->
+        render({
+            MemorySection(MemoryUiState(loading = false), {}, {}, scope = MemoryScope.GLOBAL, query = "",
+                onScopeChange = {}, onQueryChange = {})
+        }) { root, activity, _ ->
             val texts = texts(root)
-            assertTrue(activity.getString(R.string.memory_management_global) in texts)
-            assertTrue(activity.getString(R.string.memory_management_project) in texts)
+            assertTrue(activity.getString(R.string.memory_a_global) in texts)
+            assertTrue(activity.getString(R.string.memory_a_current_project) in texts)
             assertTrue(activity.getString(R.string.memory_management_no_workspace) in texts)
+            val tabs = root.semanticsOwner.getAllSemanticsNodes(mergingEnabled = false).filter {
+                it.config.getOrNull(SemanticsProperties.Role) == Role.Tab
+            }
+            assertEquals(2, tabs.size)
+            val global = tabs.single { it.config.getOrNull(SemanticsProperties.Selected) == true }
+            val project = tabs.single { it.config.getOrNull(SemanticsProperties.Selected) == false }
+            assertFalse(global.config.contains(SemanticsProperties.Disabled))
+            assertTrue(project.config.contains(SemanticsProperties.Disabled))
         }
     }
 
@@ -81,26 +92,45 @@ class MemorySectionTest {
         val global = entry(MemoryScope.GLOBAL)
         val project = entry(MemoryScope.PROJECT)
         var opened: MemoryEntry? = null
+        val selectedScope = mutableStateOf(MemoryScope.PROJECT)
         render({
             MemorySection(MemoryUiState(entries = listOf(global, project), hasWorkspace = true, projectName = "workspace", loading = false),
-                onOpenDetail = { opened = it }, onDelete = {})
-        }) { root, _ ->
-            val rows = root.semanticsOwner.getAllSemanticsNodes(mergingEnabled = true).filter { node ->
-                node.config.getOrNull(SemanticsProperties.Text)?.any { it.text == "same-name" } == true &&
-                    node.config.getOrNull(SemanticsActions.OnClick)?.action != null
-            }
-            assertEquals(2, rows.size)
-            rows.forEach { node ->
-                val preview = node.config.getOrNull(SemanticsProperties.Text)!!.map { it.text }
-                    .single { it.endsWith("preview") }
-                assertTrue(node.config.getOrNull(SemanticsActions.OnClick)!!.action!!.invoke())
-                assertEquals(if (preview == "GLOBAL preview") global else project, opened)
+                onOpenDetail = { opened = it }, onDelete = {}, scope = selectedScope.value, query = "",
+                onScopeChange = { selectedScope.value = it }, onQueryChange = {})
+        }) { root, _, pump ->
+            listOf(project, global).forEach { expected ->
+                if (selectedScope.value != expected.scope) {
+                    val tab = root.semanticsOwner.getAllSemanticsNodes(mergingEnabled = false).single {
+                        it.config.getOrNull(SemanticsProperties.TestTag) == "memory-scope-global"
+                    }
+                    assertTrue(tab.config.getOrNull(SemanticsActions.OnClick)!!.action!!.invoke())
+                    pump(12)
+                }
+                val rows = root.semanticsOwner.getAllSemanticsNodes(mergingEnabled = true).filter { node ->
+                    node.config.getOrNull(SemanticsProperties.TestTag)?.startsWith("memory-row-") == true
+                }
+                assertEquals(1, rows.size)
+                assertEquals("memory-row-${expected.id}", rows.single().config[SemanticsProperties.TestTag])
+                val visible = texts(root)
+                assertTrue(expected.name in visible)
+                assertTrue(expected.description in visible)
+                assertTrue(expected.preview in visible)
+                assertFalse((if (expected.scope == MemoryScope.PROJECT) global else project).preview in visible)
+                fun containsName(node: androidx.compose.ui.semantics.SemanticsNode): Boolean =
+                    node.config.getOrNull(SemanticsProperties.Text)?.any { it.text == expected.name } == true ||
+                        node.children.any(::containsName)
+                fun openAction(node: androidx.compose.ui.semantics.SemanticsNode): (() -> Boolean)? =
+                    node.config.getOrNull(SemanticsActions.OnClick)?.action?.takeIf { containsName(node) }
+                        ?: node.children.firstNotNullOfOrNull(::openAction)
+                assertTrue(requireNotNull(openAction(rows.single())).invoke())
+                assertEquals(expected, opened)
             }
         }
     }
 
     @Test fun projectScopeIsDisabledWithoutWorkspaceAndGlobalRemainsSelected() {
-        render({ NewMemoryForm(hasWorkspace = false, saving = false, error = null, onSave = { _, _, _, _ -> }) }) { root, activity ->
+        render({ NewMemoryForm(hasWorkspace = false, saving = false, error = null, onSave = { _, _, _, _ -> },
+            initialScope = MemoryScope.PROJECT) }) { root, activity, _ ->
             val radios = root.semanticsOwner.getAllSemanticsNodes(mergingEnabled = false).filter {
                 it.config.getOrNull(SemanticsProperties.Role) == Role.RadioButton
             }
@@ -117,7 +147,7 @@ class MemorySectionTest {
         render({
             NewMemoryForm(hasWorkspace = true, saving = false, error = MemoryManagementError.NAME_CONFLICT,
                 onSave = { _, _, _, _ -> })
-        }) { root, activity ->
+        }) { root, activity, _ ->
             assertTrue(activity.getString(R.string.memory_management_name_conflict) in texts(root))
             val inputs = root.semanticsOwner.getAllSemanticsNodes(mergingEnabled = false).filter {
                 it.config.getOrNull(SemanticsActions.SetText)?.action != null
@@ -299,9 +329,9 @@ class MemorySectionTest {
 
     @Test fun detailShowsTheExactFileAndScopeAndCopiesTheCompleteMarkdownBody() {
         val document = MemoryDocument(entry(MemoryScope.PROJECT), "# Complete Markdown\n\n**all** of the body")
-        render({ MemoryDetailSection(document) }) { root, activity ->
+        render({ MemoryDetailSection(document, projectName = "workspace") }) { root, activity, _ ->
             assertTrue(document.entry.fileName in texts(root))
-            assertTrue(activity.getString(R.string.memory_management_project) in texts(root))
+            assertTrue(activity.getString(R.string.memory_management_project_named, "workspace") in texts(root))
             val copy = root.semanticsOwner.getAllSemanticsNodes(mergingEnabled = true).single { node ->
                 node.config.getOrNull(SemanticsProperties.Text)?.any {
                     it.text == activity.getString(R.string.memory_management_copy_body)
@@ -310,6 +340,45 @@ class MemorySectionTest {
             assertTrue(copy.config.getOrNull(SemanticsActions.OnClick)!!.action!!.invoke())
             val clipboard = activity.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             assertEquals(document.content, clipboard.primaryClip!!.getItemAt(0).text.toString())
+        }
+    }
+
+    @Test fun newMemoryFormStartsInTheCurrentProjectScopeWithoutChangingItsDefaultGlobalContract() {
+        MemoryScope.entries.forEach { initial ->
+            render({ NewMemoryForm(hasWorkspace = true, saving = false, error = null,
+                onSave = { _, _, _, _ -> }, initialScope = initial) }) { root, activity, _ ->
+                val selected = root.semanticsOwner.getAllSemanticsNodes(mergingEnabled = false).single {
+                    it.config.getOrNull(SemanticsProperties.Role) == Role.RadioButton &&
+                        it.config.getOrNull(SemanticsProperties.Selected) == true
+                }
+                val option = requireNotNull(selected.parent)
+                fun containsScopeText(node: androidx.compose.ui.semantics.SemanticsNode): Boolean =
+                    node.config.getOrNull(SemanticsProperties.Text)?.any {
+                        it.text == activity.getString(memoryScopeLabelRes(initial))
+                    } == true || node.children.any(::containsScopeText)
+                assertTrue(containsScopeText(option))
+                assertFalse(selected.config.contains(SemanticsProperties.Disabled))
+            }
+        }
+    }
+
+    @Test fun savingDisablesAllDraftInputsAndBothScopeChoices() {
+        render({ NewMemoryForm(hasWorkspace = true, saving = true, error = null,
+            onSave = { _, _, _, _ -> }, initialScope = MemoryScope.PROJECT) }) { root, activity, _ ->
+            val nodes = root.semanticsOwner.getAllSemanticsNodes(mergingEnabled = false)
+            val inputs = nodes.filter { it.config.contains(SemanticsProperties.EditableText) }
+            assertEquals(3, inputs.size)
+            assertTrue(inputs.all { it.config.contains(SemanticsProperties.Disabled) })
+            assertTrue(inputs.all { it.config.getOrNull(SemanticsActions.SetText)?.action == null })
+            val radios = nodes.filter { it.config.getOrNull(SemanticsProperties.Role) == Role.RadioButton }
+            assertEquals(2, radios.size)
+            assertTrue(radios.all { it.config.contains(SemanticsProperties.Disabled) })
+            val create = root.semanticsOwner.getAllSemanticsNodes(mergingEnabled = true).single { node ->
+                node.config.getOrNull(SemanticsProperties.Text)?.any {
+                    it.text == activity.getString(R.string.memory_management_creating)
+                } == true && node.config.contains(SemanticsActions.OnClick)
+            }
+            assertTrue(create.config.contains(SemanticsProperties.Disabled))
         }
     }
 
@@ -322,33 +391,52 @@ class MemorySectionTest {
             node.config.getOrNull(SemanticsProperties.Text)?.map { it.text } ?: emptyList()
         }
 
-    private fun render(content: @Composable () -> Unit, inspect: (ViewRootForTest, ComponentActivity) -> Unit) {
+    private fun render(
+        content: @Composable () -> Unit,
+        inspect: (ViewRootForTest, ComponentActivity, (Int) -> Unit) -> Unit
+    ): Unit = runTest(timeout = 20.seconds) {
         val controller = Robolectric.buildActivity(ComponentActivity::class.java).setup().visible()
         val activity = controller.get()
         val view = ComposeView(activity)
+        val clock = BroadcastFrameClock()
+        val recomposer = Recomposer(coroutineContext + clock)
+        val runner = backgroundScope.launch(UnconfinedTestDispatcher(testScheduler) + clock) {
+            recomposer.runRecomposeAndApplyChanges()
+        }
+        var frame = 0L
+        val pump: (Int) -> Unit = { count -> repeat(count) {
+            shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(16))
+            testScheduler.advanceTimeBy(16)
+            Snapshot.sendApplyNotifications()
+            runCurrent()
+            view.measure(
+                View.MeasureSpec.makeMeasureSpec(1_000, View.MeasureSpec.EXACTLY),
+                View.MeasureSpec.makeMeasureSpec(2_000, View.MeasureSpec.EXACTLY)
+            )
+            view.layout(0, 0, view.measuredWidth, view.measuredHeight)
+            (view.getChildAt(0) as? ViewRootForTest)?.measureAndLayoutForTest()
+            if (clock.hasAwaiters) clock.sendFrame(++frame * 16_000_000L)
+            runCurrent()
+        } }
         try {
             view.setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed)
+            view.setParentCompositionContext(recomposer)
             view.setContent {
                 CompositionLocalProvider(LocalDensity provides Density(1f)) {
                     AIEditorTheme(darkTheme = false, content = content)
                 }
             }
             activity.setContentView(view)
-            repeat(3) {
-                shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(32))
-                view.measure(
-                    View.MeasureSpec.makeMeasureSpec(1_000, View.MeasureSpec.EXACTLY),
-                    View.MeasureSpec.makeMeasureSpec(2_000, View.MeasureSpec.EXACTLY)
-                )
-                view.layout(0, 0, view.measuredWidth, view.measuredHeight)
-            }
+            pump(12)
             val root = view.getChildAt(0) as ViewRootForTest
             root.measureAndLayoutForTest()
-            inspect(root, activity)
+            inspect(root, activity, pump)
         } finally {
             view.disposeComposition()
+            recomposer.cancel()
+            runner.cancel()
+            runCurrent()
             controller.pause().stop().destroy()
-            shadowOf(Looper.getMainLooper()).idle()
         }
     }
 }

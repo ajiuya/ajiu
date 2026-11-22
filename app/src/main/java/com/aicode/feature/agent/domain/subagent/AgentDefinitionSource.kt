@@ -1,7 +1,9 @@
 package com.aicode.feature.agent.domain.subagent
 
 import com.aicode.core.util.FileLogger
+import com.aicode.feature.workspace.domain.AgentConfigKind
 import com.aicode.feature.workspace.domain.FileAccessProvider
+import kotlinx.coroutines.CancellationException
 
 /** 子代理定义来源：一个目录下的 `*.md`，每个文件一个 agent。 */
 interface AgentDefinitionSource {
@@ -17,19 +19,29 @@ internal object AgentDefinitionDirectoryScanner {
      * 单个文件解析异常（IO 失败、frontmatter 非法等）只跳过该文件，不拖垮整个目录；
      * 扫描过程整体异常（远程工作区未连接等）时降级为空列表并记日志，不向上抛。
      */
-    fun scan(provider: FileAccessProvider, root: String): List<AgentDefinition> = runCatching {
-        if (!provider.isDirectory(root)) return@runCatching emptyList()
-        val base = root.trimEnd('/')
-        provider.listFiles(root)
-            .filter { !it.isDirectory && it.name.endsWith(".md", ignoreCase = true) }
-            .mapNotNull { entry ->
-                runCatching { AgentDefinitionParser.parse(provider, "$base/${entry.name}") }
-                    .onFailure { FileLogger.w(TAG, "解析子代理定义失败，已跳过: ${entry.name}", it) }
-                    .getOrNull()
-            }
-            .sortedBy { it.name.lowercase() }
-    }.getOrElse { e ->
-        FileLogger.w(TAG, "扫描子代理定义目录失败: $root", e)
-        emptyList()
+    fun scan(provider: FileAccessProvider, root: String, forceRefresh: Boolean = false): List<AgentDefinition> {
+        provider.agentConfigSnapshot(root, AgentConfigKind.AGENTS, forceRefresh)?.let { snapshot ->
+            return snapshot.files.mapNotNull { (path, text) -> AgentDefinitionParser.parseText(text, path) }
+                .sortedBy { it.name.lowercase() }
+        }
+        return runCatching {
+            if (!provider.isDirectory(root)) return@runCatching emptyList()
+            val base = root.trimEnd('/')
+            provider.listFiles(root)
+                .filter { !it.isDirectory && it.name.endsWith(".md", ignoreCase = true) }
+                .mapNotNull { entry ->
+                    runCatching { AgentDefinitionParser.parse(provider, "$base/${entry.name}") }
+                        .onFailure {
+                            if (it is CancellationException) throw it
+                            FileLogger.w(TAG, "解析子代理定义失败，已跳过: ${entry.name}", it)
+                        }
+                        .getOrNull()
+                }
+                .sortedBy { it.name.lowercase() }
+        }.getOrElse { e ->
+            if (e is CancellationException) throw e
+            FileLogger.w(TAG, "扫描子代理定义目录失败: $root", e)
+            emptyList()
+        }
     }
 }

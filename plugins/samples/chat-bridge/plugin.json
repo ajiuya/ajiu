@@ -1,0 +1,72 @@
+{
+  "$schema": "../../schema/plugin.schema.json",
+  "manifestVersion": 1,
+  "id": "demo.chat-bridge",
+  "name": {
+    "default": "Chat Bridge",
+    "zh-CN": "对话桥"
+  },
+  "version": "1.2.0",
+  "publisher": "demo",
+  "repository": "https://github.com/example/chat-bridge",
+  "description": {
+    "default": "A chat bridge with read-only pending permission notices and a native user-confirmation request example. Only the person using the app can approve in the native dialog.",
+    "zh-CN": "演示消息回路、只读待授权状态与原生本人确认请求。页面不能代批，授权必须由本人在宿主原生界面完成。"
+  },
+  "license": "MIT",
+  "icon": "users",
+  "engines": {
+    "pluginApi": "^1.0.0"
+  },
+  "runtime": {
+    "type": "javascript",
+    "entry": "dist/main.js"
+  },
+  "contributes": {
+    "uiEntries": [
+      {
+        "id": "chat",
+        "title": {
+          "default": "Chat Bridge",
+          "zh-CN": "对话桥"
+        },
+        "slot": "settings.ai",
+        "page": "pages/chat.html",
+        "icon": "users"
+      },
+      {
+        "id": "native-confirmation-demo",
+        "title": {
+          "default": "Native User Confirmation Demo",
+          "zh-CN": "原生本人确认演示"
+        },
+        "slot": "chat.header.menu",
+        "page": "pages/chat.html",
+        "icon": "shield"
+      },
+      {
+        "id": "session-action",
+        "title": {
+          "zh-CN": "会话动作示例",
+          "en": "Session Action Demo"
+        },
+        "slot": "chat.session.menu",
+        "icon": "zap",
+        "handler": "actions.notifySession"
+      }
+    ],
+    "hooks": [
+      {
+        "id": "permission-notice",
+        "event": "agent.permission.review",
+        "handler": "hooks.observePermission",
+        "mode": "observe"
+      },
+      {
+        "id": "run-finished",
+        "event": "agent.run.finished",
+        "handler": "hooks.runFinished"
+      }
+    ]
+  }
+}

@@ -23,6 +23,21 @@ interface TerminalSessionProvider {
         sourceSessionId: String? = null
     ): String
 
+    suspend fun startPluginCommand(
+        command: String,
+        title: String?,
+        owner: TerminalResourceOwner,
+        onOutput: (ByteArray) -> Unit
+    ): String = throw UnsupportedOperationException("Plugin terminals are unavailable")
+
+    fun pluginTabStatus(id: String, owner: TerminalResourceOwner): TerminalTabStatus? = null
+
+    fun writePluginInput(id: String, owner: TerminalResourceOwner, text: String, appendNewline: Boolean): Boolean = false
+
+    fun interruptPluginTab(id: String, owner: TerminalResourceOwner): Boolean = false
+
+    suspend fun closePluginTab(id: String, owner: TerminalResourceOwner): Boolean = false
+
     /** 按 id 向标签发送输入并回车执行。返回是否命中标签且仍活跃。 */
     fun sendInput(id: String, input: String, appendNewline: Boolean = true): Boolean
 
@@ -41,3 +56,10 @@ interface TerminalSessionProvider {
     /** 关闭并销毁标签。返回是否成功。 */
     fun closeTab(id: String): Boolean
 }
+
+data class TerminalResourceOwner(val pluginId: String, val resourceId: String)
+
+data class TerminalTabStatus(val running: Boolean, val exitCode: Int?)
+
+internal fun TerminalTab.isOwnedBy(owner: TerminalResourceOwner): Boolean =
+    ownerPluginId == owner.pluginId && ownerResourceId == owner.resourceId

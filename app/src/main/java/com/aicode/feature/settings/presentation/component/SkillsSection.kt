@@ -9,15 +9,21 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -27,6 +33,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -50,14 +57,14 @@ import compose.icons.feathericons.ChevronRight
 import compose.icons.feathericons.Trash2
 
 /**
- * 技能二级页：与「工具授权」一致的折叠分组列表——「当前项目 / 全局」两组各自可折叠，
- * 每行一个技能（图标 + 名称 + 描述），左滑删除，点击行进入详情。
+ * 技能二级页：当前项目、全局与插件三个折叠分组。
+ * 用户技能左滑删除，点击进入详情；插件技能仅提供只读查看。
  *
  * 列表走 [LazyColumn] 只组合可见行：技能数量随项目增长且没有上限，
  * 用 Column + verticalScroll 一次性组合全部行会让滚动明显掉帧。
  *
  * 顶栏右上角「多选」进入批量模式（[selection] 由 SettingsScreen 持有）：可批量启用 / 停用 / 删除。
- * 全选覆盖两组（含折叠起来的组），避免「点了全选却漏掉折叠里的」。
+ * 全选覆盖两个可编辑分组（含折叠起来的组）。
  */
 @Composable
 internal fun SkillsSection(
@@ -70,19 +77,22 @@ internal fun SkillsSection(
     onBatchDelete: (List<SkillUiEntry>) -> Unit,
     onBatchSetEnabled: (List<SkillUiEntry>, Boolean) -> Unit
 ) {
-    // 只在数据变化时分组，避免每次重组都产生两份新 List。
+
     val (projectSkills, globalSkills) = remember(entries) {
         entries.filter { it.scope == SkillScope.PROJECT } to entries.filter { it.scope == SkillScope.GLOBAL }
     }
 
+    val pluginSkills = remember(entries) { entries.filter { it.scope == SkillScope.PLUGIN } }
+    var pluginDetail by remember(entries) { mutableStateOf<SkillUiEntry?>(null) }
     var showBatchDeleteConfirm by remember { mutableStateOf(false) }
-    val allKeys = remember(entries) { entries.map { skillSelectionKey(it) } }
-    val keyToEntry = remember(entries) { entries.associateBy { skillSelectionKey(it) } }
+    val editableEntries = remember(entries) { entries.filterNot { it.scope == SkillScope.PLUGIN } }
+    val allKeys = remember(editableEntries) { editableEntries.map { skillSelectionKey(it) } }
+    val keyToEntry = remember(editableEntries) { editableEntries.associateBy { skillSelectionKey(it) } }
 
     // 列表刷新后剔除已消失的选中项；全空了就退出多选。
     LaunchedEffect(allKeys, selection.isActive) {
         selection.retainOnly(allKeys.toSet())
-        if (selection.isActive && entries.isEmpty()) selection.exit()
+        if (selection.isActive && allKeys.isEmpty()) selection.exit()
     }
 
     if (entries.isEmpty()) {
@@ -127,6 +137,7 @@ internal fun SkillsSection(
 
     var projectExpanded by rememberSaveable { mutableStateOf(true) }
     var globalExpanded by rememberSaveable { mutableStateOf(true) }
+    var pluginExpanded by rememberSaveable { mutableStateOf(true) }
     val allSelected = selection.selectedCount > 0 && selection.selectedCount == allKeys.size
     val selectedEntries: List<SkillUiEntry> = selection.selectedKeys.mapNotNull { keyToEntry[it] }
 
@@ -245,7 +256,49 @@ internal fun SkillsSection(
                     }
                 }
             }
+
+            if (pluginSkills.isNotEmpty()) {
+                item(key = "plugin-header", contentType = "header") {
+                    CollapsibleGroupHeader(
+                        text = stringResource(R.string.plugin_source),
+                        expanded = pluginExpanded,
+                        onToggle = { pluginExpanded = !pluginExpanded }
+                    )
+                }
+                if (pluginExpanded) {
+                    item(key = "plugin-read-only", contentType = "hint") {
+                        SettingsGroup { SkillEmptyHint(stringResource(R.string.plugin_definitions_read_only)) }
+                    }
+                    itemsIndexed(
+                        items = pluginSkills,
+                        key = { _, entry -> "plugin:${entry.name}" },
+                        contentType = { _, _ -> "plugin-skill-row" }
+                    ) { index, entry ->
+                        LazyGroupItem(index = index, lastIndex = pluginSkills.lastIndex) {
+                            SettingsRow(
+                                icon = FeatherIcons.Book,
+                                title = entry.name,
+                                subtitle = entry.description.ifBlank { stringResource(R.string.mcp_no_description) },
+                                trailing = {
+                                    if (entry.disabled) {
+                                        McpPill(
+                                            text = stringResource(R.string.common_disabled),
+                                            textColor = MaterialTheme.colorScheme.outline,
+                                            backgroundColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.12f)
+                                        )
+                                    }
+                                },
+                                onClick = { pluginDetail = entry }
+                            )
+                        }
+                    }
+                }
+            }
         }
+    }
+
+    pluginDetail?.let { entry ->
+        PluginDefinitionDialog(entry.name, entry.description, entry.instructions) { pluginDetail = null }
     }
 
     if (showBatchDeleteConfirm) {
@@ -356,5 +409,35 @@ private fun SkillEmptyHint(text: String) {
         style = MaterialTheme.typography.bodyMedium,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
         modifier = Modifier.padding(horizontal = Spacing.lg, vertical = 12.dp)
+    )
+}
+
+@Composable
+internal fun PluginDefinitionDialog(name: String, description: String, body: String, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(name) },
+        text = {
+            SelectionContainer {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = LocalConfiguration.current.screenHeightDp.dp * 0.62f)
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(Spacing.md)
+                ) {
+                    Text(
+                        text = stringResource(R.string.plugin_definitions_read_only),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(description.ifBlank { stringResource(R.string.mcp_no_description) })
+                    Text(body, style = MaterialTheme.typography.bodyMedium)
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.common_close)) }
+        }
     )
 }

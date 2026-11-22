@@ -107,6 +107,30 @@ class BackupMetadataTest {
     }
 
     @Test
+    fun oldBackupsDoNotInventAReasoningPreference() {
+        for (fields in listOf("", ",\"autoExpandReasoning\":null")) {
+            val content = """{"schemaVersion":71,"createdAt":0,"themeMode":"DARK"$fields}"""
+            assertNull(json.decodeFromString<BackupMetadata>(content).autoExpandReasoning)
+            val snapshot = json.decodeFromString<BackupSnapshot>(content)
+            assertNull(snapshot.autoExpandReasoning)
+            assertNull(snapshot.toMetadata().autoExpandReasoning)
+        }
+    }
+
+    @Test
+    fun reasoningPreferenceRoundtripPreservesNullFalseAndTrue() {
+        for (enabled in listOf(null, false, true)) {
+            val snapshot = BackupSnapshot(schemaVersion = 71, createdAt = 1,
+                themeMode = "DARK", autoExpandReasoning = enabled)
+            val restored = json.decodeFromString<BackupSnapshot>(json.encodeToString(BackupSnapshot.serializer(), snapshot))
+            assertEquals(enabled, restored.autoExpandReasoning)
+            val metadata = restored.toMetadata()
+            assertEquals(enabled, metadata.autoExpandReasoning)
+            assertEquals(metadata, json.decodeFromString<BackupMetadata>(json.encodeToString(BackupMetadata.serializer(), metadata)))
+        }
+    }
+
+    @Test
     fun oldBubbleStyleSettingsRemainNullInBothBackupFormats() {
         for (fields in listOf("", ",\"userChatBubbleStyleId\":null,\"assistantChatBubbleStyleId\":null")) {
             val encoded = """{"schemaVersion":67,"createdAt":0,"themeMode":"DARK"$fields}"""
@@ -186,5 +210,152 @@ class BackupMetadataTest {
         assertTrue(metadata.includesAppSettings)
         assertEquals(snapshot.chatTextScale, metadata.chatTextScale)
         assertEquals(snapshot.chatBackgroundAlpha, metadata.chatBackgroundAlpha)
+    }
+
+    @Test
+    fun legacyMetadataDefaultsToEmptyVersionOneContent() {
+        for (fields in listOf("", ",\"contentSections\":[]")) {
+            val metadata = json.decodeFromString<BackupMetadata>(
+                """{"schemaVersion":63,"createdAt":1$fields}"""
+            )
+            assertEquals(1, metadata.contentFormatVersion)
+            assertTrue(metadata.contentSections.isEmpty())
+            assertTrue(metadata.pluginSections.isEmpty())
+        }
+        val legacy = BackupSnapshot(schemaVersion = 63, createdAt = 1).toMetadata()
+        assertEquals(1, legacy.contentFormatVersion)
+        assertTrue(legacy.contentSections.isEmpty())
+    }
+
+    @Test
+    fun backupOptionsPreserveOriginalDefaultsAndKeepContentOptIn() {
+        val options = BackupOptions()
+        assertTrue(options.providers)
+        assertTrue(options.remoteConnections)
+        assertTrue(options.chatHistory)
+        assertTrue(options.mcpServers)
+        assertTrue(options.permissionRules)
+        assertTrue(options.appSettings)
+        assertFalse(options.workspaceFiles)
+        assertTrue(options.pluginIds.isEmpty())
+        assertFalse(options.memories)
+        assertFalse(options.skills)
+        assertFalse(options.prompts)
+        assertFalse(options.plugins)
+    }
+
+    @Test
+    fun contentSectionRoundtripPreservesEveryScopeAndSourceIdentity() {
+        val sections = BackupContentKind.entries.flatMap { kind ->
+            BackupContentLocation.entries.filter { location ->
+                when (kind) {
+                    BackupContentKind.PLUGIN -> location == BackupContentLocation.PLUGIN
+                    BackupContentKind.SKILLS -> location != BackupContentLocation.PLUGIN
+                    BackupContentKind.MEMORY, BackupContentKind.PROMPTS -> location in setOf(
+                        BackupContentLocation.PHONE_GLOBAL, BackupContentLocation.PHONE_PROJECT,
+                        BackupContentLocation.PHONE_REMOTE_PROJECT
+                    )
+                }
+            }.map { location ->
+                BackupContentSectionMeta(
+                    id = "${kind.name}_${location.name}", kind = kind, location = location,
+                    label = "中文分区 ${kind.name} ${location.name}", fileCount = 7, bytes = 1234,
+                    workspaceName = "工程", sourceKey = "source-profile-1", sourceLabel = "手机或当前 SSH",
+                    pluginId = if (kind == BackupContentKind.PLUGIN) "fixture.full" else null,
+                    pluginVersion = if (kind == BackupContentKind.PLUGIN) "1.2.3" else null,
+                    pluginContentHash = if (kind == BackupContentKind.PLUGIN) "a".repeat(64) else null
+                )
+            }
+        }
+        val metadata = BackupMetadata(schemaVersion = 63, createdAt = 1, contentSections = sections)
+        val restored = json.decodeFromString<BackupMetadata>(json.encodeToString(BackupMetadata.serializer(), metadata))
+
+        assertEquals(metadata, restored)
+        assertEquals(12, restored.contentSections.size)
+        sections.zip(restored.contentSections).forEach { (expected, actual) ->
+            assertEquals(expected.kind, actual.kind)
+            assertEquals(expected.location, actual.location)
+            assertEquals(expected.label, actual.label)
+            assertEquals(expected.workspaceName, actual.workspaceName)
+            assertEquals(expected.sourceKey, actual.sourceKey)
+            assertEquals(expected.sourceLabel, actual.sourceLabel)
+            assertEquals(expected.pluginId, actual.pluginId)
+            assertEquals(expected.pluginVersion, actual.pluginVersion)
+            assertEquals(expected.pluginContentHash, actual.pluginContentHash)
+        }
+    }
+
+    @Test
+    fun contentMetadataDoesNotSerializeRuntimeAuthorization() {
+        val metadata = BackupMetadata(schemaVersion = 63, createdAt = 1, contentSections = listOf(
+            BackupContentSectionMeta(
+                "plugin", BackupContentKind.PLUGIN, BackupContentLocation.PLUGIN, "完整插件",
+                pluginId = "fixture.full", pluginVersion = "1.0.0", pluginContentHash = "b".repeat(64)
+            )
+        ))
+        val encoded = json.encodeToString(BackupMetadata.serializer(), metadata)
+
+        for (field in listOf("root", "capabilities", "trust", "trustGrant", "trustGrants", "operationGrants", "pendingApprovals", "executionGeneration")) {
+            assertFalse(field, encoded.contains("\"$field\""))
+        }
+        assertEquals(metadata, json.decodeFromString<BackupMetadata>(encoded))
+    }
+
+    @Test
+    fun contentSelectionDefaultsNeverSelectOrOverwriteAnything() {
+        val selection = BackupContentRestoreSelection()
+        assertTrue(selection.sectionIds.isEmpty())
+        assertFalse(selection.overwrite)
+        assertNull(selection.remoteTargetIdentity)
+        assertEquals(selection, BackupContentRestoreSelection(emptySet(), false, null))
+    }
+
+    @Test
+    fun importPreviewKeepsContentAndRemoteTargetSeparateFromWorkspaceFlag() {
+        val section = BackupContentSectionMeta(
+            "ssh-skills", BackupContentKind.SKILLS, BackupContentLocation.SSH_PROJECT, "SSH 项目技能",
+            workspaceName = "project", sourceKey = "profile-1", sourceLabel = "Current SSH"
+        )
+        val target = BackupContentRestoreTarget("target-identity", "当前 SSH")
+        val preview = ImportPreview(emptyList(), contentSections = listOf(section), remoteTarget = target)
+        assertFalse(preview.hasWorkspaceData)
+        assertEquals(listOf(section), preview.contentSections)
+        assertEquals(target, preview.remoteTarget)
+        assertTrue(preview.pluginSections.isEmpty())
+
+        val legacy = ImportPreview(listOf(WorkspaceBackupMeta("project", 2)))
+        assertTrue(legacy.hasWorkspaceData)
+        assertTrue(legacy.contentSections.isEmpty())
+        assertNull(legacy.remoteTarget)
+    }
+
+    @Test
+    fun restoreStatsPlusPreservesEveryCounterAndBothResultLists() {
+        val first = BackupContentRestoreResult(
+            "memory", BackupContentKind.MEMORY, "记忆", BackupContentRestoreStatus.RESTORED,
+            restoredFiles = 2, skippedFiles = 3, conflicts = 1, code = "MEMORY_RESULT"
+        )
+        val second = BackupContentRestoreResult(
+            "skills", BackupContentKind.SKILLS, "技能", BackupContentRestoreStatus.NOT_SELECTED
+        )
+        val hook = PluginBackupSectionResult("fixture.full", PluginBackupSectionStatus.UNAVAILABLE, "FULL_PLUGIN_RESTORE_SELECTED")
+        val left = RestoreStats(1, 2, 3, 4, 5, 6, 7, 8, 9, listOf(hook), listOf(first))
+        val right = RestoreStats(9, 8, 7, 6, 5, 4, 3, 2, 1, contentSections = listOf(second))
+        val sum = left + right
+
+        assertEquals(10, sum.providers)
+        assertEquals(10, sum.remoteConnections)
+        assertEquals(10, sum.remoteMounts)
+        assertEquals(10, sum.chatSessions)
+        assertEquals(10, sum.agentMessages)
+        assertEquals(10, sum.todoItems)
+        assertEquals(10, sum.mcpServers)
+        assertEquals(10, sum.globalPermissionRules)
+        assertEquals(10, sum.workspaceFiles)
+        assertEquals(listOf(hook), sum.pluginSections)
+        assertEquals(listOf(first, second), sum.contentSections)
+        assertEquals(left, left + RestoreStats())
+        assertEquals(right, RestoreStats() + right)
+        assertTrue(RestoreStats().contentSections.isEmpty())
     }
 }

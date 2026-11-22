@@ -6,6 +6,7 @@ import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import androidx.room.Transaction
 import com.aicode.feature.agent.data.local.entity.AgentNotificationEntity
+import kotlinx.coroutines.flow.Flow
 
 @Dao
 interface AgentNotificationDao {
@@ -26,6 +27,14 @@ interface AgentNotificationDao {
         ORDER BY n.seq
     """)
     suspend fun pending(sessionId: String, requiresConfirmation: Boolean): List<AgentNotificationEntity>
+
+    @Query("""
+        SELECT n.* FROM agent_notification_outbox n
+        JOIN chat_sessions s ON s.id = n.sessionId AND s.executionGeneration = n.generation
+        WHERE n.sessionId = :sessionId AND n.retiredAt IS NULL
+        ORDER BY n.seq
+    """)
+    fun observeTimeline(sessionId: String): Flow<List<AgentNotificationEntity>>
 
     @Query("""
         SELECT COUNT(*) FROM agent_notification_outbox n

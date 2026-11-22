@@ -135,6 +135,7 @@ class TypewriterSpeedSettingsTest {
                             streamIdleTimeoutSec = 300, onSetStreamIdleTimeoutSec = {},
                             maxNetworkRetries = 6, onSetMaxNetworkRetries = {},
                             enterToSend = false, onToggleEnterToSend = {},
+                            autoExpandReasoning = false, onToggleAutoExpandReasoning = {},
                             compactionThresholdPercent = 85, onSetCompactionThresholdPercent = {},
                             sendFileMaxSizeMb = 100, onSetSendFileMaxSizeMb = {},
                             goalMaxTurns = 50, onSetGoalMaxTurns = {},

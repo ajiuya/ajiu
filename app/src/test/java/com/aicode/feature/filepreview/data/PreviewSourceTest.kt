@@ -371,7 +371,8 @@ class PreviewSourceTest {
     fun remoteCopyIsPrivateReusedWithinTheSessionAndRemovedAtClose() = runBlocking {
         val bytes = "remote contents".toByteArray()
         val rootRead = copyRoot { bytes.inputStream() }
-        val source = detached(rootRead)
+        every { rootRead.size("~/workspace/site/file.bin") } returns bytes.size.toLong()
+        val source = detached(rootRead, bytes.size.toLong())
         val copy = source.localFile()
         assertEquals("remote contents", copy.readText())
         assertTrue(copy.toPath().startsWith(cache.toPath()))
@@ -387,8 +388,9 @@ class PreviewSourceTest {
     fun totalSessionCopyBudgetRejectsAnotherCopyBeforeOpeningItsStream() = runBlocking {
         val bytes = "one".toByteArray()
         val rootRead = copyRoot { bytes.inputStream() }
+        every { rootRead.size("~/workspace/site/file.bin") } returns bytes.size.toLong()
         every { rootRead.size("~/workspace/site/second.bin") } returns PreviewLimits.FILE_BYTES
-        detached(rootRead).use { source ->
+        detached(rootRead, bytes.size.toLong()).use { source ->
             source.localFile()
             assertTrue(runCatching { source.localFile("second.bin") }.exceptionOrNull() is IOException)
             verify(exactly = 0) { rootRead.openRead("~/workspace/site/second.bin", any()) }
@@ -411,11 +413,25 @@ class PreviewSourceTest {
     }
 
     @Test
+    fun earlyEndOfFileDoesNotReturnAPartialCopy() = runBlocking {
+        val rootRead = copyRoot { ByteArrayInputStream(byteArrayOf(1, 2, 3, 4)) }
+        detached(rootRead).use { source ->
+            val failure = runCatching { source.localFile() }.exceptionOrNull()
+            assertTrue(failure is IOException)
+            assertTrue(failure?.message.orEmpty().contains("ended before its reported size"))
+            assertTrue(cache.walkTopDown().none { it.isFile })
+        }
+        awaitCleanup { cache.listFiles().isNullOrEmpty() }
+    }
+
+    @Test
     fun cancelledCopyCleansOnlyItsOwnResourcesAndKeepsTheSessionUsable() = runBlocking {
         val entered = CountDownLatch(1)
         val released = CountDownLatch(1)
         val attempts = AtomicInteger()
         val rootRead = copyRoot { "other file".byteInputStream() }
+        every { rootRead.size("~/workspace/site/existing.bin") } returns "other file".toByteArray().size.toLong()
+        every { rootRead.size("~/workspace/site/file.bin") } returns "retry contents".toByteArray().size.toLong()
         every { rootRead.openRead("~/workspace/site/file.bin", any()) } answers {
             if (attempts.incrementAndGet() == 1) object : InputStream() {
                 override fun read(): Int {
@@ -492,7 +508,7 @@ class PreviewSourceTest {
         every { rootRead.openRead(any(), any()) } answers { input() }
     }
 
-    private fun detached(rootRead: RootRead): PreviewSource = PreviewSource(
-        PreviewPaths.entry("~/workspace/site/file.bin"), 16, Job(), null, rootRead, null, cache,
+    private fun detached(rootRead: RootRead, size: Long = 16): PreviewSource = PreviewSource(
+        PreviewPaths.entry("~/workspace/site/file.bin"), size, Job(), null, rootRead, null, cache,
     ) {}
 }

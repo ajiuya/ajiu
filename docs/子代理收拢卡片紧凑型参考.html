@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>子代理收拢卡片 · 紧凑型多版参考</title>
+  <style>
+    :root {
+      --page: #edf1f7;
+      --phone: #f8fafc;
+      --surface: #fff;
+      --surface-2: #f4f6fa;
+      --line: #dce3ee;
+      --text: #182033;
+      --muted: #758197;
+      --subtle: #a1adbd;
+      --primary: #5b5bd6;
+      --primary-soft: #eeedff;
+      --success: #188653;
+      --success-soft: #e8f6ee;
+      --warning: #b8771d;
+      --warning-soft: #fff5dc;
+      --danger: #c84b4b;
+      --danger-soft: #fff0f0;
+      --shadow: 0 20px 48px rgba(38, 52, 77, .16);
+      font-family: Inter, "Noto Sans SC", "Microsoft YaHei", system-ui, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-width: 320px; color: var(--text); background: radial-gradient(circle at 50% -10%, #fff 0, var(--page) 44rem); }
+    button { font: inherit; }
+    .page { max-width: 1220px; margin: 0 auto; padding: 38px 22px 60px; }
+    .hero { display: flex; align-items: end; justify-content: space-between; gap: 22px; margin-bottom: 22px; }
+    .eyebrow { margin: 0 0 8px; color: var(--primary); font-size: 12px; font-weight: 850; letter-spacing: .14em; text-transform: uppercase; }
+    h1 { margin: 0; font-size: clamp(25px, 4vw, 40px); letter-spacing: -.045em; }
+    .intro { max-width: 700px; margin: 10px 0 0; color: var(--muted); font-size: 15px; line-height: 1.65; }
+    .badge { padding: 9px 13px; border: 1px solid #d8d5ff; border-radius: 999px; color: #4c4ca7; background: #f6f5ff; font-size: 12px; white-space: nowrap; }
+    .tabs { display: flex; gap: 7px; padding: 6px; margin-bottom: 22px; border: 1px solid var(--line); border-radius: 16px; background: rgba(255,255,255,.76); box-shadow: 0 8px 25px rgba(38,52,77,.06); }
+    .tabs button { flex: 1; min-height: 44px; border: 0; border-radius: 11px; color: var(--muted); background: transparent; cursor: pointer; font-size: 13px; font-weight: 800; }
+    .tabs button:hover { background: #f3f5fa; color: var(--text); }
+    .tabs button.active { color: #fff; background: var(--primary); box-shadow: 0 5px 13px rgba(91,91,214,.25); }
+    .layout { display: grid; grid-template-columns: minmax(0, 1fr) 290px; gap: 23px; align-items: start; }
+    .stage { min-height: 760px; display: grid; place-items: center; padding: 28px 18px; border: 1px solid #dce3ef; border-radius: 28px; background: linear-gradient(145deg, #f7f9fc, #e8edf5); }
+    .phone { position: relative; width: min(100%, 392px); min-height: 705px; overflow: hidden; border: 8px solid #1c2535; border-radius: 38px; background: var(--phone); box-shadow: var(--shadow); }
+    .notch { position: absolute; z-index: 4; top: 0; left: 50%; width: 132px; height: 24px; transform: translateX(-50%); border-radius: 0 0 17px 17px; background: #1c2535; }
+    .statusbar { display: flex; justify-content: space-between; padding: 13px 17px 7px; color: #66738a; font-size: 10px; font-weight: 800; }
+    .appbar { display: flex; align-items: center; justify-content: space-between; padding: 7px 17px 13px; border-bottom: 1px solid #e7ebf2; background: rgba(248,250,252,.96); }
+    .app-title { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 850; }
+    .app-mark { display: grid; width: 25px; height: 25px; place-items: center; border-radius: 8px; color: #fff; background: linear-gradient(135deg, #706ce8, #4541ac); font-size: 11px; font-weight: 900; }
+    .app-actions { color: #7c889c; letter-spacing: 3px; }
+    .chat { min-height: 600px; padding: 16px 13px 74px; overflow: hidden; }
+    .message { max-width: 86%; margin: 0 0 13px; padding: 10px 12px; border-radius: 14px; color: #4f5e73; background: #fff; font-size: 12px; line-height: 1.55; }
+    .message.user { margin-left: auto; border-bottom-right-radius: 5px; color: #fff; background: var(--primary); }
+    .message.ai { border: 1px solid #e1e7f0; border-bottom-left-radius: 5px; }
+    .message-label { display: block; margin-bottom: 5px; color: #8a96a8; font-size: 10px; font-weight: 850; }
+    .message.user .message-label { color: #d9d8ff; }
+    .composer { position: absolute; right: 13px; bottom: 12px; left: 13px; display: flex; align-items: center; gap: 8px; padding: 8px 9px 8px 12px; border: 1px solid #dce3ed; border-radius: 14px; color: #a1acbc; background: rgba(255,255,255,.95); font-size: 11px; }
+    .send { display: grid; width: 25px; height: 25px; margin-left: auto; place-items: center; border-radius: 8px; color: #fff; background: var(--primary); font-size: 13px; }
+    .card-label { margin: 0 0 9px; color: #61708a; font-size: 11px; font-weight: 850; letter-spacing: .04em; }
+    .card-label span { color: var(--primary); }
+    .card { border: 1px solid var(--line); border-radius: 18px; color: var(--text); background: var(--surface); box-shadow: 0 8px 22px rgba(44,60,89,.07); }
+    .card button { border: 0; cursor: pointer; }
+    .header { display: flex; align-items: center; gap: 10px; width: 100%; padding: 12px 13px; color: inherit; background: transparent; text-align: left; }
+    .header:hover { background: #fafbff; }
+    .icon { display: grid; flex: 0 0 auto; width: 31px; height: 31px; place-items: center; border-radius: 10px; color: var(--primary); background: var(--primary-soft); font-size: 16px; font-weight: 900; }
+    .copy { min-width: 0; flex: 1; }
+    .title { display: flex; align-items: center; gap: 7px; font-size: 13px; font-weight: 850; }
+    .count { color: var(--muted); font-size: 10px; font-weight: 650; }
+    .sub { margin-top: 3px; overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+    .arrow { color: #8591a4; font-size: 18px; transition: transform .2s ease; }
+    .open .arrow { transform: rotate(90deg); }
+    .chips { display: flex; flex-wrap: wrap; gap: 5px; padding: 0 13px 11px 54px; }
+    .chip { padding: 3px 6px; border-radius: 999px; font-size: 9px; font-weight: 750; }
+    .chip.running { color: var(--primary); background: var(--primary-soft); }
+    .chip.done { color: var(--success); background: var(--success-soft); }
+    .chip.waiting { color: var(--warning); background: var(--warning-soft); }
+    .chip.failed { color: var(--danger); background: var(--danger-soft); }
+    .extra { display: none; padding: 0 10px 10px; }
+    .open .extra { display: block; }
+    .extra-row { display: flex; align-items: center; gap: 8px; padding: 8px 6px; border-top: 1px solid #edf0f5; font-size: 10px; }
+    .extra-row b { min-width: 43px; font-size: 10px; }
+    .extra-row span { overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
+
+    /* A1: two-line summary */
+    .a1 .compact-header { min-height: 0; padding-top: 9px; padding-bottom: 7px; }
+    .a1 .compact-header .icon { width: 27px; height: 27px; border-radius: 8px; font-size: 14px; }
+    .a1 .compact-header .title { font-size: 12px; }
+    .a1 .compact-header .count { font-size: 9px; }
+    .a1 .compact-stats { display: flex; flex: 0 0 auto; align-items: center; gap: 5px; color: var(--muted); font-size: 9px; white-space: nowrap; }
+    .a1 .compact-stats .running { color: var(--primary); }
+    .a1 .compact-stats .done { color: var(--success); }
+    .a1 .compact-stats .waiting { color: var(--warning); }
+    .a1 .compact-live { display: flex; align-items: center; gap: 6px; min-width: 0; padding: 0 13px 9px 51px; color: var(--muted); font-size: 9px; line-height: 1.25; }
+    .a1 .compact-live .live-dot { flex: 0 0 auto; width: 5px; height: 5px; border-radius: 50%; background: var(--primary); box-shadow: 0 0 0 3px var(--primary-soft); }
+    .a1 .compact-live b { color: var(--text); }
+    .a1 .compact-live .activity { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .a1 .compact-live .elapsed { flex: 0 0 auto; margin-left: auto; color: var(--subtle); }
+
+    /* A2: matrix */
+    .a2 .mini-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; padding: 0 10px 10px; }
+    .a2 .mini { display: flex; align-items: center; gap: 6px; min-width: 0; padding: 7px; border: 1px solid #edf0f5; border-radius: 10px; background: #fbfcfe; text-align: left; }
+    .a2 .mini:hover, .a2 .mini.selected { border-color: #bebcff; background: #f5f4ff; }
+    .avatar { display: grid; flex: 0 0 auto; width: 22px; height: 22px; place-items: center; border-radius: 7px; color: #fff; background: #6874db; font-size: 9px; font-weight: 850; }
+    .mini-copy { min-width: 0; flex: 1; }
+    .mini-name { display: block; overflow: hidden; font-size: 10px; font-weight: 850; text-overflow: ellipsis; white-space: nowrap; }
+    .mini-state { display: block; margin-top: 2px; overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+    .mini-status { width: 6px; height: 6px; margin-left: auto; border-radius: 50%; background: var(--primary); }
+    .mini-status.done { background: var(--success); }
+    .mini-status.waiting { background: var(--warning); }
+    .a2 .focus { display: none; margin: 0 10px 10px; padding: 8px 9px; border-radius: 10px; color: #5a687b; background: #f5f7fb; font-size: 10px; line-height: 1.45; }
+    .a2 .focus.show { display: block; }
+
+    /* A3: progress and result */
+    .a3 .progress-line { display: flex; align-items: center; gap: 11px; padding: 0 13px 10px; }
+    .ring { display: grid; width: 38px; height: 38px; place-items: center; border-radius: 50%; background: conic-gradient(var(--primary) 0 75%, #e5e8f1 75% 100%); }
+    .ring::after { display: grid; width: 28px; height: 28px; place-items: center; border-radius: 50%; color: var(--text); background: #fff; content: "3/4"; font-size: 9px; font-weight: 900; }
+    .progress-copy { flex: 1; }
+    .progress-copy b { display: block; font-size: 11px; }
+    .progress-copy span { display: block; margin-top: 3px; color: var(--muted); font-size: 9px; }
+    .metric-row { display: flex; gap: 5px; margin-top: 5px; }
+    .metric { padding: 3px 5px; border-radius: 5px; color: var(--muted); background: var(--surface-2); font-size: 8px; }
+    .a3 .result { margin: 0 10px 10px; padding: 8px 9px; border-left: 3px solid var(--success); border-radius: 0 9px 9px 0; color: #59677a; background: #f5faf7; font-size: 10px; line-height: 1.45; }
+    .a3 .result b { color: var(--success); }
+
+    /* A4: latest activity */
+    .a4 .activity { position: relative; padding: 0 13px 10px 54px; }
+    .a4 .activity::before { position: absolute; top: 7px; bottom: 14px; left: 58px; width: 1px; background: #e3e7f0; content: ""; }
+    .activity-row { position: relative; display: flex; gap: 8px; padding: 3px 0 8px; font-size: 10px; }
+    .activity-row:last-child { padding-bottom: 0; }
+    .activity-dot { z-index: 1; flex: 0 0 auto; width: 8px; height: 8px; margin: 3px 0 0 0; border: 2px solid #fff; border-radius: 50%; background: var(--primary); box-shadow: 0 0 0 1px var(--primary); }
+    .activity-dot.done { background: var(--success); box-shadow: 0 0 0 1px var(--success); }
+    .activity-copy { min-width: 0; flex: 1; }
+    .activity-copy b { display: block; font-size: 10px; }
+    .activity-copy span { display: block; margin-top: 2px; overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
+    .activity-time { color: var(--subtle); font-size: 9px; white-space: nowrap; }
+    .more { display: block; width: calc(100% - 20px); margin: 0 10px 10px; padding: 6px; border-radius: 8px; color: var(--primary); background: #f5f4ff; font-size: 9px; font-weight: 800; }
+
+    .side { padding: 20px; border: 1px solid var(--line); border-radius: 20px; background: rgba(255,255,255,.82); }
+    .side h2 { margin: 0 0 9px; font-size: 16px; }
+    .side p { margin: 0 0 15px; color: var(--muted); font-size: 12px; line-height: 1.65; }
+    .side dl { margin: 0; }
+    .side dt { margin-top: 12px; font-size: 12px; font-weight: 850; }
+    .side dd { margin: 4px 0 0; color: var(--muted); font-size: 12px; line-height: 1.55; }
+    .tradeoff { margin-top: 18px; padding: 12px; border-radius: 13px; color: #5a4a12; background: #fff8df; font-size: 11px; line-height: 1.55; }
+    .footnote { margin: 16px 0 0; color: var(--subtle); font-size: 11px; line-height: 1.6; }
+    @media (max-width: 880px) { .layout { grid-template-columns: 1fr; } .side { order: -1; } .side dl { display: grid; grid-template-columns: 120px 1fr; gap: 5px 12px; } .side dt { margin-top: 3px; } .side dd { margin-top: 3px; } }
+    @media (max-width: 560px) { .page { padding: 24px 12px 42px; } .hero { display: block; } .badge { display: inline-block; margin-top: 15px; } .stage { padding: 14px 6px; border-radius: 20px; } .tabs button { padding: 0 3px; font-size: 11px; } }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">Ajiu Workbench · Compact Study</p>
+        <h1>紧凑型子代理收拢卡片</h1>
+        <p class="intro">这四版都保留当前“两层收拢”边界：第一层仍是分组摘要，点击后才进入成员卡片；区别只在第一层增加哪些可扫读信息。</p>
+      </div>
+      <div class="badge">参考稿 · 未修改生产 UI</div>
+    </header>
+
+    <nav class="tabs" aria-label="紧凑方案切换">
+      <button class="active" data-variant="a1">1 · 两行摘要</button>
+      <button data-variant="a2">2 · 成员矩阵</button>
+      <button data-variant="a3">3 · 进度结果</button>
+      <button data-variant="a4">4 · 最新动态</button>
+    </nav>
+
+    <section class="layout">
+      <div class="stage" id="stage"></div>
+      <aside class="side" id="side"></aside>
+    </section>
+    <p class="footnote">交互说明：点击卡片标题可模拟分组展开/收拢；成员矩阵中的成员可点击查看一句摘要；这些动作只用于参考稿演示。</p>
+  </main>
+
+  <script>
+    const agents = [
+      { name: '探索员', initial: '探', task: '梳理调用链与影响面', status: 'running', statusText: '运行中', time: '刚刚', detail: '正在阅读真实代码，确认哪些数据可以直接复用。' },
+      { name: '编码员', initial: '编', task: '实现卡片布局候选', status: 'running', statusText: '运行中', time: '01:42', detail: '正在整理可复用的 Compose 状态与点击回调。' },
+      { name: '审核员', initial: '审', task: '检查交互回归风险', status: 'done', statusText: '完成', time: '03:18', detail: '已检查折叠、展开和列表定位。' },
+      { name: '测试员', initial: '测', task: '准备布局验收用例', status: 'waiting', statusText: '等待确认', time: '—', detail: '等待选择最终视觉方向后补充验收矩阵。' }
+    ];
+    let current = 'a1';
+    let open = false;
+    let selected = 0;
+
+    const chip = a => `<span class="chip ${a.status}">${a.statusText}</span>`;
+    const chips = () => agents.map(chip).join('');
+    const header = (sub, icon = '⌁') => `<button class="header" id="toggle" aria-expanded="${open}"><span class="icon">${icon}</span><span class="copy"><span class="title">子代理 <span class="count">4 个</span></span><span class="sub">${sub}</span></span><span class="arrow">›</span></button>`;
+    const compactHeader = () => `<button class="header compact-header" id="toggle" aria-expanded="${open}"><span class="icon">⌁</span><span class="copy"><span class="title">子代理 <span class="count">4 个</span></span></span><span class="compact-stats"><span class="running">● 2 运行</span><span class="done">● 1 完成</span><span class="waiting">● 1 待确认</span></span><span class="arrow">›</span></button>`;
+    const extraRows = () => `<div class="extra"><div class="extra-row"><b>探索员</b><span>正在梳理调用链与影响面 · 运行中</span></div><div class="extra-row"><b>编码员</b><span>正在实现卡片布局候选 · 运行中</span></div><div class="extra-row"><b>审核员</b><span>检查完成 · 结果已返回</span></div><div class="extra-row"><b>测试员</b><span>等待确认 · 尚未开始执行</span></div></div>`;
+    const chat = card => `<div class="phone"><div class="notch"></div><div class="statusbar"><span>9:41</span><span>▮▮▮　Wi‑Fi　▰</span></div><div class="appbar"><div class="app-title"><span class="app-mark">A</span>阿九工作台</div><span class="app-actions">•••</span></div><div class="chat"><div class="message user"><span class="message-label">你</span>把这次任务拆给几个子代理并行处理。</div><div class="message ai"><span class="message-label">AI</span>已分派 4 个子代理。我会在这里收拢展示进度。</div>${card}<div class="message ai"><span class="message-label">AI</span>完成后我会把结论汇总到当前对话，不需要你来回切换页面。</div></div><div class="composer"><span>继续输入指令…</span><span class="send">↑</span></div></div>`;
+
+    function baseCard(label, body) { return `<div class="${current}"><p class="card-label">方案 ${label} <span>· 紧凑型</span></p><div class="card ${open ? 'open' : ''}">${body}</div></div>`; }
+
+    function renderA1() {
+      const body = `${compactHeader()}<div class="compact-live"><i class="live-dot"></i><span class="activity"><b>编码员</b> · 正在读取源码</span><span class="elapsed">01:42</span></div>${extraRows()}`;
+      return { html: chat(baseCard('1', body)), side: `<h2>1 · 两行摘要（压缩版）</h2><p>把标题、状态统计和当前动态压成两行，去掉独立副标题与状态胶囊行，保留核心信息。</p><dl><dt>第一行</dt><dd>子代理总数、运行/完成/待确认统计。</dd><dt>第二行</dt><dd>当前执行者、当前动态、已运行时间。</dd><dt>点击卡片</dt><dd>进入现有第二层成员卡片。</dd><dt>信息密度</dt><dd>与上一版相近，但少一整行高度。</dd></dl><div class="tradeoff"><b>推荐度：最高。</b><br>这是“信息量”和“聊天连续性”之间最平衡的压缩方式。</div>` };
+    }
+
+    function renderA2() {
+      const body = `${header(open ? '点击成员查看摘要，再进入详情' : '四个成员以两列小单元格快速扫读', '4')}<div class="chips">${chips()}</div><div class="mini-grid">${agents.map((a, i) => `<button class="mini ${selected === i ? 'selected' : ''}" data-member="${i}"><span class="avatar">${a.initial}</span><span class="mini-copy"><span class="mini-name">${a.name}</span><span class="mini-state">${a.statusText}</span></span><i class="mini-status ${a.status}"></i></button>`).join('')}</div><div class="focus ${selected >= 0 ? 'show' : ''}"><b>${agents[selected].name}</b> · ${agents[selected].statusText}<br>${agents[selected].detail}</div>${extraRows()}`;
+      return { html: chat(baseCard('2', body)), side: `<h2>2 · 成员矩阵</h2><p>把成员名从一行省略改成两列小单元格，收拢态就能看见每个成员和状态。</p><dl><dt>新增信息</dt><dd>四个角色、四个状态、选中成员的一句摘要。</dd><dt>点击成员</dt><dd>只更新卡内摘要，不立即撑开全部正文。</dd><dt>信息密度</dt><dd>较高，卡片增加约一行高度。</dd></dl><div class="tradeoff"><b>优点：</b>最容易扫读成员状态。<br><b>代价：</b>中文长角色名和小屏宽度需要控制。</div>` };
+    }
+
+    function renderA3() {
+      const body = `${header(open ? '点击卡片查看成员详情' : '3/4 成员已有结果，仍有 2 个在执行', '◌')}<div class="progress-line"><i class="ring"></i><div class="progress-copy"><b>整体进度 · 75%</b><span>已完成 1 · 运行中 2 · 等待确认 1</span><div class="metric-row"><span class="metric">工具调用 12</span><span class="metric">耗时 03:18</span><span class="metric">文件 3</span></div></div></div><div class="result"><b>最新结果</b><br>审核员已确认折叠、展开和列表定位不会改变时间线顺序。</div>${extraRows()}`;
+      return { html: chat(baseCard('3', body)), side: `<h2>3 · 进度结果</h2><p>不展开成员名单，而是把用户最关心的总体进度和最新有效结果放到卡片上。</p><dl><dt>新增信息</dt><dd>完成比例、执行统计、耗时、变更文件、最新结果。</dd><dt>点击卡片</dt><dd>进入现有第二层成员卡片。</dd><dt>信息密度</dt><dd>中等，结果导向。</dd></dl><div class="tradeoff"><b>优点：</b>适合任务已经执行一段时间的状态。<br><b>代价：</b>不能第一眼看出每个角色当前状态。</div>` };
+    }
+
+    function renderA4() {
+      const body = `${header(open ? '点击时间线节点进入对应成员详情' : '显示最近两条活动，其他成员仍保持收拢', '≋')}<div class="chips">${chips()}</div><div class="activity"><div class="activity-row"><i class="activity-dot"></i><div class="activity-copy"><b>编码员正在读取源码</b><span>当前：整理 Compose 状态与点击回调</span></div><span class="activity-time">刚刚</span></div><div class="activity-row"><i class="activity-dot done"></i><div class="activity-copy"><b>审核员已完成</b><span>折叠、展开和列表定位检查通过</span></div><span class="activity-time">03:18</span></div></div><button class="more" id="more">查看其余 2 个子代理</button>${extraRows()}`;
+      return { html: chat(baseCard('4', body)), side: `<h2>4 · 最新动态</h2><p>把“成员列表”改成极短的活动流，只展示最新两条动态，其余内容留在第二层。</p><dl><dt>新增信息</dt><dd>当前活动、最近完成结果、活动时间。</dd><dt>点击活动</dt><dd>进入对应成员详情。</dd><dt>信息密度</dt><dd>中等，时间感最强。</dd></dl><div class="tradeoff"><b>优点：</b>用户能快速知道刚刚发生了什么。<br><b>代价：</b>历史成员状态不如矩阵版直观。</div>` };
+    }
+
+    function render() {
+      const result = current === 'a1' ? renderA1() : current === 'a2' ? renderA2() : current === 'a3' ? renderA3() : renderA4();
+      document.getElementById('stage').innerHTML = result.html;
+      document.getElementById('side').innerHTML = result.side;
+      document.querySelectorAll('[data-variant]').forEach(b => b.classList.toggle('active', b.dataset.variant === current));
+      bind();
+    }
+    function bind() {
+      document.querySelectorAll('[data-variant]').forEach(b => b.onclick = () => { current = b.dataset.variant; open = false; render(); });
+      const toggle = document.getElementById('toggle');
+      if (toggle) toggle.onclick = () => { open = !open; render(); };
+      document.querySelectorAll('[data-member]').forEach(b => b.onclick = event => { event.stopPropagation(); selected = Number(b.dataset.member); render(); });
+      const more = document.getElementById('more');
+      if (more) more.onclick = () => { open = true; render(); };
+    }
+    render();
+  </script>
+</body>
+</html>

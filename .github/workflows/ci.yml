@@ -61,6 +61,26 @@ jobs:
       - name: Check migration versions
         run: python3 scripts/check_migrations.py
 
+      - name: Set up plugin build runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: plugins/package-lock.json
+
+      - name: Check plugin host and page contracts
+        run: |
+          node scripts/check-host-methods.mjs
+          node scripts/check-page-bridge.mjs
+          node scripts/check-plugin-manifests.mjs
+
+      - name: Build and test plugin SDK
+        run: |
+          npm ci --prefix plugins --ignore-scripts
+          npm run typecheck:plugins --prefix plugins
+          npm run build:sdk --prefix plugins
+          npm test --prefix plugins
+
       # 镜像目录同步脚本的离线自测：锁住 Alpine/Ubuntu/Debian 三套解析器对上游格式的假设，
       # 上游改版式时在 PR 阶段就暴露，而不是等每日定时任务悄悄失败。
       - name: Self-test container image sync script

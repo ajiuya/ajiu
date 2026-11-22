@@ -12,7 +12,7 @@ Entries marked with a version (e.g. "since 1.11.0") were introduced in that vers
 | --- | --- |
 | Chat & workspace | Title bar, sidebar, toolbar, message queue, workspace switching |
 | Checkpoints & undo | Automatic snapshot before AI edits, one-tap safe rollback |
-| Terminal | Multi-tab sessions, auxiliary key bar, color and font settings |
+| Terminal | Multi-tab sessions, auxiliary key bar, color and font settings; background task notices show the terminal tab title and exit code without command paths |
 | File browsing & code editing | Indented tree view, syntax highlighting, built-in code editor (since 1.11.0) |
 | Git version management | Visual status management, branch switching, commit history, revert and delete (since 1.11.0) |
 | Tablet & large screen | Responsive split panes, persistent sidebar, side-by-side workbench (since 1.11.0) |

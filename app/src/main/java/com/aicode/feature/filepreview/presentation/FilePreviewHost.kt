@@ -1,5 +1,8 @@
 package com.aicode.feature.filepreview.presentation
 
+import android.content.ActivityNotFoundException
+import android.content.ClipData
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.widget.Toast
@@ -61,11 +64,31 @@ import compose.icons.FeatherIcons
 import compose.icons.feathericons.ArrowLeft
 import compose.icons.feathericons.MoreVertical
 import java.io.File
+import java.io.IOException
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+
+internal fun externalShareIntent(context: Context, uri: Uri, mime: String, title: String): Intent {
+    val send = Intent(Intent.ACTION_SEND).setType(mime).putExtra(Intent.EXTRA_STREAM, uri)
+    send.clipData = ClipData.newUri(context.contentResolver, title, uri)
+    send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    return Intent.createChooser(send, null).apply {
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+}
+
+internal fun externalViewIntent(uri: Uri, mime: String): Intent = Intent(Intent.ACTION_VIEW).apply {
+    setDataAndType(uri, mime)
+    clipData = ClipData.newRawUri(null, uri)
+    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+}
+
+internal fun startExternalIntent(context: Context, intent: Intent) {
+    context.startActivity(intent)
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -121,6 +144,7 @@ internal fun FilePreviewHost(
         scope.launch {
             try { block(current) }
             catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: ActivityNotFoundException) { toast(R.string.chat_open_file_no_app) }
             catch (_: Exception) { toast(R.string.file_preview_action_failed) }
             finally { actionRunning = false }
         }
@@ -158,8 +182,7 @@ internal fun FilePreviewHost(
                                 val file = withContext(Dispatchers.IO) { sharedFile(context.cacheDir, current, path, title) }
                                 withContext(Dispatchers.IO) { current.checkCurrent() }
                                 val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
-                                context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType(mime).putExtra(Intent.EXTRA_STREAM, uri)
-                                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION), null))
+                                startExternalIntent(context, externalShareIntent(context, uri, mime, title))
                             }
                         })
                         DropdownMenuItem(text = { Text(stringResource(R.string.file_preview_save_as)) }, enabled = source != null, onClick = {
@@ -176,7 +199,7 @@ internal fun FilePreviewHost(
                                 val file = withContext(Dispatchers.IO) { sharedFile(context.cacheDir, current, path, title) }
                                 withContext(Dispatchers.IO) { current.checkCurrent() }
                                 val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
-                                context.startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri, mime).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
+                                startExternalIntent(context, externalViewIntent(uri, mime))
                             }
                         })
                         if (kind in setOf(PreviewKind.MARKDOWN, PreviewKind.HTML, PreviewKind.TEXT, PreviewKind.JSON, PreviewKind.TABLE)) {
@@ -220,7 +243,9 @@ internal fun FilePreviewHost(
                                         ApkInstaller.Result.STARTED -> Unit
                                         ApkInstaller.Result.NEED_PERMISSION -> {
                                             toast(R.string.chat_open_apk_permission)
-                                            ApkInstaller.openInstallPermissionSettings(context)
+                                            if (!ApkInstaller.openInstallPermissionSettings(context)) {
+                                                toast(R.string.chat_open_file_no_app)
+                                            }
                                         }
                                         ApkInstaller.Result.NO_HANDLER -> toast(R.string.chat_open_file_no_app)
                                     }
@@ -253,18 +278,42 @@ internal fun FilePreviewHost(
     }
 }
 
-private fun sharedFile(cache: File, source: PreviewSource, path: String, displayName: String): File {
+internal suspend fun sharedFile(cache: File, source: PreviewSource, path: String, displayName: String): File {
+    val sourceFile = source.localFile(path)
+    source.checkCurrent()
+    if (source.resolve(path).substringBefore('#') == source.entryPath && sourceFile.length() != source.size) {
+        throw IOException("Preview file changed while preparing external access")
+    }
+    if (!source.ownsCopy(sourceFile)) return sourceFile
+
     val root = File(cache, "shared_previews").apply { mkdirs() }
     root.listFiles()?.filter { it.lastModified() < System.currentTimeMillis() - 24L * 60 * 60 * 1000 }?.forEach { it.deleteRecursively() }
     val name = displayName.substringAfterLast('/').substringAfterLast('\\').filterNot { it.isISOControl() }
         .take(160).takeUnless { it.isBlank() || it == "." || it == ".." } ?: "file"
     val folder = File(root, UUID.randomUUID().toString()).apply { mkdirs() }
+    val partial = File(folder, ".${UUID.randomUUID()}.partial")
     val target = File(folder, name)
     try {
-        source.openRead(path).use { input -> target.outputStream().use { input.copyTo(it) } }
+        sourceFile.inputStream().use { input ->
+            partial.outputStream().use { output ->
+                val buffer = ByteArray(32 * 1024)
+                var copied = 0L
+                while (true) {
+                    source.checkCurrent()
+                    val count = input.read(buffer)
+                    if (count < 0) break
+                    output.write(buffer, 0, count)
+                    copied += count
+                }
+                output.flush()
+                if (copied != sourceFile.length()) throw IOException("Preview file changed while preparing external access")
+            }
+        }
         source.checkCurrent()
+        if (!partial.renameTo(target)) throw IOException("Cannot finalize preview copy")
         return target
     } catch (failure: Throwable) {
+        partial.delete()
         target.delete()
         folder.delete()
         throw failure

@@ -214,6 +214,47 @@ class TerminalSessionManager @Inject constructor(
         return id
     }
 
+    override suspend fun startPluginCommand(command: String, title: String?, owner: TerminalResourceOwner, onOutput: (ByteArray) -> Unit): String {
+        val execution = WorkspaceExecutionContext.current() ?: error("Captured execution required")
+        execution.requireMode(ExecutionMode.LOCAL_PROOT)
+        ensureContainer()
+        execution.checkCurrent()
+        val id = nextId()
+        val shell = containerEngine.defaultShell()
+        val (session, client) = buildSession("export ENV=/etc/profile; cd ~/workspace || exit; exec ${com.aicode.feature.agent.domain.tool.explorer.shellQuote(shell)} -c ${com.aicode.feature.agent.domain.tool.explorer.shellQuote(command)}", onOutput)
+        try {
+            execution.checkCurrent()
+            addTab(TerminalTab(id, title ?: id, session, true, command, client = client,
+                runState = RunState.Running, sourceMode = ExecutionMode.LOCAL_PROOT.name,
+                ownerPluginId = owner.pluginId, ownerResourceId = owner.resourceId))
+            return id
+        } catch (failure: Throwable) {
+            withContext(kotlinx.coroutines.NonCancellable) {
+                session.finishIfRunning()
+                while (session.isRunning) delay(25)
+            }
+            throw failure
+        }
+    }
+
+    override fun pluginTabStatus(id: String, owner: TerminalResourceOwner): TerminalTabStatus? =
+        tab(id)?.takeIf { it.isOwnedBy(owner) }?.let { TerminalTabStatus(it.session.isRunning, (it.runState as? RunState.Finished)?.exitCode) }
+
+    override fun writePluginInput(id: String, owner: TerminalResourceOwner, text: String, appendNewline: Boolean): Boolean =
+        tab(id)?.takeIf { it.isOwnedBy(owner) }?.let { sendInput(id, text, appendNewline) } ?: false
+
+    override fun interruptPluginTab(id: String, owner: TerminalResourceOwner): Boolean =
+        tab(id)?.takeIf { it.isOwnedBy(owner) }?.let { writeBytesToTab(id, 3) } ?: false
+
+    override suspend fun closePluginTab(id: String, owner: TerminalResourceOwner): Boolean {
+        val tab = tab(id)?.takeIf { it.isOwnedBy(owner) } ?: return false
+        tab.session.finishIfRunning()
+        while (tab.session.isRunning) delay(25)
+        tab.session.setRawOutputListener(null)
+        closeTab(id)
+        return true
+    }
+
     private fun runningTab(id: String): TerminalTab? {
         val t = tab(id) ?: return null
         return if (t.runState is RunState.Running) t else null
@@ -263,7 +304,7 @@ class TerminalSessionManager @Inject constructor(
     }
 
     /** 列出全部标签的摘要（id/标题/是否后台/运行状态/命令），供 AI 选目标。 */
-    override fun listTabs(): List<TabInfo> = _tabs.value.map {
+    override fun listTabs(): List<TabInfo> = _tabs.value.filter { it.ownerPluginId == null }.map {
         TabInfo(
             id = it.id,
             title = it.title,
@@ -283,6 +324,7 @@ class TerminalSessionManager @Inject constructor(
         val tab = tab(id) ?: return false
         releaseKeepalive(id)
         tab.onUserInput = {}
+        tab.session.setRawOutputListener(null)
         runCatching { tab.session.finishIfRunning() }
         tab.view = null
         val remaining = _tabs.value.filterNot { it.id == id }
@@ -363,7 +405,7 @@ class TerminalSessionManager @Inject constructor(
         val completedExitCode = (tab.runState as RunState.Finished).exitCode
         releaseKeepalive(tab.id)
         bumpRevision()
-        if (tab.notifyOnExit && !tab.finishedNotified) {
+        if (tab.ownerPluginId == null && tab.notifyOnExit && !tab.finishedNotified) {
             tab.finishedNotified = true
             _tabFinishedEvents.tryEmit(
                 TabFinishedEvent(
@@ -405,7 +447,7 @@ class TerminalSessionManager @Inject constructor(
      * client 的 viewProvider/onFinished 都以 session 为键回查 [_tabs]：会话与标签一一对应，
      * 故无需把 tab 引用提前注入 client（避免「构造 client 时 tab 还不存在」的先有鸡先有蛋）。
      */
-    private fun buildSession(shellCommand: String): Pair<TerminalSession, AppTerminalSessionClient> {
+    private fun buildSession(shellCommand: String, onOutput: ((ByteArray) -> Unit)? = null): Pair<TerminalSession, AppTerminalSessionClient> {
         val execution = WorkspaceExecutionContext.current()
         execution?.requireMode(ExecutionMode.LOCAL_PROOT)
         val workspace = execution?.localMapping?.workspaceRoot?.absolutePath ?: workspaceRepository.currentPath()
@@ -450,6 +492,7 @@ class TerminalSessionManager @Inject constructor(
             TRANSCRIPT_ROWS,
             inputTrackingClient
         )
+        if (onOutput != null) session.setRawOutputListener { _, data, length -> onOutput(data.copyOf(length)) }
         session.updateSize(DEFAULT_COLUMNS, DEFAULT_ROWS)
         FileLogger.i(TAG, "PTY 会话已创建：pid=${session.pid} 运行中=${session.isRunning}")
         return session to client

@@ -2,6 +2,8 @@ package com.aicode.feature.agent.domain.notification
 
 import com.aicode.feature.agent.data.local.dao.AgentNotificationDao
 import com.aicode.feature.agent.data.local.entity.AgentNotificationEntity
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flowOf
 
 internal class FakeAgentNotificationDao : AgentNotificationDao {
     val generations = linkedMapOf("s1" to 0L, "s2" to 0L, "parent" to 0L, "child" to 0L)
@@ -27,6 +29,9 @@ internal class FakeAgentNotificationDao : AgentNotificationDao {
     override suspend fun pending(sessionId: String, requiresConfirmation: Boolean) =
         rows.filter { it.sessionId == sessionId && it.currentPending() && it.requiresConfirmation == requiresConfirmation }
             .sortedBy { it.seq }
+
+    override fun observeTimeline(sessionId: String): Flow<List<AgentNotificationEntity>> =
+        flowOf(rows.filter { it.sessionId == sessionId && it.retiredAt == null && it.generation == generations[sessionId] }.sortedBy { it.seq })
 
     override suspend fun pendingCount(sessionId: String) = rows.count { it.sessionId == sessionId && it.currentPending() }
 

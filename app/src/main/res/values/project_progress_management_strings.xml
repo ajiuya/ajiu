@@ -50,7 +50,7 @@
     <string name="project_progress_outside_workspace">项目不在当前工作区根目录下，仅可查看记录，不能在此绑定</string>
     <string name="project_progress_handoff">登记手工交接摘要</string>
     <string name="project_progress_handoff_hint">为所选项目保存摘要与完整正文，供后续任务参考；不会执行正文中的命令或恢复历史任务。</string>
-    <string name="project_progress_capacity">项目记录容量（所有环境合计）</string>
+    <string name="project_progress_capacity">记录容量</string>
     <string name="project_progress_capacity_value">活动记录 %1$d / %2$d，归档 %3$d；已用 %4$d / %5$d 字节</string>
     <string name="project_progress_capacity_unknown">容量未知，无法确认剩余记录数或存储空间</string>
     <string name="project_progress_capacity_warning">剩余容量较少，保存可能失败。归档不会减少已用字节，也不保证释放存储容量。</string>

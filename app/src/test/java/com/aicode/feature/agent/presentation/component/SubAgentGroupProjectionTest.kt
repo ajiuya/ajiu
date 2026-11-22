@@ -64,7 +64,7 @@ class SubAgentGroupProjectionTest {
             ordinary("user-2", secondTurn, MessageRole.USER) + currentChildren + ordinary("answer-2", secondTurn)
         val projection = projectSubAgentGroup(raw, parent, activeTurnKey = secondTurn)
         assertEquals(2, projection.groups.size)
-        assertEquals(listOf(7, 12), projection.groups.map { it.childItems.size })
+        assertEquals(listOf(7, 12), projection.groups.map { it.capsules.size })
         assertEquals(19, projection.representedChildIds.size)
         assertEquals(19, projection.capsules.size)
         assertTrue(projection.items.none { it.subAgentCapsule != null })
@@ -74,23 +74,28 @@ class SubAgentGroupProjectionTest {
         assertTrue(projection.bodyItems.indexOfFirst { it.key == firstGroup.key } > projection.bodyItems.indexOfFirst { it.key == "answer-1" })
         assertTrue(projection.bodyItems.indexOfFirst { it.key == firstGroup.key } < projection.bodyItems.indexOfFirst { it.key == "user-2" })
         assertEquals(secondGroup.key, projection.footerItems.single().key)
+        val lazySequence = lazyItems(projection)
+        assertEquals(null, lazySequence[projection.bodyItems.size])
+        assertEquals(secondGroup.key, lazySequence[projection.bodyItems.size + 1]?.key)
         assertEquals(7, summarizeSubAgentGroup(firstGroup.capsules).workingCount)
         assertEquals(12, summarizeSubAgentGroup(secondGroup.capsules).workingCount)
     }
 
     @Test
-    fun expandedChildrenRemainIndividuallyKeyedOriginalSiblingsAfterGroupHeader() {
+    fun expandedGroupRemainsOneOriginalListItemBesideItsSiblings() {
         val before = ordinary("before")
         val chunk = ordinary("chunk").copy(contentType = "assistant-chunk", slice = "unchanged", isChunkHeader = false)
         val after = ordinary("after")
         val children = (1..8).map { child("child-$it") }
-        val projection = projectSubAgentGroup(listOf(before) + children + chunk + after, parent, expanded = true, activeTurnKey = firstTurn)
+        val projection = projectSubAgentGroup(listOf(before) + children + chunk + after, parent, activeTurnKey = firstTurn)
         assertEquals(listOf(before, chunk, after), projection.bodyItems)
-        children.forEachIndexed { index, item -> assertSame(item, projection.footerItems[index + 1]) }
+        assertEquals(listOf(SUB_AGENT_GROUP_CONTENT_TYPE), projection.footerItems.map { it.contentType })
+        assertEquals(8, projection.groups.single().capsules.size)
         assertEquals(projection.items.size, projection.items.map { it.key }.toSet().size)
         assertEquals(projection.items.size + 1, projection.expectedLazyItemCount)
         assertSame(after, projection.bodyItems.last())
         assertSame(children.last().message, projection.footerItems.first().message)
+        assertTrue(projection.items.none { it.subAgentCapsule != null })
     }
 
     @Test
@@ -99,11 +104,13 @@ class SubAgentGroupProjectionTest {
         val current = child("current", secondTurn, "completed")
         val nextUser = ordinary("user-2", secondTurn, MessageRole.USER)
         val raw = listOf(ordinary("user-1", role = MessageRole.USER), old, ordinary("old-result"), nextUser, current, ordinary("current-result", secondTurn))
-        val projection = projectSubAgentGroup(raw, parent, expanded = true, activeTurnKey = secondTurn)
-        assertEquals(listOf(old), projection.groups[0].childItems)
-        assertTrue(projection.bodyItems.indexOf(old) < projection.bodyItems.indexOf(nextUser))
-        assertEquals(listOf(current), projection.footerItems.drop(1))
-        val closed = projectSubAgentGroup(raw, parent, expanded = true)
+        val projection = projectSubAgentGroup(raw, parent, activeTurnKey = secondTurn)
+        assertEquals(listOf("old"), projection.groups[0].capsules.map { it.subSessionId })
+        assertTrue(projection.bodyItems.none { it.subAgentCapsule != null })
+        assertTrue(projection.bodyItems.indexOfFirst { it.key == projection.groups[0].key } < projection.bodyItems.indexOf(nextUser))
+        assertEquals(listOf(SUB_AGENT_GROUP_CONTENT_TYPE), projection.footerItems.map { it.contentType })
+        assertEquals(listOf("current"), projection.groups[1].capsules.map { it.subSessionId })
+        val closed = projectSubAgentGroup(raw, parent)
         assertTrue(closed.footerItems.isEmpty())
         assertEquals(projection.groups.map { it.key }, closed.groups.map { it.key })
         val following = projectSubAgentGroup(raw + ordinary("user-3", "turn:user-3", MessageRole.USER), parent, activeTurnKey = "turn:user-3")
@@ -122,13 +129,10 @@ class SubAgentGroupProjectionTest {
         assertNotEquals(firstGroup, secondGroup)
         assertNotEquals(first.key, second.key)
         assertEquals(setOf("same"), initial.representedChildIds)
-        val opened = projectSubAgentGroup(raw, parent, activeTurnKey = secondTurn, expansionOverrides = mapOf(firstGroup to true))
-        assertSame(first, opened.bodyItems.last())
-        assertEquals(1, opened.footerItems.size)
-        val both = projectSubAgentGroup(raw, parent, activeTurnKey = secondTurn,
-            expansionOverrides = mapOf(firstGroup to true, secondGroup to true))
-        assertEquals(listOf(first, second), both.items.filter { it.subAgentCapsule != null })
-        assertEquals(initial.groups.map { it.key }, both.groups.map { it.key })
+        val opened = projectSubAgentGroup(raw, parent, activeTurnKey = secondTurn)
+        assertEquals(initial.items.map { it.key }, opened.items.map { it.key })
+        assertTrue(opened.items.none { it.subAgentCapsule != null })
+        assertEquals(initial.groups.map { it.key }, opened.groups.map { it.key })
         val otherParent = projectSubAgentGroup(raw, "another-parent")
         assertTrue(otherParent.groups.none { it.key in initial.groups.map(SubAgentTurnGroup::key) })
         val refreshed = projectSubAgentGroup(listOf(child("older"), first.copy(subAgentCapsule = first.subAgentCapsule!!.copy(title = "new preview")), second), parent)
@@ -140,13 +144,14 @@ class SubAgentGroupProjectionTest {
         val older = child("a", revision = "old", status = "running", carriers = setOf("notice-old"))
         val other = child("b", status = "running")
         val latest = child("a", revision = "new", status = "running", carriers = setOf("notice-new"))
-        val projection = projectSubAgentGroup(listOf(older, other, latest), parent, expanded = true, activeTurnKey = firstTurn)
-        assertEquals(listOf(other, latest), projection.footerItems.drop(1))
+        val projection = projectSubAgentGroup(listOf(older, other, latest), parent, activeTurnKey = firstTurn)
+        assertEquals(listOf(SUB_AGENT_GROUP_CONTENT_TYPE), projection.footerItems.map { it.contentType })
         assertEquals(setOf("call-old", "call-b", "call-new", "notice-old", "notice-new"), projection.carrierMessageIds)
         assertEquals(2, projection.capsules.size)
         assertEquals(1, findSubAgentGroupMessageIndex(projection, "call-old"))
-        assertEquals(3, findSubAgentGroupMessageIndex(projection, "call-new"))
-        assertSame(latest, lazyItems(projection)[3])
+        assertEquals(1, findSubAgentGroupMessageIndex(projection, "call-new"))
+        assertSame(projection.footerItems.single(), lazyItems(projection)[1])
+        assertTrue(projection.items.none { it.subAgentCapsule != null })
         assertFalse(projection.items.any { it === older })
     }
 
@@ -157,10 +162,11 @@ class SubAgentGroupProjectionTest {
             child("queued", status = "queued"), child("stopped", status = "interrupted"), child("done-b", status = "completed"),
             child("deleted", status = "deleted"), child("history", status = "unknown"), child("waiting", status = "awaiting_confirmation"),
         )
-        val projection = projectSubAgentGroup(children, parent, expanded = true, activeTurnKey = firstTurn)
+        val projection = projectSubAgentGroup(children, parent, activeTurnKey = firstTurn)
         assertEquals(listOf("done-a", "done-b", "failed", "stopped", "deleted", "history", "running", "queued", "waiting"),
             projection.capsules.map { it.subSessionId })
-        projection.footerItems.drop(1).forEach { item -> assertSame(children.single { it.key == item.key }, item) }
+        assertEquals(listOf(SUB_AGENT_GROUP_CONTENT_TYPE), projection.footerItems.map { it.contentType })
+        assertTrue(projection.items.none { it.subAgentCapsule != null })
         assertEquals(SubAgentGroupSummary(workingCount = 3, completedCount = 2, awaitingConfirmationCount = 1,
             failedCount = 1, interruptedCount = 1, deletedCount = 1, historyCount = 1), summarizeSubAgentGroup(projection.capsules))
     }
@@ -175,15 +181,15 @@ class SubAgentGroupProjectionTest {
         )
         val ranks = subAgentGroupStatusRanks(raw, summaries)
         assertEquals(listOf(2, 0, 1), raw.map { ranks[it.key] })
-        val projection = projectSubAgentGroup(raw, parent, expanded = true, statusRanks = ranks)
+        val projection = projectSubAgentGroup(raw, parent, statusRanks = ranks)
         assertEquals(listOf("b", "c", "a"), projection.capsules.map { it.subSessionId })
         val updated = summaries.mapValues { (_, value) -> value.copy(latestPreview = "more text", startedAtMs = 10L, finishedAtMs = 900L) }
         val updatedRaw = raw.map { it.copy(message = it.message.copy(content = "longer content", toolDurationMs = 800L, inputTokens = 400)) }
         assertEquals(ranks, subAgentGroupStatusRanks(updatedRaw, updated))
-        val after = projectSubAgentGroup(updatedRaw, parent, expanded = true, statusRanks = ranks)
+        val after = projectSubAgentGroup(updatedRaw, parent, statusRanks = ranks)
         assertEquals(projection.items.map { it.key }, after.items.map { it.key })
         val statusChanged = updated + ("a" to updated.getValue("a").copy(status = SubAgentInteractionStatus.COMPLETED))
-        val final = projectSubAgentGroup(updatedRaw, parent, expanded = true, statusRanks = subAgentGroupStatusRanks(updatedRaw, statusChanged))
+        val final = projectSubAgentGroup(updatedRaw, parent, statusRanks = subAgentGroupStatusRanks(updatedRaw, statusChanged))
         assertEquals(listOf("a", "b", "c"), final.capsules.map { it.subSessionId })
         assertEquals(projection.groups.map { it.key }, final.groups.map { it.key })
     }
@@ -195,8 +201,8 @@ class SubAgentGroupProjectionTest {
         val user = ordinary("user-2", secondTurn, MessageRole.USER)
         val result = ordinary("result-2", secondTurn)
         val raw = listOf(ordinary("result-1"), first, user, second, result)
-        listOf(false, true).forEach { expanded ->
-            val projection = projectSubAgentGroup(raw, parent, expanded, activeTurnKey = secondTurn)
+        run {
+            val projection = projectSubAgentGroup(raw, parent, activeTurnKey = secondTurn)
             val actual = lazyItems(projection)
             listOf("notice-a", "notice-b").forEach { id ->
                 val item = actual[findSubAgentGroupMessageIndex(projection, id)]!!
@@ -207,7 +213,7 @@ class SubAgentGroupProjectionTest {
             assertSame(result, actual[findSubAgentGroupMessageIndex(projection, result.message.id)])
             listOf(first, second).forEach { child ->
                 val item = actual[findSubAgentGroupMessageIndex(projection, child.message.id)]!!
-                if (expanded) assertSame(child, item) else assertEquals(SUB_AGENT_GROUP_CONTENT_TYPE, item.contentType)
+                assertEquals(SUB_AGENT_GROUP_CONTENT_TYPE, item.contentType)
             }
             assertEquals(-1, findSubAgentGroupMessageIndex(projection, "missing"))
             assertEquals(projection.expectedLazyItemCount, actual.size)
@@ -218,7 +224,7 @@ class SubAgentGroupProjectionTest {
     fun unscopedActiveChildCannotClaimFallbackOrCreateAnUnverifiedTailGroup() {
         val orphan = child("active").copy(chatTurnKey = null)
         val ordinary = ordinary("raw-dispatch")
-        val projection = projectSubAgentGroup(listOf(ordinary, orphan), parent, expanded = true, activeTurnKey = secondTurn)
+        val projection = projectSubAgentGroup(listOf(ordinary, orphan), parent, activeTurnKey = secondTurn)
         assertEquals(listOf(ordinary), projection.bodyItems)
         assertTrue(projection.groups.isEmpty())
         assertTrue(projection.representedChildIds.isEmpty())

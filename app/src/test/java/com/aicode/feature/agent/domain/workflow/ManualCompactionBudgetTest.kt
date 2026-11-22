@@ -101,9 +101,9 @@ class ManualCompactionBudgetTest {
     private val workflow = StatefulAgentWorkflow(
         toolRegistry = registry,
         aiProviderRepository = providers,
-        openAIApi = mockk(),
-        anthropicApi = mockk(),
-        geminiApi = mockk(),
+        providerFactory = com.aicode.feature.agent.domain.provider.ProviderInstanceFactory(
+            mockk(), mockk(), mockk(), metadata, mockk(relaxed = true), keyRotator
+        ),
         promptProvider = prompts,
         permissionManager = mockk(),
         policyEngine = mockk(),
@@ -118,14 +118,15 @@ class ManualCompactionBudgetTest {
         messagePersistenceUseCase = persistence,
         checkpointManager = mockk(),
         llmCallRecordDao = mockk(),
-        keyRotator = keyRotator,
         agentNotificationCenter = mockk(),
         eventInjector = mockk(),
         fileAccess = mockk(),
         appContext = mockk(),
         rootCommandManager = mockk(),
+        shizukuManager = mockk(),
         recoveryRepository = mockk(relaxed = true),
-        workspaceExecutionContextFactory = mockk()
+        workspaceExecutionContextFactory = mockk(),
+        pluginHooks = mockk(relaxed = true)
     )
 
     @Before

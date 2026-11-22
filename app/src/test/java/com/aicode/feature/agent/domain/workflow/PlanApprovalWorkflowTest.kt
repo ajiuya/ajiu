@@ -21,9 +21,9 @@ class PlanApprovalWorkflowTest {
     private val workflow = StatefulAgentWorkflow(
         toolRegistry = mockk(),
         aiProviderRepository = mockk(),
-        openAIApi = mockk(),
-        anthropicApi = mockk(),
-        geminiApi = mockk(),
+        providerFactory = com.aicode.feature.agent.domain.provider.ProviderInstanceFactory(
+            mockk(), mockk(), mockk(), mockk(), mockk(), mockk()
+        ),
         promptProvider = mockk(),
         permissionManager = mockk(),
         policyEngine = mockk(),
@@ -38,14 +38,15 @@ class PlanApprovalWorkflowTest {
         messagePersistenceUseCase = mockk(),
         checkpointManager = mockk(),
         llmCallRecordDao = mockk(),
-        keyRotator = mockk(),
         agentNotificationCenter = mockk(),
         eventInjector = mockk(),
         fileAccess = mockk(),
         appContext = mockk(),
         rootCommandManager = mockk(),
+        shizukuManager = mockk(),
         recoveryRepository = mockk(relaxed = true),
-        workspaceExecutionContextFactory = mockk()
+        workspaceExecutionContextFactory = mockk(),
+        pluginHooks = mockk(relaxed = true)
     )
     private val plan = ToolCall("plan", SubmitPlanTool.NAME, mapOf("plan" to JsonPrimitive("Implement and test")))
     private val write = ToolCall("write", "writeFile", emptyMap())

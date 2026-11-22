@@ -1,0 +1,57 @@
+{
+  "$schema": "../../schema/plugin.schema.json",
+  "manifestVersion": 1,
+  "id": "demo.background-approval",
+  "name": {
+    "default": "Background Approval Notice",
+    "zh-CN": "后台授权提示"
+  },
+  "version": "1.1.2",
+  "publisher": "demo",
+  "repository": "https://github.com/jieapi/AiCode",
+  "description": {
+    "default": "Shows a read-only floating notice for pending permissions. Open the session and confirm personally in the native app; the plugin cannot approve on your behalf.",
+    "zh-CN": "通过悬浮球显示只读待授权提示，可打开会话返回原生界面，由本人确认；插件不能代批。"
+  },
+  "license": "MIT",
+  "engines": {
+    "pluginApi": "^1.0.0"
+  },
+  "runtime": {
+    "type": "javascript",
+    "entry": "dist/main.js",
+    "resident": true
+  },
+  "contributes": {
+    "overlay": {
+      "purpose": "在 App 处于后台时显示只读待授权提示并提供返回会话入口",
+      "surfaces": [
+        {
+          "id": "ball",
+          "page": "pages/ball.html",
+          "width": 48,
+          "height": 48,
+          "draggable": true
+        }
+      ]
+    },
+    "hooks": [
+      {
+        "id": "boot",
+        "event": "app.started",
+        "handler": "hooks.boot"
+      },
+      {
+        "id": "permission-notice",
+        "event": "agent.permission.review",
+        "handler": "hooks.observePermission",
+        "mode": "observe"
+      },
+      {
+        "id": "run-finished",
+        "event": "agent.run.finished",
+        "handler": "hooks.runFinished"
+      }
+    ]
+  }
+}

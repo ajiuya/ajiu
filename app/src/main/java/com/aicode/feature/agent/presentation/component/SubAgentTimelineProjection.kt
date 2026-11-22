@@ -2,6 +2,7 @@ package com.aicode.feature.agent.presentation.component
 
 import androidx.compose.runtime.staticCompositionLocalOf
 import com.aicode.core.ui.WeightedLruCache
+import com.aicode.feature.agent.domain.notification.AgentMessageAction
 import com.aicode.feature.agent.presentation.AgentUIMessage
 import com.aicode.feature.agent.presentation.BACKGROUND_NOTIFICATION_PREFIX
 import com.aicode.feature.agent.presentation.MessageRole
@@ -12,6 +13,7 @@ import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
 
 internal val LocalRepresentedSubAgentIds = staticCompositionLocalOf<Set<String>> { emptySet() }
 
@@ -337,12 +339,23 @@ private fun claimableSubAgentTaskResult(item: JsonObject): Boolean {
 
 internal data class SubAgentNotificationMetadata(
     val ordinal: Int,
+    val eventId: String = "",
+    val sourceId: String = "",
     val kind: String? = null,
     val subSessionId: String? = null,
     val title: String = "",
     val summary: String = "",
     val status: String? = null,
     val body: String = "",
+    val sourceTitle: String = "",
+    val action: AgentMessageAction = AgentMessageAction.MESSAGE,
+    val targetTitle: String = "",
+    val fromParent: Boolean = false,
+    val taskTitle: String = "",
+    val command: String = "",
+    val exitCode: String = "",
+    val detail: String = "",
+    val tailOutput: String = "",
     val raw: String,
 ) {
     val preview: String get() = summary.ifBlank { body.ifBlank { raw } }
@@ -396,12 +409,28 @@ private fun parseSubAgentNotificationMetadataUncached(raw: String, toolResult: B
                 }?.takeIf { it.isNotBlank() }
                 SubAgentNotificationMetadata(
                     ordinal = index,
+                    eventId = notice.string("event_id") ?: notice.string("eventId").orEmpty(),
+                    sourceId = when (kind) {
+                        "background_task" -> notice.string("task_id").orEmpty()
+                        "subagent" -> notice.string("subagent_id").orEmpty()
+                        "agent_message" -> notice.string("from_id").orEmpty()
+                        else -> ""
+                    },
                     kind = kind,
                     subSessionId = childId,
                     title = notice.string("subagent_title") ?: notice.string("from_title").orEmpty(),
                     summary = notice.string("summary").orEmpty(),
                     status = notice.string("status"),
                     body = notice.string("message") ?: notice.string("result_excerpt").orEmpty(),
+                    sourceTitle = notice.string("from_title").orEmpty(),
+                    action = notice.string("action")?.let(::parseAgentMessageAction) ?: AgentMessageAction.MESSAGE,
+                    targetTitle = notice.string("target_title").orEmpty(),
+                    fromParent = notice.boolean("from_parent"),
+                    taskTitle = notice.string("title").orEmpty(),
+                    command = notice.string("command").orEmpty(),
+                    exitCode = notice.stringOrInteger("exit_code").orEmpty(),
+                    detail = notice.string("detail").orEmpty(),
+                    tailOutput = notice.string("tail_output").orEmpty(),
                     raw = element.toString(),
                 )
             }
@@ -452,12 +481,23 @@ private fun parseSubAgentNotificationMetadataUncached(raw: String, toolResult: B
         }?.takeIf { completeFields && it.isNotBlank() }
         notices += SubAgentNotificationMetadata(
             ordinal = notices.size,
+            eventId = fields["event-id"].orEmpty(),
+            sourceId = fields["task-id"] ?: fields["subagent-id"] ?: fields["from-id"] ?: "",
             kind = kind,
             subSessionId = childId,
             title = fields["subagent-title"] ?: fields["from-title"].orEmpty(),
             summary = fields["summary"].orEmpty(),
             status = fields["status"],
             body = fields["message"] ?: fields["result-excerpt"].orEmpty(),
+            sourceTitle = fields["from-title"].orEmpty(),
+            action = fields["action"]?.let(::parseAgentMessageAction) ?: AgentMessageAction.MESSAGE,
+            targetTitle = fields["target-title"].orEmpty(),
+            fromParent = fields["from-parent"].equals("true", ignoreCase = true),
+            taskTitle = fields["title"].orEmpty(),
+            command = fields["command"].orEmpty(),
+            exitCode = fields["exit-code"].orEmpty(),
+            detail = fields["detail"].orEmpty(),
+            tailOutput = fields["tail-output"].orEmpty(),
             raw = block.value,
         )
         cursor = block.range.last + 1
@@ -511,3 +551,13 @@ private fun parseMetadataObject(raw: String): JsonObject? {
 
 private fun JsonObject.string(key: String): String? =
     (this[key] as? JsonPrimitive)?.takeIf { it.isString }?.contentOrNull
+
+private fun JsonObject.stringOrInteger(key: String): String? =
+    (this[key] as? JsonPrimitive)?.takeIf { it.isString || it.intOrNull != null }?.contentOrNull
+
+private fun JsonObject.boolean(key: String): Boolean =
+    (this[key] as? JsonPrimitive)?.contentOrNull?.toBooleanStrictOrNull() == true
+
+private fun parseAgentMessageAction(value: String): AgentMessageAction =
+    runCatching { AgentMessageAction.valueOf(value.trim().uppercase(Locale.ROOT)) }
+        .getOrDefault(AgentMessageAction.MESSAGE)

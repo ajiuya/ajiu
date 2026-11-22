@@ -28,7 +28,8 @@ import java.security.MessageDigest
  */
 class McpTool(
     private val client: McpClient,
-    private val descriptor: McpToolDescriptor
+    private val descriptor: McpToolDescriptor,
+    private val checkCurrent: () -> Unit = {}
 ) : AgentTool() {
 
     companion object {
@@ -85,13 +86,17 @@ class McpTool(
 
     override suspend fun execute(args: Map<String, JsonElement>): ToolResult {
         return try {
+            checkCurrent()
             FileLogger.d(TAG, "调用 MCP 工具 $name (remote=$remoteName) args=${args.keys}")
             val call = client.callTool(remoteName, JsonObject(args))
+            checkCurrent()
             if (call.isError) {
                 ToolResult.Error(call.text)
             } else {
                 ToolResult.Success(JsonPrimitive(call.text))
             }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
         } catch (e: McpException) {
             FileLogger.e(TAG, "MCP 工具调用失败: $name", e)
             ToolResult.Error("MCP 工具执行失败：${e.message}")

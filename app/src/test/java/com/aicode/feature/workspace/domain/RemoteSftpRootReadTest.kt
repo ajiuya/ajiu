@@ -65,7 +65,10 @@ class RemoteSftpRootReadTest {
             if (firstArg<RemoteConnectionIdentity>() !== identity) throw CancellationException("Connection changed")
             newChannel().also(onChannel)
         }
-        access = RemoteSftpFileAccess(connection, workspace)
+        access = RemoteSftpFileAccess(connection, workspace, mockk<RemoteAgentConfigCache>(relaxed = true) {
+            every { captureProfile() } returns RemoteAgentConfigProfile("fixture", 0)
+            every { invalidation(any()) } returns {}
+        })
     }
 
     @Test

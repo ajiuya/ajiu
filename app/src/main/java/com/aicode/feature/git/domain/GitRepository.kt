@@ -11,6 +11,8 @@ import com.aicode.feature.git.domain.model.GraphCommit
 import com.aicode.feature.git.domain.model.GitStash
 import com.aicode.feature.git.domain.model.GitStatus
 import com.aicode.feature.git.domain.model.GitTag
+import com.aicode.feature.settings.data.repository.ExecutionMode
+import com.aicode.feature.settings.data.repository.ExecutionModeHolder
 import com.aicode.feature.workspace.data.repository.WorkspaceRepository
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -34,7 +36,8 @@ private const val TAG = "GitRepository"
 @Singleton
 class GitRepository @Inject constructor(
     private val engine: CommandEngine,
-    private val workspaceRepository: WorkspaceRepository
+    private val workspaceRepository: WorkspaceRepository,
+    private val executionModeHolder: ExecutionModeHolder
 ) {
     /** 当前选中的 git 仓库路径；null 表示未指定（用工作区根）。 */
     @Volatile
@@ -69,16 +72,18 @@ class GitRepository @Inject constructor(
 
     /**
      * 发现工作区里的 git 仓库：工作区根 + 一层直接子目录。
-     * 本地模式用 File 列子目录；远程模式下 File 操作无效（路径是远程的），runCatching 捕获后
-     * 自动退化为只检查工作区根。返回按「根优先、子目录按名称排序」的路径列表。
+     * 本地模式用 File 列子目录；远程模式只检查工作区根，避免扫到手机上的同名目录。
+     * 返回按「根优先、子目录按名称排序」的路径列表。
      */
     suspend fun discoverRepos(): List<String> {
         val root = workspaceRepository.currentPath()
         val candidates = mutableListOf(root)
-        runCatching {
-            java.io.File(root).listFiles { f -> f.isDirectory }
-                ?.sortedBy { it.name }
-                ?.forEach { candidates.add(it.absolutePath) }
+        if (executionModeHolder.currentMode() != ExecutionMode.REMOTE_SSH) {
+            runCatching {
+                java.io.File(root).listFiles { f -> f.isDirectory }
+                    ?.sortedBy { it.name }
+                    ?.forEach { candidates.add(it.absolutePath) }
+            }
         }
         return candidates.filter { isGitRepo(it) }
     }
@@ -92,9 +97,10 @@ class GitRepository @Inject constructor(
 
     /**
      * 列出工作区根的一层直接子目录（供仓库选择弹窗展示扫描范围）。
-     * 本地模式用 File 列；远程模式下 File 操作无效（路径是远程的），runCatching 捕获后返回空。
+     * 本地模式用 File 列；远程模式返回空，避免扫到手机上的同名目录。
      */
     fun listSubdirectories(): List<String> {
+        if (executionModeHolder.currentMode() == ExecutionMode.REMOTE_SSH) return emptyList()
         val root = workspaceRepository.currentPath()
         return runCatching {
             java.io.File(root).listFiles { f -> f.isDirectory }

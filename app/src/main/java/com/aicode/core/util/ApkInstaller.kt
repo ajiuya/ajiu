@@ -61,12 +61,13 @@ object ApkInstaller {
         val uri = runCatching {
             FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", apk)
         }.getOrNull() ?: return Result.NO_HANDLER
-        val intent = Intent(Intent.ACTION_VIEW)
-            .setDataAndType(uri, APK_MIME_TYPE)
-            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
         return runCatching {
-            context.startActivity(intent)
+            context.startActivity(installIntent(uri))
             Result.STARTED
         }.getOrDefault(Result.NO_HANDLER)
     }
+
+    internal fun installIntent(uri: Uri): Intent = Intent(Intent.ACTION_VIEW)
+        .setDataAndType(uri, APK_MIME_TYPE)
+        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
 }

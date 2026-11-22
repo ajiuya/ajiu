@@ -65,6 +65,8 @@ internal fun GeneralSettingsSection(
     onSetMaxNetworkRetries: (Int) -> Unit,
     enterToSend: Boolean,
     onToggleEnterToSend: (Boolean) -> Unit,
+    autoExpandReasoning: Boolean,
+    onToggleAutoExpandReasoning: (Boolean) -> Unit,
     compactionThresholdPercent: Int,
     onSetCompactionThresholdPercent: (Int) -> Unit,
     sendFileMaxSizeMb: Int,
@@ -180,6 +182,18 @@ internal fun GeneralSettingsSection(
         }
 
         SettingsGroup {
+            SettingsRow(
+                icon = null,
+                title = stringResource(R.string.settings_auto_expand_reasoning),
+                subtitle = stringResource(R.string.settings_auto_expand_reasoning_desc),
+                trailing = {
+                    AppSwitch(
+                        checked = autoExpandReasoning,
+                        onCheckedChange = onToggleAutoExpandReasoning
+                    )
+                }
+            )
+            SettingsDivider()
             SettingsRow(
                 icon = FeatherIcons.Zap,
                 title = stringResource(R.string.settings_typewriter_speed),

@@ -3,6 +3,7 @@ package com.aicode.feature.agent.domain.subagent
 import com.aicode.core.util.FileLogger
 import com.aicode.core.watch.FileChange
 import com.aicode.core.watch.FileChangeHub
+import com.aicode.feature.agent.domain.plugin.PluginDefinitionReadOnlyException
 import com.aicode.feature.agent.domain.container.ContainerInstaller
 import com.aicode.feature.workspace.domain.FileAccessProvider
 import com.aicode.feature.workspace.domain.ProjectAicodeRoot
@@ -83,6 +84,7 @@ class AgentDefinitionConfigRepository @Inject constructor(
 
     /** 在指定作用域的配置中启用/禁用某个子代理。 */
     fun setDisabled(name: String, disabled: Boolean, scope: AgentDefinitionScope) {
+        if (scope == AgentDefinitionScope.PLUGIN) throw PluginDefinitionReadOnlyException()
         val names = (if (scope == AgentDefinitionScope.GLOBAL) readGlobalDisabled() else readDisabled(projectFile()))
             .toMutableSet()
         if (disabled) names.add(name) else names.removeAll { it.equals(name, ignoreCase = true) }

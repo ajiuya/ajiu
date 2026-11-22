@@ -59,7 +59,12 @@ class RootCommandManager internal constructor(
         private const val POLL_INTERVAL_MS = 10L
     }
 
-    private data class Permit(val sessionId: String, val command: String, val generation: Long)
+    private data class Permit(
+        val sessionId: String,
+        val command: String,
+        val generation: Long,
+        val authorityId: String
+    )
 
     private class ManagedCommand(val permit: Permit) {
         var process: Process? = null
@@ -112,16 +117,23 @@ class RootCommandManager internal constructor(
         }
     }
 
-    suspend fun authorize(sessionId: String, command: String, expectedGeneration: Long): String? {
+    suspend fun authorize(
+        sessionId: String,
+        command: String,
+        expectedGeneration: Long,
+        expectedAuthorityId: String
+    ): String? {
         if (sessionId.isBlank() || command.isBlank() || !accessSnapshot().enabled) return null
         return synchronized(gate) {
             val current = repository.state.value
             observeLocked(current)
-            if (blocked || !current.enabled || current.generation != expectedGeneration) {
+            if (blocked || !current.enabled || current.generation != expectedGeneration ||
+                current.authorityId.isBlank() || current.authorityId != expectedAuthorityId
+            ) {
                 null
             } else {
                 UUID.randomUUID().toString().also {
-                    permits[it] = Permit(sessionId, command, current.generation)
+                    permits[it] = Permit(sessionId, command, current.generation, current.authorityId)
                 }
             }
         }
@@ -144,7 +156,8 @@ class RootCommandManager internal constructor(
             val permit = permitId?.let { permits.remove(it) }
             if (blocked || !current.enabled) return RootCommandResult("", EXIT_DISABLED)
             if (permit == null || permit.sessionId != sessionId || permit.command != command ||
-                permit.generation != current.generation
+                permit.generation != current.generation || current.authorityId.isBlank() ||
+                permit.authorityId != current.authorityId
             ) {
                 return RootCommandResult("", EXIT_APPROVAL_REQUIRED)
             }
@@ -193,7 +206,9 @@ class RootCommandManager internal constructor(
                 observeLocked(repository.state.value)
                 if (execution.result != null) return
                 val current = repository.state.value
-                if (blocked || !current.enabled || current.generation != execution.permit.generation) {
+                if (blocked || !current.enabled || current.generation != execution.permit.generation ||
+                    current.authorityId.isBlank() || current.authorityId != execution.permit.authorityId
+                ) {
                     finish(execution, RootCommandResult("", EXIT_DISABLED))
                     return
                 }

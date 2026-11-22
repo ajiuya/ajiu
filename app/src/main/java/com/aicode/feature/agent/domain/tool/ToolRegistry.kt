@@ -17,12 +17,21 @@ class ToolRegistry {
         return tools[name]
     }
 
+    internal fun registerIfVacant(tool: AgentTool): Boolean = synchronized(tools) {
+        if (tool.name in tools) false else { tools[tool.name] = tool; true }
+    }
+
+    internal fun unregisterOwned(tool: AgentTool) = synchronized(tools) {
+        if (tools[tool.name] === tool) tools.remove(tool.name)
+        Unit
+    }
+
     fun unregister(name: String) {
         tools.remove(name)
     }
 
     fun getToolNames(): Set<String> {
-        return tools.keys.toSet()
+        return synchronized(tools) { tools.keys.toSet() }
     }
 
     /** 返回可用工具列表。 */
@@ -35,4 +44,11 @@ class ToolRegistry {
     fun hasTool(name: String): Boolean {
         return tools.containsKey(name)
     }
+}
+
+internal fun ToolRegistry.forInvocation(name: String, offered: List<AgentTool>): AgentTool? {
+    val registered = getTool(name) ?: return null
+    // Reinstalling with the same name does not authorize a model call offered by the old installation.
+    if (name.startsWith("plugin__") && offered.none { it === registered }) return null
+    return registered
 }

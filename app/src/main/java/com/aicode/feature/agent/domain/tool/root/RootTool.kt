@@ -31,7 +31,8 @@ class RootTool @Inject constructor(
     override val name = NAME
     override val description =
         "Execute a command on the Android host using the user's existing su/Magisk authorization. " +
-            "Requires the device-local Root switch and a command-specific approval in the current session. " +
+            "Requires the device-local Root switch and authorization for the current session, with allow-once or allow-session choices. " +
+            "Each execution still consumes a one-time permit for its full command. Disabling Root revokes session authorization. " +
             "This is not container root and does not grant root to an unrooted device. " +
             "Stopping a managed process cannot undo completed writes or reclaim arbitrary detached daemons."
     override val permissionPolicy = ToolPermissionPolicy.ASK

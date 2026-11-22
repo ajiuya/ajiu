@@ -74,16 +74,17 @@ object AgentNotificationFormatter {
             AgentNotificationKind.USER_MESSAGE -> "user-message"
         }
         appendLine("<$tag>")
+        appendLine("  <event-id>${escapeXml(eventId)}</event-id>")
         when (kind) {
             AgentNotificationKind.BACKGROUND_TASK -> {
-                appendLine("  <task-id>$sourceId</task-id>")
-                appendLine("  <title>$title</title>")
-                appendLine("  <command>${command ?: ""}</command>")
-                appendLine("  <exit-code>${exitCode ?: ""}</exit-code>")
+                appendLine("  <task-id>${escapeXml(sourceId)}</task-id>")
+                appendLine("  <title>${escapeXml(title)}</title>")
+                appendLine("  <command>${escapeXml(command ?: "")}</command>")
+                appendLine("  <exit-code>${escapeXml(exitCode?.toString().orEmpty())}</exit-code>")
             }
             AgentNotificationKind.SUBAGENT -> {
-                appendLine("  <subagent-id>$sourceId</subagent-id>")
-                appendLine("  <subagent-title>$title</subagent-title>")
+                appendLine("  <subagent-id>${escapeXml(sourceId)}</subagent-id>")
+                appendLine("  <subagent-title>${escapeXml(title)}</subagent-title>")
                 changedFiles.takeIf { it.isNotEmpty() }?.let { files ->
                     appendLine("  <changed-files>${escapeXml(files.joinToString(", "))}</changed-files>")
                 }
@@ -92,16 +93,19 @@ object AgentNotificationFormatter {
                 }
             }
             AgentNotificationKind.AGENT_MESSAGE -> {
-                appendLine("  <from-id>$sourceId</from-id>")
-                appendLine("  <from-title>$title</from-title>")
+                appendLine("  <from-id>${escapeXml(sourceId)}</from-id>")
+                appendLine("  <from-title>${escapeXml(title)}</from-title>")
+                if (fromParent) appendLine("  <from-parent>true</from-parent>")
+                appendLine("  <action>${action.name.lowercase()}</action>")
+                targetTitle?.takeIf { it.isNotBlank() }?.let { appendLine("  <target-title>${escapeXml(it)}</target-title>") }
                 message?.takeIf { it.isNotBlank() }?.let { appendLine("  <message>${escapeXml(it)}</message>") }
             }
             AgentNotificationKind.USER_MESSAGE -> {
                 message?.takeIf { it.isNotBlank() }?.let { appendLine("  <message>${escapeXml(it)}</message>") }
             }
         }
-        appendLine("  <status>${statusText()}</status>")
-        appendLine("  <summary>${summaryText()}</summary>")
+        appendLine("  <status>${escapeXml(statusText())}</status>")
+        appendLine("  <summary>${escapeXml(summaryText())}</summary>")
         detail?.takeIf { it.isNotBlank() }?.let { appendLine("  <detail>${escapeXml(it)}</detail>") }
         // 转义尖括号：输出里若含 <status>/<summary> 等字样会污染提示条的正则提取。
         tailOutput?.takeIf { it.isNotBlank() }?.let { appendLine("  <tail-output>${escapeXml(it)}</tail-output>") }
@@ -109,6 +113,7 @@ object AgentNotificationFormatter {
     }
 
     private fun PendingNotification.toJsonObject(): JsonElement = buildJsonObject {
+        put("event_id", eventId)
         put("kind", when (kind) {
             AgentNotificationKind.BACKGROUND_TASK -> "background_task"
             AgentNotificationKind.SUBAGENT -> "subagent"
@@ -134,6 +139,9 @@ object AgentNotificationFormatter {
             AgentNotificationKind.AGENT_MESSAGE -> {
                 put("from_id", sourceId)
                 put("from_title", title)
+                put("from_parent", fromParent)
+                put("action", action.name.lowercase())
+                targetTitle?.takeIf { it.isNotBlank() }?.let { put("target_title", JsonPrimitive(it)) }
                 message?.takeIf { it.isNotBlank() }?.let { put("message", JsonPrimitive(it)) }
             }
             AgentNotificationKind.USER_MESSAGE -> {
@@ -165,8 +173,11 @@ object AgentNotificationFormatter {
             NotificationOutcome.FAILED -> "子代理「$title」已执行失败"
             NotificationOutcome.STOPPED -> "子代理「$title」已被用户手动终止，任务未完成"
         }
-        AgentNotificationKind.AGENT_MESSAGE ->
-            if (fromParent) "主会话发来一条消息" else "子代理「$title」发来一条消息"
+        AgentNotificationKind.AGENT_MESSAGE -> when (action) {
+            AgentMessageAction.ADD_INSTRUCTION -> "给${targetTitle?.takeIf { it.isNotBlank() } ?: title}代理添加指令"
+            AgentMessageAction.CORRECTION -> "给${targetTitle?.takeIf { it.isNotBlank() } ?: title}代理发送纠偏"
+            AgentMessageAction.MESSAGE -> if (fromParent) "主会话发来一条消息" else "${title.ifBlank { "子代理" }}发来一条消息"
+        }
         AgentNotificationKind.USER_MESSAGE ->
             "用户在工作期间插入了一条消息"
     }

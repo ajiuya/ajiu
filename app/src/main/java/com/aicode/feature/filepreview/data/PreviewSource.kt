@@ -124,6 +124,8 @@ internal class PreviewSource internal constructor(
             }
         }
 
+    internal fun ownsCopy(file: File): Boolean = synchronized(resourcesLock) { file in ownedFiles }
+
     @OptIn(InternalCoroutinesApi::class)
     suspend fun localFile(path: String = entryPath): File = withContext(Dispatchers.IO + executionContext) {
         val callerContext = currentCoroutineContext()
@@ -202,6 +204,7 @@ internal class PreviewSource internal constructor(
                                 output.write(buffer, 0, length)
                                 count += length
                             }
+                            if (count != expected) throw IOException("Preview source ended before its reported size")
                             output.flush()
                             checkCurrent()
                             currentCoroutineContext().ensureActive()

@@ -16,6 +16,7 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -38,8 +39,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -201,7 +206,22 @@ internal fun ProjectProgressSection(
     ) {
         item(key = "overview") {
             SettingsGroup {
-                SettingsRow(title = selected?.name ?: state.workspaceName.orEmpty(), subtitle = selected?.identity?.projectRoot ?: state.workspaceRoot)
+                Column(
+                    Modifier.fillMaxWidth().padding(Spacing.lg),
+                    verticalArrangement = Arrangement.spacedBy(Spacing.xs)
+                ) {
+                    Text(
+                        selected?.name ?: state.workspaceName.orEmpty(),
+                        style = MaterialTheme.typography.bodyLarge
+                    )
+                    Text(
+                        selected?.identity?.projectRoot ?: state.workspaceRoot,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
                 SettingsDivider()
                 Row(
                     Modifier.fillMaxWidth().padding(horizontal = Spacing.lg, vertical = Spacing.md),
@@ -220,7 +240,7 @@ internal fun ProjectProgressSection(
             item(key = "latest-handoff") {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                     SettingsGroupHeader(stringResource(R.string.project_progress_latest_handoff))
-                    TextButton(onClick = onHandoff, enabled = enabled) { Text(stringResource(R.string.project_progress_write_handoff)) }
+                    TextButton(onClick = { if (enabled) onHandoff() }, enabled = enabled) { Text(stringResource(R.string.project_progress_write_handoff)) }
                 }
                 when {
                     state.handoffLoading -> ProjectProgressInlineLoading()
@@ -261,7 +281,7 @@ internal fun ProjectProgressSection(
             item(key = "history-heading") {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                     SettingsGroupHeader(stringResource(if (state.showingArchive) R.string.project_progress_archive_history else R.string.project_progress_recent))
-                    TextButton(onClick = { onArchive(!state.showingArchive) }, enabled = enabled) {
+                    TextButton(onClick = { if (enabled) onArchive(!state.showingArchive) }, enabled = enabled) {
                         Text(stringResource(if (state.showingArchive) R.string.project_progress_view_recent else R.string.project_progress_view_archive))
                     }
                 }
@@ -279,7 +299,7 @@ internal fun ProjectProgressSection(
                 if (state.historyLoading) {
                     ProjectProgressInlineLoading()
                 } else if (state.hasMore) {
-                    TextButton(onClick = onLoadMore, enabled = enabled) { Text(stringResource(R.string.project_progress_load_more)) }
+                    TextButton(onClick = { if (enabled) onLoadMore() }, enabled = enabled) { Text(stringResource(R.string.project_progress_load_more)) }
                 }
             }
         }
@@ -306,55 +326,215 @@ internal fun ProjectProgressManagement(
     onAutoProgress: (Boolean) -> Unit,
     onHandoff: () -> Unit
 ) {
+    val actionsEnabled = enabled && !state.busy
+    val selected = state.selectedProject
+    val binding = projectProgressCurrentBinding(state)
+    val locale = LocalConfiguration.current.locales[0]
     Column(verticalArrangement = Arrangement.spacedBy(Spacing.sm)) {
         SettingsGroup {
-            Row(Modifier.fillMaxWidth().clickable(role = Role.Button, onClick = onToggle).padding(Spacing.lg), verticalAlignment = Alignment.CenterVertically) {
-                Text(stringResource(R.string.project_progress_management), modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge)
+            Row(
+                Modifier.fillMaxWidth()
+                    .testTag("project-settings-toggle")
+                    .clickable(enabled = !state.busy, role = Role.Button) {
+                        if (!state.busy) onToggle()
+                    }
+                    .padding(Spacing.lg),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(Spacing.xs)) {
+                    Text(stringResource(R.string.project_progress_management), style = MaterialTheme.typography.bodyLarge)
+                    if (!expanded) {
+                        Text(
+                            binding,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            state.capacity?.let { capacity ->
+                                stringResource(
+                                    R.string.project_settings_capacity_summary,
+                                    capacity.activeEntries,
+                                    capacity.maxActiveEntries,
+                                    projectProgressFormatBytes(capacity.usedBytes, locale),
+                                    projectProgressFormatBytes(capacity.maxBytes, locale)
+                                )
+                            } ?: stringResource(R.string.project_progress_capacity_unknown),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.semanticColors.subtleText
+                        )
+                    }
+                }
                 ExpandableChevronIcon(expanded = expanded, tint = MaterialTheme.semanticColors.subtleText)
             }
         }
-        if (!expanded && state.capacity == null) {
-            Text(stringResource(R.string.project_progress_capacity_unknown), modifier = Modifier.padding(Spacing.sm),
-                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.semanticColors.subtleText)
-        }
         if (expanded) {
-            SettingsGroup {
-                state.selectedProject?.let { selected ->
+            SettingsGroupHeader(stringResource(R.string.project_settings_binding_title))
+            SettingsGroup(Modifier.testTag("project-settings-binding")) {
+                Column(
+                    Modifier.fillMaxWidth().padding(Spacing.lg),
+                    verticalArrangement = Arrangement.spacedBy(Spacing.sm)
+                ) {
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(Spacing.sm),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            stringResource(R.string.project_progress_binding),
+                            modifier = Modifier.weight(1f),
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        ProjectProgressLabel(
+                            stringResource(
+                                if (state.sessionId == null) R.string.project_settings_binding_scope_workspace
+                                else R.string.project_settings_binding_scope_session
+                            ),
+                            modifier = Modifier.testTag("project-settings-binding-scope")
+                        )
+                    }
+                    Text(
+                        binding,
+                        modifier = Modifier.testTag("project-settings-binding-status"),
+                        style = MaterialTheme.typography.bodyLarge
+                    )
+                    Text(
+                        stringResource(
+                            if (state.sessionId == null) R.string.project_settings_binding_scope_hint_workspace
+                            else R.string.project_settings_binding_scope_hint_session
+                        ),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    if (selected != null) {
+                        if (!state.canBindSelected) {
+                            Text(
+                                stringResource(R.string.project_progress_outside_workspace),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.semanticColors.onWarningContainer
+                            )
+                        }
+                        Button(
+                            onClick = { if (actionsEnabled && state.canBindSelected) onBind() },
+                            enabled = actionsEnabled && state.canBindSelected,
+                            modifier = Modifier.fillMaxWidth().testTag("project-settings-bind")
+                        ) {
+                            Text(stringResource(R.string.project_progress_bind))
+                        }
+                    }
+                }
+                SettingsDivider()
+                SettingsRow(
+                    title = stringResource(R.string.project_progress_unbind),
+                    subtitle = stringResource(R.string.project_progress_unbind_hint),
+                    enabled = actionsEnabled,
+                    onClick = { if (actionsEnabled) onUnbind() },
+                    modifier = Modifier.testTag("project-settings-unbind")
+                )
+            }
+            if (selected != null) {
+                SettingsGroupHeader(stringResource(R.string.project_settings_record_options))
+                SettingsGroup {
                     SettingsRow(
                         title = stringResource(R.string.project_progress_auto_capture),
                         subtitle = stringResource(R.string.project_progress_auto_capture_hint),
-                        trailing = { AppSwitch(checked = selected.autoProgressEnabled, onCheckedChange = onAutoProgress, enabled = enabled) }
+                        trailing = {
+                            AppSwitch(
+                                checked = selected.autoProgressEnabled,
+                                onCheckedChange = { if (actionsEnabled) onAutoProgress(it) },
+                                enabled = actionsEnabled,
+                                modifier = Modifier.testTag("project-settings-auto-progress")
+                            )
+                        }
                     )
-                    SettingsDivider()
-                    SettingsRow(title = stringResource(R.string.project_progress_bind), subtitle = if (state.canBindSelected) {
-                        stringResource(if (state.sessionId == null) R.string.project_progress_bind_workspace_hint else R.string.project_progress_bind_session_hint)
-                    } else stringResource(R.string.project_progress_outside_workspace), enabled = enabled && state.canBindSelected, onClick = onBind)
-                    SettingsDivider()
                 }
-                SettingsRow(title = stringResource(R.string.project_progress_unbind), subtitle = stringResource(R.string.project_progress_unbind_hint),
-                    enabled = enabled, onClick = onUnbind)
-            }
-            SettingsGroup {
-                SettingsRow(title = stringResource(R.string.project_progress_environment), subtitle = stringResource(R.string.project_progress_environment_value,
-                    projectProgressEnvironment(state.selectedProject?.identity?.mode ?: state.environmentMode), state.workspaceRoot.orEmpty()))
-                SettingsDivider()
-                SettingsRow(title = stringResource(R.string.project_progress_binding_scope), subtitle = stringResource(
-                    if (state.sessionId == null) R.string.project_progress_workspace_scope else R.string.project_progress_session_scope))
-                state.associations?.let { associations ->
-                    SettingsDivider()
-                    SettingsRow(title = stringResource(R.string.project_progress_binding), subtitle = projectProgressBindingText(associations, state.sessionId != null))
-                }
-            }
-            SettingsGroup {
-                SettingsRow(title = stringResource(R.string.project_progress_capacity), subtitle = state.capacity?.let { capacity ->
-                    stringResource(R.string.project_progress_capacity_value, capacity.activeEntries, capacity.maxActiveEntries,
-                        capacity.archivedEntries, capacity.usedBytes, capacity.maxBytes)
-                } ?: stringResource(R.string.project_progress_capacity_unknown))
-            }
-            if (state.selectedProject != null) {
-                Button(onClick = onHandoff, enabled = enabled, modifier = Modifier.fillMaxWidth()) {
+                Button(onClick = { if (actionsEnabled) onHandoff() }, enabled = actionsEnabled, modifier = Modifier.fillMaxWidth()) {
                     Text(stringResource(R.string.project_progress_handoff))
                 }
+            }
+            ProjectProgressEnvironmentCard(state)
+            ProjectProgressCapacityCard(state.capacity, enabled = !state.busy)
+        }
+    }
+}
+
+@Composable
+private fun ProjectProgressEnvironmentCard(state: ProjectProgressUiState) {
+    var detailsExpanded by rememberSaveable(state.workspaceRoot, state.environmentMode) { mutableStateOf(false) }
+    val clipboard = LocalClipboardManager.current
+    val path = state.workspaceRoot.orEmpty()
+    SettingsGroupHeader(stringResource(R.string.project_progress_environment))
+    SettingsGroup(Modifier.testTag("project-settings-environment")) {
+        Column(
+            Modifier.fillMaxWidth().padding(horizontal = Spacing.lg).padding(bottom = Spacing.lg),
+            verticalArrangement = Arrangement.spacedBy(Spacing.sm)
+        ) {
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(Spacing.sm),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(Spacing.xs)) {
+                    ProjectProgressLabel(projectProgressEnvironment(state.environmentMode))
+                    state.workspaceName?.takeIf { it.isNotBlank() }?.let { name ->
+                        Text(
+                            name,
+                            style = MaterialTheme.typography.bodyMedium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+                TextButton(
+                    onClick = { detailsExpanded = !detailsExpanded },
+                    modifier = Modifier.testTag("project-settings-environment-details")
+                ) {
+                    Text(stringResource(R.string.project_settings_environment_details))
+                    ExpandableChevronIcon(expanded = detailsExpanded, tint = MaterialTheme.semanticColors.subtleText)
+                }
+            }
+            if (detailsExpanded) {
+                SettingsDivider()
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(Spacing.sm),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        stringResource(R.string.project_settings_path),
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    TextButton(
+                        onClick = { if (!state.busy) clipboard.setText(AnnotatedString(path)) },
+                        enabled = !state.busy,
+                        modifier = Modifier.testTag("project-settings-copy-path")
+                    ) {
+                        Text(stringResource(R.string.project_settings_copy_path))
+                    }
+                }
+                SelectionContainer {
+                    Text(
+                        path,
+                        modifier = Modifier.fillMaxWidth().testTag("project-settings-path"),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            } else {
+                Text(
+                    path,
+                    modifier = Modifier.fillMaxWidth().testTag("project-settings-path"),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.MiddleEllipsis
+                )
             }
         }
     }
@@ -366,7 +546,7 @@ internal fun ProjectProgressFilterBar(filter: ProjectProgressFilter, enabled: Bo
         Row(Modifier.fillMaxWidth().selectableGroup().padding(Spacing.xs), horizontalArrangement = Arrangement.spacedBy(Spacing.xs)) {
             ProjectProgressFilter.entries.forEach { option ->
                 Surface(
-                    modifier = Modifier.weight(1f).selectable(selected = filter == option, enabled = enabled, role = Role.Tab, onClick = { onFilter(option) }),
+                    modifier = Modifier.weight(1f).selectable(selected = filter == option, enabled = enabled, role = Role.Tab, onClick = { if (enabled) onFilter(option) }),
                     shape = RoundedCornerShape(Radius.sm), color = if (filter == option) MaterialTheme.semanticColors.cardSurface else Color.Transparent
                 ) {
                     Text(stringResource(when (option) {
@@ -399,7 +579,7 @@ internal fun ProjectProgressHandoffCard(entry: ProjectMemoryEntry, enabled: Bool
 @Composable
 private fun ProjectProgressEntryRow(entry: ProjectMemoryEntry, enabled: Boolean, onOpen: () -> Unit) {
     Column(
-        Modifier.fillMaxWidth().clickable(enabled = enabled, onClick = onOpen).padding(Spacing.lg),
+        Modifier.fillMaxWidth().clickable(enabled = enabled, onClick = { if (enabled) onOpen() }).padding(Spacing.lg),
         verticalArrangement = Arrangement.spacedBy(Spacing.sm)
     ) {
         ProjectProgressEntryHeading(entry)
@@ -418,8 +598,8 @@ private fun ProjectProgressEntryHeading(entry: ProjectMemoryEntry) {
 }
 
 @Composable
-private fun ProjectProgressLabel(text: String) {
-    Surface(shape = RoundedCornerShape(Radius.xs), color = MaterialTheme.semanticColors.infoContainer) {
+private fun ProjectProgressLabel(text: String, modifier: Modifier = Modifier) {
+    Surface(modifier = modifier, shape = RoundedCornerShape(Radius.xs), color = MaterialTheme.semanticColors.infoContainer) {
         Text(text, modifier = Modifier.padding(horizontal = Spacing.sm, vertical = Spacing.xs),
             style = MaterialTheme.typography.labelSmall, color = MaterialTheme.semanticColors.onInfoContainer)
     }
@@ -428,9 +608,14 @@ private fun ProjectProgressLabel(text: String) {
 @Composable
 private fun projectProgressOverviewBinding(state: ProjectProgressUiState): String = stringResource(
     R.string.project_progress_overview_binding,
-    projectProgressEnvironment(state.selectedProject?.identity?.mode ?: state.environmentMode),
-    state.associations?.let { projectProgressBindingText(it, state.sessionId != null) } ?: stringResource(R.string.project_progress_binding_unknown)
+    projectProgressEnvironment(state.environmentMode),
+    projectProgressCurrentBinding(state)
 )
+
+@Composable
+private fun projectProgressCurrentBinding(state: ProjectProgressUiState): String =
+    state.associations?.let { projectProgressBindingText(it, state.sessionId != null) }
+        ?: stringResource(R.string.project_progress_binding_unknown)
 
 @Composable
 private fun projectProgressEnvironment(mode: String?): String = stringResource(when (mode) {

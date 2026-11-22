@@ -20,7 +20,7 @@ import com.aicode.feature.terminal.presentation.TerminalViewModel
 import com.aicode.feature.terminal.presentation.component.TerminalScreen
 
 /** 大屏右栏（工作台）当前承载的内容。 */
-internal enum class WorkbenchPaneKind { NONE, EDITOR, TERMINAL, GIT, BROWSER }
+internal enum class WorkbenchPaneKind { NONE, EDITOR, TERMINAL, GIT, BROWSER, PLUGIN }
 
 /**
  * 大屏下与聊天并排的右栏内容。
@@ -41,11 +41,13 @@ internal fun WorkbenchPaneContent(
     onClose: () -> Unit,
     onOpenFile: ((String) -> Unit)? = null,
     editorLeaveGuard: EditorLeaveGuard? = null,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    pluginToolKey: String? = null
 ) {
     Box(modifier = modifier) {
         when (kind) {
             WorkbenchPaneKind.NONE -> Unit
+            WorkbenchPaneKind.PLUGIN -> pluginToolKey?.let { com.aicode.feature.plugin.presentation.PluginWorkspacePage(it, onClose) }
 
             WorkbenchPaneKind.EDITOR -> CodeEditorScreen(
                 path = editorPath,
@@ -87,7 +89,7 @@ internal fun WorkbenchPaneContent(
             WorkbenchPaneKind.BROWSER -> {
                 val browserViewModel: BrowserViewModel = hiltViewModel()
                 BrowserScreen(
-                    browserManager = browserViewModel.browserManager,
+                    viewModel = browserViewModel,
                     onNavigateBack = onClose,
                     embedded = true
                 )

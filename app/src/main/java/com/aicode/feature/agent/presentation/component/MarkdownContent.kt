@@ -5,7 +5,9 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
@@ -136,6 +138,7 @@ internal fun MarkdownContent(
     /** 长文本虚拟化渲染：正文改用 LazyColumn 逐块渲染（调用方需配合 heightIn 等有限高度约束
      *  才能触发懒加载），避免超大 md 一次性全量组合/测量造成的卡顿。 */
     lazyScroll: Boolean = false,
+    lazyListState: LazyListState? = null,
     onRendered: ((String) -> Unit)? = null,
 ) {
     val isDark = MaterialTheme.colorScheme.background.luminance() < 0.5f
@@ -213,14 +216,15 @@ internal fun MarkdownContent(
             // 长文本用 LazyColumn 逐块渲染时，animations（文本尺寸动画等）不适用，属预期。
             // 下面三个对象（successRenderer / mdComponents / mdAnimations）均 remember：不缓存的话
             // 每次重组都新建 lambda 实例，令下游 Markdown 无法 skip。
+            val effectiveListState = if (lazyScroll) lazyListState ?: rememberLazyListState() else null
             val successRenderer: @Composable (
                 state: MarkdownParseState.Success,
                 components: MarkdownComponents,
                 modifier: Modifier
-            ) -> Unit = remember(lazyScroll, highlightOwner) {
-                if (lazyScroll) {
+            ) -> Unit = remember(lazyScroll, effectiveListState, highlightOwner) {
+                if (effectiveListState != null) {
                     { state, components, m ->
-                        LazyColumn(modifier = m) {
+                        LazyColumn(modifier = m, state = effectiveListState) {
                             items(
                                 items = state.node.children,
                                 key = { node -> CodeHighlightBlockIdentity(highlightOwner, node.startOffset, node.type.toString()).key },

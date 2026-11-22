@@ -3,6 +3,7 @@ package com.aicode.feature.agent.domain.skill
 import com.aicode.core.util.FileLogger
 import com.aicode.feature.workspace.domain.FileAccessProvider
 import org.yaml.snakeyaml.Yaml
+import kotlinx.coroutines.CancellationException
 
 object SkillParser {
     private const val TAG = "SkillParser"
@@ -20,6 +21,7 @@ object SkillParser {
         val fileName = runCatching {
             provider.listFiles(dir).map { it.name }
         }.getOrElse {
+            if (it is CancellationException) throw it
             FileLogger.w(TAG, "列出技能目录失败: $dir", it)
             return null
         }.let { names ->
@@ -28,6 +30,7 @@ object SkillParser {
         } ?: return null
 
         val text = runCatching { provider.readFile("$dir/$fileName") }.getOrElse {
+            if (it is CancellationException) throw it
             FileLogger.w(TAG, "读取 Skill 文件失败: $dir/$fileName", it)
             return null
         }

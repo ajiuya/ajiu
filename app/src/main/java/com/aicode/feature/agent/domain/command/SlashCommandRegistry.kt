@@ -3,10 +3,14 @@ package com.aicode.feature.agent.domain.command
 import android.content.Context
 import com.aicode.feature.agent.domain.skill.Skill
 import com.aicode.feature.agent.domain.skill.SkillRepository
+import com.aicode.feature.workspace.domain.WorkspaceExecutionContextFactory
 import dagger.hilt.android.qualifiers.ApplicationContext
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -24,7 +28,8 @@ import kotlinx.coroutines.withContext
 class SlashCommandRegistry @Inject constructor(
     actionHandlers: Set<@JvmSuppressWildcards ActionCommandHandler>,
     private val skillRepository: SkillRepository,
-    @param:ApplicationContext private val context: Context
+    @param:ApplicationContext private val context: Context,
+    private val executionContextFactory: WorkspaceExecutionContextFactory
 ) {
     private val actions: List<ActionCommandHandler> = actionHandlers.sortedBy { it.name.lowercase() }
     private val actionsByName: Map<String, ActionCommandHandler> =
@@ -34,15 +39,54 @@ class SlashCommandRegistry @Inject constructor(
     @Volatile
     private var skills: List<Skill> = emptyList()
 
+    private val refreshLock = Any()
+    private var refreshOwner = 0L
+    private var skillsSource: String? = null
+
     private val _commands = MutableStateFlow<List<SlashCommand>>(emptyList())
 
     /** `/` 菜单展示的命令列表。 */
-    val commands: StateFlow<List<SlashCommand>> = _commands.asStateFlow()
+    val commands: StateFlow<List<SlashCommand>>
+        get() {
+            discardChangedSkills()
+            return _commands.asStateFlow()
+        }
 
     /** 重新扫描技能并重建菜单。涉及文件 IO，调用方应在 IO 上下文调用。 */
-    suspend fun refresh() = withContext(Dispatchers.IO) {
-        skills = skillRepository.listSkills()
-        _commands.value = buildCommands()
+    suspend fun refresh() {
+        val owner = synchronized(refreshLock) { ++refreshOwner }
+        val execution = executionContextFactory.freeze()
+        withContext(Dispatchers.IO + execution) {
+            discardChangedSkills()
+            val source = skillRepository.sourceIdentity()
+            val updated = skillRepository.listSkills()
+            currentCoroutineContext().ensureActive()
+            synchronized(refreshLock) {
+                if (owner != refreshOwner) return@synchronized
+                skillRepository.checkSourceIdentity(source)
+                skills = updated
+                skillsSource = source
+                _commands.value = buildCommands()
+            }
+        }
+    }
+
+    private fun discardChangedSkills() {
+        synchronized(refreshLock) {
+            val source = skillsSource ?: return
+            try {
+                if (source == skillRepository.sourceIdentity()) return
+            } catch (e: Exception) {
+                skills = emptyList()
+                skillsSource = null
+                _commands.value = buildCommands()
+                if (e is CancellationException) throw e
+                return
+            }
+            skills = emptyList()
+            skillsSource = null
+            _commands.value = buildCommands()
+        }
     }
 
     private fun buildCommands(): List<SlashCommand> = buildList {
@@ -86,8 +130,13 @@ class SlashCommandRegistry @Inject constructor(
             if (!handler.acceptsArgs && args.isNotEmpty()) return null
             return ResolvedCommand.Action(handler, args)
         }
-        val skill = skills.firstOrNull { it.name.equals(name, ignoreCase = true) } ?: return null
-        return ResolvedCommand.SkillCommand(skill, args)
+        discardChangedSkills()
+        return synchronized(refreshLock) {
+            val source = skillsSource ?: return@synchronized null
+            skillRepository.checkSourceIdentity(source)
+            val skill = skills.firstOrNull { it.name.equals(name, ignoreCase = true) } ?: return@synchronized null
+            ResolvedCommand.SkillCommand(skill, args)
+        }
     }
 
     /** 解析结果：内置动作或技能。 */

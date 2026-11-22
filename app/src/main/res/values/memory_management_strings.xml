@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="memory_management_title">记忆管理</string>
+    <string name="memory_management_title">记忆</string>
     <string name="memory_management_add">新增记忆</string>
     <string name="memory_management_refresh">刷新记忆</string>
     <string name="memory_management_global">全局记忆</string>
@@ -10,12 +10,12 @@
     <string name="memory_management_empty">此作用域暂无记忆</string>
     <string name="memory_management_name">名称</string>
     <string name="memory_management_name_hint">使用字母、数字、连字符或下划线，与记忆工具使用相同名称。</string>
-    <string name="memory_management_description">摘要</string>
-    <string name="memory_management_no_description">暂无摘要</string>
-    <string name="memory_management_body">正文（Markdown）</string>
-    <string name="memory_management_scope">作用域</string>
-    <string name="memory_management_file">文件</string>
-    <string name="memory_management_copy_body">复制正文</string>
+    <string name="memory_management_description">描述</string>
+    <string name="memory_management_no_description">暂无描述</string>
+    <string name="memory_management_body">正文</string>
+    <string name="memory_management_scope">作用范围</string>
+    <string name="memory_management_file">文件名称</string>
+    <string name="memory_management_copy_body">复制全文</string>
     <string name="memory_management_create">创建</string>
     <string name="memory_management_creating">正在创建…</string>
     <string name="memory_management_delete_title">删除记忆</string>

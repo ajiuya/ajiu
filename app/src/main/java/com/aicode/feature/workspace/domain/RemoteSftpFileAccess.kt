@@ -18,9 +18,12 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import net.schmizz.sshj.sftp.FileAttributes
 import net.schmizz.sshj.sftp.FileMode
 import net.schmizz.sshj.sftp.OpenMode
 import net.schmizz.sshj.sftp.RemoteFile
+import net.schmizz.sshj.sftp.RenameFlags
+import net.schmizz.sshj.sftp.Response.StatusCode
 import net.schmizz.sshj.sftp.SFTPClient
 import net.schmizz.sshj.sftp.SFTPException
 import net.schmizz.sshj.xfer.FilePermission
@@ -29,10 +32,13 @@ import java.io.File
 import java.io.IOException
 import java.io.InputStream
 import java.io.InputStreamReader
+import java.io.OutputStream
 import java.nio.charset.Charset
 import java.nio.file.Paths
-import java.nio.file.FileAlreadyExistsException
-import java.nio.file.NoSuchFileException
+import kotlin.io.FileAlreadyExistsException
+import java.nio.file.FileSystemLoopException
+import kotlin.io.NoSuchFileException
+import java.util.ArrayDeque
 import java.util.EnumSet
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.inject.Inject
@@ -60,7 +66,8 @@ class RemoteOutputTooLargeException(message: String) : IOException(message)
  */
 class RemoteSftpFileAccess @Inject constructor(
     private val connection: RemoteSshConnection,
-    private val workspaceRepository: WorkspaceRepository
+    private val workspaceRepository: WorkspaceRepository,
+    private val agentConfigCache: RemoteAgentConfigCache
 ) : FileAccessProvider {
 
     private val sftpMutex get() = connection.sftpOperationMutex
@@ -73,11 +80,15 @@ class RemoteSftpFileAccess @Inject constructor(
         return if (path.isNotBlank() && path != "/") path else cfg.remoteWorkspacePath.trimEnd('/')
     }
 
-    internal data class ExecutionSource(val identity: RemoteConnectionIdentity, val workspaceRoot: String)
+    internal data class ExecutionSource(
+        val identity: RemoteConnectionIdentity,
+        val workspaceRoot: String,
+        internal val agentConfigProfile: RemoteAgentConfigProfile
+    )
 
     internal fun captureExecutionSource(): ExecutionSource {
         val identity = connection.captureIdentity()
-        return ExecutionSource(identity, currentWorkspaceRoot()).also(::checkExecutionSource)
+        return ExecutionSource(identity, currentWorkspaceRoot(), agentConfigCache.captureProfile()).also(::checkExecutionSource)
     }
 
     internal fun checkExecutionSource(source: ExecutionSource) {
@@ -146,10 +157,273 @@ class RemoteSftpFileAccess @Inject constructor(
     } catch (e: CancellationException) {
         throw e
     } catch (e: Exception) {
-        if (e !is SFTPException && e !is NoSuchFileException && e !is FileAlreadyExistsException) {
+        if (e !is SFTPException && e !is NoSuchFileException && e !is FileAlreadyExistsException &&
+            e !is FileReadTooLargeException && e !is FileSystemLoopException && e !is FilePathOverlapException
+        ) {
             runCatching { connection.invalidateSftp() }
         }
         throw e
+    }
+
+    internal fun transferBackend(path: String, check: () -> Unit): TransferBackend {
+        val execution = WorkspaceExecutionContext.current() ?: throw IOException("Captured transfer execution required")
+        val source = executionSource() ?: throw IOException("Captured remote transfer source required")
+        val remote = toRemotePath(path)
+        val entry = withTransferSftp(source, check) { resolveRemotePath(it, remote, false) }
+        fun checkSource() {
+            check()
+            execution.checkCurrent()
+            checkExecutionSource(source)
+        }
+        return object : TransferBackend {
+            private fun <T> access(relative: String, block: (SFTPClient, String) -> T): T =
+                withTransferSftp(source, ::checkSource) { channel ->
+                    if (resolveRemotePath(channel, remote, false) != entry) throw IOException("Transfer remote path changed")
+                    val child = transferRemoteChild(channel, entry, relative)
+                    block(channel, child)
+                }
+
+            override fun stat(relative: String): TransferStat? = access(relative) { channel, child ->
+                lstatOrNull(channel, child)?.let(::transferStat)
+            }
+            override fun list(relative: String): List<String> = access(relative) { channel, child ->
+                transferList(channel, child)
+            }
+            override fun openRead(relative: String): InputStream {
+                val child = access(relative) { channel, child ->
+                    if (lstatOrNull(channel, child)?.type != FileMode.Type.REGULAR) throw IOException("Regular transfer file required")
+                    child
+                }
+                return identityCheckedRead(openRead(child, execution.fileCacheIdentity), ::checkSource)
+            }
+            override fun readLink(relative: String): String = access(relative) { channel, child -> channel.readlink(child) }
+            override fun isExecutable(relative: String): Boolean = access(relative) { channel, child ->
+                val attrs = lstatOrNull(channel, child)
+                if (attrs?.type != FileMode.Type.REGULAR) throw IOException("Regular transfer file required")
+                attrs.permissions.any { it == FilePermission.USR_X || it == FilePermission.GRP_X || it == FilePermission.OTH_X }
+            }
+            override fun deleteEntry(relative: String) = access(relative) { channel, child ->
+                val attrs = lstatOrNull(channel, child) ?: throw IOException("Transfer source disappeared before removal")
+                if (attrs.type == FileMode.Type.DIRECTORY) channel.rmdir(child) else channel.rm(child)
+            }
+            override fun createStage(kind: TransferKind): TransferStage = access("") { channel, target ->
+                val parent = target.substringBeforeLast('/', "").ifEmpty { "/" }
+                if (lstatOrNull(channel, parent)?.type != FileMode.Type.DIRECTORY) throw IOException("Transfer target parent required")
+                val owned = parent.trimEnd('/') + "/.aicode-transfer-" + java.util.UUID.randomUUID()
+                channel.mkdir(owned)
+                val stage = RemoteTransferStage(source, execution, owned, target, ::checkSource) {
+                    if (resolveRemotePath(it, remote, false) != entry) throw IOException("Transfer remote target changed")
+                }
+                try {
+                    stage.initialize(kind)
+                    stage
+                } catch (failure: Throwable) {
+                    runCatching { stage.close() }.exceptionOrNull()?.let(failure::addSuppressed)
+                    runCatching { channel.rmdir(owned) }.exceptionOrNull()?.let(failure::addSuppressed)
+                    throw failure
+                }
+            }
+        }
+    }
+
+    private fun <T> withTransferSftp(source: ExecutionSource, check: () -> Unit, block: (SFTPClient) -> T): T =
+        runBlocking(WorkspaceExecutionContext.blockingContext() + Dispatchers.IO) {
+            currentCoroutineContext().ensureActive()
+            check()
+            checkExecutionSource(source)
+            rootReadChannel(source).use { owned ->
+                check()
+                block(owned.channel)
+            }
+        }
+
+    private fun transferStat(attrs: FileAttributes): TransferStat {
+        val kind = when (attrs.type) {
+            FileMode.Type.REGULAR -> TransferKind.FILE
+            FileMode.Type.DIRECTORY -> TransferKind.DIRECTORY
+            FileMode.Type.SYMLINK -> TransferKind.LINK
+            else -> throw IOException("Unsupported remote transfer entry type")
+        }
+        val size = if (kind == TransferKind.FILE) attrs.size else null
+        if (size != null && size < 0) throw IOException("Invalid remote transfer size")
+        return TransferStat(kind, size, attrs.mtime.toString())
+    }
+
+    private fun transferList(channel: SFTPClient, path: String): List<String> {
+        if (lstatOrNull(channel, path)?.type != FileMode.Type.DIRECTORY) throw IOException("Transfer directory required")
+        var count = 0
+        val entries = channel.ls(path) { entry ->
+            if (entry.name == "." || entry.name == "..") false else {
+                if (++count > TRANSFER_MAX_ENTRIES) throw IOException("Transfer directory exceeds the entry limit")
+                true
+            }
+        }
+        return checkedTransferNames(entries.map { it.name })
+    }
+
+    private fun transferRemoteChild(channel: SFTPClient, root: String, relative: String): String {
+        transferRelative(relative)
+        var path = root
+        if (relative.isNotEmpty()) {
+            for (part in relative.split('/')) {
+                if (lstatOrNull(channel, path)?.type != FileMode.Type.DIRECTORY) throw IOException("Unsafe transfer parent")
+                path = path.trimEnd('/') + "/" + part
+            }
+        }
+        return path
+    }
+
+    private inner class RemoteTransferStage(
+        private val source: ExecutionSource,
+        private val execution: WorkspaceExecutionContext,
+        private val owned: String,
+        private val target: String,
+        private val check: () -> Unit,
+        private val checkTarget: (SFTPClient) -> Unit,
+    ) : TransferStage {
+        private val marker = "$owned/.owner"
+        private val token = java.util.UUID.randomUUID().toString().toByteArray(Charsets.US_ASCII)
+        private val payload = "$owned/payload"
+        private val previous = "$owned/previous"
+        private var preservePrevious = false
+        override var committed: Boolean = false
+            private set
+
+        fun initialize(kind: TransferKind) {
+            withTransferSftp(source, check) { channel ->
+                channel.open(marker, EnumSet.of(OpenMode.WRITE, OpenMode.CREAT, OpenMode.EXCL)).use {
+                    it.write(0, token, 0, token.size)
+                }
+                if (kind == TransferKind.DIRECTORY) channel.mkdir(payload)
+            }
+        }
+
+        private fun owns(channel: SFTPClient): Boolean {
+            if (lstatOrNull(channel, owned)?.type != FileMode.Type.DIRECTORY ||
+                lstatOrNull(channel, marker)?.let { it.type != FileMode.Type.REGULAR || it.size != token.size.toLong() } != false
+            ) return false
+            val found = ByteArray(token.size)
+            channel.open(marker).use { file ->
+                var offset = 0
+                while (offset < found.size) {
+                    val count = file.read(offset.toLong(), found, offset, found.size - offset)
+                    if (count <= 0) return false
+                    offset += count
+                }
+            }
+            return token.contentEquals(found)
+        }
+
+        private fun <T> access(relative: String, block: (SFTPClient, String) -> T): T =
+            withTransferSftp(source, check) { channel ->
+                if (!owns(channel)) throw IOException("Remote transfer staging ownership changed")
+                checkTarget(channel)
+                val child = transferRemoteChild(channel, payload, relative)
+                block(channel, child)
+            }
+
+        override fun stat(relative: String): TransferStat? = access(relative) { channel, child -> lstatOrNull(channel, child)?.let(::transferStat) }
+        override fun list(relative: String): List<String> = access(relative) { channel, child -> transferList(channel, child) }
+        override fun readLink(relative: String): String = access(relative) { channel, child -> channel.readlink(child) }
+        override fun isExecutable(relative: String): Boolean = access(relative) { channel, child ->
+            val attrs = lstatOrNull(channel, child)
+            if (attrs?.type != FileMode.Type.REGULAR) throw IOException("Regular staging file required")
+            attrs.permissions.any { it == FilePermission.USR_X || it == FilePermission.GRP_X || it == FilePermission.OTH_X }
+        }
+        override fun openRead(relative: String): InputStream {
+            val child = access(relative) { channel, child ->
+                if (lstatOrNull(channel, child)?.type != FileMode.Type.REGULAR) throw IOException("Regular transfer file required")
+                child
+            }
+            return identityCheckedRead(openRead(child, execution.fileCacheIdentity), check)
+        }
+        override fun mkdir(relative: String) = access(relative) { channel, child -> channel.mkdir(child) }
+        override fun writeLink(relative: String, target: String) = access(relative) { channel, child ->
+            if (target.length > TRANSFER_MAX_LINK_CHARS || '\u0000' in target) throw IOException("Invalid symbolic link")
+            channel.symlink(child, target)
+        }
+        override fun writeFile(relative: String, writer: (OutputStream) -> Unit) = access(relative) { channel, child ->
+            channel.open(child, EnumSet.of(OpenMode.WRITE, OpenMode.CREAT, OpenMode.EXCL)).use { file ->
+                var offset = 0L
+                val output = object : OutputStream() {
+                    override fun write(value: Int) { write(byteArrayOf(value.toByte()), 0, 1) }
+                    override fun write(buffer: ByteArray, start: Int, length: Int) {
+                        if (start < 0 || length < 0 || start > buffer.size - length) throw IndexOutOfBoundsException()
+                        var at = start
+                        while (at < start + length) {
+                            check()
+                            val count = minOf(TRANSFER_BUFFER_BYTES, start + length - at)
+                            file.write(offset, buffer, at, count)
+                            offset += count
+                            at += count
+                        }
+                    }
+                }
+                writer(output)
+                check()
+                if (file.length() != offset) throw IOException("Remote staging write length mismatch")
+            }
+        }
+        override fun setExecutable(relative: String, executable: Boolean) = access(relative) { channel, child ->
+            if (lstatOrNull(channel, child)?.type != FileMode.Type.REGULAR) throw IOException("Regular staging file required")
+            channel.chmod(child, if (executable) 448 else 384)
+            check()
+        }
+        override fun commit(overwrite: Boolean, checkBeforeCommit: () -> Unit) = access("") { channel, _ ->
+            checkBeforeCommit()
+            check()
+            checkTarget(channel)
+            if (!owns(channel)) throw IOException("Remote transfer staging ownership changed")
+            if (overwrite && lstatOrNull(channel, target)?.type == FileMode.Type.DIRECTORY) {
+                channel.rename(target, previous)
+                try {
+                    check()
+                    checkTarget(channel)
+                    if (!owns(channel) || lstatOrNull(channel, target) != null) throw IOException("Remote replacement target changed")
+                    channel.rename(payload, target)
+                } catch (failure: Throwable) {
+                    try {
+                        if (!owns(channel) || lstatOrNull(channel, target) != null) throw IOException("Remote replaced directory cannot be restored safely")
+                        channel.rename(previous, target)
+                    } catch (restore: Throwable) {
+                        preservePrevious = true
+                        failure.addSuppressed(restore)
+                    }
+                    throw failure
+                }
+            } else if (overwrite) {
+                channel.rename(payload, target, EnumSet.of(RenameFlags.OVERWRITE, RenameFlags.ATOMIC))
+            } else {
+                if (lstatOrNull(channel, target) != null) throw IOException("Transfer target appeared before commit")
+                channel.rename(payload, target)
+            }
+            committed = true
+        }
+        override fun close() {
+            // Only owned staging cleanup is cancellation-independent; captured source identity is still mandatory.
+            runBlocking(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
+                execution.checkCurrent()
+                checkExecutionSource(source)
+                connection.openReadChannel(source.identity).use { channel ->
+                    if (!owns(channel) || preservePrevious) return@use
+                    fun remove(path: String, depth: Int) {
+                        if (depth > TRANSFER_MAX_DEPTH + 1) throw IOException("Staging cleanup depth exceeded")
+                        execution.checkCurrent()
+                        checkExecutionSource(source)
+                        if (!owns(channel)) throw IOException("Remote staging ownership changed")
+                        val attrs = lstatOrNull(channel, path) ?: return
+                        if (attrs.type == FileMode.Type.DIRECTORY) {
+                            for (name in transferList(channel, path)) remove(path.trimEnd('/') + "/" + name, depth + 1)
+                            channel.rmdir(path)
+                        } else channel.rm(path)
+                    }
+                    remove(payload, 0)
+                    remove(previous, 0)
+                    channel.rm(marker)
+                    channel.rmdir(owned)
+                }
+            }
+        }
     }
 
     override fun readFile(path: String): String = String(readAll(toRemotePath(path)), Charsets.UTF_8)
@@ -312,6 +586,14 @@ class RemoteSftpFileAccess @Inject constructor(
         connection.checkIdentity(identity)
         return cacheIdentity(identity, root)
     }
+
+    override fun agentConfigSourceIdentity(): String =
+        agentConfigCache.sourceIdentity(executionSource() ?: captureExecutionSource())
+
+    override fun agentConfigSnapshot(root: String, kind: AgentConfigKind, forceRefresh: Boolean): AgentConfigSnapshot? =
+        agentConfigCache.directory(executionSource() ?: captureExecutionSource(), root, kind, forceRefresh)
+
+    override fun invalidateAgentConfig(path: String) = agentConfigCache.invalidation(toRemotePath(path)).invoke()
 
     override fun openRead(path: String): InputStream = openRead(path, cacheIdentity())
 
@@ -488,12 +770,13 @@ class RemoteSftpFileAccess @Inject constructor(
         return canonicalPath.toString()
     }
 
-    private fun openRead(path: String, expectedCacheIdentity: String, playbackRoot: String?): InputStream = runBlocking(WorkspaceExecutionContext.blockingContext() + Dispatchers.IO) {
+    private fun openRead(path: String, expectedCacheIdentity: String, playbackRoot: String?, maxBytes: Long? = null): InputStream = runBlocking(WorkspaceExecutionContext.blockingContext() + Dispatchers.IO) {
         val execution = WorkspaceExecutionContext.current()
         val source = executionSource()
         val identity = source?.identity ?: connection.captureIdentity()
         val root = source?.workspaceRoot ?: currentWorkspaceRoot()
         fun checkSource() {
+            if (maxBytes != null) WorkspaceExecutionContext.blockingContext()[Job]?.ensureActive()
             execution?.checkCurrent()
             connection.checkIdentity(identity)
             if (cacheIdentity(identity, root) != expectedCacheIdentity || currentWorkspaceRoot() != root) {
@@ -503,6 +786,11 @@ class RemoteSftpFileAccess @Inject constructor(
         checkSource()
         val remote = remotePathFor(path, root, identity.home)
         val channel = connection.openReadChannel(identity)
+        val channelClosed = AtomicBoolean()
+        fun closeChannel() {
+            if (channelClosed.compareAndSet(false, true)) channel.close()
+        }
+        val cancellation = if (maxBytes != null) execution?.onCancellation { closeChannel() } else null
         val file = try {
             checkSource()
             val readable = if (playbackRoot == null) remote else
@@ -511,13 +799,15 @@ class RemoteSftpFileAccess @Inject constructor(
             if (attrs.type == FileMode.Type.DIRECTORY) throw IOException("Is a directory: $remote")
             if (playbackRoot != null && attrs.type != FileMode.Type.REGULAR) throw IOException("Regular media file required")
             checkSource()
+            if (maxBytes != null && attrs.size > maxBytes) throw FileReadTooLargeException(maxBytes)
             channel.open(readable)
         } catch (failure: Throwable) {
             val reported = try { checkSource(); failure } catch (changed: CancellationException) {
                 if (changed !== failure) changed.addSuppressed(failure)
                 changed
             }
-            runCatching { channel.close() }.exceptionOrNull()?.let(reported::addSuppressed)
+            cancellation?.dispose()
+            runCatching { closeChannel() }.exceptionOrNull()?.let(reported::addSuppressed)
             throw reported
         }
         val stream = object : InputStream() {
@@ -532,7 +822,8 @@ class RemoteSftpFileAccess @Inject constructor(
             override fun close() {
                 if (!closed.compareAndSet(false, true)) return
                 // Closing the private channel wakes an in-flight read before releasing its handle.
-                try { channel.close() } finally { runCatching { input.close() } }
+                cancellation?.dispose()
+                try { closeChannel() } finally { runCatching { input.close() } }
             }
         }
         val checked = identityCheckedRead(stream, ::checkSource)
@@ -541,11 +832,56 @@ class RemoteSftpFileAccess @Inject constructor(
 
     override fun readBytes(path: String): ByteArray = readAll(toRemotePath(path))
 
+    override fun readBytes(path: String, maxBytes: Long): ByteArray {
+        require(maxBytes in 0..Int.MAX_VALUE.toLong())
+        return openRead(path, cacheIdentity(), playbackRoot = null, maxBytes = maxBytes).use {
+            it.readBytesBounded(maxBytes)
+        }
+    }
+
+    override fun resolvePath(path: String, followFinalLink: Boolean): String =
+        withSftp { resolveRemotePath(it, toRemotePath(path), followFinalLink) }
+
+    private fun resolveRemotePath(sftp: SFTPClient, path: String, followFinalLink: Boolean): String {
+        val pending = ArrayDeque(path.split('/').filter { it.isNotEmpty() })
+        var current = "/"
+        var links = 0
+        while (pending.isNotEmpty()) {
+            val part = pending.removeFirst()
+            when (part) {
+                "." -> continue
+                ".." -> {
+                    current = current.substringBeforeLast('/', "").ifEmpty { "/" }
+                    continue
+                }
+            }
+            val candidate = current.trimEnd('/') + "/" + part
+            val attributes = lstatOrNull(sftp, candidate)
+            if ((followFinalLink || pending.isNotEmpty()) && attributes?.type == FileMode.Type.SYMLINK) {
+                if (++links > 40) throw FileSystemLoopException(path)
+                val target = sftp.readlink(candidate)
+                if (target.startsWith('/')) current = "/"
+                target.split('/').filter { it.isNotEmpty() }.asReversed().forEach(pending::addFirst)
+            } else {
+                current = candidate
+            }
+        }
+        return current
+    }
+
+    private fun lstatOrNull(sftp: SFTPClient, path: String): FileAttributes? = try {
+        sftp.lstat(path)
+    } catch (failure: SFTPException) {
+        if (failure.statusCode != StatusCode.NO_SUCH_FILE && failure.statusCode != StatusCode.NO_SUCH_PATH) throw failure
+        null
+    }
+
     override fun writeBytes(path: String, bytes: ByteArray, overwrite: Boolean) {
         val remote = toRemotePath(path)
         // 与 writeStream 同构：先写 .aicode-part 再改名，避免原地 TRUNC 让并发读者看到半截内容，
         // 也避免中途断开时在目标位置留下半个文件。
         val tmp = tmpPathFor(remote)
+        val invalidate = agentConfigCache.invalidation(remote)
         withSftp { sftp ->
             if (sftp.statExistence(remote) != null && !overwrite) throw FileAlreadyExistsException(File(remote))
             ensureParent(sftp, remote)
@@ -554,6 +890,7 @@ class RemoteSftpFileAccess @Inject constructor(
                     writeAll(rf, bytes)
                 }
                 replaceVia(sftp, tmp, remote)
+                invalidate()
             } catch (e: Exception) {
                 runCatching { sftp.rm(tmp) }
                 throw e
@@ -581,6 +918,7 @@ class RemoteSftpFileAccess @Inject constructor(
         val remote = toRemotePath(path)
         // 先落到 .aicode-part 再改名：传输中途断开时不会在目标位置留下半截文件
         val tmp = tmpPathFor(remote)
+        val invalidate = agentConfigCache.invalidation(remote)
         return withSftp { sftp ->
             if (sftp.statExistence(remote) != null && !overwrite) throw FileAlreadyExistsException(File(remote))
             ensureParent(sftp, remote)
@@ -603,6 +941,7 @@ class RemoteSftpFileAccess @Inject constructor(
             }
             // 目标已存在时先尝试直接覆盖改名，失败再删目标改名（见 replaceVia）。
             replaceVia(sftp, tmp, remote)
+            invalidate()
             written
         }
     }
@@ -627,63 +966,99 @@ class RemoteSftpFileAccess @Inject constructor(
 
     override fun delete(path: String) {
         val remote = toRemotePath(path)
+        val invalidate = agentConfigCache.invalidation(remote)
         // 接口约定 delete 只删文件或空目录：目录非空时 rmdir 失败 → 抛异常（与本地 File.delete() 对齐）。
         withSftp { sftp ->
-            val attrs = sftp.statExistence(remote) ?: return@withSftp
-            if (attrs.type == FileMode.Type.DIRECTORY) sftp.rmdir(remote) else sftp.rm(remote)
+            val entry = resolveRemotePath(sftp, remote, followFinalLink = false)
+            val attrs = lstatOrNull(sftp, entry) ?: return@withSftp
+            if (attrs.type == FileMode.Type.DIRECTORY) sftp.rmdir(entry) else sftp.rm(entry)
+            invalidate()
         }
     }
 
     override fun deleteRecursively(path: String) {
         val remote = toRemotePath(path)
-        withSftp { sftp -> deleteRecursive(sftp, remote) }
+        val invalidate = agentConfigCache.invalidation(remote)
+        withSftp { sftp ->
+            val entry = resolveRemotePath(sftp, remote, followFinalLink = false)
+            if (lstatOrNull(sftp, entry) == null) return@withSftp
+            try { deleteRecursive(sftp, entry) } finally { invalidate() }
+        }
     }
 
     override fun rename(path: String, newPath: String) {
         val from = toRemotePath(path)
         val to = toRemotePath(newPath)
+        val invalidateFrom = agentConfigCache.invalidation(from)
+        val invalidateTo = agentConfigCache.invalidation(to)
         withSftp { sftp ->
-            if (sftp.statExistence(from) == null) throw NoSuchFileException(File(from))
-            if (sftp.statExistence(to) != null) throw FileAlreadyExistsException(File(to))
-            sftp.rename(from, to)
+            val source = resolveRemotePath(sftp, from, followFinalLink = false)
+            val target = resolveRemotePath(sftp, to, followFinalLink = false)
+            if (lstatOrNull(sftp, source) == null) throw NoSuchFileException(File(from))
+            if (lstatOrNull(sftp, target) != null) throw FileAlreadyExistsException(File(to))
+            sftp.rename(source, target)
+            invalidateFrom()
+            invalidateTo()
         }
     }
 
     override fun copy(path: String, newPath: String, overwrite: Boolean) {
-        val from = Paths.get(toRemotePath(path)).normalize().toString()
-        val to = Paths.get(toRemotePath(newPath)).normalize().toString()
+        val from = toRemotePath(path)
+        val to = toRemotePath(newPath)
+        val invalidate = agentConfigCache.invalidation(to)
         withSftp { sftp ->
-            val source = sftp.statExistence(from) ?: throw NoSuchFileException(File(from))
-            if (to == from || (source.type == FileMode.Type.DIRECTORY && Paths.get(to).startsWith(Paths.get(from)))) {
-                throw IOException("destination is the source or its descendant: $newPath")
-            }
-            if (sftp.statExistence(to) != null) {
+            val sourceEntry = resolveRemotePath(sftp, from, followFinalLink = false)
+            val source = resolveRemotePath(sftp, from, followFinalLink = true)
+            val target = resolveRemotePath(sftp, to, followFinalLink = false)
+            val targetIdentity = resolveRemotePath(sftp, to, followFinalLink = true)
+            if (lstatOrNull(sftp, source) == null) throw NoSuchFileException(File(from))
+            checkCopyMovePaths(listOf(sourceEntry, source), listOf(target, targetIdentity))
+            if (lstatOrNull(sftp, target) != null) {
                 if (!overwrite) throw FileAlreadyExistsException(File(to))
-                deleteRecursive(sftp, to)
+                try { deleteRecursive(sftp, target) } finally { invalidate() }
             }
-            copyRecursive(sftp, from, to)
+            try { copyRecursive(sftp, source, target) } finally { invalidate() }
         }
     }
 
     override fun move(path: String, newPath: String, overwrite: Boolean) {
-        val from = Paths.get(toRemotePath(path)).normalize().toString()
-        val to = Paths.get(toRemotePath(newPath)).normalize().toString()
+        val from = toRemotePath(path)
+        val to = toRemotePath(newPath)
+        val invalidateFrom = agentConfigCache.invalidation(from)
+        val invalidateTo = agentConfigCache.invalidation(to)
         withSftp { sftp ->
-            val source = sftp.statExistence(from) ?: throw NoSuchFileException(File(from))
-            if (to == from || (source.type == FileMode.Type.DIRECTORY && Paths.get(to).startsWith(Paths.get(from)))) {
-                throw IOException("destination is the source or its descendant: $newPath")
-            }
-            if (sftp.statExistence(to) != null) {
+            val source = resolveRemotePath(sftp, from, followFinalLink = false)
+            val sourceIdentity = resolveRemotePath(sftp, from, followFinalLink = true)
+            val target = resolveRemotePath(sftp, to, followFinalLink = false)
+            val targetIdentity = resolveRemotePath(sftp, to, followFinalLink = true)
+            if (lstatOrNull(sftp, source) == null) throw NoSuchFileException(File(from))
+            checkCopyMovePaths(listOf(source, sourceIdentity), listOf(target, targetIdentity))
+            if (lstatOrNull(sftp, target) != null) {
                 if (!overwrite) throw FileAlreadyExistsException(File(to))
-                deleteRecursive(sftp, to)
+                try { deleteRecursive(sftp, target) } finally { invalidateTo() }
             }
-            sftp.rename(from, to)
+            sftp.rename(source, target)
+            invalidateFrom()
+            invalidateTo()
+        }
+    }
+
+    private fun checkCopyMovePaths(sources: List<String>, targets: List<String>) {
+        if (sources.any { source -> targets.any { target ->
+                Paths.get(source).startsWith(Paths.get(target)) || Paths.get(target).startsWith(Paths.get(source))
+            } }) {
+            throw FilePathOverlapException("Source and destination overlap")
         }
     }
 
     override fun mkdirs(path: String) {
         val remote = toRemotePath(path)
-        withSftp { it.mkdirs(remote) }
+        val invalidate = agentConfigCache.invalidation(remote)
+        withSftp {
+            val existed = it.statExistence(remote) != null
+            it.mkdirs(remote)
+            if (!existed) invalidate()
+        }
     }
 
     override fun parentPath(path: String): String? {
@@ -734,12 +1109,12 @@ class RemoteSftpFileAccess @Inject constructor(
 
     /** 递归删除（SFTP 无递归删除原语）：后序遍历，目录在子项删完后 rmdir。 */
     private fun deleteRecursive(sftp: SFTPClient, remote: String) {
-        val attrs = sftp.statExistence(remote) ?: return
+        val attrs = lstatOrNull(sftp, remote) ?: return
         if (attrs.type == FileMode.Type.DIRECTORY) {
             for (info in sftp.ls(remote)) {
                 val name = info.name
                 if (name == "." || name == "..") continue
-                deleteRecursive(sftp, info.path)
+                deleteRecursive(sftp, remote.trimEnd('/') + "/" + name)
             }
             sftp.rmdir(remote)
         } else {
@@ -749,13 +1124,15 @@ class RemoteSftpFileAccess @Inject constructor(
 
     /** 递归复制（SFTP 无服务端复制原语）：目录建好后逐项复制，文件流式读写。 */
     private fun copyRecursive(sftp: SFTPClient, from: String, to: String) {
-        val attrs = sftp.statExistence(from) ?: throw NoSuchFileException(File(from))
-        if (attrs.type == FileMode.Type.DIRECTORY) {
+        val attrs = lstatOrNull(sftp, from) ?: throw NoSuchFileException(File(from))
+        if (attrs.type == FileMode.Type.SYMLINK) {
+            sftp.symlink(to, sftp.readlink(from))
+        } else if (attrs.type == FileMode.Type.DIRECTORY) {
             sftp.mkdirs(to)
             for (info in sftp.ls(from)) {
                 val name = info.name
                 if (name == "." || name == "..") continue
-                copyRecursive(sftp, info.path, "$to/$name")
+                copyRecursive(sftp, from.trimEnd('/') + "/" + name, to.trimEnd('/') + "/" + name)
             }
         } else {
             sftp.open(from).use { src ->
@@ -798,7 +1175,8 @@ private class RemoteFileInputStream(private val file: RemoteFile) : InputStream(
 
     override fun read(): Int {
         val n = file.read(offset, single, 0, 1)
-        if (n <= 0) return -1
+        if (n < 0) return -1
+        if (n == 0) throw IOException("Remote file read made no progress")
         offset += 1
         return single[0].toInt() and 0xFF
     }
@@ -806,7 +1184,8 @@ private class RemoteFileInputStream(private val file: RemoteFile) : InputStream(
     override fun read(b: ByteArray, off: Int, len: Int): Int {
         if (len == 0) return 0
         val n = file.read(offset, b, off, len)
-        if (n <= 0) return -1
+        if (n < 0) return -1
+        if (n == 0) throw IOException("Remote file read made no progress")
         offset += n
         return n
     }

@@ -2,13 +2,18 @@ package com.aicode.testutil
 
 import com.aicode.feature.workspace.domain.FileAccessProvider
 import com.aicode.feature.workspace.domain.FileEntry
+import com.aicode.feature.workspace.domain.readBytesBounded
 import com.aicode.feature.workspace.domain.sha256Fingerprint
+import com.aicode.feature.workspace.domain.FileReadTooLargeException
 import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
 import java.nio.charset.Charset
-import java.nio.file.FileAlreadyExistsException
-import java.nio.file.NoSuchFileException
+import kotlin.io.FileAlreadyExistsException
+import kotlin.io.NoSuchFileException
+import java.nio.file.FileSystemLoopException
+import java.nio.file.Files
+import java.util.ArrayDeque
 
 /**
  * 测试用的 [FileAccessProvider]：把传入路径直接当本地文件系统路径处理。
@@ -75,6 +80,37 @@ class TestFileAccessProvider : FileAccessProvider {
     }
 
     override fun readBytes(path: String): ByteArray = File(path).readBytes()
+
+    override fun readBytes(path: String, maxBytes: Long): ByteArray {
+        require(maxBytes in 0..Int.MAX_VALUE.toLong())
+        val file = File(resolvePath(path))
+        if (file.length() > maxBytes) throw FileReadTooLargeException(maxBytes)
+        return file.inputStream().use { it.readBytesBounded(maxBytes) }
+    }
+
+    override fun resolvePath(path: String, followFinalLink: Boolean): String {
+        val absolute = File(path).toPath().toAbsolutePath()
+        val pending = ArrayDeque(absolute.map { it.toString() })
+        var current = absolute.root
+        var links = 0
+        while (pending.isNotEmpty()) {
+            val part = pending.removeFirst()
+            when (part) {
+                "." -> continue
+                ".." -> { current = current.parent ?: current.root; continue }
+            }
+            val candidate = current.resolve(part)
+            if ((followFinalLink || pending.isNotEmpty()) && Files.isSymbolicLink(candidate)) {
+                if (++links > 40) throw FileSystemLoopException(path)
+                val target = Files.readSymbolicLink(candidate)
+                if (target.isAbsolute) current = target.root
+                target.map { it.toString() }.asReversed().forEach(pending::addFirst)
+            } else {
+                current = candidate
+            }
+        }
+        return current.toString()
+    }
 
     override fun writeBytes(path: String, bytes: ByteArray, overwrite: Boolean) {
         val file = File(path)

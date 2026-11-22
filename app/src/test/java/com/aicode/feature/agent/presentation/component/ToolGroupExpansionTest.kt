@@ -362,4 +362,50 @@ class ToolGroupExpansionTest {
         assertTrue(rendered.header().turnProcess.any { it.key == "a1#reasoning" })
         assertFalse(rendered.first { it.key == "a1" }.reasoningVisible)
     }
+
+    @Test
+    fun halfTurnKeyIsInheritedOnlyOnceWhenTheTurnGainsItsUserMessage() {
+        // 补齐轮首时沿用半轮 key 是有意的：展开选择与滚动锚点靠它稳定。
+        // 但同一个 key 只能归一个轮，后续的轮必须退回自己的消息级 key。
+        val halfTurn = listOf(assistant("a1"), tool("t1"))
+        val previous = reconcileTurnKeys(halfTurn, emptyMap(), "s1")
+        assertEquals(setOf("turn:head:session:s1"), previous.values.toSet())
+
+        val full = listOf(user("u0")) + halfTurn
+        val keys = reconcileTurnKeys(full, previous, "s1")
+        assertEquals("turn:head:session:s1", keys.getValue("u0"))
+        assertEquals("turn:head:session:s1", keys.getValue("a1"))
+        assertEquals("turn:head:session:s1", keys.getValue("t1"))
+
+        val withNextTurn = full + listOf(user("u1"), assistant("a2"), tool("t2"))
+        val next = reconcileTurnKeys(withNextTurn, keys, "s1")
+        assertEquals("turn:head:session:s1", next.getValue("u0"))
+        assertEquals("turn:u1", next.getValue("u1"))
+    }
+
+    @Test
+    fun twoTurnsNeverShareTheSameHeaderKey() {
+        val previous = mapOf(
+            "a1" to "turn:head:session:s1", "t1" to "turn:head:session:s1",
+            "a2" to "turn:head:session:s1", "t2" to "turn:head:session:s1",
+        )
+        val messages = listOf(
+            user("u0"), assistant("a1"), tool("t1"),
+            user("u1"), assistant("a2"), tool("t2"),
+        )
+        val keys = reconcileTurnKeys(messages, previous, "s1")
+        val rendered = flattenChatProcesses(buildChatItems(messages, sessionId = "s1", turnKeys = keys))
+        val itemKeys = rendered.map { it.key }
+        assertEquals(itemKeys.size, itemKeys.toSet().size)
+        assertEquals("turn:head:session:s1", keys.getValue("u0"))
+        assertEquals("turn:u1", keys.getValue("u1"))
+    }
+
+    @Test
+    fun halfTurnKeyStillCarriesAcrossWindowsWithoutUserMessage() {
+        // 窗口两端都还没补齐轮首时，会话级 key 必须继续沿用：展开选择与滚动锚点靠它保持稳定。
+        val first = reconcileTurnKeys(listOf(assistant("a1"), tool("t1")), emptyMap(), "s1")
+        val next = reconcileTurnKeys(listOf(assistant("a2"), assistant("a1"), tool("t1")), first, "s1")
+        assertEquals(setOf("turn:head:session:s1"), next.values.toSet())
+    }
 }
