@@ -88,6 +88,8 @@ class ProjectProgressViewModelTest {
         viewModel.open("session"); settle()
         assertEquals(setOf(project.id, sibling.id), viewModel.state.value.projects.map { it.id }.toSet())
         assertNull(viewModel.state.value.selectedProjectId)
+        assertEquals(project, viewModel.state.value.currentWorkspaceProject)
+        assertTrue(viewModel.state.value.projectListReady)
         viewModel.selectProject(sibling); settle()
         assertFalse(viewModel.state.value.canBindSelected)
         viewModel.bindSelected(); settle()
@@ -109,13 +111,14 @@ class ProjectProgressViewModelTest {
         assertNull(viewModel.state.value.form)
     }
 
-    @Test fun registrationWithoutSessionOnlySetsWorkspaceDefaultAndKeepsExistingName() {
-        val existing = journal.registerProject(identity, "original")
+    @Test fun existingWorkspaceProjectCannotBeRegisteredAgainOrImplicitlyBound() {
+        journal.registerProject(identity, "original")
         viewModel.open(null); settle()
         viewModel.startRegister()
         viewModel.register("replacement"); settle()
+        assertNull(viewModel.state.value.form)
         assertEquals("original", journal.listProjects().single().name)
-        assertEquals(existing.id, journal.workspaceProject(identity)?.id)
+        assertNull(journal.workspaceProject(identity))
         verify(exactly = 0) { journal.bindSessionProject(any(), any(), any()) }
     }
 
@@ -191,9 +194,12 @@ class ProjectProgressViewModelTest {
         viewModel.open("session"); settle()
         viewModel.startRegister()
         viewModel.register("new-project"); settle()
-        assertEquals(1, journal.listProjects().size)
+        val registered = journal.listProjects().single()
         assertEquals(ProjectProgressError.REGISTERED_BINDING_FAILED, viewModel.state.value.error)
-        assertEquals(ProjectProgressForm.REGISTER, viewModel.state.value.form)
+        assertNull(viewModel.state.value.form)
+        assertEquals(registered.id, viewModel.state.value.selectedProjectId)
+        assertEquals(registered, viewModel.state.value.currentWorkspaceProject)
+        assertTrue(viewModel.state.value.projectListReady)
         assertFalse(viewModel.state.value.busy)
     }
 
@@ -211,7 +217,26 @@ class ProjectProgressViewModelTest {
         viewModel.open("session"); settle()
         assertEquals(ProjectProgressError.READ_FAILED, viewModel.state.value.error)
         assertFalse(viewModel.state.value.loading)
+        assertFalse(viewModel.state.value.projectListReady)
+        assertNull(viewModel.state.value.currentWorkspaceProject)
+        viewModel.startRegister()
+        viewModel.register("unverified-project")
+        settle()
+        assertNull(viewModel.state.value.form)
+        verify(exactly = 0) { journal.registerProject(any(), any(), any(), any()) }
         assertFalse(viewModel.state.value.toString().contains("private storage detail"))
+    }
+
+    @Test fun failedRefreshDoesNotOfferRegistrationBasedOnThePreviousProjectList() {
+        journal.registerProject(identity, "original")
+        viewModel.open("session"); settle()
+        assertEquals(1, viewModel.state.value.projects.size)
+        every { journal.listProjects(any()) } throws IOException("private storage detail")
+        viewModel.refresh(); settle()
+        assertEquals(1, viewModel.state.value.projects.size)
+        assertFalse(viewModel.state.value.projectListReady)
+        viewModel.startRegister()
+        assertNull(viewModel.state.value.form)
     }
 
     @Test fun revokeRequiresConfirmationAndUsesTheFullReadRevision() {

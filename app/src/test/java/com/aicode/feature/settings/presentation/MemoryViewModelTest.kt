@@ -225,11 +225,13 @@ class MemoryViewModelTest {
     }
 
     @Test fun detailUsesTheFreshVersionReturnedByTheExactScopeRead() {
-        val fresh = document.copy(entry = entry.copy(version = "version-2"))
+        val fresh = document.copy(entry = entry.copy(version = "version-2", modifiedAt = 1_795_442_400_000L))
         every { repository.readEntry(any(), any()) } returns MemoryManagementResult.Success(fresh)
         viewModel.open(); settle()
         viewModel.openDetail(entry); settle()
         assertEquals("version-2", viewModel.state.value.selectedEntry?.version)
+        assertEquals(fresh.entry.modifiedAt, viewModel.state.value.selectedEntry?.modifiedAt)
+        assertEquals(fresh.entry.modifiedAt, viewModel.state.value.document?.entry?.modifiedAt)
         viewModel.requestDelete(viewModel.state.value.document!!.entry)
         viewModel.confirmDelete(); settle()
         verify(exactly = 1) { repository.deleteEntry(any(), fresh.entry) }

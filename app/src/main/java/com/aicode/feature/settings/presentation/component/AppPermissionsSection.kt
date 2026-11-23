@@ -32,11 +32,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.semantics
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.LifecycleResumeEffect
 import com.aicode.R
 import com.aicode.core.theme.Spacing
 import com.aicode.feature.agent.domain.shizuku.ShizukuState
+import com.aicode.feature.settings.domain.model.MobileBuildSettings
 import compose.icons.FeatherIcons
 import compose.icons.feathericons.Activity
 import compose.icons.feathericons.Bell
@@ -66,7 +68,14 @@ internal fun AppPermissionsSection(
     rootEnabled: Boolean = false,
     rootChanging: Boolean = false,
     rootError: String? = null,
-    onSetRootEnabled: (Boolean) -> Unit = {}
+    onSetRootEnabled: (Boolean) -> Unit = {},
+    mobileBuildSettings: MobileBuildSettings = MobileBuildSettings(),
+    mobileBuildSaving: Boolean = false,
+    @StringRes mobileBuildError: Int? = null,
+    mobileBuildOptionsSavedVersion: Long = 0L,
+    onSetMobileBuildEnabled: (Boolean) -> Unit = {},
+    onSaveMobileBuildOptions: (MobileBuildSettings) -> Unit = {},
+    onClearMobileBuildError: () -> Unit = {}
 ) {
     val context = LocalContext.current
 
@@ -192,6 +201,7 @@ internal fun AppPermissionsSection(
                 icon = FeatherIcons.Terminal,
                 title = stringResource(R.string.settings_root_access),
                 subtitle = rootError ?: stringResource(R.string.settings_root_access_hint),
+                modifier = Modifier.semantics(mergeDescendants = true) {},
                 trailing = {
                     AppSwitch(
                         checked = rootEnabled,
@@ -201,6 +211,15 @@ internal fun AppPermissionsSection(
                 }
             )
         }
+        MobileBuildSettingsGroup(
+            settings = mobileBuildSettings,
+            saving = mobileBuildSaving,
+            error = mobileBuildError,
+            optionsSavedVersion = mobileBuildOptionsSavedVersion,
+            onSetEnabled = onSetMobileBuildEnabled,
+            onSaveOptions = onSaveMobileBuildOptions,
+            onClearError = onClearMobileBuildError
+        )
     }
 
     if (showStorageDeniedDialog) {

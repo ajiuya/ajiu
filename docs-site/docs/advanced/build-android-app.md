@@ -184,12 +184,59 @@ unzip gradle.zip -d /workspace/tools
 
 ## 5. 编译
 
+### 设置中启用手机构建
+
+在「设置 → 软件权限 → 手机构建」开启开关后，使用项目原有的 `./gradlew` 或 `gradle` 命令即可默认读取手机档，不需要每个项目都添加脚本。可在「构建参数」面板选择 Gradle 堆 2 GB / 2.5 GB / 3 GB，并调整常驻进程、并行、worker 和单元测试堆；保存后下一次本地构建生效。
+
+关闭开关会恢复项目与原有用户级默认配置，保留参数选择，不影响 SSH 或 CI；用户主动指定其他 Gradle 用户目录或命令行覆盖时仍以显式配置为准。堆上限不是总内存上限，常驻也不保证进程不被 PRoot 或系统清理。完整范围见 [手机构建](/guide/app-permissions#手机构建)。
+
+### 本仓库：使用手机低内存档
+
+在本仓库根目录（以下假设为 `/workspace`）运行：
+
 ```bash
 cd /workspace
 JAVA_HOME=/usr/lib/jvm/java-17-openjdk-arm64 \
 ANDROID_HOME=/root/android/sdk \
-./gradlew assembleDebug
+./scripts/gradle-mobile.sh :app:assembleUniversalDebug
 ```
+
+以下脚本固定手机档只影响本次命令，不修改项目或全局 `gradle.properties`；脚本自身不会改变普通 `./gradlew` 和 CI 的默认配置。若已启用设置中的手机构建，脚本显式指定的选项会覆盖对应面板选择；希望使用面板参数时，改用普通 `./gradlew`：
+
+| 项目 | 手机档默认值 |
+| --- | --- |
+| Gradle 最大堆 | `3g` |
+| Gradle 最大元空间 | `512m` |
+| Gradle worker | `1` |
+| 并行、常驻 daemon、配置缓存 | `--no-parallel --no-daemon --no-configuration-cache` |
+| Kotlin 编译 | 保持 `in-process`，不另开 Kotlin 编译 daemon |
+| 本仓库 app JVM 单测 | 每个测试进程最大堆 `1g`，最多同时运行 `1` 个测试进程 |
+
+例如，只运行通用 debug 变体的单元测试：
+
+```bash
+./scripts/gradle-mobile.sh :app:testUniversalDebugUnitTest
+```
+
+脚本以 `-PmobileBuild=true` 启用 app 单测的手机档；未传该属性或其值不是 `true` 时，不设置这些测试限制。脚本不指定应用版本，版本仍由 tag / 提交推导，或由调用方显式传入 `-PappVersionName` 与 `-PappVersionCode`。
+
+如果设备资源允许，可仅为一次命令调整 Gradle 或测试堆大小：
+
+```bash
+MOBILE_GRADLE_HEAP=2560m MOBILE_TEST_HEAP=768m \
+./scripts/gradle-mobile.sh :app:testUniversalDebugUnitTest \
+  --tests 'com.aicode.feature.agent.domain.provider.GeminiAdapterTest'
+```
+
+两个变量均只接受**无空格、无前导零的正整数加 `m` 或 `g`**（单位不区分大小写），例如 `3072m`、`3g`；空值、`0g`、小数、裸数字或附带 JVM 参数都会被拒绝。只想调整其中一个时可省略另一个。脚本会原样转发任务及参数，包括引号包住的含空格参数；内存只能通过上述环境变量调整，不能另传 JVM / worker / 手机档属性覆盖。与手机档冲突的 daemon、并行、配置缓存参数，以及停止 daemon、重定向项目或受保护选项的缩写也会被明确拒绝。
+
+::: warning 内存与进程边界
+`--no-daemon` 不代表绝不创建新的 JVM：Gradle 为匹配 JVM 参数仍可能启动本次构建专用、结束后退出的 single-use daemon。脚本不会停止、重配或清理已经运行的其他 Gradle daemon。旧 daemon、其他构建、测试 JVM、原生工具与系统自身仍会占用内存；`3g` / `1g` 只是各自的堆上限，不是总内存上限，也不能保证 Android 不回收构建进程。避免同时启动多次构建，按设备余量选择堆大小；出现 Java 堆不足时再评估是否上调。
+:::
+
+其他 Android 项目没有本仓库的手机脚本时，使用各自的 wrapper 和任务；不要直接假定支持 `mobileBuild` 或上述脚本。
+
+### 依赖下载与输出
 
 依赖下载慢时，可以在 `settings.gradle.kts` 的 `dependencyResolutionManagement.repositories` 里改用阿里云镜像（AGP 默认从 `google()` / `mavenCentral()` 拉依赖）：
 
@@ -199,7 +246,7 @@ maven { url = uri("https://maven.aliyun.com/repository/central") }
 maven { url = uri("https://maven.aliyun.com/repository/gradle-plugin") }
 ```
 
-首次构建大约 10 到 15 分钟（下载依赖加 Kotlin 编译），之后增量构建 1 到 2 分钟。Gradle daemon 在 PRoot 下可以正常工作，能加速增量构建；如果遇到 daemon 异常退出导致锁文件冲突，单次加 `--no-daemon` 即可。
+首次构建需要下载依赖并编译 Kotlin，耗时受网络、设备内存与任务范围影响；手机档的单 worker 和关闭配置缓存也可能增加耗时。这个档位用于降低并发内存压力，不会修复依赖下载的 HTTP 502、网络中断或工具链安装问题，这些问题仍需分别排查。
 
 成功后 APK 的输出路径取决于项目配置，通常是：
 
@@ -216,7 +263,7 @@ app/build/outputs/apk/<flavor>/debug/app-<flavor>-debug.apk
 | `aapt2 syntax error` | 用了 x86 版 aapt2 | 确认 `~/.gradle/gradle.properties` 里的 `aapt2FromMavenOverride` 指向 ARM 版 |
 | `Failed to install build-tools` | AGP 联网验证失败 | 确认本地已装项目所需的 build-tools 版本 |
 | apt 下载 403 | 镜像源临时不可用 | 换镜像源（清华 → 中科大） |
-| Gradle 锁文件冲突 | 上次构建未正常退出 | 删除 `~/.gradle/caches/*.lock`，或加 `--no-daemon` |
+| Gradle 锁文件冲突 | 其他构建仍占用目录，或上次构建异常退出 | 先检查占用进程；不要删除活跃构建的锁文件。手机脚本不会停止已有 daemon，`--no-daemon` 也不保证消除锁冲突 |
 
 ## 补充：内置 Alpine 容器的修复
 

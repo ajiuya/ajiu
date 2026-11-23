@@ -26,11 +26,14 @@ import androidx.compose.ui.platform.ViewCompositionStrategy
 import androidx.compose.ui.platform.ViewRootForTest
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.SemanticsActions
+import androidx.compose.ui.semantics.SemanticsNode
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.semantics.getAllSemanticsNodes
 import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.TextLayoutResult
+import androidx.compose.ui.text.style.TextOverflow
 import com.aicode.R
 import com.aicode.core.theme.AIEditorTheme
 import com.aicode.core.ui.AdaptiveModalBottomSheet
@@ -40,6 +43,9 @@ import com.aicode.feature.agent.domain.memory.MemoryManagementError
 import com.aicode.feature.agent.domain.memory.MemoryScope
 import com.aicode.feature.settings.presentation.MemoryUiState
 import java.time.Duration
+import java.time.Instant
+import java.util.Locale
+import java.util.TimeZone
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
@@ -125,6 +131,222 @@ class MemorySectionTest {
                 assertTrue(requireNotNull(openAction(rows.single())).invoke())
                 assertEquals(expected, opened)
             }
+        }
+    }
+
+    @Test fun listRowsPlaceRecentBeforeOlderBeforeUnknownByActualVerticalPosition() {
+        val recent = timedEntry(MemoryScope.GLOBAL, "z-recent.md", "z-recent", 3_000L)
+        val older = timedEntry(MemoryScope.GLOBAL, "m-older.md", "m-older", 1_000L)
+        val unknown = timedEntry(MemoryScope.GLOBAL, "a-unknown.md", "a-unknown", null)
+        render({
+            MemorySection(MemoryUiState(entries = listOf(unknown, older, recent), hasWorkspace = true, loading = false),
+                {}, {}, scope = MemoryScope.GLOBAL, query = "", onScopeChange = {}, onQueryChange = {})
+        }) { root, _, _ ->
+            assertRowOrder(root, listOf(recent, older, unknown))
+            listOf(recent, older, unknown).forEach { item ->
+                val preview = taggedNode(root, "memory-preview-${item.id}")
+                val updated = taggedNode(root, "memory-updated-${item.id}")
+                assertNotEquals(preview.id, updated.id)
+                assertTrue("The update time must have its own line below the preview",
+                    preview.boundsInRoot.bottom <= updated.boundsInRoot.top)
+            }
+        }
+    }
+
+    @Config(qualifiers = "tr-rTR")
+    @Test fun listEqualTimeRowsUseRootCaseFoldedNameThenFileNameRegardlessOfInputOrder() {
+        val previousLocale = Locale.getDefault()
+        try {
+            Locale.setDefault(Locale.forLanguageTag("tr-TR"))
+            val firstByFile = timedEntry(MemoryScope.PROJECT, "B-file.md", "iota", 2_000L)
+            val nextByFile = timedEntry(MemoryScope.PROJECT, "a-file.md", "IOta", 2_000L)
+            val lastByName = timedEntry(MemoryScope.PROJECT, "0-first.md", "Jupiter", 2_000L)
+            val input = mutableStateOf(listOf(lastByName, nextByFile, firstByFile))
+            render({
+                MemorySection(MemoryUiState(entries = input.value, hasWorkspace = true, loading = false),
+                    {}, {}, scope = MemoryScope.PROJECT, query = "", onScopeChange = {}, onQueryChange = {})
+            }) { root, _, pump ->
+                assertEquals("tr", Locale.getDefault().language)
+                assertRowOrder(root, listOf(firstByFile, nextByFile, lastByName))
+                input.value = listOf(nextByFile, firstByFile, lastByName)
+                pump(12)
+                assertRowOrder(root, listOf(firstByFile, nextByFile, lastByName))
+                input.value = listOf(nextByFile, lastByName, firstByFile).map { it.copy(modifiedAt = null) }
+                pump(12)
+                assertRowOrder(root, listOf(firstByFile, nextByFile, lastByName))
+            }
+        } finally {
+            Locale.setDefault(previousLocale)
+        }
+    }
+
+    @Test fun listScopeAndSearchChangesKeepNewestFirstAndNeverMixSameNamedScopes() {
+        val globalRecent = timedEntry(MemoryScope.GLOBAL, "z-recent.md", "z-recent", 3_000L)
+        val globalOlder = timedEntry(MemoryScope.GLOBAL, "m-older.md", "m-older", 2_000L,
+            description = "Needle summary")
+        val globalUnknown = timedEntry(MemoryScope.GLOBAL, "a-unknown.md", "a-unknown", null,
+            preview = "Needle preview")
+        val projectRecent = globalUnknown.copy(scope = MemoryScope.PROJECT, modifiedAt = 4_000L)
+        val projectOlder = globalRecent.copy(scope = MemoryScope.PROJECT, modifiedAt = 1_000L)
+        val projectUnknown = globalOlder.copy(scope = MemoryScope.PROJECT, modifiedAt = null)
+        val selectedScope = mutableStateOf(MemoryScope.GLOBAL)
+        val query = mutableStateOf("")
+        render({
+            MemorySection(MemoryUiState(entries = listOf(globalUnknown, projectUnknown, globalOlder,
+                projectOlder, globalRecent, projectRecent), hasWorkspace = true, loading = false),
+                {}, {}, scope = selectedScope.value, query = query.value,
+                onScopeChange = { selectedScope.value = it }, onQueryChange = { query.value = it })
+        }) { root, _, pump ->
+            fun search(value: String) {
+                val input = root.semanticsOwner.getAllSemanticsNodes(mergingEnabled = false).single {
+                    it.config.getOrNull(SemanticsActions.SetText)?.action != null
+                }
+                assertTrue(requireNotNull(input.config[SemanticsActions.SetText].action).invoke(AnnotatedString(value)))
+                pump(12)
+                assertEquals(value, query.value)
+            }
+            fun select(scope: MemoryScope) {
+                val tag = if (scope == MemoryScope.GLOBAL) "memory-scope-global" else "memory-scope-project"
+                assertTrue(requireNotNull(taggedNode(root, tag).config[SemanticsActions.OnClick].action).invoke())
+                pump(12)
+                assertEquals(scope, selectedScope.value)
+            }
+            assertRowOrder(root, listOf(globalRecent, globalOlder, globalUnknown))
+            search("  nEeDlE  ")
+            assertRowOrder(root, listOf(globalOlder, globalUnknown))
+            select(MemoryScope.PROJECT)
+            assertEquals("  nEeDlE  ", query.value)
+            assertRowOrder(root, listOf(projectRecent, projectUnknown))
+            search("")
+            assertRowOrder(root, listOf(projectRecent, projectOlder, projectUnknown))
+            select(MemoryScope.GLOBAL)
+            assertRowOrder(root, listOf(globalRecent, globalOlder, globalUnknown))
+            search("  M-OLDER ")
+            assertRowOrder(root, listOf(globalOlder))
+        }
+    }
+
+    @Config(qualifiers = "en-rUS")
+    @Test fun listUpdatedAtUsesUtcMinuteFormatAndEnglishUnknownLabel() {
+        val previousZone = TimeZone.getDefault()
+        try {
+            TimeZone.setDefault(TimeZone.getTimeZone("UTC"))
+            val known = timedEntry(MemoryScope.GLOBAL, "known.md", "known",
+                Instant.parse("2024-01-02T23:04:59Z").toEpochMilli())
+            val unknown = timedEntry(MemoryScope.GLOBAL, "unknown.md", "unknown", null,
+                description = "", preview = "")
+            render({
+                MemorySection(MemoryUiState(entries = listOf(unknown, known), hasWorkspace = true, loading = false),
+                    {}, {}, scope = MemoryScope.GLOBAL, query = "", onScopeChange = {}, onQueryChange = {})
+            }) { root, activity, _ ->
+                assertEquals("Updated 2024-01-02 23:04",
+                    activity.getString(R.string.memory_management_updated_at, "2024-01-02 23:04"))
+                assertEquals(listOf("Updated 2024-01-02 23:04"),
+                    taggedNode(root, "memory-updated-${known.id}").config[SemanticsProperties.Text].map { it.text })
+                assertEquals("Time unknown", activity.getString(R.string.memory_management_time_unknown))
+                assertEquals(listOf("Updated Time unknown"),
+                    taggedNode(root, "memory-updated-${unknown.id}").config[SemanticsProperties.Text].map { it.text })
+            }
+        } finally {
+            TimeZone.setDefault(previousZone)
+        }
+    }
+
+    @Config(qualifiers = "zh-rCN")
+    @Test fun listUpdatedAtUsesDeviceTimeZoneAndChineseUnknownLabel() {
+        val previousZone = TimeZone.getDefault()
+        try {
+            TimeZone.setDefault(TimeZone.getTimeZone("GMT+08:00"))
+            val known = timedEntry(MemoryScope.GLOBAL, "known.md", "known",
+                Instant.parse("2024-01-02T23:04:59Z").toEpochMilli())
+            val unknown = timedEntry(MemoryScope.GLOBAL, "unknown.md", "unknown", null)
+            render({
+                MemorySection(MemoryUiState(entries = listOf(unknown, known), hasWorkspace = true, loading = false),
+                    {}, {}, scope = MemoryScope.GLOBAL, query = "", onScopeChange = {}, onQueryChange = {})
+            }) { root, activity, _ ->
+                assertEquals("更新于 2024-01-03 07:04",
+                    activity.getString(R.string.memory_management_updated_at, "2024-01-03 07:04"))
+                assertEquals(listOf("更新于 2024-01-03 07:04"),
+                    taggedNode(root, "memory-updated-${known.id}").config[SemanticsProperties.Text].map { it.text })
+                assertEquals("时间未知", activity.getString(R.string.memory_management_time_unknown))
+                assertEquals(listOf("更新于 时间未知"),
+                    taggedNode(root, "memory-updated-${unknown.id}").config[SemanticsProperties.Text].map { it.text })
+            }
+        } finally {
+            TimeZone.setDefault(previousZone)
+        }
+    }
+
+    @Config(qualifiers = "en-rUS-w320dp-h640dp")
+    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
+    @Test fun listNarrowRowKeepsUpdatedAtInItsOwnTextBelowPreviewWhenNameRequestsEllipsis() {
+        val previousZone = TimeZone.getDefault()
+        try {
+            TimeZone.setDefault(TimeZone.getTimeZone("UTC"))
+            val item = timedEntry(MemoryScope.GLOBAL, "long.md", "A very long memory name ".repeat(20).trimEnd(),
+                Instant.parse("2024-01-02T23:04:59Z").toEpochMilli(),
+                description = "Summary", preview = "Preview")
+            render({
+                MemorySection(MemoryUiState(entries = listOf(item), hasWorkspace = true, loading = false),
+                    {}, {}, scope = MemoryScope.GLOBAL, query = "", onScopeChange = {}, onQueryChange = {})
+            }, width = 320, height = 640) { root, _, _ ->
+                assertRowOrder(root, listOf(item))
+                val name = taggedNode(root, "memory-name-${item.id}")
+                val preview = taggedNode(root, "memory-preview-${item.id}")
+                val updated = taggedNode(root, "memory-updated-${item.id}")
+                assertNotEquals(name.id, updated.id)
+                assertNotEquals(preview.id, updated.id)
+                assertEquals(listOf(item.name), name.config[SemanticsProperties.Text].map { it.text })
+                assertEquals(listOf("Updated 2024-01-02 23:04"), updated.config[SemanticsProperties.Text].map { it.text })
+                assertTrue(name.boundsInRoot.bottom <= preview.boundsInRoot.top)
+                assertTrue(preview.boundsInRoot.bottom <= updated.boundsInRoot.top)
+                assertEquals(preview.boundsInRoot.left, updated.boundsInRoot.left, 0.5f)
+                val row = taggedNode(root, "memory-row-${item.id}").boundsInRoot
+                assertTrue(updated.boundsInRoot.width > 0f && updated.boundsInRoot.height > 0f)
+                assertTrue(updated.boundsInRoot.left >= row.left && updated.boundsInRoot.right <= row.right)
+                assertTrue(updated.boundsInRoot.top >= row.top && updated.boundsInRoot.bottom <= row.bottom)
+                val nameLayout = textLayout(name)
+                assertEquals(item.name, nameLayout.layoutInput.text.text)
+                assertEquals(1, nameLayout.layoutInput.maxLines)
+                assertEquals(TextOverflow.Ellipsis, nameLayout.layoutInput.overflow)
+                assertTrue(nameLayout.layoutInput.softWrap)
+                assertTrue(nameLayout.multiParagraph.intrinsics.maxIntrinsicWidth > name.boundsInRoot.width)
+                assertTrue(nameLayout.size.width <= nameLayout.layoutInput.constraints.maxWidth)
+                assertTrue(nameLayout.size.width <= name.boundsInRoot.width + 0.5f)
+                assertEquals("API 28 legacy line-break shadow returns one full paragraph", 1, nameLayout.lineCount)
+                assertEquals("The shadow cannot prove real glyph ellipsis", item.name.length,
+                    nameLayout.getLineEnd(0, visibleEnd = true))
+                assertFalse("The shadow cannot prove a requested overflowing ellipsis glyph", nameLayout.isLineEllipsized(0))
+                val updatedLayout = textLayout(updated)
+                assertEquals("Updated 2024-01-02 23:04", updatedLayout.layoutInput.text.text)
+                assertTrue(updatedLayout.layoutInput.softWrap)
+                assertEquals(Int.MAX_VALUE, updatedLayout.layoutInput.maxLines)
+                assertEquals(TextOverflow.Clip, updatedLayout.layoutInput.overflow)
+                assertFalse(updatedLayout.didOverflowHeight)
+                assertFalse(updatedLayout.multiParagraph.didExceedMaxLines)
+                assertTrue(updatedLayout.lineCount > 0)
+                // The API 28 shadow reports the constraint width for a wrap-content paragraph; check visible line bounds.
+                if (updatedLayout.lineCount == 1) {
+                    assertTrue(updatedLayout.multiParagraph.intrinsics.maxIntrinsicWidth <= updated.boundsInRoot.width + 0.5f)
+                }
+                assertTrue(updatedLayout.size.width <= updated.boundsInRoot.width + 0.5f)
+                assertTrue(updatedLayout.multiParagraph.height <= updatedLayout.size.height + 0.5f)
+                assertTrue(updatedLayout.size.height <= updated.boundsInRoot.height + 0.5f)
+                assertEquals(0, updatedLayout.getLineStart(0))
+                assertEquals("Updated 2024-01-02 23:04".length,
+                    updatedLayout.getLineEnd(updatedLayout.lineCount - 1, visibleEnd = true))
+                for (line in 0 until updatedLayout.lineCount) {
+                    assertFalse(updatedLayout.isLineEllipsized(line))
+                    assertTrue(updatedLayout.getLineLeft(line) >= -0.5f)
+                    assertTrue(updatedLayout.getLineRight(line) <= updated.boundsInRoot.width + 0.5f)
+                    assertTrue(updatedLayout.getLineTop(line) >= -0.5f)
+                    assertTrue(updatedLayout.getLineBottom(line) <= updated.boundsInRoot.height + 0.5f)
+                    assertTrue(updatedLayout.getLineBottom(line) > updatedLayout.getLineTop(line))
+                    if (line > 0) assertTrue(updatedLayout.getLineTop(line) >= updatedLayout.getLineBottom(line - 1))
+                }
+            }
+        } finally {
+            TimeZone.setDefault(previousZone)
         }
     }
 
@@ -386,6 +608,47 @@ class MemorySectionTest {
         scope, "same-name.md", "same-name", "${scope.name} summary", "${scope.name} preview", "${scope.name}-v1"
     )
 
+    private fun timedEntry(
+        scope: MemoryScope,
+        fileName: String,
+        name: String,
+        modifiedAt: Long?,
+        description: String = "Summary",
+        preview: String = "Preview"
+    ) = MemoryEntry(scope, fileName, name, description, preview, "$scope-$fileName-v1", modifiedAt)
+
+    private fun taggedNode(root: ViewRootForTest, tag: String): SemanticsNode =
+        root.semanticsOwner.getAllSemanticsNodes(mergingEnabled = false).single {
+            it.config.getOrNull(SemanticsProperties.TestTag) == tag
+        }
+
+    private fun assertRowOrder(root: ViewRootForTest, expected: List<MemoryEntry>) {
+        val rows = root.semanticsOwner.getAllSemanticsNodes(mergingEnabled = false).filter {
+            it.config.getOrNull(SemanticsProperties.TestTag)?.startsWith("memory-row-") == true
+        }
+        assertEquals(expected.size, rows.size)
+        assertEquals(expected.map { "memory-row-${it.id}" }.toSet(),
+            rows.map { it.config[SemanticsProperties.TestTag] }.toSet())
+        val viewport = taggedNode(root, "memory-list").boundsInRoot
+        val expectedRows = expected.map { taggedNode(root, "memory-row-${it.id}") }
+        expectedRows.forEach { row ->
+            val bounds = row.boundsInRoot
+            assertTrue("${row.config[SemanticsProperties.TestTag]} must really be visible: $bounds in $viewport",
+                bounds.width > 0f && bounds.height > 0f && bounds.top >= viewport.top && bounds.bottom <= viewport.bottom)
+        }
+        expectedRows.zipWithNext().forEach { (first, second) ->
+            assertTrue("${first.config[SemanticsProperties.TestTag]} at ${first.boundsInRoot.top} must be above " +
+                "${second.config[SemanticsProperties.TestTag]} at ${second.boundsInRoot.top}",
+                first.boundsInRoot.top < second.boundsInRoot.top)
+        }
+    }
+
+    private fun textLayout(node: SemanticsNode): TextLayoutResult {
+        val results = mutableListOf<TextLayoutResult>()
+        assertTrue(requireNotNull(node.config.getOrNull(SemanticsActions.GetTextLayoutResult)?.action).invoke(results))
+        return results.single()
+    }
+
     private fun texts(root: ViewRootForTest): List<String> =
         root.semanticsOwner.getAllSemanticsNodes(mergingEnabled = false).flatMap { node ->
             node.config.getOrNull(SemanticsProperties.Text)?.map { it.text } ?: emptyList()
@@ -393,6 +656,8 @@ class MemorySectionTest {
 
     private fun render(
         content: @Composable () -> Unit,
+        width: Int = 1_000,
+        height: Int = 2_000,
         inspect: (ViewRootForTest, ComponentActivity, (Int) -> Unit) -> Unit
     ): Unit = runTest(timeout = 20.seconds) {
         val controller = Robolectric.buildActivity(ComponentActivity::class.java).setup().visible()
@@ -410,8 +675,8 @@ class MemorySectionTest {
             Snapshot.sendApplyNotifications()
             runCurrent()
             view.measure(
-                View.MeasureSpec.makeMeasureSpec(1_000, View.MeasureSpec.EXACTLY),
-                View.MeasureSpec.makeMeasureSpec(2_000, View.MeasureSpec.EXACTLY)
+                View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
+                View.MeasureSpec.makeMeasureSpec(height, View.MeasureSpec.EXACTLY)
             )
             view.layout(0, 0, view.measuredWidth, view.measuredHeight)
             (view.getChildAt(0) as? ViewRootForTest)?.measureAndLayoutForTest()

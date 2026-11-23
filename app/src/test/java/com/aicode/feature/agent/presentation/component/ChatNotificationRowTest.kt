@@ -36,8 +36,108 @@ class ChatNotificationRowTest {
         assertEquals("", model.detail)
         assertTrue(model.isBackgroundTask)
         assertEquals("0", model.backgroundTaskExitCode)
+        assertEquals(NotificationOutcome.COMPLETED, model.backgroundTaskOutcome)
         assertEquals("01:23", model.time)
         assertEquals(ChatNotificationTone.TASK_SUCCESS, model.tone)
+    }
+
+    @Test
+    fun backgroundTaskKeepsPayloadStatusIndependentOfKnownAndUnknownExitCodes() {
+        val outcomes = mapOf(
+            "completed" to NotificationOutcome.COMPLETED,
+            "failed" to NotificationOutcome.FAILED,
+            "stopped" to NotificationOutcome.STOPPED,
+            "unrecognized" to null,
+            null to null,
+        )
+        for ((status, outcome) in outcomes) {
+            for (exit in listOf("0", "23", "", "unknown")) {
+                val model = notificationRowModel(
+                    SubAgentNotificationMetadata(
+                        ordinal = 0, kind = "background_task", title = "Fallback task title", taskTitle = "",
+                        status = status, exitCode = exit, command = "private command", detail = "private detail",
+                        tailOutput = "private output", raw = "task",
+                    ),
+                )
+
+                assertTrue(model.isBackgroundTask)
+                assertEquals("Fallback task title", model.title)
+                assertEquals("", model.detail)
+                assertEquals(exit.takeIf(String::isNotBlank), model.backgroundTaskExitCode)
+                assertEquals(outcome, model.backgroundTaskOutcome)
+                assertEquals(if (status == "completed") ChatNotificationTone.TASK_SUCCESS
+                    else ChatNotificationTone.TASK_FAILURE, model.tone)
+                assertEquals(null, model.agentOutcome)
+                assertEquals(null, model.agentSender)
+            }
+        }
+    }
+
+    @Test
+    fun timelineXmlAndJsonBackgroundTasksPreserveTheSameTitleStatusAndNullableExitCode() {
+        val injector = DefaultAgentEventInjector()
+        for (outcome in NotificationOutcome.entries) {
+            for (exit in listOf(0, 23, null)) {
+                val pending = PendingNotification(
+                    kind = AgentNotificationKind.BACKGROUND_TASK, sourceId = "term-layout",
+                    title = "Build & verify <notification> layout", outcome = outcome, exitCode = exit,
+                    command = "private command", detail = "private detail", tailOutput = "private output",
+                    eventId = "layout-${outcome.name}-$exit",
+                )
+                val timestamp = 120_000L
+                val timelineModel = requireNotNull(notificationTimelineItem(pending, timestamp).notification)
+                val expectedStatus = when (outcome) {
+                    NotificationOutcome.COMPLETED -> "completed"
+                    NotificationOutcome.FAILED -> "failed"
+                    NotificationOutcome.STOPPED -> "stopped"
+                }
+                for ((raw, toolResult) in listOf(
+                    injector.inject("", listOf(pending)) to false,
+                    injector.inject("{\"status\":\"success\"}", listOf(pending)) to true,
+                )) {
+                    val parsed = parseSubAgentNotificationMetadata(raw, toolResult).single()
+                    assertEquals("background_task", parsed.kind)
+                    assertEquals(pending.eventId, parsed.eventId)
+                    assertEquals(pending.sourceId, parsed.sourceId)
+                    assertEquals(pending.title, parsed.taskTitle)
+                    assertEquals(expectedStatus, parsed.status)
+                    assertEquals(exit?.toString().orEmpty(), parsed.exitCode)
+                    assertEquals(pending.command, parsed.command)
+                    assertEquals(pending.detail, parsed.detail)
+                    assertEquals(pending.tailOutput, parsed.tailOutput)
+                    assertEquals(timelineModel, notificationRowModel(parsed, formatClockTime(timestamp)))
+                }
+                assertEquals(pending.title, timelineModel.title)
+                assertEquals(outcome, timelineModel.backgroundTaskOutcome)
+                assertEquals(exit?.toString(), timelineModel.backgroundTaskExitCode)
+                assertEquals("", timelineModel.detail)
+            }
+        }
+    }
+
+    @Test
+    fun xmlAndJsonUnknownStatusesDoNotInventSuccessOrExitCodeZero() {
+        for ((status, exit) in listOf(null to null, "unrecognized" to null, "unrecognized" to "0")) {
+            val xmlStatus = status?.let { "<status>$it</status>" }.orEmpty()
+            val xmlExit = exit?.let { "<exit-code>$it</exit-code>" }.orEmpty()
+            val jsonStatus = status?.let { ",\"status\":\"$it\"" }.orEmpty()
+            val jsonExit = exit?.let { ",\"exit_code\":$it" }.orEmpty()
+            val payloads = listOf(
+                "[系统通知 - 非用户输入]\n<task-notification><title>Unknown task</title>$xmlStatus$xmlExit</task-notification>" to false,
+                """{"status":"success","notifications":[{"kind":"background_task","title":"Unknown task"$jsonStatus$jsonExit}]}""" to true,
+            )
+            for ((raw, toolResult) in payloads) {
+                val parsed = parseSubAgentNotificationMetadata(raw, toolResult).single()
+                val model = notificationRowModel(parsed)
+                assertEquals("background_task", parsed.kind)
+                assertEquals(status, parsed.status)
+                assertEquals(exit.orEmpty(), parsed.exitCode)
+                assertEquals("Unknown task", model.title)
+                assertEquals(null, model.backgroundTaskOutcome)
+                assertEquals(exit, model.backgroundTaskExitCode)
+                assertEquals(ChatNotificationTone.TASK_FAILURE, model.tone)
+            }
+        }
     }
 
     @Test
@@ -58,6 +158,85 @@ class ChatNotificationRowTest {
         assertEquals("编码员发来一条消息", model.title)
         assertEquals("已完成 TerminalSession 通知合并修复，测试通过", model.detail)
         assertEquals(ChatNotificationTone.AGENT, model.tone)
+        assertEquals("编码员", model.agentSender)
+        assertEquals(null, model.agentOutcome)
+    }
+
+    @Test
+    fun subAgentResultsKeepOriginalSummaryAndExposeTheirRealOutcomeSeparately() {
+        for ((status, outcome) in listOf(
+            "completed" to NotificationOutcome.COMPLETED,
+            "failed" to NotificationOutcome.FAILED,
+            "stopped" to NotificationOutcome.STOPPED,
+        )) {
+            val summary = "原始执行摘要：$status"
+            val model = notificationRowModel(
+                SubAgentNotificationMetadata(
+                    ordinal = 0, kind = "subagent", title = "测试员", sourceTitle = "旧发送者",
+                    summary = summary, status = status, body = "真实结果正文", raw = "result",
+                ),
+                time = "17:42",
+            )
+
+            assertEquals("测试员", model.source)
+            assertEquals("测试员", model.agentSender)
+            assertEquals(outcome, model.agentOutcome)
+            assertEquals(summary, model.title)
+            assertEquals("真实结果正文", model.detail)
+            assertEquals("17:42", model.time)
+            assertEquals(if (outcome == NotificationOutcome.COMPLETED) ChatNotificationTone.AGENT
+                else ChatNotificationTone.TASK_FAILURE, model.tone)
+        }
+    }
+
+    @Test
+    fun timelineSubAgentResultsDoNotTurnFailureOrStopIntoCompletionOrLoseTheOriginalSummary() {
+        val summaries = mapOf(
+            NotificationOutcome.COMPLETED to "子代理「审核员」已执行完成",
+            NotificationOutcome.FAILED to "子代理「审核员」已执行失败",
+            NotificationOutcome.STOPPED to "子代理「审核员」已停止",
+        )
+        for ((outcome, summary) in summaries) {
+            val item = notificationTimelineItem(
+                PendingNotification(
+                    AgentNotificationKind.SUBAGENT, "reviewer", "审核员", outcome,
+                    resultExcerpt = "原始结果", eventId = "reviewer-${outcome.name}",
+                ),
+                timestamp = 120_000L,
+            )
+            val model = requireNotNull(item.notification)
+
+            assertEquals("chat-notification:reviewer-${outcome.name}", item.key)
+            assertEquals("审核员", model.agentSender)
+            assertEquals(outcome, model.agentOutcome)
+            assertEquals(summary, model.title)
+            assertEquals("原始结果", model.detail)
+            assertEquals(formatClockTime(120_000L), model.time)
+        }
+    }
+
+    @Test
+    fun plainAgentMessagesUseTheirSenderWithoutInventingAnExecutionOutcome() {
+        for ((fromParent, source, sender) in listOf(
+            Triple(false, "探索员", "探索员"),
+            Triple(true, "探索员", "主代理"),
+            Triple(false, "", "子代理"),
+        )) {
+            val model = notificationRowModel(
+                SubAgentNotificationMetadata(
+                    ordinal = 0, kind = "agent_message", sourceTitle = source, title = source,
+                    action = AgentMessageAction.MESSAGE, fromParent = fromParent,
+                    status = "message", body = "消息正文", raw = "message",
+                ),
+            )
+
+            assertEquals(sender, model.agentSender)
+            assertEquals(sender, model.source)
+            assertEquals("${sender}发来一条消息", model.title)
+            assertEquals(null, model.agentOutcome)
+            assertEquals("消息正文", model.detail)
+            assertEquals(ChatNotificationTone.AGENT, model.tone)
+        }
     }
 
     @Test
@@ -89,6 +268,12 @@ class ChatNotificationRowTest {
         assertEquals("给探索员代理发送纠偏", correction.title)
         assertEquals(ChatNotificationTone.COMMAND, instruction.tone)
         assertEquals(ChatNotificationTone.COMMAND, correction.tone)
+        assertEquals("主代理", instruction.source)
+        assertEquals("主代理", correction.source)
+        assertEquals(null, instruction.agentSender)
+        assertEquals(null, correction.agentSender)
+        assertEquals(null, instruction.agentOutcome)
+        assertEquals(null, correction.agentOutcome)
         assertEquals("继续核对 Handler 消息积压风险", instruction.detail)
         assertEquals("将列宽 resize 峰值与真实泄漏分开报告", correction.detail)
     }
@@ -176,6 +361,7 @@ class ChatNotificationRowTest {
         assertEquals("Build", row.notification?.title)
         assertEquals("", row.notification?.detail)
         assertEquals("0", row.notification?.backgroundTaskExitCode)
+        assertEquals(NotificationOutcome.COMPLETED, row.notification?.backgroundTaskOutcome)
     }
 
     @Test

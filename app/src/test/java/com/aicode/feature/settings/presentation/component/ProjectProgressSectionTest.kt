@@ -128,6 +128,17 @@ class ProjectProgressSectionTest {
         render({ ProjectProgressEditorForm(ProjectProgressForm.REGISTER, false, null, {}, { _, _ -> }) }) { root, _ ->
             assertEquals(1, inputs(root).size)
         }
+        render({ ProjectProgressEditorForm(ProjectProgressForm.REGISTER, false, ProjectProgressError.READ_FAILED,
+            {}, { _, _ -> }, registrationReady = false) }) { root, activity ->
+            assertTrue(activity.getString(R.string.project_progress_save) in texts(root))
+            val saveButton = root.semanticsOwner.getAllSemanticsNodes(mergingEnabled = true).single {
+                it.config.getOrNull(SemanticsProperties.Role) == Role.Button &&
+                    it.config.getOrNull(SemanticsProperties.Text)?.any { text ->
+                        text.text == activity.getString(R.string.project_progress_save)
+                    } == true
+            }
+            assertTrue(saveButton.config.contains(SemanticsProperties.Disabled))
+        }
         render({ ProjectProgressEditorForm(ProjectProgressForm.HANDOFF, false, ProjectProgressError.SAVE_FAILED, {}, { _, _ -> }) }) { root, activity ->
             assertEquals(2, inputs(root).size)
             assertTrue(activity.getString(R.string.project_progress_save_failed) in texts(root))
@@ -295,7 +306,7 @@ class ProjectProgressSectionTest {
         }
         try {
             render({
-                ProjectProgressSection(state, {}, {}, {}, { operations += "bind" }, { operations += "unbind" },
+                ProjectProgressSection(state, {}, {}, {}, {}, { operations += "bind" }, { operations += "unbind" },
                     { operations += "auto" }, { operations += "handoff" }, {}, {}, {})
             }, parentCompositionContext = recomposer) { root, activity ->
                 val header = activity.getString(R.string.project_progress_management)
@@ -388,11 +399,12 @@ class ProjectProgressSectionTest {
         onSelect: (ProjectMemoryProject) -> Unit = {},
         onAuto: (Boolean) -> Unit = {}
     ) {
-        ProjectProgressSection(state, onSelect, {}, {}, {}, {}, onAuto, {}, {}, {}, {})
+        ProjectProgressSection(state, onSelect, {}, {}, {}, {}, {}, onAuto, {}, {}, {}, {})
     }
 
     private fun baseState() = ProjectProgressUiState(
-        workspaceName = "Workspace", workspaceRoot = "/workspace", loading = false, sessionId = "session", associations = associations
+        workspaceName = "Workspace", workspaceRoot = "/workspace", loading = false, projectsLoaded = true,
+        sessionId = "session", associations = associations
     )
 
     private fun entry() = ProjectMemoryEntry(

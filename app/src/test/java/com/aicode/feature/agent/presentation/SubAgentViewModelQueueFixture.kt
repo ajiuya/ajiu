@@ -242,6 +242,21 @@ internal class SubAgentViewModelQueueFixture(
             val workspace = firstArg<String>()
             sessionRows.values.firstOrNull { it.workspacePath == workspace && it.parentId == null }
         }
+        coEvery { sessions.updateProviderModelWithDirectChildren(any(), any(), any()) } answers {
+            val id = firstArg<String>()
+            val provider = secondArg<String?>()
+            val model = thirdArg<String?>()
+            val parent = sessionRows[id]
+            if (parent == null) emptyList() else {
+                val targets = sessionRows.values.filter {
+                    it.id == id || (it.parentId == id && it.workspacePath == parent.workspacePath)
+                }.map { it.id }
+                targets.forEach { target ->
+                    sessionRows[target] = sessionRows.getValue(target).copy(providerId = provider, model = model, lastInputTokens = 0)
+                }
+                targets
+            }
+        }
         coEvery { sessions.isSessionEmpty(any()) } returns true
         coEvery { sessions.deleteSession(any()) } answers {
             val id = firstArg<String>()

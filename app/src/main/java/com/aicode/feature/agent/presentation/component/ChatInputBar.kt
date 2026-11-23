@@ -56,6 +56,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Brush
@@ -143,7 +144,7 @@ import kotlinx.coroutines.launch
 private val INPUT_BAR_MASK_HEIGHT = 110.dp
 
 /** 输入框高度上下限：超过上限后文本在框内滚动，右上角露出「展开」按钮。 */
-private val INPUT_FIELD_MIN_HEIGHT = 40.dp
+private val INPUT_FIELD_MIN_HEIGHT = 36.dp
 private val INPUT_FIELD_MAX_HEIGHT = 120.dp
 private val INPUT_FIELD_HORIZONTAL_PADDING = Spacing.lg
 private val INPUT_FIELD_VERTICAL_PADDING = 6.dp
@@ -283,11 +284,21 @@ internal fun ChatInputBar(
             animationSpec = AppMotion.tween(AppMotion.colorMillis),
             label = "inputbar-content-alpha"
         )
-        // 渐变终点固定在蒙版可视高度内：若跟随整个 Box（含 imeInset 被键盘拉长的部分），
-        // 键盘弹起时可见区域只占渐变前段，alpha 被摊薄到几乎透明——看起来像没有蒙版。
-        val maskGradientEndY = with(LocalDensity.current) { INPUT_BAR_MASK_HEIGHT.toPx() }
+        // 蒙版只绘制、不参与测高；渐变在键盘上沿结束，IME 区域保持纯色，不摊薄可视渐变。
+        val maskColor = MaterialTheme.colorScheme.surface
         BoxWithConstraints(
-            modifier = Modifier.fillMaxWidth()
+            modifier = Modifier
+                .fillMaxWidth()
+                .drawBehind {
+                    val gradientEndY = size.height - imeInset.toPx()
+                    drawRect(
+                        Brush.verticalGradient(
+                            listOf(maskColor.copy(alpha = 0f), maskColor.copy(alpha = 0.98f)),
+                            startY = (gradientEndY - INPUT_BAR_MASK_HEIGHT.toPx()).coerceAtLeast(0f),
+                            endY = gradientEndY
+                        )
+                    )
+                }
         ) {
             val dashboardBodyMaxHeight = (maxHeight - imeInset - Spacing.md).coerceAtLeast(0.dp) * 0.4f
             val composerWidth = (maxWidth - (Spacing.lg + Spacing.sm) * 2).coerceAtLeast(0.dp)
@@ -296,26 +307,6 @@ internal fun ChatInputBar(
             val recoveryBubbleMaxWidth = minOf(
                 composerWidth / 2,
                 (composerWidth - expandButtonWidth - editorMinWidth).coerceAtLeast(0.dp)
-            )
-            // 半透明渐变蒙版：盖住输入框区域 + 导航栏（手势小白条）区域，滚动内容滑入时被遮罩
-            // （能看见但看不清）；高度含 IME inset 随键盘上移，渐变在 INPUT_BAR_MASK_HEIGHT 内完成，
-            // 之下为纯色。注意 IME padding 不能加在外层 Box 上——align(BottomCenter) 的子项
-            // 对齐在 padding 内部，会漏掉导航栏那条区域。
-            Box(
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .fillMaxWidth()
-                    .height(INPUT_BAR_MASK_HEIGHT + imeInset)
-                    .background(
-                        Brush.verticalGradient(
-                            listOf(
-                                MaterialTheme.colorScheme.surface.copy(alpha = 0f),
-                                MaterialTheme.colorScheme.surface.copy(alpha = 0.98f)
-                            ),
-                            startY = 0f,
-                            endY = maskGradientEndY
-                        )
-                    )
             )
             Column(
                 modifier = Modifier
@@ -493,6 +484,7 @@ internal fun ChatInputBar(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .testTag("chat_composer")
                     .clip(RoundedCornerShape(Radius.lg))
                     .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.98f))
                     .border(
@@ -500,7 +492,7 @@ internal fun ChatInputBar(
                         MaterialTheme.colorScheme.outlineVariant,
                         RoundedCornerShape(Radius.lg)
                     )
-                    .padding(horizontal = Spacing.sm, vertical = Spacing.xs)
+                    .padding(horizontal = Spacing.sm, vertical = Spacing.xs / 2)
             ) {
                 PendingAttachmentPreviewList(
                     attachments = pendingAttachments,
@@ -541,7 +533,7 @@ internal fun ChatInputBar(
                     Box(
                         modifier = Modifier
                             .widthIn(max = recoveryBubbleMaxWidth)
-                            .heightIn(max = INPUT_FIELD_MIN_HEIGHT)
+                            .heightIn(max = 40.dp)
                             .padding(top = Spacing.xs)
                     ) {
                         recoveryBubble()
@@ -551,7 +543,7 @@ internal fun ChatInputBar(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = Spacing.xs, vertical = Spacing.xs),
+                        .padding(horizontal = Spacing.xs),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     FlowRow(
@@ -853,7 +845,7 @@ internal fun SendButton(
     val clampedProgress = tokenProgress.coerceIn(0f, 1f)
     Box(
         modifier = Modifier
-            .padding(Spacing.xs)
+            .padding(horizontal = Spacing.xs)
             .size(44.dp),
         contentAlignment = Alignment.Center
     ) {

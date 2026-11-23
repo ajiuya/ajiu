@@ -3,10 +3,10 @@
     <string name="memory_management_title">记忆</string>
     <string name="memory_management_add">新增记忆</string>
     <string name="memory_management_refresh">刷新记忆</string>
-    <string name="memory_management_global">全局记忆</string>
+    <string name="memory_management_global">个人记忆</string>
     <string name="memory_management_project">当前项目记忆</string>
     <string name="memory_management_project_named">当前项目 · %1$s</string>
-    <string name="memory_management_no_workspace">尚未选择工作区，项目记忆暂不可用；仍可查看和新增全局记忆。</string>
+    <string name="memory_management_no_workspace">尚未选择工作区，项目记忆暂不可用；仍可查看和新增个人记忆。</string>
     <string name="memory_management_empty">此作用域暂无记忆</string>
     <string name="memory_management_name">名称</string>
     <string name="memory_management_name_hint">使用字母、数字、连字符或下划线，与记忆工具使用相同名称。</string>
@@ -15,6 +15,9 @@
     <string name="memory_management_body">正文</string>
     <string name="memory_management_scope">作用范围</string>
     <string name="memory_management_file">文件名称</string>
+    <string name="memory_management_updated">更新时间</string>
+    <string name="memory_management_updated_at">更新于 %1$s</string>
+    <string name="memory_management_time_unknown">时间未知</string>
     <string name="memory_management_copy_body">复制全文</string>
     <string name="memory_management_create">创建</string>
     <string name="memory_management_creating">正在创建…</string>

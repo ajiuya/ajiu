@@ -40,6 +40,7 @@ import org.robolectric.RuntimeEnvironment
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.ConscryptMode
+import java.time.Duration
 
 @OptIn(ExperimentalCoroutinesApi::class)
 @RunWith(RobolectricTestRunner::class)
@@ -54,6 +55,7 @@ class AgentLiveNotificationManagerTest {
         override val lifecycle: Lifecycle get() = registry
     }
     private val service = mockk<TerminalKeepaliveService>(relaxed = true)
+    private val activeTaskOwner = "notification-test:active-task"
     private lateinit var context: StartingContext
     private lateinit var manager: AgentLiveNotificationManager
 
@@ -79,6 +81,7 @@ class AgentLiveNotificationManagerTest {
         dispatcher.scheduler.runCurrent()
         TaskKeepaliveController.detach(service)
         manager.dismiss()
+        TaskKeepaliveController.release(context, activeTaskOwner)
         TaskKeepaliveController.setPersistent(context, false)
         TaskKeepaliveController.onTaskRemoved(context)
         TaskKeepaliveController.onAppVisible(context)
@@ -184,6 +187,29 @@ class AgentLiveNotificationManagerTest {
         TaskKeepaliveController.onAppVisible(context)
         assertEquals(3, context.starts)
         assertEquals(1, TaskKeepaliveController.snapshot().ownerCount)
+    }
+
+    @Test
+    fun notificationUpdatesDoNotBypassActiveTaskRecoveryBackoff() {
+        context.reject = true
+        TaskKeepaliveController.acquire(context, activeTaskOwner, cpu = true)
+        setEnabled(true)
+        repeat(30) { update() }
+        assertEquals(1, context.starts)
+        assertEquals(2, TaskKeepaliveController.snapshot().ownerCount)
+        assertFalse(manager.hasLiveNotificationEnabled())
+        context.reject = false
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(1))
+        assertEquals(2, context.starts)
+        assertFalse(manager.hasLiveNotificationEnabled())
+        TaskKeepaliveController.attach(service)
+        assertTrue(manager.hasLiveNotificationEnabled())
+        TaskKeepaliveController.detach(service)
+        repeat(30) { update() }
+        assertEquals(2, context.starts)
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(3))
+        assertEquals(3, context.starts)
+        assertFalse(manager.hasLiveNotificationEnabled())
     }
 
     @Test

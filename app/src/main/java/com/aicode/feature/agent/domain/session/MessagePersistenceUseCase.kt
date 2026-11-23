@@ -4,6 +4,7 @@ import com.aicode.feature.agent.data.local.dao.AgentMessageDao
 import com.aicode.feature.agent.data.local.database.AgentDatabase
 import com.aicode.feature.agent.data.local.entity.AgentMessageEntity
 import com.aicode.feature.agent.domain.model.AgentMessage
+import com.aicode.feature.agent.domain.model.id
 import com.aicode.feature.agent.domain.model.CONTEXT_COMPACTION_MARKER
 import com.aicode.feature.agent.domain.model.CONTEXT_SUMMARY_LEGACY_PREFIX
 import com.aicode.feature.agent.domain.model.ContextUsageBreakdown
@@ -343,6 +344,46 @@ class MessagePersistenceUseCase @Inject constructor(
         pendingImages: MutableMap<String, CachedImage>
     ): List<AgentMessage> {
         val storedEntities = agentMessageDao.getMessagesBySessionOnce(sessionId)
+        return replayHistory(storedEntities, pendingToolMarker, pendingImages)
+    }
+
+    internal suspend fun matchesCompactionSource(
+        messages: List<AgentMessage>,
+        entities: List<AgentMessageEntity>
+    ): Boolean = withContext(Dispatchers.IO) {
+        val replayed = replayHistory(entities, SessionUseCase.PENDING_TOOL_MARKER, mutableMapOf(), loadImages = false)
+        val ids = messages.map { it.id }
+        val selected = ids.toHashSet()
+        if (replayed.filter {
+                it.id in selected || it is AgentMessage.UserMessage && it.modelInputOwnerId in selected
+            }.map { it.id } != ids) return@withContext false
+        val currentById = replayed.associateBy { it.id }
+        messages.all { original ->
+            val current = currentById[original.id]
+            when {
+                original is AgentMessage.UserMessage && current is AgentMessage.UserMessage ->
+                    original.content == current.content && original.isCompactionMarker == current.isCompactionMarker &&
+                        original.modelInputOwnerId == current.modelInputOwnerId && original.projectMemoryKey == current.projectMemoryKey
+                original is AgentMessage.AssistantMessage && current is AgentMessage.AssistantMessage ->
+                    original.content == current.content && original.toolCalls == current.toolCalls &&
+                        original.isContextSummary == current.isContextSummary
+                original is AgentMessage.ToolResultMessage && current is AgentMessage.ToolResultMessage -> {
+                    fun text(message: AgentMessage.ToolResultMessage) = message.modelResult
+                        ?: com.aicode.feature.agent.domain.tool.modelToolResultText(message.toolName, message.result)
+                        ?: message.result
+                    original.toolName == current.toolName && text(original) == text(current)
+                }
+                else -> false
+            }
+        }
+    }
+
+    private suspend fun replayHistory(
+        storedEntities: List<AgentMessageEntity>,
+        pendingToolMarker: String,
+        pendingImages: MutableMap<String, CachedImage>,
+        loadImages: Boolean = true
+    ): List<AgentMessage> {
         val positions = storedEntities.withIndex().associate { it.value.id to it.index }
         val entities = storedEntities.filter { !it.isCompacted && !it.isContextExcluded }
             .let { orderHistoryEntities(it) }
@@ -397,7 +438,7 @@ class MessagePersistenceUseCase @Inject constructor(
                         rawContent
                     }
 
-                    val images = attachments.mapNotNull { it.toAgentImage(pendingImages) }
+                    val images = if (loadImages) attachments.mapNotNull { it.toAgentImage(pendingImages) } else emptyList()
 
                     val snapshot = e.modelInputSnapshotJson?.let {
                         json.decodeFromString<com.aicode.feature.agent.domain.model.ModelInputSnapshot>(it).also { value ->
@@ -443,7 +484,7 @@ class MessagePersistenceUseCase @Inject constructor(
                                 thinkingBlocksJson = e.thinkingBlocksJson ?: "",
                                 inputTokens = e.inputTokens,
                                 // 附件里的图片按路径重建 base64（带缓存），供下一轮上下文回放。
-                                images = imageAttachments.mapNotNull { it.toAgentImage(pendingImages) }
+                                images = if (loadImages) imageAttachments.mapNotNull { it.toAgentImage(pendingImages) } else emptyList()
                             )
                         )
                         for (call in toolCalls) {

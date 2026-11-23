@@ -21,7 +21,7 @@ internal data class CompactionStreamPolicy(
     val materialTokens: Int = CompactionSummaryPolicy.MAX_MATERIAL_TOKENS,
     val firstChunkTimeoutMs: Long = 120_000,
     val idleTimeoutMs: Long = 120_000,
-    val totalTimeoutMs: Long = 20 * 60_000,
+    val totalTimeoutMs: Long = 35 * 60_000,
     val progressIntervalMs: Long = 250,
     val heartbeatIntervalMs: Long = 1_000,
     val recordTimeoutMs: Long = 2_000,
@@ -72,6 +72,7 @@ internal object CompactionStreamErrors {
             response.toolCalls.isNotEmpty() -> "compaction_tools"
             response.images.isNotEmpty() -> "compaction_images"
             response.content.isBlank() -> "compaction_empty"
+            response.stopReason.isNullOrBlank() -> "compaction_missing_stop"
             response.stopReason !in setOf("stop", "end_turn", "STOP", "completed") -> "compaction_invalid_response"
             else -> null
         }
@@ -121,6 +122,7 @@ internal class CompactionStreamOwners {
 
 internal class CompactionStreamProviderSettings(private val provider: AIProvider) {
     val outputLimit = provider.maxOutputTokens
+    private val requestOutputLimit = provider.requestOutputTokenLimit
     private val retries = provider.maxNetworkRetries
     private val switcher = provider.keySwitcher
     private val firstByte = provider.firstByteTimeoutMs
@@ -128,6 +130,7 @@ internal class CompactionStreamProviderSettings(private val provider: AIProvider
 
     fun apply(output: Int, policy: CompactionStreamPolicy) {
         provider.maxOutputTokens = output
+        provider.requestOutputTokenLimit = output
         provider.maxNetworkRetries = 0
         provider.keySwitcher = null
         provider.firstByteTimeoutMs = policy.firstChunkTimeoutMs
@@ -136,6 +139,7 @@ internal class CompactionStreamProviderSettings(private val provider: AIProvider
 
     fun restore() {
         provider.maxOutputTokens = outputLimit
+        provider.requestOutputTokenLimit = requestOutputLimit
         provider.maxNetworkRetries = retries
         provider.keySwitcher = switcher
         provider.firstByteTimeoutMs = firstByte

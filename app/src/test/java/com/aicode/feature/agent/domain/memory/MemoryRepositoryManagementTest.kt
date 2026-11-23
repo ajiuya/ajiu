@@ -12,6 +12,7 @@ import io.mockk.mockk
 import java.io.File
 import java.math.BigInteger
 import java.nio.file.Files
+import java.nio.file.attribute.FileTime
 import java.security.MessageDigest
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
@@ -40,6 +41,141 @@ class MemoryRepositoryManagementTest {
         projectAicodeRoot = mockk()
         repository = MemoryRepository(GlobalMemorySource(installer), holder, installer, projectAicodeRoot)
         target = repository.captureStorageTarget(project.path)
+    }
+
+    @Test fun listAndReadExposeActualMtimeWithoutChangingMarkdownBytesOrTimestamp() {
+        target.globalRoot.mkdirs()
+        val bytes = ("---\r\nname: manual-alias\r\ndescription: kept summary\r\ncustom: untouched\r\n---\r\n" +
+            "# Preserve Markdown\r\n\r\n**first** body\r\n").toByteArray(Charsets.UTF_8)
+        val file = File(target.globalRoot, "legacy name.v1.md").apply { writeBytes(bytes) }
+        Files.setLastModifiedTime(file.toPath(), FileTime.fromMillis(1_700_000_123_456L))
+        val actualModified = Files.getLastModifiedTime(file.toPath())
+        assertTrue(actualModified.toMillis() > 0L)
+
+        repeat(2) {
+            val listed = success(repository.listEntries(target)).single()
+            assertEquals("legacy name.v1.md", listed.fileName)
+            assertEquals("manual-alias", listed.name)
+            assertEquals(actualModified.toMillis(), listed.modifiedAt)
+            assertDiskSnapshot(file, bytes, actualModified)
+
+            val document = success(repository.readEntry(target, listed))
+            assertEquals(listed, document.entry)
+            assertEquals(actualModified.toMillis(), document.entry.modifiedAt)
+            assertEquals("# Preserve Markdown\n\n**first** body", document.content)
+            assertDiskSnapshot(file, bytes, actualModified)
+        }
+    }
+
+    @Test fun readEntryRefreshesModifiedAtAfterSameNamedContentIsUpdated() {
+        success(repository.createOnly(target, MemoryScope.PROJECT, "entry", "summary", "first body"))
+        val file = File(requireNotNull(target.projectRoot), "entry.md")
+        Files.setLastModifiedTime(file.toPath(), FileTime.fromMillis(1_700_000_000_000L))
+        val originalModified = Files.getLastModifiedTime(file.toPath())
+        val listed = success(repository.listEntries(target)).single()
+        assertEquals(originalModified.toMillis(), listed.modifiedAt)
+
+        assertTrue(repository.saveMemory("entry", "summary", "# Updated body", MemoryScope.PROJECT, project.path))
+        Files.setLastModifiedTime(file.toPath(), FileTime.fromMillis(1_700_086_400_000L))
+        val updatedModified = Files.getLastModifiedTime(file.toPath())
+        val updatedBytes = file.readBytes()
+        assertTrue(updatedModified.toMillis() > originalModified.toMillis())
+
+        val latest = success(repository.readEntry(target, listed))
+        assertEquals(listed.id, latest.entry.id)
+        assertEquals(listed.name, latest.entry.name)
+        assertEquals(MemoryScope.PROJECT, latest.entry.scope)
+        assertEquals("# Updated body", latest.content)
+        assertEquals(updatedModified.toMillis(), latest.entry.modifiedAt)
+        assertNotEquals(listed.modifiedAt, latest.entry.modifiedAt)
+        assertNotEquals(listed.version, latest.entry.version)
+        assertDiskSnapshot(file, updatedBytes, updatedModified)
+        assertEquals(latest.entry, success(repository.listEntries(target)).single())
+        assertDiskSnapshot(file, updatedBytes, updatedModified)
+    }
+
+    @Test fun zeroFilesystemMtimeIsUnknownForBothListingAndReading() {
+        success(repository.createOnly(target, MemoryScope.GLOBAL, "unknown-time", "", "unchanged body"))
+        val file = File(target.globalRoot, "unknown-time.md")
+        val bytes = file.readBytes()
+        Files.setLastModifiedTime(file.toPath(), FileTime.fromMillis(0L))
+        val actualModified = Files.getLastModifiedTime(file.toPath())
+        assertEquals("The fixture must really have the Unix epoch mtime", 0L, actualModified.toMillis())
+
+        val listed = success(repository.listEntries(target)).single()
+        assertNull(listed.modifiedAt)
+        assertDiskSnapshot(file, bytes, actualModified)
+        val document = success(repository.readEntry(target, listed))
+        assertNull(document.entry.modifiedAt)
+        assertEquals(listed, document.entry)
+        assertEquals("unchanged body", document.content)
+        assertDiskSnapshot(file, bytes, actualModified)
+    }
+
+    @Test fun aiListMemoriesKeepsNameOrderWhenFileMtimesRunInReverse() {
+        target.globalRoot.mkdirs()
+        val snapshots = linkedMapOf<File, Pair<ByteArray, FileTime>>()
+        listOf(
+            "z-last" to 1_700_172_800_000L,
+            "a-first" to 1_700_000_000_000L,
+            "m-middle" to 1_700_086_400_000L
+        ).forEach { (name, millis) ->
+            val bytes = "---\nname: $name\ndescription: kept\n---\n$name body\n".toByteArray(Charsets.UTF_8)
+            val file = File(target.globalRoot, "$name.md").apply { writeBytes(bytes) }
+            Files.setLastModifiedTime(file.toPath(), FileTime.fromMillis(millis))
+            snapshots[file] = bytes to Files.getLastModifiedTime(file.toPath())
+        }
+        val firstModified = snapshots.getValue(File(target.globalRoot, "a-first.md")).second.toMillis()
+        val middleModified = snapshots.getValue(File(target.globalRoot, "m-middle.md")).second.toMillis()
+        val lastModified = snapshots.getValue(File(target.globalRoot, "z-last.md")).second.toMillis()
+        assertTrue(firstModified < middleModified && middleModified < lastModified)
+
+        val entries = success(repository.listEntries(target))
+        assertEquals(listOf("a-first", "m-middle", "z-last"), entries.map { it.name })
+        entries.forEach { listed ->
+            assertEquals(snapshots.getValue(File(target.globalRoot, listed.fileName)).second.toMillis(), listed.modifiedAt)
+        }
+        snapshots.forEach { (file, snapshot) -> assertDiskSnapshot(file, snapshot.first, snapshot.second) }
+        val memories = repository.listMemories(null)
+        assertEquals(listOf("a-first", "m-middle", "z-last"), memories.map { it.name })
+        assertEquals(listOf("a-first.md", "m-middle.md", "z-last.md"), memories.map { it.file?.name })
+        assertTrue(memories.all { it.scope == MemoryScope.GLOBAL })
+        assertEquals(listOf("a-first body", "m-middle body", "z-last body"), memories.map { it.content })
+        snapshots.forEach { (file, snapshot) -> assertDiskSnapshot(file, snapshot.first, snapshot.second) }
+    }
+
+    @Test fun sameNameModifiedTimesRemainScopeExactEvenWhenGlobalIsNewer() {
+        success(repository.createOnly(target, MemoryScope.GLOBAL, "shared", "global", "global body"))
+        success(repository.createOnly(target, MemoryScope.PROJECT, "shared", "project", "project body"))
+        val globalFile = File(target.globalRoot, "shared.md")
+        val projectFile = File(requireNotNull(target.projectRoot), "shared.md")
+        val globalBytes = globalFile.readBytes()
+        val projectBytes = projectFile.readBytes()
+        Files.setLastModifiedTime(globalFile.toPath(), FileTime.fromMillis(1_700_086_400_000L))
+        Files.setLastModifiedTime(projectFile.toPath(), FileTime.fromMillis(1_700_000_000_000L))
+        val globalModified = Files.getLastModifiedTime(globalFile.toPath())
+        val projectModified = Files.getLastModifiedTime(projectFile.toPath())
+        assertTrue(globalModified.toMillis() > projectModified.toMillis())
+
+        val entries = success(repository.listEntries(target))
+        assertEquals(2, entries.size)
+        val global = entries.single { it.scope == MemoryScope.GLOBAL }
+        val local = entries.single { it.scope == MemoryScope.PROJECT }
+        assertNotEquals(global.id, local.id)
+        assertEquals(globalModified.toMillis(), global.modifiedAt)
+        assertEquals(projectModified.toMillis(), local.modifiedAt)
+        val globalDocument = success(repository.readEntry(target, global))
+        val projectDocument = success(repository.readEntry(target, local))
+        assertEquals(global, globalDocument.entry)
+        assertEquals(local, projectDocument.entry)
+        assertEquals("global body", globalDocument.content)
+        assertEquals("project body", projectDocument.content)
+        val toolMemory = repository.listMemories(project.path).single()
+        assertEquals(MemoryScope.PROJECT, toolMemory.scope)
+        assertEquals("project body", toolMemory.content)
+        assertEquals("project body", repository.loadContent("shared", project.path))
+        assertDiskSnapshot(globalFile, globalBytes, globalModified)
+        assertDiskSnapshot(projectFile, projectBytes, projectModified)
     }
 
     @Test fun sameNameStaysSeparateWhileToolAggregationRemainsProjectFirst() {
@@ -331,6 +467,11 @@ class MemoryRepositoryManagementTest {
         assertEquals("old target", success(remoteRepository.readEntry(frozen, success(remoteRepository.listEntries(frozen)).single())).content)
         assertTrue(File(frozen.projectRoot, "entry.md").exists())
         assertFalse(File(aicode, "projects").exists())
+    }
+
+    private fun assertDiskSnapshot(file: File, bytes: ByteArray, modified: FileTime) {
+        assertArrayEquals("Reading must not rewrite ${file.name}", bytes, file.readBytes())
+        assertEquals("Reading must not touch ${file.name} mtime", modified, Files.getLastModifiedTime(file.toPath()))
     }
 
     private fun <T> success(result: MemoryManagementResult<T>): T = when (result) {

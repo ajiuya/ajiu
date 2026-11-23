@@ -11,6 +11,9 @@ import com.aicode.feature.agent.domain.tool.ToolPermissionPolicy
 import com.aicode.feature.agent.domain.tool.ToolResult
 import com.aicode.feature.agent.domain.tool.ToolStreamEvent
 import com.aicode.feature.terminal.domain.TerminalSessionProvider
+import com.aicode.feature.terminal.domain.TerminalTaskRecord
+import com.aicode.feature.terminal.domain.TerminalTaskScopeResolver
+import com.aicode.feature.terminal.data.repository.TerminalTaskHistoryRepository
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -71,7 +74,9 @@ internal fun filterOutputLines(output: String, regex: Regex): List<String> =
  * send 动作按输入内容匹配，key/read/close 按整工具匹配。
  */
 class TerminalSessionTool @Inject constructor(
-    private val sessionManager: TerminalSessionProvider
+    private val sessionManager: TerminalSessionProvider,
+    private val taskHistory: TerminalTaskHistoryRepository,
+    private val historyScopeResolver: TerminalTaskScopeResolver
 ) : AgentTool(), StreamingAgentTool {
     private companion object {
         const val TAG = "TerminalSessionTool"
@@ -101,7 +106,7 @@ class TerminalSessionTool @Inject constructor(
 
     override val name = "terminal"
     override val description =
-        "启动和管理当前执行环境（本地容器或远程 SSH）的持续终端会话，适合耗时任务（构建、安装依赖）、常驻服务或需要多次输入的交互命令。支持发送输入、快捷键和读取输出；会自行结束且需等待结果的任务用 start + notify=true，常驻或交互式任务按需 read/send/key。中断前台进程用 key=ctrl+c。read 可用 filter 正则按行筛选输出，close 可用 tab_ids 一次关闭多个标签。"
+        "启动和管理当前执行环境（本地容器或远程 SSH）的持续终端会话，适合耗时任务（构建、安装依赖）、常驻服务或需要多次输入的交互命令。支持发送输入、快捷键和读取输出；会自行结束且需等待结果的任务用 start + notify=true，常驻或交互式任务按需 read/send/key。中断前台进程用 key=ctrl+c。read 可用 filter 正则按行筛选输出；本地 notify=true 任务另有只读 history_id，重启后可核对已保存快照与真实退出码，未知结果不能视为完成。历史不能发送输入或重跑。close 可用 tab_ids 一次关闭多个标签。"
     override val permissionPolicy = ToolPermissionPolicy.ASK
     override val capabilities = setOf(ToolCapability.EXECUTE_COMMANDS)
 
@@ -150,6 +155,12 @@ class TerminalSessionTool @Inject constructor(
             description = "close 可选：要关闭的终端标签 id 数组，可一次关闭多个，如 [\"term-1\",\"term-2\"]；与 tab_id 同时给时合并去重",
             required = false,
             itemsSchema = mapOf("type" to "string")
+        ),
+        "history_id" to ToolParameter(
+            name = "history_id",
+            type = ParameterType.STRING,
+            description = "read 可选：本地后台任务的独立历史 ID，读取当前工作区及发起会话的只读快照；不能与 tab_id 同传，不能用于 send/key/close。结果未知时先核验，不自动重跑。",
+            required = false
         ),
         "filter" to ToolParameter(
             name = "filter",
@@ -243,12 +254,17 @@ class TerminalSessionTool @Inject constructor(
         }
         else -> {
             val tabId = args["tab_id"]?.asPlainString()
+            val historyId = args["history_id"]?.asPlainString()
             PendingToolPermission(
                 id = callId,
                 toolName = name,
                 title = "确认读取终端输出",
-                summary = tabId?.takeIf { it.isNotBlank() } ?: "列出所有标签",
-                details = if (tabId.isNullOrBlank()) "列出当前所有终端标签及其状态" else "读取终端 $tabId 的当前输出",
+                summary = historyId?.takeIf { it.isNotBlank() } ?: tabId?.takeIf { it.isNotBlank() } ?: "列出所有标签",
+                details = when {
+                    !historyId.isNullOrBlank() -> "读取所属会话与当前本地工作区的只读任务历史 $historyId"
+                    tabId.isNullOrBlank() -> "列出当前终端标签及所属任务历史"
+                    else -> "读取终端 $tabId 的当前输出"
+                },
                 argsPreview = argsPreview
             )
         }
@@ -262,15 +278,19 @@ class TerminalSessionTool @Inject constructor(
         context: com.aicode.feature.agent.domain.model.AgentContext
     ): ToolResult = execute(args, context.sessionId)
 
-    private suspend fun execute(args: Map<String, JsonElement>, sourceSessionId: String?): ToolResult =
-        when (actionOf(args)) {
+    private suspend fun execute(args: Map<String, JsonElement>, sourceSessionId: String?): ToolResult {
+        if (args.containsKey("history_id") && actionOf(args) != "read") {
+            return ToolResult.Error("history_id 只供读取，不能恢复或操作进程", "TERMINAL_HISTORY_READ_ONLY")
+        }
+        return when (actionOf(args)) {
             "start" -> start(args, sourceSessionId)
             "send" -> send(args)
             "key" -> sendKey(args)
-            "read" -> read(args)
+            "read" -> read(args, sourceSessionId)
             "close" -> close(args)
             else -> ToolResult.Error("缺少或非法的 action 参数（应为 start/send/key/read/close）")
         }
+    }
 
     /**
      * 事件流路径下，让 start/send 像 Bash 一样把等待窗口内的新输出实时推给 UI。
@@ -280,10 +300,14 @@ class TerminalSessionTool @Inject constructor(
         args: Map<String, JsonElement>,
         context: com.aicode.feature.agent.domain.model.AgentContext
     ): Flow<ToolStreamEvent> = flow {
+        if (args.containsKey("history_id") && actionOf(args) != "read") {
+            emit(ToolStreamEvent.Completed(ToolResult.Error("history_id 只供读取，不能恢复或操作进程", "TERMINAL_HISTORY_READ_ONLY")))
+            return@flow
+        }
         when (actionOf(args)) {
             "start" -> streamStart(args, context)
             "send" -> streamSend(args)
-            else -> emit(ToolStreamEvent.Completed(execute(args)))
+            else -> emit(ToolStreamEvent.Completed(execute(args, context.sessionId)))
         }
     }
 
@@ -393,18 +417,9 @@ class TerminalSessionTool @Inject constructor(
                 if (!running) break
             }
 
-            val running = sessionManager.listTabs().firstOrNull { it.id == tabId }?.running ?: false
-            val output = sessionManager.getTabOutput(tabId) ?: ""
-            FileLogger.v(TAG, "start 捕获 tab=$tabId running=$running 输出 ${output.length} 字符")
-            ToolResult.Success(
-                JsonObject(
-                    mapOf(
-                        "tab_id" to JsonPrimitive(tabId),
-                        "running" to JsonPrimitive(running),
-                        "output" to JsonPrimitive(output)
-                    )
-                )
-            )
+            capturedResult(tabId, actionLabel = "start")
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             FileLogger.e(TAG, "启动后台命令失败: $command", e)
             ToolResult.Error("启动后台命令失败：${e.message}")
@@ -479,46 +494,95 @@ class TerminalSessionTool @Inject constructor(
     }
 
     /** 读取终端输出；省略 tab_id 则列出所有标签。TerminalSessionManager 需主线程。 */
-    private suspend fun read(args: Map<String, JsonElement>): ToolResult = withContext(Dispatchers.Main) {
-        val tabId = args["tab_id"]?.asPlainString()
-        if (tabId.isNullOrBlank()) {
-            val list = sessionManager.listTabs()
-            if (list.isEmpty()) return@withContext ToolResult.Success(JsonPrimitive("当前没有终端标签。"))
-            val text = list.joinToString("\n") {
-                val state = if (it.running) "运行中" else "已结束"
-                val kind = if (it.isBackground) "后台" else "交互"
-                "${it.id}  [$kind/$state]  ${it.title}" + (it.command?.let { c -> "  ($c)" } ?: "")
-            }
-            return@withContext ToolResult.Success(JsonPrimitive(text))
+    private suspend fun read(args: Map<String, JsonElement>, sourceSessionId: String?): ToolResult = withContext(Dispatchers.Main) {
+        val tabId = args["tab_id"]?.asPlainString()?.takeIf { it.isNotBlank() }
+        val historyId = args["history_id"]?.asPlainString()?.takeIf { it.isNotBlank() }
+        if (args.containsKey("history_id") && historyId == null) {
+            return@withContext ToolResult.Error("history_id 不能为空", "INVALID_HISTORY_ID")
+        }
+        if (tabId != null && historyId != null) {
+            return@withContext ToolResult.Error("tab_id 与 history_id 不能同时使用", "AMBIGUOUS_TERMINAL_TARGET")
         }
         val filter = args["filter"]?.asPlainString()?.trim()?.takeIf { it.isNotEmpty() }
-        val regex = if (filter == null) {
-            null
-        } else {
-            try {
-                Regex(filter)
-            } catch (e: Exception) {
-                return@withContext ToolResult.Error(
-                    "filter 不是合法的正则表达式：${e.message ?: filter}",
-                    "INVALID_REGEX"
-                )
+        val regex = try {
+            filter?.let(::Regex)
+        } catch (e: Exception) {
+            return@withContext ToolResult.Error("filter 不是合法的正则表达式：${e.message ?: filter}", "INVALID_REGEX")
+        }
+        if (historyId != null) {
+            if (sourceSessionId.isNullOrBlank()) {
+                return@withContext ToolResult.Error("读取历史需要发起会话身份", "TERMINAL_HISTORY_UNAVAILABLE")
             }
+            try {
+                val scope = historyScopeResolver.capture()
+                    ?: return@withContext ToolResult.Error("任务历史仅用于当前本地容器与工作区", "TERMINAL_HISTORY_UNAVAILABLE")
+                val record = taskHistory.read(historyId, scope, sourceSessionId)
+                    ?: return@withContext ToolResult.Error("未找到属于当前会话与工作区的任务历史", "TERMINAL_HISTORY_NOT_FOUND")
+                if (historyScopeResolver.capture() != scope) {
+                    return@withContext ToolResult.Error("历史读取期间执行来源已变化", "TERMINAL_HISTORY_UNAVAILABLE")
+                }
+                return@withContext ToolResult.Success(historyResult(record, filteredOutput(record.output, filter, regex)))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: IllegalArgumentException) {
+                return@withContext ToolResult.Error("history_id 无效", "INVALID_HISTORY_ID")
+            } catch (e: Exception) {
+                return@withContext ToolResult.Error("任务历史读取失败，不能据此判断执行结果", "TERMINAL_HISTORY_READ_FAILED")
+            }
+        }
+        if (tabId == null) {
+            val list = sessionManager.listTabs()
+            val activeText = if (list.isEmpty()) "当前没有终端标签。" else list.joinToString("\n") {
+                val state = if (it.running) "运行中" else "已结束"
+                val kind = if (it.isBackground) "后台" else "交互"
+                "${it.id}  [$kind/$state]  ${it.title}" + (it.command?.let { c -> "  ($c)" } ?: "") +
+                    (it.historyId?.let { id -> "  history_id=$id" } ?: "") +
+                    (it.historyError?.let { "  [历史保存失败]" } ?: "")
+            }
+            val historyText = try {
+                val scope = if (sourceSessionId.isNullOrBlank()) null else historyScopeResolver.capture()
+                if (scope == null || sourceSessionId == null) "" else {
+                    val records = taskHistory.list(scope, sourceSessionId)
+                    if (historyScopeResolver.capture() != scope) {
+                        return@withContext ToolResult.Error("历史列表读取期间执行来源已变化", "TERMINAL_HISTORY_UNAVAILABLE")
+                    }
+                    if (records.isEmpty()) "" else "\n\n任务历史（只读，不能作为活终端操作）：\n" + records.joinToString("\n") {
+                        "history_id=${it.historyId}  [${it.status.name}]  ${it.title}" +
+                            (it.exitCode?.let { code -> "  exit_code=$code" } ?: "  未记录退出码；需核验，不能认定完成")
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                "\n任务历史读取失败，历史是否存在及执行结果未知。"
+            }
+            return@withContext ToolResult.Success(JsonPrimitive(activeText + historyText))
         }
         val output = sessionManager.getTabOutput(tabId)
             ?: return@withContext ToolResult.Error("未找到终端标签：$tabId")
-        if (regex == null) {
-            FileLogger.v(TAG, "读取 $tabId 输出 ${output.length} 字符")
-            return@withContext ToolResult.Success(JsonPrimitive(output))
-        }
-        val matched = filterOutputLines(output, regex)
-        FileLogger.v(TAG, "读取 $tabId 输出 ${output.length} 字符，filter=$filter 命中 ${matched.size} 行")
-        val text = if (matched.isEmpty()) {
-            "没有匹配 $filter 的行（原输出共 ${output.lineSequence().count()} 行）。"
-        } else {
-            matched.joinToString("\n")
-        }
-        ToolResult.Success(JsonPrimitive(text))
+        ToolResult.Success(JsonPrimitive(filteredOutput(output, filter, regex)))
     }
+
+    private fun filteredOutput(output: String, filter: String?, regex: Regex?): String {
+        if (regex == null) return output
+        val matched = filterOutputLines(output, regex)
+        return if (matched.isEmpty()) {
+            "没有匹配 $filter 的行（原输出共 ${output.lineSequence().count()} 行）。"
+        } else matched.joinToString("\n")
+    }
+
+    private fun historyResult(record: TerminalTaskRecord, output: String): JsonObject = JsonObject(buildMap {
+        put("history_id", JsonPrimitive(record.historyId))
+        put("read_only", JsonPrimitive(true))
+        put("status", JsonPrimitive(record.status.name))
+        put("title", JsonPrimitive(record.title))
+        put("started_at", JsonPrimitive(record.startedAt))
+        put("updated_at", JsonPrimitive(record.updatedAt))
+        record.exitCode?.let { put("exit_code", JsonPrimitive(it)) }
+        record.historyError?.let { put("history_error", JsonPrimitive(it)) }
+        put("output", JsonPrimitive(output))
+        put("snapshot_note", JsonPrimitive("最后成功保存的有界终端快照；未记录退出码不代表成功、失败或仍在运行。历史不会重新执行命令或恢复审批。"))
+    })
 
     /**
      * 关闭终端标签，支持 `tab_ids` 数组一次关闭多个（与 `tab_id` 合并去重）。
@@ -569,11 +633,13 @@ class TerminalSessionTool @Inject constructor(
         )
         return ToolResult.Success(
             JsonObject(
-                mapOf(
-                    "tab_id" to JsonPrimitive(tabId),
-                    "running" to JsonPrimitive(tab.running),
-                    "output" to JsonPrimitive(rawOutput)
-                )
+                buildMap {
+                    put("tab_id", JsonPrimitive(tabId))
+                    put("running", JsonPrimitive(tab.running))
+                    put("output", JsonPrimitive(rawOutput))
+                    tab.historyId?.let { put("history_id", JsonPrimitive(it)) }
+                    tab.historyError?.let { put("history_error", JsonPrimitive(it)) }
+                }
             )
         )
     }

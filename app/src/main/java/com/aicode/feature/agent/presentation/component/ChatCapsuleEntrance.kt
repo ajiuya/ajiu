@@ -9,7 +9,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
-import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.unit.dp
 import androidx.compose.runtime.remember
@@ -17,7 +16,6 @@ import com.aicode.feature.agent.presentation.MessageRole
 
 internal const val CAPSULE_ENTRANCE_DURATION_MS = 420
 private const val CAPSULE_ENTRANCE_OFFSET_DP = 9f
-private const val CAPSULE_ENTRANCE_INITIAL_SCALE = 0.98f
 private const val CAPSULE_ENTRANCE_BACK_OVERSHOOT = 1.15f
 
 internal fun capsuleEntranceEase(progress: Float): Float {
@@ -47,15 +45,11 @@ internal fun CapsuleEntrance(
         val height = (placeable.height * eased).toInt().coerceIn(constraints.minHeight, constraints.maxHeight)
         val back = capsuleEntranceBack(progress)
         val translationY = CAPSULE_ENTRANCE_OFFSET_DP.dp.toPx() * (1f - back)
-        val scale = CAPSULE_ENTRANCE_INITIAL_SCALE + (1f - CAPSULE_ENTRANCE_INITIAL_SCALE) * back
         val width = placeable.width.coerceIn(constraints.minWidth, constraints.maxWidth)
         layout(width, height) {
             placeable.placeWithLayer(0, 0) {
                 alpha = eased
                 this.translationY = translationY
-                scaleX = scale
-                scaleY = scale
-                transformOrigin = TransformOrigin.Center
             }
         }
     }

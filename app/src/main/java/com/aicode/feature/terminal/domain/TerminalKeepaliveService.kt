@@ -43,6 +43,7 @@ class TerminalKeepaliveService : Service() {
     private var stopping = false
     private var currentChannelId: String? = null
     private var cpuRenewAt = 0L
+    private var protectionSequence = 0L
 
     private val renewCpuLock = Runnable {
         if (!stopping && foreground) reconcileTasks()
@@ -54,20 +55,27 @@ class TerminalKeepaliveService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        protectionSequence = TaskKeepaliveController.currentStartSequence()
         if (ensureForeground()) {
-            TaskKeepaliveController.attach(this)
-            reconcileTasks()
-            startLiveObserver()
+            if (TaskKeepaliveController.attach(this, protectionSequence)) {
+                reconcileTasks()
+                startLiveObserver()
+            } else stopProtection()
         }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val currentSequence = TaskKeepaliveController.currentStartSequence()
+        if (intent?.hasExtra(TaskKeepaliveController.EXTRA_START_SEQUENCE) == true &&
+            intent.getLongExtra(TaskKeepaliveController.EXTRA_START_SEQUENCE, -1) != currentSequence
+        ) return START_NOT_STICKY
         // A new start can arrive after stopSelf but before destruction of this same instance.
         if (stopping && TaskKeepaliveController.snapshot().serviceRequired) {
             stopping = false
+            protectionSequence = TaskKeepaliveController.currentStartSequence()
             if (ensureForeground()) {
-                TaskKeepaliveController.attach(this)
-                startLiveObserver()
+                if (TaskKeepaliveController.attach(this, protectionSequence)) startLiveObserver()
+                else stopProtection()
             }
         }
         if (!stopping) reconcileTasks()
@@ -107,8 +115,8 @@ class TerminalKeepaliveService : Service() {
         if (!ensureForeground()) return
         if (snapshot.cpuRequired) {
             if (wakeLock?.isHeld != true || SystemClock.elapsedRealtime() >= cpuRenewAt) {
-                acquireCpuLock()
-                cpuRenewAt = SystemClock.elapsedRealtime() + CPU_RENEW_MS
+                val acquired = acquireCpuLock()
+                cpuRenewAt = if (acquired) SystemClock.elapsedRealtime() + CPU_RENEW_MS else 0L
                 handler.removeCallbacks(renewCpuLock)
                 handler.postDelayed(renewCpuLock, CPU_RENEW_MS)
             }
@@ -130,7 +138,7 @@ class TerminalKeepaliveService : Service() {
                 foreground = true
             } catch (error: Exception) {
                 foreground = false
-                TaskKeepaliveController.foregroundFailed(this, error)
+                TaskKeepaliveController.foregroundFailed(this, error, protectionSequence)
                 stopProtection()
                 return false
             }
@@ -352,35 +360,58 @@ class TerminalKeepaliveService : Service() {
         stopSelf()
     }
 
-    private fun acquireCpuLock() {
-        runCatching {
+    private fun acquireCpuLock(): Boolean {
+        return runCatching {
             val lock = wakeLock ?: getSystemService(PowerManager::class.java)
                 .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AiCode:ActiveTasks")
                 .apply { setReferenceCounted(false) }
                 .also { wakeLock = it }
+            val renewing = lock.isHeld
             lock.acquire(CPU_TIMEOUT_MS)
-        }.onFailure { FileLogger.e(TAG, "CPU wake lock unavailable", it) }
+            check(lock.isHeld) { "CPU wake lock was not held after acquisition" }
+            FileLogger.i(TAG, "CPU wake lock ${if (renewing) "renewed" else "acquired"}; held=true timeoutMs=$CPU_TIMEOUT_MS")
+            true
+        }.getOrElse {
+            FileLogger.e(TAG, "CPU wake lock acquisition failed; held=${wakeLock?.isHeld == true} errorType=${it.javaClass.simpleName}")
+            false
+        }
     }
 
     private fun releaseCpuLock() {
-        runCatching { wakeLock?.let { if (it.isHeld) it.release() } }
-            .onFailure { FileLogger.w(TAG, "CPU wake lock release failed", it) }
+        runCatching {
+            wakeLock?.let {
+                if (it.isHeld) {
+                    it.release()
+                    FileLogger.i(TAG, "CPU wake lock release requested; held=${it.isHeld}")
+                }
+            }
+        }.onFailure { FileLogger.w(TAG, "CPU wake lock release failed; held=${wakeLock?.isHeld == true} errorType=${it.javaClass.simpleName}") }
     }
 
     @Suppress("DEPRECATION")
     private fun acquireWifiLock() {
         runCatching {
-            val manager = applicationContext.getSystemService(WifiManager::class.java) ?: return
+            val manager = checkNotNull(applicationContext.getSystemService(WifiManager::class.java))
             val lock = wifiLock ?: manager.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "AiCode:ActiveTasks")
                 .apply { setReferenceCounted(false) }
                 .also { wifiLock = it }
-            if (!lock.isHeld) lock.acquire()
-        }.onFailure { FileLogger.w(TAG, "Wi-Fi lock unavailable", it) }
+            if (!lock.isHeld) {
+                lock.acquire()
+                check(lock.isHeld) { "Wi-Fi lock was not held after acquisition" }
+                FileLogger.i(TAG, "Wi-Fi lock acquired; held=true")
+            }
+        }.onFailure { FileLogger.w(TAG, "Wi-Fi lock acquisition failed; held=${wifiLock?.isHeld == true} errorType=${it.javaClass.simpleName}") }
     }
 
     private fun releaseWifiLock() {
-        runCatching { wifiLock?.let { if (it.isHeld) it.release() } }
-            .onFailure { FileLogger.w(TAG, "Wi-Fi lock release failed", it) }
+        runCatching {
+            wifiLock?.let {
+                if (it.isHeld) {
+                    it.release()
+                    FileLogger.i(TAG, "Wi-Fi lock release requested; held=${it.isHeld}")
+                }
+            }
+        }.onFailure { FileLogger.w(TAG, "Wi-Fi lock release failed; held=${wifiLock?.isHeld == true} errorType=${it.javaClass.simpleName}") }
     }
 
     companion object {

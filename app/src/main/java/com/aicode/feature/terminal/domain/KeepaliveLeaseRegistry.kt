@@ -11,9 +11,13 @@ internal class KeepaliveLeaseRegistry(private val nowMillis: () -> Long) {
         val wifiRequired: Boolean,
         val foreground: Boolean,
         val startPending: Boolean,
-        val suspended: Boolean
+        val suspended: Boolean,
+        val recoveryAttempts: Int = 0,
+        val recoveryPending: Boolean = false,
+        val recoveryExhausted: Boolean = false
     ) {
         val protected: Boolean get() = serviceRequired && foreground
+        val activeRequired: Boolean get() = cpuRequired || wifiRequired
     }
 
     private val owners = mutableMapOf<String, Lease>()
@@ -22,6 +26,9 @@ internal class KeepaliveLeaseRegistry(private val nowMillis: () -> Long) {
     private var foreground = false
     private var startPending = false
     private var suspended = false
+    private var recoveryAttempts = 0
+    private var recoveryPending = false
+    private var recoveryExhausted = false
 
     @Synchronized
     fun acquire(owner: String, cpu: Boolean, network: Boolean) {
@@ -90,6 +97,13 @@ internal class KeepaliveLeaseRegistry(private val nowMillis: () -> Long) {
     }
 
     @Synchronized
+    fun setRecoveryState(attempts: Int, pending: Boolean, exhausted: Boolean = false) {
+        recoveryAttempts = attempts
+        recoveryPending = pending
+        recoveryExhausted = exhausted
+    }
+
+    @Synchronized
     fun snapshot(): Snapshot {
         val now = nowMillis()
         owners.entries.removeAll { (_, lease) -> lease.expiresAt?.let { it <= now } == true }
@@ -102,7 +116,10 @@ internal class KeepaliveLeaseRegistry(private val nowMillis: () -> Long) {
             wifiRequired = required && owners.values.any { it.network },
             foreground = foreground,
             startPending = startPending,
-            suspended = suspended
+            suspended = suspended,
+            recoveryAttempts = recoveryAttempts,
+            recoveryPending = recoveryPending,
+            recoveryExhausted = recoveryExhausted
         )
     }
 }

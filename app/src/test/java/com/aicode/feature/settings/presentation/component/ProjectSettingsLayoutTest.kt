@@ -82,10 +82,78 @@ import org.robolectric.annotation.TextLayoutMode
 @OptIn(InternalComposeUiApi::class, ExperimentalCoroutinesApi::class)
 class ProjectSettingsLayoutTest {
     @Test(timeout = 90_000)
+    fun registeredWorkspaceShowsOneOpenActionAndListsOnlyOtherProjects(): Unit = render {
+        wholeSection = true
+        val current = project.copy(id = "current", name = "Current project")
+        val other = project.copy(id = "other", name = "Other project", identity = identity.copy(projectRoot = "/workspace/other"))
+        state = state.copy(selectedProjectId = null, projects = listOf(current, other))
+        settle()
+
+        val overview = tag("project-progress-overview").bounds()
+        val open = tag("project-progress-open-current")
+        val otherHeader = textNode(label(R.string.project_progress_other_projects)).bounds()
+        val otherRow = tag("project-progress-project-${other.id}").bounds()
+        assertTrue(tag("project-progress-overview").containsText(current.name))
+        assertTrue(open.containsText(label(R.string.project_progress_view)))
+        assertFalse(hasTag("project-progress-register"))
+        assertFalse(hasTag("project-progress-project-${current.id}"))
+        assertTrue("other projects must follow the workspace card", overview.bottom <= otherHeader.top)
+        assertTrue("other project rows must follow their heading", otherHeader.bottom <= otherRow.top)
+        assertTrue("other project name must remain inside its row", textNode(other.name).bounds().let {
+            it.top >= otherRow.top && it.bottom <= otherRow.bottom
+        })
+        clickTag("project-progress-open-current")
+        assertEquals(listOf("select:${current.id}"), operations)
+    }
+
+    @Test(timeout = 90_000)
+    fun unregisteredWorkspaceOffersRegistrationAndKeepsOtherRootsSeparate(): Unit = render {
+        wholeSection = true
+        val other = project.copy(id = "other", name = "Other project", identity = identity.copy(projectRoot = "/workspace/other"))
+        state = state.copy(selectedProjectId = null, projects = listOf(other))
+        settle()
+
+        assertTrue(hasTag("project-progress-register"))
+        assertTrue(tag("project-progress-register").containsText(label(R.string.project_progress_register_short)))
+        assertTrue(hasTag("project-progress-project-${other.id}"))
+        assertTrue(hasText(label(R.string.project_progress_other_projects)))
+        clickTag("project-progress-register")
+        assertEquals(listOf("register"), operations)
+    }
+
+    @Test(timeout = 90_000)
+    fun unknownProjectListDoesNotOfferRegistration(): Unit = render {
+        wholeSection = true
+        state = state.copy(selectedProjectId = null, projects = emptyList(), projectsLoaded = false,
+            error = com.aicode.feature.settings.presentation.ProjectProgressError.READ_FAILED)
+        settle()
+
+        assertTrue(hasText(label(R.string.project_progress_environment_value,
+            activity.getString(R.string.project_progress_local_environment),
+            activity.getString(R.string.project_progress_registration_unknown))))
+        assertFalse(hasTag("project-progress-register"))
+        assertFalse(hasTag("project-progress-open-current"))
+        assertTrue(operations.isEmpty())
+    }
+
+    @Test(timeout = 90_000)
+    fun expandedManagementStaysAfterProjectHistory(): Unit = render {
+        wholeSection = true
+        settle()
+        val historyTop = textNode(label(R.string.project_progress_recent)).bounds().top
+        assertTrue(tag("project-settings-toggle").bounds().top > historyTop)
+        clickTag("project-settings-toggle")
+        settle()
+        assertTrue(tag("project-settings-toggle").bounds().top > textNode(label(R.string.project_progress_recent)).bounds().top)
+        assertTrue(operations.isEmpty())
+    }
+
+    @Test(timeout = 90_000)
     fun foldedManagementKeepsUnknownCapacityAndOpeningItNeverChangesAProject(): Unit = render {
         wholeSection = true
         settle()
         visibleTag("project-settings-toggle")
+        assertFalse(tag("project-settings-toggle").containsText(label(R.string.project_progress_not_bound)))
         val associationsBefore = state.associations
         val selectedBefore = state.selectedProject
         assertTrue(hasText(label(R.string.project_progress_capacity_unknown)))
@@ -383,19 +451,24 @@ class ProjectSettingsLayoutTest {
     ) {
         wholeSection = true
         val path = "/workspace/" + "deep root/".repeat(80)
-        state = state.copy(projects = listOf(project.copy(identity = identity.copy(projectRoot = path))))
+        state = state.copy(selectedProjectId = null, workspaceRoot = path,
+            projects = listOf(project.copy(identity = identity.copy(projectRoot = path))))
         settle()
-        val pathNode = textNode(path)
+        val pathNode = tag("project-progress-workspace-path")
         val input = textLayout(pathNode).layoutInput
         assertEquals(path, input.text.text)
         assertEquals(2, input.maxLines)
         assertEquals(TextOverflow.Ellipsis, input.overflow)
         assertEquals(1.5f, input.density.fontScale, 0f)
         assertVisible(pathNode)
+        val status = textNode(label(R.string.project_progress_environment_value,
+            label(R.string.project_progress_local_environment), label(R.string.project_progress_registered)))
+        assertVisible(status)
+        assertTrue(status.bounds().bottom <= tag("project-progress-open-current").bounds().top)
         val longHeight = pathNode.size.height
-        state = state.copy(projects = listOf(project))
+        state = state.copy(workspaceRoot = identity.projectRoot, projects = listOf(project))
         settle()
-        val shortHeight = textNode(identity.projectRoot).size.height
+        val shortHeight = tag("project-progress-workspace-path").size.height
         assertTrue("$longHeight must not grow with the full root length; short=$shortHeight", longHeight <= shortHeight * 2 + 2)
         assertTrue(operations.isEmpty())
     }
@@ -412,6 +485,7 @@ class ProjectSettingsLayoutTest {
                 ProjectProgressSection(
                     state,
                     { operations += "select:${it.id}" },
+                    { operations += "close-project" },
                     { operations += "open:${it.id}" },
                     { operations += "register" },
                     { operations += "bind" },
@@ -652,7 +726,7 @@ class ProjectSettingsLayoutTest {
         private val project = ProjectMemoryProject("project-id", "Project name", identity = identity)
         private fun baseState() = ProjectProgressUiState(
             workspaceName = "Workspace", workspaceRoot = identity.projectRoot, environmentMode = identity.mode,
-            loading = false, sessionId = "session", projects = listOf(project), selectedProjectId = project.id,
+            loading = false, projectsLoaded = true, sessionId = "session", projects = listOf(project), selectedProjectId = project.id,
             associations = ProjectMemoryAssociations(false, null, false, null)
         )
         private fun capacity(active: Int = 3, archived: Int = 7, bytes: Int = 60) =

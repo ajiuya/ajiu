@@ -451,6 +451,7 @@ class AgentRunManager internal constructor(
     fun resetIdle(sessionId: String) = managerScope.launch { setAgentState(sessionId, AgentUIState.Idle) }
 
     fun resetModelRuntime(sessionId: String) = managerScope.launch {
+        agentWorkflow.discardCompactionCheckpoint(sessionId)
         _contextUsages.value -= sessionId
         setGenerationSpeed(sessionId, null)
     }
@@ -536,6 +537,10 @@ class AgentRunManager internal constructor(
     }
 
     private fun compactionFailureMessage(code: String): String = context.getString(when {
+        code == "compaction_total_timeout" -> R.string.compaction_error_total_timeout
+        code == "compaction_first_chunk_timeout" -> R.string.compaction_error_first_content_timeout
+        code == "compaction_idle_timeout" -> R.string.compaction_error_idle_timeout
+        code in setOf("compaction_no_final", "compaction_missing_stop") -> R.string.compaction_error_missing_terminal
         code.contains("timeout") -> R.string.compaction_error_timeout
         code == "compaction_http_401" || code == "compaction_http_403" -> R.string.compaction_error_authentication
         code == "compaction_http_429" -> R.string.compaction_error_rate_limit
@@ -797,7 +802,10 @@ class AgentRunManager internal constructor(
         outcome = if (exitCode == 0) NotificationOutcome.COMPLETED else NotificationOutcome.FAILED,
         command = command,
         exitCode = exitCode,
-        tailOutput = tailOutput
+        tailOutput = if (historyError == null) tailOutput else {
+            listOf("Task history could not be saved; this command exit status was observed.", tailOutput.orEmpty())
+                .joinToString("\n")
+        }
     )
 
     private fun flushPendingNotifications(sessionId: String) {
@@ -2149,6 +2157,7 @@ class AgentRunManager internal constructor(
             agentNotificationCenter.clear(sessionId)
             acceptanceEpoch++
             recoveryRepository.invalidateSession(sessionId, "rewind")
+            agentWorkflow.discardCompactionCheckpoint(sessionId)
             projectMemoryRuntimeBindings.release(sessionId)
             projectProgressTerminalTracker.clearSession(sessionId)
             stoppingSessions.add(sessionId)

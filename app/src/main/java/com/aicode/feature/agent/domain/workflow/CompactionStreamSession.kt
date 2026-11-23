@@ -48,6 +48,30 @@ internal class CompactionStreamSession(
         private set
     val elapsedMs: Long get() = (now() - started).coerceAtLeast(0)
     private data class Done<T>(val value: T)
+    private var work: CompactionCheckpoints.Work? = null
+    private var onCheckpoint: () -> Unit = {}
+    private var blockIndex = 0
+    private var pendingBlock: CompactionCheckpoints.Block? = null
+    val replaying: Boolean get() = work?.block(blockIndex) != null
+
+    fun restore(checkpoint: CompactionCheckpoints.Work, onUpdate: () -> Unit) {
+        check(attempts == 0 && work == null)
+        work = checkpoint
+        attempts = checkpoint.attempts
+        onCheckpoint = onUpdate
+    }
+
+    fun materialBudget(default: Int): Int = work?.block(blockIndex)?.materialBudget
+        ?: work?.failure?.takeIf { it.index == blockIndex }?.materialBudget?.takeIf { it > 0 }
+        ?: default
+
+    fun commitBlock() {
+        val completed = pendingBlock ?: return
+        requireNotNull(work).complete(blockIndex, completed)
+        blockIndex++
+        pendingBlock = null
+        onCheckpoint()
+    }
 
     suspend fun <T> withDeadline(block: suspend () -> T): T {
         currentCoroutineContext().ensureActive()
@@ -63,10 +87,24 @@ internal class CompactionStreamSession(
         onUpdate: suspend (CompactionStreamUpdate) -> Unit,
         onAttempt: suspend (CompactionStreamAttempt) -> Unit,
         onRetry: suspend (CompactionStreamException) -> Unit = {},
+        requestFingerprint: (() -> String)? = null,
+        materialBudget: () -> Int = { 0 },
     ): String {
-        var index = 0
-        var retryableFailures = 0
-        var truncationFailures = 0
+        currentCoroutineContext().ensureActive()
+        work?.block(blockIndex)?.let { completed ->
+            if (completed.request != requestFingerprint?.invoke()) {
+                throw CompactionStreamException("compaction_checkpoint_mismatch")
+            }
+            blockIndex++
+            return completed.summary
+        }
+        val previousFailure = work?.failure?.takeIf { it.index == blockIndex }
+        var retryableFailures = previousFailure?.retryable ?: 0
+        var truncationFailures = previousFailure?.truncated ?: 0
+        if (retryableFailures >= policy.attemptsPerBlock || truncationFailures >= policy.truncationAttemptsPerBlock) {
+            throw CompactionStreamException(requireNotNull(previousFailure).code)
+        }
+        var index = retryableFailures + truncationFailures
         while (true) {
             currentCoroutineContext().ensureActive()
             if (elapsedMs >= policy.totalTimeoutMs) throw CompactionStreamException("compaction_total_timeout")
@@ -82,6 +120,8 @@ internal class CompactionStreamSession(
             var errorCode: String? = null
             var failure: CompactionStreamException? = null
             attempts++
+            work?.attempts = attempts
+            onCheckpoint()
             suspend fun update(state: CompactionStreamState, error: String? = null, force: Boolean = false) {
                 val time = now()
                 if (force || lastEmission == Long.MIN_VALUE || time - lastEmission >= policy.progressIntervalMs) {
@@ -155,13 +195,25 @@ internal class CompactionStreamSession(
                 received = maxOf(received, complete.content.length.toLong())
                 update(CompactionStreamState.NONE, force = true)
                 currentCoroutineContext().ensureActive()
+                if (work != null && requestFingerprint != null) {
+                    pendingBlock = CompactionCheckpoints.Block(requestFingerprint(), materialBudget(), complete.content)
+                }
                 return complete.content
             } catch (cancelled: CancellationException) {
                 errorCode = if (elapsedMs >= policy.totalTimeoutMs) "compaction_total_timeout" else "compaction_cancelled"
+                if (errorCode == "compaction_total_timeout") {
+                    work?.failure = CompactionCheckpoints.Failure(blockIndex, materialBudget(), retryableFailures + 1,
+                        truncationFailures, errorCode)
+                    onCheckpoint()
+                }
                 throw cancelled
             } catch (error: Exception) {
                 failure = CompactionStreamErrors.classify(error)
                 errorCode = failure.code
+                if (failure.code == "compaction_truncated") truncationFailures++ else retryableFailures++
+                work?.failure = CompactionCheckpoints.Failure(blockIndex, materialBudget(), retryableFailures,
+                    truncationFailures, failure.code)
+                onCheckpoint()
             } finally {
                 val record = CompactionStreamAttempt(response, outputTokens, (now() - attemptStart).coerceAtLeast(0),
                     firstContent?.let { (it - attemptStart).coerceAtLeast(0) }, errorCode, wall, index)
@@ -178,10 +230,13 @@ internal class CompactionStreamSession(
             currentCoroutineContext().ensureActive()
             val error = requireNotNull(failure)
             val exhausted = if (error.code == "compaction_truncated") {
-                ++truncationFailures >= policy.truncationAttemptsPerBlock
+                truncationFailures >= policy.truncationAttemptsPerBlock
             } else {
-                ++retryableFailures >= policy.attemptsPerBlock
+                retryableFailures >= policy.attemptsPerBlock
             }
+            work?.failure = CompactionCheckpoints.Failure(blockIndex, materialBudget(), retryableFailures,
+                truncationFailures, error.code)
+            onCheckpoint()
             if (!error.retryable || exhausted) throw error
             if (attempts >= policy.maxAttempts) throw CompactionStreamException("compaction_attempt_limit")
             received = 0
@@ -190,6 +245,9 @@ internal class CompactionStreamSession(
             currentCoroutineContext().ensureActive()
             if (elapsedMs >= policy.totalTimeoutMs) throw CompactionStreamException("compaction_total_timeout")
             onRetry(error)
+            work?.failure = CompactionCheckpoints.Failure(blockIndex, materialBudget(), retryableFailures,
+                truncationFailures, error.code)
+            onCheckpoint()
             index++
         }
     }

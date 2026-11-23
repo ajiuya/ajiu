@@ -1,6 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="compaction_error_timeout">上下文压缩等待超时，已保留原历史。请稍后重试。</string>
+    <string name="compaction_error_total_timeout">本次上下文压缩已达到总时限，原历史未改动。可手动重试；来源和设置未变时，将复用仍有效的完整分块。</string>
+    <string name="compaction_error_first_content_timeout">压缩模型未在首内容时限内返回内容，原历史已保留。请检查服务状态后重试。</string>
+    <string name="compaction_error_idle_timeout">压缩响应在接收途中长时间没有新内容，原历史已保留。请检查连接和服务状态后重试。</string>
+    <string name="compaction_error_missing_terminal">压缩响应缺少完整结束标记，未采用半截摘要，原历史已保留。请重试或检查服务协议兼容性。</string>
     <string name="compaction_error_authentication">压缩模型未通过身份验证，已保留原历史。请检查提供商配置。</string>
     <string name="compaction_error_rate_limit">压缩模型请求受限，已保留原历史。请稍后重试。</string>
     <string name="compaction_error_service">压缩服务暂不可用，已保留原历史。请稍后重试。</string>

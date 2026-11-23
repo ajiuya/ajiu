@@ -4,6 +4,7 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import androidx.room.Transaction
 import com.aicode.feature.agent.data.local.entity.ChatSessionEntity
 import kotlinx.coroutines.flow.Flow
 
@@ -96,6 +97,19 @@ interface ChatSessionDao {
 
     @Query("UPDATE chat_sessions SET providerId = :providerId, model = :model, lastInputTokens = 0 WHERE id = :id")
     suspend fun updateProviderModel(id: String, providerId: String?, model: String?)
+
+    @Query("UPDATE chat_sessions SET providerId = :providerId, model = :model, lastInputTokens = 0 WHERE id IN (:ids)")
+    suspend fun updateProviderModelBatch(ids: List<String>, providerId: String?, model: String?)
+
+    @Transaction
+    suspend fun updateProviderModelWithDirectChildren(id: String, providerId: String?, model: String?): List<String> {
+        val parent = getById(id) ?: return emptyList()
+        val ids = (listOf(parent.id) + getSubSessionsByParentOnce(id)
+            .filter { it.parentId == id && it.workspacePath == parent.workspacePath }
+            .map { it.id }).distinct()
+        updateProviderModelBatch(ids, providerId, model)
+        return ids
+    }
 
     @Query("UPDATE chat_sessions SET reasoningEffort = :effort WHERE id = :id")
     suspend fun updateReasoningEffort(id: String, effort: String)

@@ -5,11 +5,16 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
+import android.content.Intent
 import android.net.wifi.WifiManager
 import android.os.Bundle
 import android.os.Looper
+import android.os.PowerManager
+import com.aicode.core.util.FileLogger
 import com.aicode.feature.agent.presentation.notification.AgentLiveNotificationState
+import io.mockk.Runs
 import io.mockk.every
+import io.mockk.just
 import io.mockk.mockkObject
 import io.mockk.unmockkObject
 import io.mockk.verify
@@ -59,6 +64,7 @@ class TerminalKeepaliveServiceTest {
     fun tearDown() {
         TaskKeepaliveController.release(context, owner)
         TaskKeepaliveController.release(context, "service-test:display")
+        TaskKeepaliveController.release(context, "service-test:other")
         TaskKeepaliveController.setPersistent(context, false)
         controller?.destroy()
         AgentLiveNotificationState.clear()
@@ -108,6 +114,7 @@ class TerminalKeepaliveServiceTest {
         assertFalse(wake.isHeld)
         assertEquals(0, shadowOf(context.getSystemService(WifiManager::class.java)).activeLockCount)
         assertFalse(TaskKeepaliveController.isProtected())
+        assertTrue(TaskKeepaliveController.states.value.recoveryPending)
     }
 
     @Test
@@ -118,6 +125,7 @@ class TerminalKeepaliveServiceTest {
         TaskKeepaliveController.acquire(context, owner, cpu = true)
         assertTrue(TaskKeepaliveController.isSuspended(context))
         assertFalse(TaskKeepaliveController.isProtected())
+        assertFalse(TaskKeepaliveController.states.value.recoveryPending)
         assertFalse(wake.isHeld)
         assertEquals(0, shadowOf(context.getSystemService(WifiManager::class.java)).activeLockCount)
     }
@@ -245,6 +253,33 @@ class TerminalKeepaliveServiceTest {
             assertTrue(ShadowPowerManager.getLatestWakeLock()?.isHeld != true)
             assertEquals(0, shadowOf(context.getSystemService(WifiManager::class.java)).activeLockCount)
         } finally { unmockkObject(service) }
+    }
+
+    @Test
+    fun failedCreationIgnoresItsOldStartCommandAndOnlyTheBackoffRequestCanRestartIt() {
+        TaskKeepaliveController.acquire(context, owner, cpu = true)
+        val originalSequence = TaskKeepaliveController.currentStartSequence()
+        val built = Robolectric.buildService(TerminalKeepaliveService::class.java)
+        controller = built
+        val service = built.get()
+        mockkObject(service)
+        try {
+            every { service.startForeground(any(), any<Notification>()) } throws IllegalStateException("FGS rejected")
+            built.create()
+            val oldStart = Intent().putExtra(TaskKeepaliveController.EXTRA_START_SEQUENCE, originalSequence)
+            assertEquals(android.app.Service.START_NOT_STICKY, service.onStartCommand(oldStart, 0, 1))
+            verify(exactly = 1) { service.startForeground(1, any<Notification>()) }
+            assertTrue(TaskKeepaliveController.states.value.recoveryPending)
+            shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(1))
+            assertEquals(1, TaskKeepaliveController.states.value.recoveryAttempts)
+            assertTrue(TaskKeepaliveController.states.value.startPending)
+        } finally { unmockkObject(service) }
+        val retry = Intent().putExtra(TaskKeepaliveController.EXTRA_START_SEQUENCE, TaskKeepaliveController.currentStartSequence())
+        assertEquals(android.app.Service.START_NOT_STICKY, service.onStartCommand(retry, 0, 2))
+        assertTrue(TaskKeepaliveController.isProtected())
+        assertTrue(ShadowPowerManager.getLatestWakeLock().isHeld)
+        assertFalse(TaskKeepaliveController.states.value.recoveryPending)
+        assertEquals(1, TaskKeepaliveController.states.value.recoveryAttempts)
     }
 
     @Test
@@ -414,6 +449,107 @@ class TerminalKeepaliveServiceTest {
             assertFalse(wake.isHeld)
             assertEquals(0, shadowOf(context.getSystemService(WifiManager::class.java)).activeLockCount)
         } finally { unmockkObject(service) }
+    }
+
+    @Test
+    fun anotherActiveOwnerKeepsBothLocksUntilTheLastTaskFinishes() {
+        start(cpu = true)
+        val wake = ShadowPowerManager.getLatestWakeLock()
+        TaskKeepaliveController.acquire(context, "service-test:other", cpu = true)
+        TaskKeepaliveController.release(context, owner)
+        assertTrue(TaskKeepaliveController.isProtected())
+        assertTrue(wake.isHeld)
+        assertEquals(1, shadowOf(context.getSystemService(WifiManager::class.java)).activeLockCount)
+        TaskKeepaliveController.release(context, "service-test:other")
+        assertFalse(TaskKeepaliveController.isProtected())
+        assertFalse(wake.isHeld)
+        assertEquals(0, shadowOf(context.getSystemService(WifiManager::class.java)).activeLockCount)
+        assertFalse(TaskKeepaliveController.states.value.recoveryPending)
+    }
+
+    @Test
+    fun lockLifecycleLogsOnlyActualAcquisitionRenewalAndReleaseWithoutTaskDetails() {
+        mockkObject(FileLogger)
+        try {
+            every { FileLogger.i(any(), any()) } just Runs
+            val service = start(cpu = true)
+            repeat(30) { service.reconcileTasks() }
+            verify(exactly = 1) { FileLogger.i(any(), match { it.startsWith("CPU wake lock acquired; held=true") }) }
+            verify(exactly = 1) { FileLogger.i(any(), "Wi-Fi lock acquired; held=true") }
+            shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMinutes(5))
+            verify(exactly = 1) { FileLogger.i(any(), match { it.startsWith("CPU wake lock renewed; held=true") }) }
+            TaskKeepaliveController.release(context, owner)
+            verify(exactly = 1) { FileLogger.i(any(), "CPU wake lock release requested; held=false") }
+            verify(exactly = 1) { FileLogger.i(any(), "Wi-Fi lock release requested; held=false") }
+            verify(exactly = 0) { FileLogger.i(any(), match { it.contains(owner) }) }
+        } finally { unmockkObject(FileLogger) }
+    }
+
+    @Test
+    fun failedLockAcquisitionNeverReportsHeldAndDoesNotSetASuccessfulRenewalDeadline() {
+        val service = start(cpu = false, network = false)
+        val power = service.getSystemService(PowerManager::class.java)
+        val wifi = context.getSystemService(WifiManager::class.java)
+        val cpuLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "test:cpu").apply { setReferenceCounted(false) }
+        val networkLock = wifi.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "test:wifi")
+            .apply { setReferenceCounted(false) }
+        val cpuShadow = shadowOf(cpuLock)
+        val networkShadow = shadowOf(networkLock)
+        service.javaClass.getDeclaredField("wakeLock").apply { isAccessible = true }.set(service, cpuLock)
+        service.javaClass.getDeclaredField("wifiLock").apply { isAccessible = true }.set(service, networkLock)
+        mockkObject(cpuShadow, networkShadow, FileLogger, recordPrivateCalls = true)
+        try {
+            every { cpuShadow["acquire"](any<Long>()) } throws SecurityException("private task details")
+            every { networkShadow["acquire"]() } throws SecurityException("private task details")
+            every { FileLogger.i(any(), any()) } just Runs
+            every { FileLogger.e(any(), any(), any()) } just Runs
+            every { FileLogger.w(any(), any(), any()) } just Runs
+            TaskKeepaliveController.acquire(context, owner, cpu = true)
+            assertFalse(cpuLock.isHeld)
+            assertFalse(networkLock.isHeld)
+            assertTrue(TaskKeepaliveController.snapshot().cpuRequired)
+            assertTrue(TaskKeepaliveController.snapshot().wifiRequired)
+            val renewal = service.javaClass.getDeclaredField("cpuRenewAt").apply { isAccessible = true }
+            assertEquals(0L, renewal.getLong(service))
+            verify(exactly = 1) {
+                FileLogger.e(any(), "CPU wake lock acquisition failed; held=false errorType=SecurityException", null)
+            }
+            verify(exactly = 1) {
+                FileLogger.w(any(), "Wi-Fi lock acquisition failed; held=false errorType=SecurityException", null)
+            }
+            verify(exactly = 0) { FileLogger.i(any(), match { it.contains("lock acquired") || it.contains("lock renewed") }) }
+            verify(exactly = 0) { FileLogger.e(any(), match { it.contains("private task details") }, any()) }
+            verify(exactly = 0) { FileLogger.w(any(), match { it.contains("private task details") }, any()) }
+        } finally { unmockkObject(cpuShadow, networkShadow, FileLogger) }
+    }
+
+    @Test
+    fun releaseFailureLogsTheStillHeldStateInsteadOfClaimingRelease() {
+        val service = start(cpu = false, network = false)
+        val lock = service.getSystemService(PowerManager::class.java)
+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "test:release")
+            .apply {
+                setReferenceCounted(false)
+                acquire(10 * 60 * 1000L)
+            }
+        val lockShadow = shadowOf(lock)
+        service.javaClass.getDeclaredField("wakeLock").apply { isAccessible = true }.set(service, lock)
+        mockkObject(lockShadow, FileLogger, recordPrivateCalls = true)
+        try {
+            every { lockShadow["release"](any<Int>()) } throws IllegalStateException("private task details")
+            every { FileLogger.i(any(), any()) } just Runs
+            every { FileLogger.w(any(), any(), any()) } just Runs
+            TaskKeepaliveController.release(context, owner)
+            verify(exactly = 1) {
+                FileLogger.w(any(), "CPU wake lock release failed; held=true errorType=IllegalStateException", null)
+            }
+            verify(exactly = 0) { FileLogger.i(any(), match { it.startsWith("CPU wake lock release requested") }) }
+            assertTrue(lock.isHeld)
+        } finally {
+            unmockkObject(lockShadow, FileLogger)
+            if (lock.isHeld) lock.release()
+            service.javaClass.getDeclaredField("wakeLock").apply { isAccessible = true }.set(service, null)
+        }
     }
 
     @Test

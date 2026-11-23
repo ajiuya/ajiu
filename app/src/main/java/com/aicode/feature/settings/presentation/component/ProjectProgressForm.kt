@@ -52,7 +52,8 @@ internal fun ProjectProgressFormSheet(
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true,
         confirmValueChange = { value -> value != SheetValue.Hidden || !saving })
     AdaptiveModalBottomSheet(onDismissRequest = { if (!state.busy) onDismiss() }, sheetState = sheetState, sheetGesturesEnabled = !state.busy) {
-        ProjectProgressEditorForm(form, state.busy, state.error, onRegister, onHandoff)
+        ProjectProgressEditorForm(form, state.busy, state.error, onRegister, onHandoff,
+            registrationReady = state.projectListReady)
     }
 }
 
@@ -62,7 +63,8 @@ internal fun ProjectProgressEditorForm(
     saving: Boolean,
     error: ProjectProgressError?,
     onRegister: (String) -> Unit,
-    onHandoff: (String, String) -> Unit
+    onHandoff: (String, String) -> Unit,
+    registrationReady: Boolean = true
 ) {
     var name by rememberSaveable(form) { mutableStateOf("") }
     var body by rememberSaveable(form) { mutableStateOf("") }
@@ -91,7 +93,8 @@ internal fun ProjectProgressEditorForm(
         error?.let { Text(stringResource(projectProgressErrorRes(it)), color = MaterialTheme.colorScheme.error) }
         Button(
             onClick = { if (registering) onRegister(name) else onHandoff(name, body) },
-            enabled = !saving && name.isNotBlank() && name.length <= (if (registering) 200 else 512) &&
+            enabled = !saving && (!registering || registrationReady) && name.isNotBlank() &&
+                name.length <= (if (registering) 200 else 512) &&
                 (registering || (body.isNotBlank() && body.length <= 8192)),
             modifier = Modifier.fillMaxWidth()
         ) {

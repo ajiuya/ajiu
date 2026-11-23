@@ -113,7 +113,7 @@ class SessionRecoveryCardTest {
         }) {
             val footerHeight = node(FOOTER).boundsInRoot.height
             val row = node(COMPOSER_ROW).boundsInRoot
-            assertEquals(40f, row.height, 0.01f)
+            assertEquals(36f, row.height, 0.01f)
             assertTrue(nodes().none { it.tag() == BUBBLE })
 
             pendingCount.value = 2

@@ -58,10 +58,13 @@ import androidx.compose.ui.input.pointer.PointerId
 import androidx.compose.ui.input.pointer.PointerInputScope
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
@@ -177,6 +180,15 @@ internal fun ToolMessageBody(
     val expandable = running || metadata == null || hasArguments == null ||
         metadata?.hasResult == true || hasArguments == true || metadata?.subAgent != null
     val effectiveExpanded = expandedOverride == true
+    val durationStyle = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace)
+    val waitingLabel = stringResource(R.string.chat_tool_waiting_execution)
+    val textMeasurer = rememberTextMeasurer()
+    val durationWidth = with(LocalDensity.current) {
+        maxOf(
+            textMeasurer.measure("99:59:59", style = durationStyle, maxLines = 1).size.width,
+            textMeasurer.measure(waitingLabel, style = durationStyle, maxLines = 1).size.width
+        ).toDp()
+    }
 
     Column(modifier = Modifier.fillMaxWidth().padding(horizontal = Spacing.xs)) {
         Row(
@@ -213,11 +225,14 @@ internal fun ToolMessageBody(
             Spacer(Modifier.width(Spacing.sm))
             Text(
                 text = durationMs?.let(::formatToolDuration)
-                    ?: if (running) stringResource(R.string.chat_tool_waiting_execution)
+                    ?: if (running) waitingLabel
                     else stringResource(R.string.chat_tool_group_duration_unknown),
+                modifier = Modifier.width(durationWidth),
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-                style = MaterialTheme.typography.labelSmall,
-                maxLines = 1
+                style = durationStyle,
+                textAlign = TextAlign.End,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
             )
             if (expandable) {
                 Spacer(Modifier.width(Spacing.xs))

@@ -36,6 +36,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
@@ -70,6 +71,7 @@ import com.aicode.core.theme.Spacing
 import com.aicode.core.theme.semanticColors
 import com.aicode.core.ui.rememberImeBottomInset
 import com.aicode.feature.agent.domain.container.ContainerInitState
+import com.aicode.feature.settings.data.repository.ExecutionMode
 import com.aicode.feature.terminal.data.repository.TerminalSettings
 import com.aicode.feature.terminal.domain.RunState
 import com.aicode.feature.terminal.domain.TerminalTab
@@ -103,7 +105,13 @@ fun TerminalScreen(
     val revision by viewModel.revision.collectAsStateWithLifecycle()
     val creatingTab by viewModel.creatingTab.collectAsStateWithLifecycle()
     val terminalSettings by viewModel.terminalSettings.collectAsStateWithLifecycle()
+    val executionMode by viewModel.executionMode.collectAsStateWithLifecycle()
+    val historyState by viewModel.historyState.collectAsStateWithLifecycle()
     var showToolsSheet by remember { mutableStateOf(false) }
+
+    DisposableEffect(viewModel) {
+        onDispose { viewModel.hideHistory() }
+    }
 
     val isDark = MaterialTheme.colorScheme.background.luminance() < 0.5f
     val bgArgb = MaterialTheme.colorScheme.background.toArgb()
@@ -140,6 +148,10 @@ fun TerminalScreen(
                     }
                 },
                 actions = {
+                    TerminalHistoryAction(
+                        isRemote = executionMode == ExecutionMode.REMOTE_SSH,
+                        onOpen = viewModel::showHistory
+                    )
                     IconButton(onClick = { showToolsSheet = true }) {
                         Icon(FeatherIcons.Settings, contentDescription = stringResource(R.string.terminal_settings_title))
                     }
@@ -204,6 +216,15 @@ fun TerminalScreen(
                     }
                 }
             }
+        }
+
+        if (historyState.visible) {
+            TerminalTaskHistorySheet(
+                state = historyState,
+                onSelect = viewModel::selectHistory,
+                onBack = viewModel::backToHistoryList,
+                onDismiss = viewModel::hideHistory
+            )
         }
 
         if (showToolsSheet) {

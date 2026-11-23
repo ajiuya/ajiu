@@ -156,7 +156,6 @@ internal enum class SettingsSection(@param:StringRes val titleRes: Int) {
     PluginDetail(R.string.plugin_details),
     Skills(R.string.settings_skills),
     Memory(R.string.memory_management_title),
-    ProjectProgress(R.string.project_progress_title),
     Prompts(R.string.prompts_title),
     PromptDetail(R.string.prompts_title),
     PromptEditor(R.string.prompts_title),
@@ -427,7 +426,6 @@ fun SettingsScreen(
     val parentSection: SettingsSection? = when (section) {
         SettingsSection.Menu -> null
         SettingsSection.Mcp -> if (openMcpOnEntry) null else if (expanded) null else SettingsSection.Menu
-        SettingsSection.ProjectProgress -> SettingsSection.Memory
         SettingsSection.ProviderEditor -> SettingsSection.Providers
         SettingsSection.Log -> logReturnSection.takeUnless { expanded && it == SettingsSection.Menu }
         SettingsSection.SkillDetail -> SettingsSection.Skills
@@ -584,16 +582,12 @@ fun SettingsScreen(
             current == SettingsSection.Memory -> sectionStateHolder.SaveableStateProvider("Memory") {
                 MemorySettingsRoute(
                     viewModel = androidx.hilt.navigation.compose.hiltViewModel(),
+                    projectProgressViewModel = androidx.hilt.navigation.compose.hiltViewModel(),
+                    sessionId = currentSessionId,
                     showBack = !expanded,
-                    onNavigateBack = { section = SettingsSection.Menu },
-                    onOpenProjectProgress = { section = SettingsSection.ProjectProgress }
+                    onNavigateBack = { section = SettingsSection.Menu }
                 )
             }
-
-            current == SettingsSection.ProjectProgress -> ProjectProgressSettingsRoute(
-                sessionId = currentSessionId,
-                onBack = { section = SettingsSection.Memory }
-            )
 
             current == SettingsSection.SkillEditor -> SkillEditorScreen(
                 initial = editingSkill,
@@ -1249,6 +1243,13 @@ fun SettingsScreen(
                     val shizukuViewModel: ShizukuViewModel =
                         androidx.hilt.navigation.compose.hiltViewModel()
                     val shizukuState by shizukuViewModel.state.collectAsStateWithLifecycle()
+                    val mobileBuildViewModel = androidx.hilt.navigation.compose.hiltViewModel<
+                        com.aicode.feature.settings.presentation.MobileBuildSettingsViewModel
+                    >()
+                    val mobileBuildSettings by mobileBuildViewModel.settings.collectAsStateWithLifecycle()
+                    val mobileBuildSaving by mobileBuildViewModel.saving.collectAsStateWithLifecycle()
+                    val mobileBuildError by mobileBuildViewModel.error.collectAsStateWithLifecycle()
+                    val mobileBuildOptionsSavedVersion by mobileBuildViewModel.optionsSavedVersion.collectAsStateWithLifecycle()
                     AppPermissionsSection(
                         shizukuState = shizukuState,
                         onRequestShizukuPermission = { shizukuViewModel.requestPermission() },
@@ -1257,7 +1258,14 @@ fun SettingsScreen(
                         rootEnabled = rootAccessState.enabled,
                         rootChanging = rootAccessChanging,
                         rootError = rootAccessError,
-                        onSetRootEnabled = viewModel::setRootAccessEnabled
+                        onSetRootEnabled = viewModel::setRootAccessEnabled,
+                        mobileBuildSettings = mobileBuildSettings,
+                        mobileBuildSaving = mobileBuildSaving,
+                        mobileBuildError = mobileBuildError,
+                        mobileBuildOptionsSavedVersion = mobileBuildOptionsSavedVersion,
+                        onSetMobileBuildEnabled = mobileBuildViewModel::setEnabled,
+                        onSaveMobileBuildOptions = mobileBuildViewModel::saveOptions,
+                        onClearMobileBuildError = mobileBuildViewModel::clearError
                     )
                 }
                 SettingsSection.BackgroundRun -> BackgroundRunSection(
@@ -1283,7 +1291,7 @@ fun SettingsScreen(
                     onClearFilters = { viewModel.clearTokenStatsFilters() }
                 )
                 SettingsSection.Storage -> storageViewModel?.let { StorageSectionHost(viewModel = it) }
-                SettingsSection.Memory, SettingsSection.ProjectProgress -> Unit
+                SettingsSection.Memory -> Unit
                 SettingsSection.ProviderEditor -> {} // 已在上方 early return 处理
                 SettingsSection.SkillEditor -> {} // 已在上方 early return 处理
                 SettingsSection.SubAgentEditor -> {} // 已在上方 early return 处理

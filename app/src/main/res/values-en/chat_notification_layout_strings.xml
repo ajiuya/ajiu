@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="chat_notification_background_task_completed">Task completed</string>
+    <string name="chat_notification_background_task_failed">Task failed</string>
+    <string name="chat_notification_background_task_stopped">Task interrupted</string>
+    <string name="chat_notification_background_task_status_unknown">Task status unknown</string>
+    <string name="chat_notification_background_task_exit_unknown">Unknown</string>
+    <string name="chat_notification_background_task_status_with_exit">%1$s · exit code %2$s</string>
+</resources>

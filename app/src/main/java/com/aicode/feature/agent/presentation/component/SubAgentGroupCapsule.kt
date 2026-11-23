@@ -5,13 +5,16 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.HorizontalDivider
@@ -25,10 +28,14 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
@@ -45,6 +52,7 @@ import com.aicode.feature.agent.presentation.SubAgentInteractionSummary
 import compose.icons.FeatherIcons
 import compose.icons.feathericons.Cpu
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 internal fun SubAgentGroupCapsule(
     capsules: List<SubAgentTimelineCapsule>,
@@ -63,6 +71,19 @@ internal fun SubAgentGroupCapsule(
             fallbackStatus = capsule.fallbackStatus,
             fallbackAgentName = capsule.fallbackAgentName,
         )
+    }
+    val workingCount = members.count { it.status.isActiveExecution() || it.status == SubAgentInteractionStatus.QUEUED }
+    val completedCount = members.count { it.status == SubAgentInteractionStatus.COMPLETED }
+    val statusLabels = SubAgentInteractionStatus.entries.map { subAgentStatusLabel(it) }
+    val statusStyle = MaterialTheme.typography.labelSmall
+    val textMeasurer = rememberTextMeasurer()
+    val statusWidth = with(LocalDensity.current) {
+        statusLabels.maxOf { textMeasurer.measure(it, style = statusStyle, maxLines = 1).size.width }.toDp()
+    }
+    val roleStyle = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold)
+    val roleWidth = with(LocalDensity.current) {
+        members.maxOf { textMeasurer.measure(subAgentRoleLabel(it), style = roleStyle, maxLines = 1).size.width }
+            .toDp().coerceIn(43.dp, 80.dp)
     }
     val memberStates = members.map {
         stringResource(R.string.subagent_group_member_status, subAgentRoleLabel(it), subAgentStatusLabel(it.status))
@@ -157,7 +178,30 @@ internal fun SubAgentGroupCapsule(
                             }
                         }
                     }
-                    if (!expanded) {
+                    if (expanded) {
+                        FlowRow(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(Spacing.sm),
+                            verticalArrangement = Arrangement.spacedBy(Spacing.xs),
+                        ) {
+                            Text(
+                                text = stringResource(R.string.subagent_group_working_count, workingCount),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.clip(RoundedCornerShape(Radius.xs))
+                                    .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.08f))
+                                    .padding(horizontal = Spacing.xs, vertical = 2.dp),
+                            )
+                            Text(
+                                text = stringResource(R.string.subagent_group_completed_count, completedCount),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.semanticColors.success,
+                                modifier = Modifier.clip(RoundedCornerShape(Radius.xs))
+                                    .background(MaterialTheme.semanticColors.success.copy(alpha = 0.08f))
+                                    .padding(horizontal = Spacing.xs, vertical = 2.dp),
+                            )
+                        }
+                    } else {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             verticalAlignment = Alignment.CenterVertically,
@@ -194,38 +238,70 @@ internal fun SubAgentGroupCapsule(
                 )
             }
             if (expanded) {
-                Column(
+                BoxWithConstraints(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(start = Spacing.md + 27.dp + Spacing.sm, end = Spacing.md, bottom = Spacing.sm),
                 ) {
-                    members.forEach { member ->
-                        HorizontalDivider(color = MaterialTheme.semanticColors.subtleBorder)
-                        val activity = subAgentVisibleTask(member).takeIf { it.isNotBlank() }
-                            ?: member.currentToolTitle?.takeIf { member.status.isActiveExecution() && it.isNotBlank() }
-                            ?: member.latestPreview.takeIf { it.isNotBlank() }
-                        val status = subAgentStatusLabel(member.status)
-                        Row(
-                            modifier = Modifier.fillMaxWidth().padding(vertical = Spacing.sm),
-                            horizontalArrangement = Arrangement.spacedBy(Spacing.sm),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Text(
-                                text = subAgentRoleLabel(member),
-                                modifier = Modifier.widthIn(min = 43.dp, max = 80.dp),
-                                style = MaterialTheme.typography.labelSmall,
-                                fontWeight = FontWeight.SemiBold,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                            Text(
-                                text = listOfNotNull(activity, status).joinToString(" · "),
-                                modifier = Modifier.weight(1f),
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.semanticColors.subtleText,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
+                    val stacked = roleWidth + statusWidth + Spacing.sm * 2 + Spacing.xl > maxWidth
+                    val visibleStatusWidth = if (stacked) {
+                        minOf(statusWidth, (maxWidth - roleWidth - Spacing.sm).coerceAtLeast(Spacing.xl))
+                    } else statusWidth
+                    Column {
+                        members.forEach { member ->
+                            HorizontalDivider(color = MaterialTheme.semanticColors.subtleBorder)
+                            val activity = subAgentVisibleTask(member).takeIf { it.isNotBlank() }
+                                ?: member.currentToolTitle?.takeIf { member.status.isActiveExecution() && it.isNotBlank() }
+                                ?: member.latestPreview.takeIf { it.isNotBlank() }
+                            val status = subAgentStatusLabel(member.status)
+                            Column(
+                                modifier = Modifier.fillMaxWidth().padding(vertical = Spacing.sm),
+                                verticalArrangement = Arrangement.spacedBy(Spacing.xs),
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(Spacing.sm),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Text(
+                                        text = subAgentRoleLabel(member),
+                                        modifier = Modifier.width(roleWidth),
+                                        style = roleStyle,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                    if (stacked) {
+                                        Spacer(Modifier.weight(1f))
+                                    } else {
+                                        Text(
+                                            text = activity.orEmpty(),
+                                            modifier = Modifier.weight(1f).testTag("subagent_task:${member.subSessionId}"),
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.semanticColors.subtleText,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                        )
+                                    }
+                                    Text(
+                                        text = status,
+                                        modifier = Modifier.width(visibleStatusWidth).testTag("subagent_status:${member.subSessionId}"),
+                                        style = statusStyle,
+                                        color = MaterialTheme.semanticColors.subtleText,
+                                        textAlign = TextAlign.End,
+                                        maxLines = if (stacked) Int.MAX_VALUE else 1,
+                                    )
+                                }
+                                if (stacked) {
+                                    Text(
+                                        text = activity.orEmpty(),
+                                        modifier = Modifier.fillMaxWidth().testTag("subagent_task:${member.subSessionId}"),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.semanticColors.subtleText,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                }
+                            }
                         }
                     }
                 }

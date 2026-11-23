@@ -39,12 +39,14 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
@@ -52,6 +54,9 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.aicode.R
 import com.aicode.core.theme.Radius
@@ -66,30 +71,121 @@ import com.aicode.feature.agent.domain.memory.MemoryManagementError
 import com.aicode.feature.agent.domain.memory.MemoryScope
 import com.aicode.feature.settings.presentation.MemoryUiState
 import com.aicode.feature.settings.presentation.MemoryViewModel
+import com.aicode.feature.settings.presentation.ProjectProgressViewModel
 import compose.icons.FeatherIcons
 import compose.icons.feathericons.ArrowLeft
 import compose.icons.feathericons.ChevronRight
 import compose.icons.feathericons.FileText
 import compose.icons.feathericons.Folder
 import compose.icons.feathericons.Globe
-import compose.icons.feathericons.List
 import compose.icons.feathericons.Search
 import compose.icons.feathericons.Plus
 import compose.icons.feathericons.RefreshCw
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun MemorySettingsRoute(
     viewModel: MemoryViewModel,
+    projectProgressViewModel: ProjectProgressViewModel,
+    sessionId: String?,
+    showBack: Boolean,
+    onNavigateBack: () -> Unit
+) {
+    val progressState by projectProgressViewModel.state.collectAsStateWithLifecycle()
+    val memoryState by viewModel.state.collectAsStateWithLifecycle()
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var selectedTab by rememberSaveable { mutableStateOf(0) }
+    var progressOpened by remember { mutableStateOf(false) }
+    var openedSessionId by remember { mutableStateOf<String?>(null) }
+    DisposableEffect(viewModel, projectProgressViewModel, lifecycleOwner) {
+        viewModel.open()
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) projectProgressViewModel.checkEnvironment()
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            projectProgressViewModel.close()
+            viewModel.close()
+        }
+    }
+    LaunchedEffect(selectedTab, sessionId) {
+        if (selectedTab == 1 && (!progressOpened || openedSessionId != sessionId)) {
+            projectProgressViewModel.open(sessionId)
+            progressOpened = true
+            openedSessionId = sessionId
+        }
+    }
+    val pageStates = rememberSaveableStateHolder()
+    val tabsEnabled = !progressState.busy && progressState.form == null && progressState.confirmation == null &&
+        !memoryState.creating && !memoryState.saving && !memoryState.deleting && memoryState.pendingDelete == null
+    val tabs = @Composable { MemorySettingsTabs(selectedTab, tabsEnabled) { selectedTab = it } }
+    if (selectedTab == 0) {
+        pageStates.SaveableStateProvider("long-term") {
+            MemoryManagementPage(viewModel, showBack, onNavigateBack, tabs)
+        }
+    } else {
+        pageStates.SaveableStateProvider("project-progress") {
+            ProjectProgressSettingsRoute(
+                viewModel = projectProgressViewModel,
+                sessionId = sessionId,
+                showBack = showBack,
+                onBack = onNavigateBack,
+                tabs = tabs
+            )
+        }
+    }
+}
+
+@Composable
+private fun MemorySettingsTabs(selectedTab: Int, enabled: Boolean, onSelect: (Int) -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().heightIn(min = 48.dp, max = 56.dp).testTag("memory-tabs")
+            .selectableGroup().padding(horizontal = Spacing.lg),
+        horizontalArrangement = Arrangement.spacedBy(Spacing.lg)
+    ) {
+        listOf(R.string.memory_long_term_title, R.string.project_progress_title).forEachIndexed { index, title ->
+            val selected = selectedTab == index
+            Column(
+                Modifier.weight(1f).heightIn(min = 48.dp, max = 56.dp).selectable(
+                    selected = selected,
+                    enabled = enabled,
+                    role = Role.Tab,
+                    onClick = { onSelect(index) }
+                ).testTag(if (index == 0) "memory-tab-long-term" else "memory-tab-project-progress"),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Bottom
+            ) {
+                Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
+                    Text(
+                        stringResource(title),
+                        style = MaterialTheme.typography.titleSmall,
+                        color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.semanticColors.subtleText,
+                        fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                Box(
+                    Modifier.fillMaxWidth().heightIn(min = 2.dp)
+                        .background(if (selected) MaterialTheme.colorScheme.primary else Color.Transparent)
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun MemoryManagementPage(
+    viewModel: MemoryViewModel,
     showBack: Boolean,
     onNavigateBack: () -> Unit,
-    onOpenProjectProgress: (() -> Unit)? = null
+    tabs: @Composable () -> Unit
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
-    DisposableEffect(viewModel) {
-        viewModel.open()
-        onDispose { viewModel.close() }
-    }
     BackHandler(enabled = state.selectedEntry != null) { viewModel.closeDetail() }
     val pageStates = rememberSaveableStateHolder()
     var selectedScope by rememberSaveable { mutableStateOf<MemoryScope?>(null) }
@@ -152,6 +248,15 @@ internal fun MemorySettingsRoute(
                 }
             ) { padding ->
                 Column(Modifier.fillMaxSize().padding(padding)) {
+                    if (selected == null) {
+                        tabs()
+                        Column(Modifier.fillMaxWidth().padding(horizontal = Spacing.lg, vertical = Spacing.sm)) {
+                            Text(stringResource(R.string.memory_long_term_title), style = MaterialTheme.typography.titleMedium)
+                            Text(stringResource(R.string.memory_long_term_hint),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
                     if (state.targetChanged) {
                         Text(
                             stringResource(R.string.memory_management_target_changed),
@@ -176,7 +281,7 @@ internal fun MemorySettingsRoute(
                                 state, viewModel::openDetail, viewModel::requestDelete,
                                 scope = scope, query = query,
                                 onScopeChange = { selectedScope = it }, onQueryChange = { query = it },
-                                onOpenProjectProgress = onOpenProjectProgress
+                                modifier = Modifier.weight(1f)
                             )
                         } else if (state.detailLoading) {
                             MemoryLoading()
@@ -236,14 +341,14 @@ internal fun MemorySection(
     query: String,
     onScopeChange: (MemoryScope) -> Unit,
     onQueryChange: (String) -> Unit,
-    onOpenProjectProgress: (() -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     val search = query.trim()
     val entries = state.entries.filter { entry ->
         entry.scope == scope && (search.isEmpty() || listOf(entry.name, entry.description, entry.preview)
             .any { it.contains(search, ignoreCase = true) })
-    }
+    }.sortedWith(compareByDescending<MemoryEntry> { it.modifiedAt ?: Long.MIN_VALUE }
+        .thenBy { it.name.lowercase(Locale.ROOT) }.thenBy { it.fileName })
     val listState = rememberLazyListState()
     if (state.loading && state.entries.isEmpty()) {
         MemoryLoading()
@@ -350,31 +455,12 @@ internal fun MemorySection(
                                     style = MaterialTheme.typography.bodySmall, color = MaterialTheme.semanticColors.subtleText,
                                     maxLines = 2, overflow = TextOverflow.Ellipsis)
                             }
+                            Text(stringResource(R.string.memory_management_updated_at, memoryModifiedTimeText(entry.modifiedAt)),
+                                modifier = Modifier.testTag("memory-updated-${entry.id}"),
+                                style = MaterialTheme.typography.labelSmall, color = MaterialTheme.semanticColors.subtleText)
                         }
                         Icon(FeatherIcons.ChevronRight, contentDescription = null,
                             modifier = Modifier.size(Spacing.lg), tint = MaterialTheme.semanticColors.subtleText)
-                    }
-                }
-            }
-        }
-        onOpenProjectProgress?.let { open ->
-            item(key = "project-progress") {
-                SettingsGroup(Modifier.padding(top = Spacing.lg).testTag("memory-project-progress")) {
-                    Row(Modifier.fillMaxWidth().clickable(onClick = open).padding(Spacing.lg),
-                        horizontalArrangement = Arrangement.spacedBy(Spacing.md), verticalAlignment = Alignment.CenterVertically) {
-                        Box(Modifier.size(Spacing.xxl).clip(RoundedCornerShape(Radius.sm))
-                            .background(MaterialTheme.semanticColors.mutedSurface), contentAlignment = Alignment.Center) {
-                            Icon(FeatherIcons.List, contentDescription = null, modifier = Modifier.size(Spacing.lg),
-                                tint = MaterialTheme.semanticColors.subtleText)
-                        }
-                        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(Spacing.xs)) {
-                            Text(stringResource(R.string.memory_a_progress_title), style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            Text(stringResource(R.string.memory_a_progress_hint), style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.semanticColors.subtleText)
-                        }
-                        Icon(FeatherIcons.ChevronRight, contentDescription = null, modifier = Modifier.size(Spacing.lg),
-                            tint = MaterialTheme.semanticColors.subtleText)
                     }
                 }
             }
@@ -386,6 +472,13 @@ internal fun MemorySection(
                 textAlign = androidx.compose.ui.text.style.TextAlign.Center)
         }
     }
+}
+
+@Composable
+internal fun memoryModifiedTimeText(modifiedAt: Long?): String {
+    val locale = LocalConfiguration.current.locales[0]
+    return modifiedAt?.let { SimpleDateFormat("yyyy-MM-dd HH:mm", locale).format(Date(it)) }
+        ?: stringResource(R.string.memory_management_time_unknown)
 }
 
 @Composable

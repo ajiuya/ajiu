@@ -53,7 +53,9 @@
     <string name="project_settings_capacity_details">Show exact details</string>
     <string name="project_settings_record_options">Recording options</string>
     <string name="project_settings_capacity_summary">Active %1$d / %2$d · %3$s / %4$s</string>
-    <string name="memory_a_global">Global</string>
+    <string name="memory_long_term_title">Long-term memory</string>
+    <string name="memory_long_term_hint">Keep stable preferences and project conventions; read full content when needed</string>
+    <string name="memory_a_global">Personal</string>
     <string name="memory_a_current_project">Current project</string>
     <string name="memory_a_search">Search names, descriptions or previews</string>
     <string name="memory_a_count">%1$d memories</string>
@@ -61,8 +63,6 @@
     <string name="memory_a_no_results">No matching memories in this scope</string>
     <string name="memory_a_more">More</string>
     <string name="memory_a_delete">Delete memory</string>
-    <string name="memory_a_progress_title">Project progress</string>
-    <string name="memory_a_progress_hint">View separately from the memory list</string>
     <string name="plugin_title">Plugins</string>
     <string name="plugin_details">Plugin details</string>
     <string name="plugin_center_mine">My plugins</string>
@@ -240,7 +240,7 @@
     <string name="plugin_error_dependency_confirmation">Dependency confirmation is invalid or expired. Review and confirm again.</string>
     <string name="plugin_error_unexpected">The plugin operation failed and was not treated as successful. Review the error and retry.</string>
     <string name="app_name">Ajiu Workbench</string>
-    <string name="chat_tool_waiting_execution">Waiting to execute</string>
+    <string name="chat_tool_waiting_execution">Pending</string>
     <string name="chat_context_details">Context usage details</string>
     <string name="chat_context_input_total">Input for this call: %1$s tokens</string>
     <string name="chat_context_input_budget">Effective input budget: %1$s tokens</string>
@@ -641,7 +641,7 @@
     <string name="provider_preset_empty">No matching presets</string>
     <string name="provider_register_now">Register</string>
     <string name="settings_keepalive_title">Background keepalive</string>
-    <string name="settings_keepalive_subtitle">Foreground notification prevents background kill</string>
+    <string name="settings_keepalive_subtitle">Foreground protection reduces the risk of background task interruption</string>
     <string name="settings_screen_on_title">Keep screen on</string>
     <string name="settings_screen_on_subtitle">Screen stays awake while the app is in the foreground</string>
     <string name="settings_network_guide_title">Background network troubleshooting</string>
@@ -669,6 +669,10 @@
     <string name="chat_notification_background_task_finished_with_exit">Background task %1$s finished (exit code %2$s)</string>
     <string name="chat_notification_background_task_finished">Background task %1$s finished</string>
     <string name="chat_notification_background_task_default_name">Unnamed terminal task</string>
+    <string name="chat_notification_agent_message">%1$s sent a message</string>
+    <string name="chat_notification_agent_completed">Execution completed</string>
+    <string name="chat_notification_agent_failed">Execution failed</string>
+    <string name="chat_notification_agent_stopped">Stopped</string>
     <string name="notification_channel_terminal_service">Terminal Services</string>
     <string name="notification_channel_terminal_service_desc">Notifications for background terminal tasks</string>
     <string name="notification_keepalive_persistent_sessions">Keepalive · terminal tasks: %1$d</string>
@@ -1310,6 +1314,9 @@
     <string name="retry_error_server">Server error</string>
     <string name="retry_error_network">Network disconnected</string>
     <string name="retry_error_timeout">Connection timed out</string>
+    <string name="retry_error_first_content_timeout">Timed out waiting for first content</string>
+    <string name="retry_error_stream_idle_timeout">Timed out waiting for response data</string>
+    <string name="retry_error_stream_interrupted">Response stream ended unexpectedly</string>
     <string name="retry_error_connection_refused">Connection refused</string>
     <string name="retry_error_dns_failed">DNS resolution failed</string>
     <string name="retry_error_connection_reset">Connection interrupted</string>
@@ -2148,6 +2155,19 @@
 
     <!-- Terminal -->
     <string name="terminal_title">Terminal</string>
+    <string name="terminal_history_title">Task history</string>
+    <string name="terminal_history_empty">No saved tasks in this local workspace</string>
+    <string name="terminal_history_loading">Loading saved tasks</string>
+    <string name="terminal_history_unavailable">Task history is unavailable. Check the current container and workspace.</string>
+    <string name="terminal_history_storage_error">Task history could not be saved or read. The latest output may not have been saved.</string>
+    <string name="terminal_history_running">Running · saved snapshot</string>
+    <string name="terminal_history_finished">Ended · exit code %1$d</string>
+    <string name="terminal_history_unknown">Result unknown · verification required</string>
+    <string name="terminal_history_boundary">History is read-only. It does not restore a terminal, rerun commands or restore previous approvals. A missing exit code does not prove success, failure or that a task is still running.</string>
+    <string name="terminal_history_output_empty">No saved output yet</string>
+    <string name="terminal_history_snapshot_note">This is the last successfully saved, bounded terminal snapshot. The most recent unwritten output may be missing.</string>
+    <string name="terminal_history_times">Started: %1$s\nUpdated: %2$s</string>
+    <string name="terminal_history_id">History ID: %1$s</string>
     <string name="terminal_prepare_error_unknown">Unknown error</string>
     <string name="terminal_start_failed">Cannot start terminal:\n%1$s</string>
     <string name="terminal_retry">Retry</string>

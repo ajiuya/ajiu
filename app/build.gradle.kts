@@ -1,5 +1,6 @@
 import java.io.FileInputStream
 import java.util.Properties
+import org.gradle.api.tasks.testing.Test
 
 plugins {
     id("com.android.application")
@@ -10,6 +11,8 @@ plugins {
     id("com.google.dagger.hilt.android")
     id("com.google.devtools.ksp")
 }
+
+val roomDeviceTest = providers.gradleProperty("roomDeviceTest").map { it == "true" }.getOrElse(false)
 
 val keystorePropertiesFile = providers.gradleProperty("releaseSigningProperties")
     .map { file(it) }
@@ -119,7 +122,8 @@ android {
             .map { it.also { name -> require(name.isNotBlank()) } }
             .getOrElse(gitVersionName())
 
-        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        testInstrumentationRunner = if (roomDeviceTest) "com.aicode.testing.RoomVerificationInstrumentation"
+            else "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
             useSupportLibrary = true
         }
@@ -169,6 +173,11 @@ android {
         getByName("x86solo") { jniLibs.srcDir("src/_x86JniLibs") }
         // 文档不放在 app/src/main/assets 下，改由 syncAiDocs 从 docs-site/docs 生成后并入
         getByName("main") { assets.srcDir(aiDocsGeneratedDir) }
+        getByName("test") { java.srcDir("src/sharedTest/java") }
+        getByName("androidTest") { java.srcDir("src/sharedTest/java") }
+        if (roomDeviceTest) {
+            getByName("debug") { manifest.srcFile("src/roomDeviceTest/AndroidManifest.xml") }
+        }
     }
 
     buildTypes {
@@ -276,6 +285,17 @@ android {
     // 故挂在 debug 变体上：迁移测试只跑 universalDebug，release 包不会带上 schema。
     sourceSets {
         getByName("debug").assets.srcDir("$projectDir/schemas")
+    }
+}
+
+if (providers.gradleProperty("mobileBuild").orNull == "true") {
+    val mobileTestHeap = providers.gradleProperty("mobileTestHeap").getOrElse("1g")
+    require(Regex("[1-9][0-9]*[mMgG]").matches(mobileTestHeap)) {
+        "mobileTestHeap must be a positive integer followed by m or g, for example 1024m or 1g"
+    }
+    tasks.withType<Test>().configureEach {
+        maxHeapSize = mobileTestHeap
+        maxParallelForks = 1
     }
 }
 
@@ -404,6 +424,7 @@ dependencies {
 
     // Testing
     testImplementation("junit:junit:4.13.2")
+    androidTestImplementation("junit:junit:4.13.2")
     // 迁移测试：MigrationTestHelper + Robolectric（在 JVM 上跑 Room 迁移，需真实 resources）
     testImplementation("androidx.room:room-testing:2.7.1")
     testImplementation("org.robolectric:robolectric:4.15.1")

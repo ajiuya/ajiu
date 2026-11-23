@@ -56,7 +56,7 @@ data class AgentImage(
     val path: String = ""
 )
 
-const val CONTEXT_COMPACTION_MARKER = "What did we do so far?"
+const val CONTEXT_COMPACTION_MARKER = "Context checkpoint: The assistant summary below preserves prior work. Continue the latest user request from the current point. Do not answer with a progress summary alone; take the next concrete step unless the task is complete or blocked by required user input, approval, or a safety constraint."
 const val CONTEXT_SUMMARY_LEGACY_PREFIX = "【系统提示：早期的对话已被压缩，以下是之前的核心状态摘要】"
 
 val AgentMessage.id: String

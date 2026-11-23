@@ -6,11 +6,13 @@ import android.view.View
 import androidx.activity.ComponentActivity
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.size
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.InternalComposeUiApi
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
@@ -24,6 +26,7 @@ import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.TextUnit
+import androidx.compose.ui.unit.dp
 import com.aicode.core.theme.AIEditorTheme
 import com.aicode.feature.agent.domain.model.ChatSession
 import com.aicode.feature.agent.presentation.AgentUIMessage
@@ -55,6 +58,91 @@ import org.robolectric.annotation.TextLayoutMode
 @LooperMode(LooperMode.Mode.PAUSED)
 @OptIn(InternalComposeUiApi::class)
 class ToolCapsuleLayoutTest {
+    @Test
+    fun capsuleEntranceKeepsHorizontalGeometryAtEveryProgress() {
+        for (progress in listOf(0f, 0.2f, 0.4f, 0.6f, 0.8f, 1f)) {
+            var left = Float.NaN
+            var width = Float.NaN
+            measure(width = 320) {
+                CapsuleEntrance(progress) {
+                    Box(Modifier.size(220.dp, 32.dp).onGloballyPositioned { coordinates ->
+                        val start = coordinates.localToRoot(Offset.Zero)
+                        val end = coordinates.localToRoot(Offset(coordinates.size.width.toFloat(), 0f))
+                        left = start.x
+                        width = end.x - start.x
+                    })
+                }
+            }
+            assertEquals("Horizontal position at progress=$progress", 0f, left, 0.01f)
+            assertEquals("Horizontal scale at progress=$progress", 220f, width, 0.01f)
+        }
+    }
+
+    @Test
+    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
+    fun timerDigitChangesKeepTitleAndDurationBoundsStableOnNarrowScreens() {
+        val actionTitle = "检查工具胶囊标题与计时读数的布局，确保长标题在窄屏中显示稳定"
+        for (fontScale in listOf(1f, 1.5f)) {
+            var titleBounds: Rect? = null
+            var durationBounds: Rect? = null
+            for (duration in listOf(100L, 9_900L, 10_000L, 59_900L, 60_000L, 3_600_000L, 359_999_000L)) {
+                val texts = measure(width = 320, fontScale = fontScale) {
+                    ToolMessageBody(message().copy(toolActionTitle = actionTitle), durationMs = duration)
+                }
+                val title = texts.single { it.layout.layoutInput.text.text == actionTitle }
+                val timer = texts.single { it.layout.layoutInput.text.text == formatToolDuration(duration) }
+                assertTrue("Title must retain visible space: ${describeTexts(texts)}", title.bounds.width > 0f)
+                assertTrue("Title and timer must keep their gap: ${describeTexts(texts)}", title.bounds.right + 8f <= timer.bounds.left + 0.01f)
+                assertFalse("Timer must fit: ${describeTexts(texts)}", timer.layout.isLineEllipsized(0))
+                assertTrue("Timer stays in the capsule", timer.bounds.right <= 320f)
+                titleBounds?.let { assertEquals("Title must not move when the duration grows", it, title.bounds) }
+                durationBounds?.let { assertEquals("Timer slot must not grow with its digits", it, timer.bounds) }
+                titleBounds = title.bounds
+                durationBounds = timer.bounds
+            }
+        }
+    }
+
+    @Test
+    @Config(qualifiers = "en-rUS")
+    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
+    fun englishPendingAndElapsedTimeKeepTheSameSlots() {
+        assertStatusTransition("Pending")
+    }
+
+    @Test
+    @Config(qualifiers = "zh-rCN")
+    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
+    fun chinesePendingAndElapsedTimeKeepTheSameSlots() {
+        assertStatusTransition("等待执行")
+    }
+
+    private fun assertStatusTransition(waitingLabel: String) {
+        for (fontScale in listOf(1f, 1.5f)) {
+            var titleBounds: Rect? = null
+            var statusBounds: Rect? = null
+            val states = listOf(
+                Triple("", null, waitingLabel),
+                Triple("", 9_900L, "9.9s"),
+                Triple(null, 10_000L, "10.0s"),
+                Triple(null, null, "—")
+            )
+            for ((liveOutput, duration, label) in states) {
+                val texts = measure(width = 320, fontScale = fontScale) {
+                    ToolMessageBody(message(), liveOutput = liveOutput, durationMs = duration)
+                }
+                val title = texts.single { it.layout.layoutInput.text.text == "Inspect file" }
+                val status = texts.single { it.layout.layoutInput.text.text == label }
+                assertFalse("Status must remain fully visible: ${describeTexts(texts)}", status.layout.isLineEllipsized(0))
+                assertTrue("Title must stay separate from status", title.bounds.right + 8f <= status.bounds.left + 0.01f)
+                titleBounds?.let { assertEquals("Waiting and timing share the same title slot", it, title.bounds) }
+                statusBounds?.let { assertEquals("Waiting and timing share the same status slot", it, status.bounds) }
+                titleBounds = title.bounds
+                statusBounds = status.bounds
+            }
+        }
+    }
+
     @Test
     fun collapsedToolBodyHas32DpHeightWithTheThemeLabelSize() {
         lateinit var body: Rect
@@ -234,6 +322,7 @@ class ToolCapsuleLayoutTest {
 
     private fun measure(
         fontScale: Float = 1f,
+        width: Int = 1_000,
         content: @Composable () -> Unit
     ): List<MeasuredText> {
         val controller = Robolectric.buildActivity(ComponentActivity::class.java).setup().visible()
@@ -251,7 +340,7 @@ class ToolCapsuleLayoutTest {
             repeat(3) {
                 shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(32))
                 view.measure(
-                    View.MeasureSpec.makeMeasureSpec(1_000, View.MeasureSpec.EXACTLY),
+                    View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
                     View.MeasureSpec.makeMeasureSpec(2_000, View.MeasureSpec.AT_MOST)
                 )
                 view.layout(0, 0, view.measuredWidth, view.measuredHeight)

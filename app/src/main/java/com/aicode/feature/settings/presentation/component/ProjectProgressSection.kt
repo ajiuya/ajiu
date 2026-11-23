@@ -31,7 +31,6 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -47,10 +46,6 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.hilt.navigation.compose.hiltViewModel
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
-import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.aicode.R
 import com.aicode.core.theme.Radius
@@ -74,31 +69,26 @@ import java.util.Date
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ProjectProgressSettingsRoute(sessionId: String?, onBack: () -> Unit) {
-    val viewModel: ProjectProgressViewModel = hiltViewModel()
+fun ProjectProgressSettingsRoute(
+    viewModel: ProjectProgressViewModel,
+    sessionId: String?,
+    showBack: Boolean,
+    onBack: () -> Unit,
+    tabs: @Composable () -> Unit
+) {
     val state by viewModel.state.collectAsStateWithLifecycle()
-    val lifecycleOwner = LocalLifecycleOwner.current
-    DisposableEffect(viewModel, sessionId, lifecycleOwner) {
-        viewModel.open(sessionId)
-        val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) viewModel.checkEnvironment()
-        }
-        lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose {
-            lifecycleOwner.lifecycle.removeObserver(observer)
-            viewModel.close()
-        }
-    }
     val goBack: () -> Unit = {
         if (!state.busy) {
             when {
+                state.confirmation != null -> viewModel.dismissConfirmation()
+                state.form != null -> viewModel.dismissForm()
                 state.selectedEntryId != null -> viewModel.closeEntry()
                 state.selectedProjectId != null -> viewModel.closeProject()
                 else -> onBack()
             }
         }
     }
-    BackHandler(onBack = goBack)
+    BackHandler(enabled = showBack || state.selectedEntryId != null || state.selectedProjectId != null, onBack = goBack)
     Scaffold(
         containerColor = settingsPageBackground(),
         topBar = {
@@ -106,8 +96,10 @@ fun ProjectProgressSettingsRoute(sessionId: String?, onBack: () -> Unit) {
                 title = { Text(stringResource(R.string.project_progress_title)) },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = settingsPageBackground()),
                 navigationIcon = {
-                    IconButton(onClick = goBack, enabled = !state.busy) {
-                        Icon(FeatherIcons.ArrowLeft, stringResource(R.string.common_back))
+                    if (showBack || state.selectedEntryId != null || state.selectedProjectId != null) {
+                        IconButton(onClick = goBack, enabled = !state.busy) {
+                            Icon(FeatherIcons.ArrowLeft, stringResource(R.string.common_back))
+                        }
                     }
                 },
                 actions = {
@@ -119,6 +111,7 @@ fun ProjectProgressSettingsRoute(sessionId: String?, onBack: () -> Unit) {
         }
     ) { padding ->
         Column(Modifier.fillMaxSize().padding(padding)) {
+            if (state.selectedEntryId == null) tabs()
             if (state.targetChanged) {
                 Text(stringResource(R.string.project_progress_target_changed), modifier = Modifier.padding(Spacing.lg), color = MaterialTheme.colorScheme.error)
                 TextButton(onClick = { viewModel.open(sessionId) }) { Text(stringResource(R.string.project_progress_reload)) }
@@ -137,6 +130,7 @@ fun ProjectProgressSettingsRoute(sessionId: String?, onBack: () -> Unit) {
                     else -> ProjectProgressSection(
                         state = state,
                         onSelectProject = viewModel::selectProject,
+                        onCloseProject = viewModel::closeProject,
                         onOpenEntry = viewModel::openEntry,
                         onRegister = viewModel::startRegister,
                         onBind = viewModel::bindSelected,
@@ -178,6 +172,7 @@ fun ProjectProgressSettingsRoute(sessionId: String?, onBack: () -> Unit) {
 internal fun ProjectProgressSection(
     state: ProjectProgressUiState,
     onSelectProject: (ProjectMemoryProject) -> Unit,
+    onCloseProject: () -> Unit,
     onOpenEntry: (ProjectMemoryEntry) -> Unit,
     onRegister: () -> Unit,
     onBind: () -> Unit,
@@ -196,121 +191,163 @@ internal fun ProjectProgressSection(
         Text(stringResource(R.string.project_progress_no_workspace), modifier = Modifier.padding(Spacing.lg), color = MaterialTheme.colorScheme.onSurfaceVariant)
         return
     }
-    val enabled = !state.busy && !state.loading && state.associations != null
+    val browseEnabled = !state.busy && state.projectListReady
+    val enabled = browseEnabled && !state.loading && state.associations != null
     val selected = state.selectedProject
+    val currentWorkspaceProject = state.currentWorkspaceProject
+    val otherProjects = if (selected == null) state.projects.filterNot { it.id == currentWorkspaceProject?.id } else emptyList()
     var managementExpanded by rememberSaveable(state.workspaceRoot, state.sessionId, selected?.id) { mutableStateOf(false) }
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(start = Spacing.lg, end = Spacing.lg, bottom = Spacing.xl),
-        verticalArrangement = Arrangement.spacedBy(Spacing.sm)
+        verticalArrangement = Arrangement.spacedBy(Spacing.xs)
     ) {
-        item(key = "overview") {
-            SettingsGroup {
-                Column(
-                    Modifier.fillMaxWidth().padding(Spacing.lg),
-                    verticalArrangement = Arrangement.spacedBy(Spacing.xs)
-                ) {
-                    Text(
-                        selected?.name ?: state.workspaceName.orEmpty(),
-                        style = MaterialTheme.typography.bodyLarge
-                    )
-                    Text(
-                        selected?.identity?.projectRoot ?: state.workspaceRoot,
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-                SettingsDivider()
-                Row(
-                    Modifier.fillMaxWidth().padding(horizontal = Spacing.lg, vertical = Spacing.md),
-                    horizontalArrangement = Arrangement.spacedBy(Spacing.sm), verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        projectProgressOverviewBinding(state), modifier = Modifier.weight(1f),
-                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    if (selected != null) ProjectProgressLabel(stringResource(
-                        if (selected.autoProgressEnabled) R.string.project_progress_auto_enabled else R.string.project_progress_auto_disabled))
+        if (selected == null) {
+            item(key = "workspace") {
+                SettingsGroup(Modifier.testTag("project-progress-overview")) {
+                    Column(
+                        Modifier.fillMaxWidth().padding(Spacing.lg),
+                        verticalArrangement = Arrangement.spacedBy(Spacing.sm)
+                    ) {
+                        Text(stringResource(R.string.project_progress_current_workspace),
+                            style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(currentWorkspaceProject?.name ?: state.workspaceName.orEmpty(),
+                            style = MaterialTheme.typography.titleMedium)
+                        Text(state.workspaceRoot, modifier = Modifier.testTag("project-progress-workspace-path"),
+                            style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        Text(
+                            stringResource(R.string.project_progress_environment_value,
+                                projectProgressEnvironment(state.environmentMode),
+                                stringResource(when {
+                                    !state.projectListReady -> R.string.project_progress_registration_unknown
+                                    currentWorkspaceProject != null -> R.string.project_progress_registered
+                                    else -> R.string.project_progress_not_registered
+                                })
+                            ),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        if (currentWorkspaceProject != null) {
+                            Text(projectProgressCurrentBinding(state), style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        if (state.projectListReady) {
+                            Button(
+                                onClick = {
+                                    if (currentWorkspaceProject != null) {
+                                        if (browseEnabled) onSelectProject(currentWorkspaceProject)
+                                    } else if (enabled) {
+                                        onRegister()
+                                    }
+                                },
+                                enabled = if (currentWorkspaceProject != null) browseEnabled else enabled,
+                                modifier = Modifier.fillMaxWidth().testTag(
+                                    if (currentWorkspaceProject != null) "project-progress-open-current" else "project-progress-register"
+                                )
+                            ) {
+                                Text(stringResource(
+                                    if (currentWorkspaceProject != null) R.string.project_progress_view
+                                    else R.string.project_progress_register_short))
+                            }
+                        }
+                    }
                 }
             }
-        }
-        if (selected != null) {
+            if (otherProjects.isNotEmpty()) {
+                item(key = "other-projects-heading") {
+                    ProjectProgressGroupHeader(stringResource(R.string.project_progress_other_projects))
+                }
+                itemsIndexed(otherProjects, key = { _, project -> "project-${project.id}" }) { index, project ->
+                    LazyGroupItem(index, otherProjects.lastIndex, modifier = Modifier.testTag("project-progress-project-${project.id}")) {
+                        SettingsRow(title = project.name, subtitle = project.identity.projectRoot,
+                            enabled = browseEnabled, onClick = { onSelectProject(project) })
+                    }
+                }
+            }
+        } else {
+            item(key = "project-overview") {
+                SettingsGroup(Modifier.testTag("project-progress-overview")) {
+                    Column(Modifier.fillMaxWidth().padding(Spacing.lg), verticalArrangement = Arrangement.spacedBy(Spacing.sm)) {
+                        Text(selected.name, style = MaterialTheme.typography.titleMedium)
+                        Text(selected.identity.projectRoot, modifier = Modifier.testTag("project-progress-workspace-path"),
+                            style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        Text(
+                            stringResource(R.string.project_progress_environment_value,
+                                projectProgressEnvironment(state.environmentMode),
+                                stringResource(if (selected.autoProgressEnabled)
+                                    R.string.project_progress_auto_enabled else R.string.project_progress_auto_disabled)
+                            ),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(projectProgressCurrentBinding(state), style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        TextButton(onClick = { if (!state.busy) onCloseProject() }, enabled = !state.busy,
+                            modifier = Modifier.testTag("project-progress-all-projects")) {
+                            Text(stringResource(R.string.project_progress_all_projects))
+                        }
+                    }
+                }
+            }
             item(key = "latest-handoff") {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                    SettingsGroupHeader(stringResource(R.string.project_progress_latest_handoff))
-                    TextButton(onClick = { if (enabled) onHandoff() }, enabled = enabled) { Text(stringResource(R.string.project_progress_write_handoff)) }
+                    ProjectProgressGroupHeader(stringResource(R.string.project_progress_latest_handoff))
+                    TextButton(onClick = { if (enabled) onHandoff() }, enabled = enabled) {
+                        Text(stringResource(R.string.project_progress_write_handoff))
+                    }
                 }
                 when {
                     state.handoffLoading -> ProjectProgressInlineLoading()
-                    state.latestHandoff != null -> ProjectProgressHandoffCard(state.latestHandoff, enabled) { onOpenEntry(state.latestHandoff) }
+                    state.latestHandoff != null -> ProjectProgressHandoffCard(state.latestHandoff, browseEnabled) { onOpenEntry(state.latestHandoff) }
                     else -> ProjectProgressHint(stringResource(R.string.project_progress_no_handoff))
                 }
             }
-        }
-        if (state.capacity?.nearCapacity == true) {
-            item(key = "capacity-warning") {
-                Text(stringResource(R.string.project_progress_capacity_warning), modifier = Modifier.padding(Spacing.sm),
-                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.semanticColors.onWarningContainer)
-            }
-        }
-        if (managementExpanded) {
-            item(key = "management") {
-                ProjectProgressManagement(state, true, { managementExpanded = false }, enabled, onBind, onUnbind, onAutoProgress, onHandoff)
-            }
-        }
-        if (selected == null) {
-            item(key = "register") {
-                SettingsGroup {
-                    SettingsRow(title = stringResource(R.string.project_progress_register), subtitle = stringResource(R.string.project_progress_register_hint),
-                        enabled = enabled, onClick = onRegister)
-                }
-                SettingsGroupHeader(stringResource(R.string.project_progress_projects))
-            }
-            if (state.projects.isEmpty()) {
-                item(key = "empty-projects") { ProjectProgressHint(stringResource(R.string.project_progress_empty_projects)) }
-            }
-            itemsIndexed(state.projects, key = { _, project -> "project-${project.id}" }) { index, project ->
-                LazyGroupItem(index, state.projects.lastIndex) {
-                    SettingsRow(title = project.name, subtitle = project.identity.projectRoot, enabled = enabled, onClick = { onSelectProject(project) })
+            if (state.capacity?.nearCapacity == true) {
+                item(key = "capacity-warning") {
+                    Text(stringResource(R.string.project_progress_capacity_warning), modifier = Modifier.padding(Spacing.sm),
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.semanticColors.onWarningContainer)
                 }
             }
-        }
-        if (selected != null) {
             item(key = "history-heading") {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                    SettingsGroupHeader(stringResource(if (state.showingArchive) R.string.project_progress_archive_history else R.string.project_progress_recent))
-                    TextButton(onClick = { if (enabled) onArchive(!state.showingArchive) }, enabled = enabled) {
+                    ProjectProgressGroupHeader(stringResource(if (state.showingArchive) R.string.project_progress_archive_history else R.string.project_progress_recent))
+                    TextButton(onClick = { if (browseEnabled) onArchive(!state.showingArchive) }, enabled = browseEnabled) {
                         Text(stringResource(if (state.showingArchive) R.string.project_progress_view_recent else R.string.project_progress_view_archive))
                     }
                 }
-                ProjectProgressFilterBar(state.filter, enabled, onFilter)
+                ProjectProgressFilterBar(state.filter, browseEnabled, onFilter)
             }
             if (state.entries.isEmpty() && !state.historyLoading) {
                 item(key = "history-empty") { ProjectProgressHint(stringResource(R.string.project_progress_empty_history)) }
             }
             itemsIndexed(state.entries, key = { _, entry -> "entry-${entry.id}" }) { index, entry ->
                 LazyGroupItem(index, state.entries.lastIndex) {
-                    ProjectProgressEntryRow(entry, enabled) { onOpenEntry(entry) }
+                    ProjectProgressEntryRow(entry, browseEnabled) { onOpenEntry(entry) }
                 }
             }
             item(key = "history-more") {
                 if (state.historyLoading) {
                     ProjectProgressInlineLoading()
                 } else if (state.hasMore) {
-                    TextButton(onClick = { if (enabled) onLoadMore() }, enabled = enabled) { Text(stringResource(R.string.project_progress_load_more)) }
+                    TextButton(onClick = { if (browseEnabled) onLoadMore() }, enabled = browseEnabled) {
+                        Text(stringResource(R.string.project_progress_load_more))
+                    }
                 }
             }
-        }
-        item(key = "history-notice") {
-            Text(stringResource(R.string.project_progress_read_only_history), modifier = Modifier.padding(Spacing.sm),
-                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.semanticColors.subtleText)
-        }
-        if (!managementExpanded) {
-            item(key = "management") {
-                ProjectProgressManagement(state, false, { managementExpanded = true }, enabled, onBind, onUnbind, onAutoProgress, onHandoff)
+            item(key = "history-notice") {
+                Text(stringResource(R.string.project_progress_read_only_history), modifier = Modifier.padding(Spacing.sm),
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.semanticColors.subtleText)
             }
+        }
+        item(key = "management") {
+            ProjectProgressManagement(state, managementExpanded, { managementExpanded = !managementExpanded },
+                enabled, onBind, onUnbind, onAutoProgress, onHandoff)
         }
     }
 }
@@ -330,7 +367,7 @@ internal fun ProjectProgressManagement(
     val selected = state.selectedProject
     val binding = projectProgressCurrentBinding(state)
     val locale = LocalConfiguration.current.locales[0]
-    Column(verticalArrangement = Arrangement.spacedBy(Spacing.sm)) {
+    Column(verticalArrangement = Arrangement.spacedBy(Spacing.xs)) {
         SettingsGroup {
             Row(
                 Modifier.fillMaxWidth()
@@ -344,13 +381,6 @@ internal fun ProjectProgressManagement(
                 Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(Spacing.xs)) {
                     Text(stringResource(R.string.project_progress_management), style = MaterialTheme.typography.bodyLarge)
                     if (!expanded) {
-                        Text(
-                            binding,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis
-                        )
                         Text(
                             state.capacity?.let { capacity ->
                                 stringResource(
@@ -370,7 +400,7 @@ internal fun ProjectProgressManagement(
             }
         }
         if (expanded) {
-            SettingsGroupHeader(stringResource(R.string.project_settings_binding_title))
+            ProjectProgressGroupHeader(stringResource(R.string.project_settings_binding_title))
             SettingsGroup(Modifier.testTag("project-settings-binding")) {
                 Column(
                     Modifier.fillMaxWidth().padding(Spacing.lg),
@@ -437,7 +467,7 @@ internal fun ProjectProgressManagement(
                 )
             }
             if (selected != null) {
-                SettingsGroupHeader(stringResource(R.string.project_settings_record_options))
+                ProjectProgressGroupHeader(stringResource(R.string.project_settings_record_options))
                 SettingsGroup {
                     SettingsRow(
                         title = stringResource(R.string.project_progress_auto_capture),
@@ -467,7 +497,7 @@ private fun ProjectProgressEnvironmentCard(state: ProjectProgressUiState) {
     var detailsExpanded by rememberSaveable(state.workspaceRoot, state.environmentMode) { mutableStateOf(false) }
     val clipboard = LocalClipboardManager.current
     val path = state.workspaceRoot.orEmpty()
-    SettingsGroupHeader(stringResource(R.string.project_progress_environment))
+    ProjectProgressGroupHeader(stringResource(R.string.project_progress_environment))
     SettingsGroup(Modifier.testTag("project-settings-environment")) {
         Column(
             Modifier.fillMaxWidth().padding(horizontal = Spacing.lg).padding(bottom = Spacing.lg),
@@ -606,13 +636,6 @@ private fun ProjectProgressLabel(text: String, modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun projectProgressOverviewBinding(state: ProjectProgressUiState): String = stringResource(
-    R.string.project_progress_overview_binding,
-    projectProgressEnvironment(state.environmentMode),
-    projectProgressCurrentBinding(state)
-)
-
-@Composable
 private fun projectProgressCurrentBinding(state: ProjectProgressUiState): String =
     state.associations?.let { projectProgressBindingText(it, state.sessionId != null) }
         ?: stringResource(R.string.project_progress_binding_unknown)
@@ -627,6 +650,11 @@ private fun projectProgressEnvironment(mode: String?): String = stringResource(w
 @Composable
 private fun ProjectProgressInlineLoading() {
     Box(Modifier.fillMaxWidth().padding(Spacing.lg), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+}
+
+@Composable
+internal fun ProjectProgressGroupHeader(text: String) {
+    SettingsGroupHeader(text, topPadding = Spacing.sm, bottomPadding = Spacing.xs)
 }
 
 @Composable

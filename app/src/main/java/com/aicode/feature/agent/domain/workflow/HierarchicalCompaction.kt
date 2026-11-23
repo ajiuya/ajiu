@@ -45,6 +45,7 @@ internal object HierarchicalCompaction {
         var leafLimit = initialCap
         var block = 0
         suspend fun checkLeafBudget(pending: LeafBlock) {
+            if (streamSession.replaying) return
             val available = streamPolicy.maxAttempts - streamSession.attempts
             val remaining = pending.cursor.fork()
             var requiredLeaves = 1
@@ -77,7 +78,7 @@ internal object HierarchicalCompaction {
         }
         while (!rootCursor.finished) {
             currentCoroutineContext().ensureActive()
-            if (streamSession.attempts >= streamPolicy.maxAttempts) throw CompactionStreamException("compaction_budget_unreachable")
+            if (!streamSession.replaying && streamSession.attempts >= streamPolicy.maxAttempts) throw CompactionStreamException("compaction_budget_unreachable")
             if (block >= 32) throw CompactionStreamException("compaction_block_limit")
             fun prepare(limit: Int): LeafBlock {
                 val plan = CompactionSummaryPolicy.planIndependent(
@@ -95,12 +96,15 @@ internal object HierarchicalCompaction {
                 }
                 return LeafBlock(candidate, plan.materialBudget, CompactionText.tokens(chunk), request)
             }
-            var pending = prepare(leafLimit)
+            var pendingLimit = streamSession.materialBudget(leafLimit)
+            var pending = prepare(pendingLimit)
             checkLeafBudget(pending)
             val summary = streamSession.summarize(
                 stream = { provider.completeStream(system, pending.request, emptyList(), reasoningEffort = "none") },
                 onUpdate = { onStreamUpdate(CompactionPhase.SUMMARIZING, it) },
                 onAttempt = onAttempt,
+                requestFingerprint = { CompactionFingerprint().add(system).add((pending.request.single() as AgentMessage.UserMessage).content).finish() },
+                materialBudget = { pendingLimit },
                 onRetry = { error ->
                     if (error.code == "compaction_http_499" || error.code == "compaction_truncated") {
                         val smallerLimit = maxOf(128, minOf(pending.budget, pending.tokens) / 2)
@@ -108,6 +112,7 @@ internal object HierarchicalCompaction {
                             val smaller = prepare(smallerLimit)
                             if (smaller.cursor.consumedCharacters < pending.cursor.consumedCharacters) {
                                 pending = smaller
+                                pendingLimit = smallerLimit
                                 leafLimit = minOf(leafLimit, smallerLimit)
                             } else throw error
                         } else throw error
@@ -117,6 +122,7 @@ internal object HierarchicalCompaction {
             )
             currentCoroutineContext().ensureActive()
             rootCursor.commitFrom(pending.cursor)
+            streamSession.commitBlock()
             leaves += summary
             block++
             onLeafSuccess(rootCursor.consumedCharacters, block)
@@ -145,13 +151,14 @@ internal object HierarchicalCompaction {
                     first++
                     continue
                 }
-                if (streamSession.attempts >= streamPolicy.maxAttempts) throw CompactionStreamException("compaction_budget_unreachable")
+                if (!streamSession.replaying && streamSession.attempts >= streamPolicy.maxAttempts) throw CompactionStreamException("compaction_budget_unreachable")
                 reduceBlock++
                 val group = nodes.subList(first, first + count).toList()
                 val cursor = ReduceCursor(group)
                 var reduceLimit = CompactionSummaryPolicy.MAX_MATERIAL_TOKENS
                 val outputs = mutableListOf<String>()
                 suspend fun checkMergeBudget(pending: ReduceBlock) {
+                    if (streamSession.replaying) return
                     val available = streamPolicy.maxAttempts - streamSession.attempts
                     var required = 1L
                     val projected = (next + outputs).toMutableList()
@@ -188,12 +195,15 @@ internal object HierarchicalCompaction {
                     currentCoroutineContext().ensureActive()
                     fun prepare(limit: Int) = prepareReduceBlock(cursor, group, system, mergeTemplate,
                         summaryBudget, outputLimit, level, reduceBlock, limit)
-                    var pending = prepare(reduceLimit)
+                    var pendingLimit = streamSession.materialBudget(reduceLimit)
+                    var pending = prepare(pendingLimit)
                     checkMergeBudget(pending)
                     val summary = streamSession.summarize(
                         stream = { provider.completeStream(system, pending.request, emptyList(), reasoningEffort = "none") },
                         onUpdate = { onStreamUpdate(CompactionPhase.MERGING, it) },
                         onAttempt = onAttempt,
+                        requestFingerprint = { CompactionFingerprint().add(system).add((pending.request.single() as AgentMessage.UserMessage).content).finish() },
+                        materialBudget = { pendingLimit },
                         onRetry = { error ->
                             if (error.code == "compaction_http_499" || error.code == "compaction_truncated") {
                                 val smallerLimit = maxOf(128, minOf(pending.budget, pending.parts.sumOf { CompactionText.tokens(it.text) }) / 2)
@@ -201,6 +211,7 @@ internal object HierarchicalCompaction {
                                     val smaller = prepare(smallerLimit)
                                     if (smaller.cursor.position < pending.cursor.position) {
                                         pending = smaller
+                                        pendingLimit = smallerLimit
                                         reduceLimit = minOf(reduceLimit, smallerLimit)
                                     } else throw error
                                 } else throw error
@@ -210,6 +221,7 @@ internal object HierarchicalCompaction {
                     )
                     currentCoroutineContext().ensureActive()
                     cursor.commitFrom(pending.cursor)
+                    streamSession.commitBlock()
                     outputs += summary
                     reduceLimit = minOf(CompactionSummaryPolicy.MAX_MATERIAL_TOKENS, pending.budget * 2)
                     merges++

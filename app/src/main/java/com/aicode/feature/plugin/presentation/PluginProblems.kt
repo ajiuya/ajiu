@@ -52,6 +52,7 @@ internal fun PluginError.toProblem(): PluginProblem = PluginProblem(code.name, w
 
 @Composable
 internal fun PluginProblems(problems: List<PluginProblem>, modifier: Modifier = Modifier) {
+    if (problems.isEmpty()) return
     Column(modifier.padding(vertical = Spacing.sm)) {
         problems.forEach { problem ->
             Text(stringResource(problem.messageRes), color = MaterialTheme.colorScheme.error)

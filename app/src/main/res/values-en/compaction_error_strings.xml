@@ -1,6 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="compaction_error_timeout">Context compression timed out. The original history was retained. Try again later.</string>
+    <string name="compaction_error_total_timeout">Context compression reached its total time limit. The original history is unchanged. Retry manually; valid completed blocks can be reused if the source and settings have not changed.</string>
+    <string name="compaction_error_first_content_timeout">The compression model did not return content before the first-content deadline. The original history was retained. Check the service and retry.</string>
+    <string name="compaction_error_idle_timeout">The compression response stopped delivering content for too long. The original history was retained. Check the connection and service before retrying.</string>
+    <string name="compaction_error_missing_terminal">The compression response has no complete terminal marker. No partial summary was used, and the original history was retained. Retry or check service protocol compatibility.</string>
     <string name="compaction_error_authentication">The compression model could not authenticate. The original history was retained. Check the provider settings.</string>
     <string name="compaction_error_rate_limit">The compression model is rate-limited. The original history was retained. Try again later.</string>
     <string name="compaction_error_service">The compression service is temporarily unavailable. The original history was retained. Try again later.</string>

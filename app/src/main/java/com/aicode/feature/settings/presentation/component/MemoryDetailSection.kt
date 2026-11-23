@@ -173,6 +173,25 @@ internal fun MemoryDetailSection(
                                 overflow = TextOverflow.Ellipsis
                             )
                         }
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                stringResource(R.string.memory_management_updated),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = semantic.subtleText
+                            )
+                            Text(
+                                memoryModifiedTimeText(document.entry.modifiedAt),
+                                modifier = Modifier.weight(1f).padding(start = Spacing.md)
+                                    .testTag("memory-detail-updated"),
+                                style = MaterialTheme.typography.bodySmall,
+                                fontWeight = FontWeight.Medium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                textAlign = TextAlign.End
+                            )
+                        }
                     }
                 }
                 SelectionContainer {

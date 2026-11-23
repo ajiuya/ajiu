@@ -107,13 +107,17 @@ internal fun settingsPageBackground(): Color =
 
 /** 分组小标题：卡片上方灰色小字，左对齐。 */
 @Composable
-internal fun SettingsGroupHeader(text: String) {
+internal fun SettingsGroupHeader(
+    text: String,
+    topPadding: Dp = Spacing.lg,
+    bottomPadding: Dp = Spacing.sm
+) {
     Text(
         text = text,
         style = MaterialTheme.typography.labelLarge.copy(fontSize = 13.sp),
         fontWeight = FontWeight.Normal,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
-        modifier = Modifier.padding(start = Spacing.md, top = Spacing.lg, bottom = Spacing.sm)
+        modifier = Modifier.padding(start = Spacing.md, top = topPadding, bottom = bottomPadding)
     )
 }
 

@@ -284,8 +284,16 @@ class ShizukuPermissionsUiTest {
         }
 
         private fun assertRootMatchesEnabled() {
-            textNode(R.string.settings_root_access)
-            val toggle = nodes().single { it.config.getOrNull(SemanticsProperties.Role) == Role.Switch }
+            val rootRow = generateSequence(textNode(R.string.settings_root_access)) { it.parent }
+                .first { node -> descendants(node).any { it.config.getOrNull(SemanticsProperties.Role) == Role.Switch } }
+            val rowNodes = descendants(rootRow)
+            assertFalse("Locate only the Root row, not the surrounding permissions page", rowNodes.any { node ->
+                node.config.getOrNull(SemanticsProperties.Text)?.any {
+                    it.text == activity.getString(R.string.mobile_build_enable) ||
+                        it.text == activity.getString(R.string.settings_shizuku)
+                } == true
+            })
+            val toggle = rowNodes.single { it.config.getOrNull(SemanticsProperties.Role) == Role.Switch }
             val expected = if (rootEnabled) ToggleableState.On else ToggleableState.Off
             assertEquals("The Root switch must follow only rootEnabled", expected, toggle.config[SemanticsProperties.ToggleableState])
         }

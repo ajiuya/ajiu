@@ -4,12 +4,15 @@ import android.content.Context
 import com.aicode.core.util.FileLogger
 import com.aicode.feature.agent.domain.container.LinuxContainerEngine
 import com.aicode.feature.settings.data.repository.ExecutionMode
+import com.aicode.feature.terminal.data.repository.TerminalTaskHistoryRepository
 import com.aicode.feature.terminal.presentation.component.AppTerminalSessionClient
 import com.aicode.feature.workspace.data.repository.WorkspaceRepository
 import com.aicode.feature.workspace.domain.WorkspaceExecutionContext
 import com.termux.terminal.TerminalSession
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -22,6 +25,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -46,7 +50,8 @@ import javax.inject.Singleton
 class TerminalSessionManager @Inject constructor(
     @param:ApplicationContext private val appContext: Context,
     private val containerEngine: LinuxContainerEngine,
-    private val workspaceRepository: WorkspaceRepository
+    private val workspaceRepository: WorkspaceRepository,
+    private val historyRepository: TerminalTaskHistoryRepository
 ) : TerminalSessionProvider {
     private companion object {
         const val TAG = "TerminalSessionManager"
@@ -178,38 +183,79 @@ class TerminalSessionManager @Inject constructor(
         notify: Boolean,
         sourceSessionId: String?
     ): String {
+        val protectedTask = terminalTaskHistoryEligible(notify, sourceSessionId)
+        val execution = WorkspaceExecutionContext.current()
+        if (protectedTask) {
+            requireTerminalHistorySession(requireNotNull(sourceSessionId))
+            requireNotNull(execution) { "Captured local execution required for terminal history" }
+            execution.requireMode(ExecutionMode.LOCAL_PROOT)
+        }
         ensureContainer()
-        val id = nextId()
-        // 用 `ec=$?` 捕获命令真实退出码后再 echo，否则 echo 本身恒为 0 会覆盖进程退出码，导致
-        // onFinished 回调里的 exitStatus 永远是 0、与屏幕上 echo 出来的码对不上。
-        // notify=true：echo 后 `exit $ec` 让 shell 以命令真实退出码结束 → proot 透传 → 回调 exitStatus
-        //   正确，且 shell 自然退出稳定触发 MSG_PROCESS_EXITED；否则脚本末尾是 echo，进程退出码被
-        //   污染成 0，而某些情况下进程不干净退出还会导致回调不触发。
-        // notify=false：echo 后 `exec ${shell}` 保活，标签可复用（dev server 退出后也能继续输入）；
-        //   此时进程不退出、不回调，退出码无意义，符合 dev server 场景设计。
-        val afterCommand = if (notify) "; exit \$ec" else "; exec ${containerEngine.defaultShell()}"
-        val shellCommand = "cd ~/workspace 2>/dev/null; export ENV=/etc/profile; " +
-            "$command; ec=\$?; echo \"[command exited: \$ec]\"$afterCommand"
-        val (session, client) = buildSession(shellCommand)
-        addTab(
-            TerminalTab(
-                id = id,
-                title = title ?: id,
-                session = session,
-                isBackground = true,
-                command = command,
-                notifyOnExit = notify,
-                sourceSessionId = sourceSessionId,
-                client = client,
-                runState = RunState.Running,
-                sourceMode = ExecutionMode.LOCAL_PROOT.name,
-                channelGeneration = null
+        val historyScope = if (protectedTask) {
+            captureTerminalTaskScope(requireNotNull(execution))
+                ?: error("Terminal history execution scope unavailable")
+        } else null
+        val historyId = if (protectedTask) UUID.randomUUID().toString() else null
+        val id = terminalTaskTabId(historyId, ::nextId)
+        val taskTitle = if (protectedTask) (title ?: id).takeTerminalChars(MAX_TERMINAL_TASK_TITLE_CHARS) else title ?: id
+        var startedSession: TerminalSession? = null
+        try {
+            if (historyScope != null && historyId != null) {
+                val now = System.currentTimeMillis()
+                historyRepository.create(TerminalTaskRecord(
+                    historyId = historyId, tabId = id, title = taskTitle,
+                    sourceSessionId = requireNotNull(sourceSessionId), scope = historyScope,
+                    startedAt = now, updatedAt = now
+                ))
+            }
+            // 用 `ec=$?` 捕获命令真实退出码后再 echo，否则 echo 本身恒为 0 会覆盖进程退出码，导致
+            // onFinished 回调里的 exitStatus 永远是 0、与屏幕上 echo 出来的码对不上。
+            // notify=true：echo 后 `exit $ec` 让 shell 以命令真实退出码结束 → proot 透传 → 回调 exitStatus
+            //   正确，且 shell 自然退出稳定触发 MSG_PROCESS_EXITED；否则脚本末尾是 echo，进程退出码被
+            //   污染成 0，而某些情况下进程不干净退出还会导致回调不触发。
+            // notify=false：echo 后 `exec ${shell}` 保活，标签可复用（dev server 退出后也能继续输入）；
+            //   此时进程不退出、不回调，退出码无意义，符合 dev server 场景设计。
+            val afterCommand = if (notify) "; exit \$ec" else "; exec ${containerEngine.defaultShell()}"
+            val shellCommand = "cd ~/workspace 2>/dev/null; export ENV=/etc/profile; " +
+                "$command; ec=\$?; echo \"[command exited: \$ec]\"$afterCommand"
+            execution?.checkCurrent()
+            if (historyScope != null) {
+                check(captureTerminalTaskScope(requireNotNull(execution)) == historyScope) {
+                    "Terminal history execution scope changed"
+                }
+            }
+            val (session, client) = buildSession(shellCommand)
+            startedSession = session
+            execution?.checkCurrent()
+            addTab(
+                TerminalTab(
+                    id = id,
+                    title = taskTitle,
+                    session = session,
+                    isBackground = true,
+                    command = command,
+                    notifyOnExit = notify,
+                    sourceSessionId = sourceSessionId,
+                    client = client,
+                    runState = RunState.Running,
+                    sourceMode = ExecutionMode.LOCAL_PROOT.name,
+                    channelGeneration = null,
+                    historyId = historyId
+                )
             )
-        )
+            if (historyId != null && !session.isRunning) finishTab(requireNotNull(tab(id)), session.exitStatus)
+        } catch (failure: Throwable) {
+            startedSession?.let { runCatching { it.finishIfRunning() } }
+            if (historyId != null) withContext(NonCancellable) {
+                runCatching { historyRepository.unknown(historyId, "", 0) }
+            }
+            throw failure
+        }
         // 后台命令不抢占当前标签焦点：仅当没有活动标签时才设为当前。
         if (_activeTabId.value == null) _activeTabId.value = id
 
         monitorBackgroundExit(id)
+        if (historyId != null) monitorTaskHistory(id)
         FileLogger.i(TAG, "后台命令标签 $id: $command")
         return id
     }
@@ -310,7 +356,9 @@ class TerminalSessionManager @Inject constructor(
             title = it.title,
             isBackground = it.isBackground,
             running = it.runState is RunState.Running,
-            command = it.command
+            command = it.command,
+            historyId = it.historyId,
+            historyError = it.historyError
         )
     }
 
@@ -322,6 +370,21 @@ class TerminalSessionManager @Inject constructor(
     /** 关闭并销毁标签（用户主动关 / AI close）。从列表移除并杀会话。 */
     override fun closeTab(id: String): Boolean {
         val tab = tab(id) ?: return false
+        if (tab.historyId != null && tab.runState is RunState.Running) {
+            val output = getTabOutput(id).orEmpty()
+            val observedExit = tab.markerExitCode ?: extractExitCode(output)
+                ?: if (!tab.session.isRunning) tab.session.exitStatus else null
+            if (observedExit != null) {
+                finishTab(tab, observedExit)
+            } else {
+                tab.historyDetached = true
+                val revision = tab.outputRevision
+                monitorScope.launch(Dispatchers.Main.immediate) {
+                    runCatching { historyRepository.unknown(tab.historyId, output, revision) }
+                        .onFailure { tab.historyError = TERMINAL_HISTORY_IO_ERROR }
+                }
+            }
+        }
         releaseKeepalive(id)
         tab.onUserInput = {}
         tab.session.setRawOutputListener(null)
@@ -400,22 +463,67 @@ class TerminalSessionManager @Inject constructor(
         }
     }
 
+    private fun monitorTaskHistory(tabId: String) {
+        monitorScope.launch(Dispatchers.Main.immediate) {
+            var lastRevision = -1L
+            while (true) {
+                delay(1_500L)
+                val current = tab(tabId) ?: return@launch
+                val historyId = current.historyId ?: return@launch
+                if (current.runState !is RunState.Running || current.historyDetached) return@launch
+                val revision = current.outputRevision
+                if (revision == lastRevision) continue
+                val output = current.readOutput()
+                lastRevision = revision
+                try {
+                    historyRepository.snapshot(historyId, output, revision)
+                    if (current.runState is RunState.Running && !current.historyDetached) current.historyError = null
+                } catch (_: Exception) {
+                    if (current.runState is RunState.Running && !current.historyDetached) current.historyError = TERMINAL_HISTORY_IO_ERROR
+                }
+                bumpRevision()
+            }
+        }
+    }
+
     private fun finishTab(tab: TerminalTab, exitCode: Int) {
+        if (tab.historyDetached || tab.runState !is RunState.Running) return
+        val output = getTabOutput(tab.id).orEmpty()
+        val revision = tab.outputRevision
         if (!tab.finish(exitCode)) return
         val completedExitCode = (tab.runState as RunState.Finished).exitCode
         releaseKeepalive(tab.id)
         bumpRevision()
-        if (tab.ownerPluginId == null && tab.notifyOnExit && !tab.finishedNotified) {
-            tab.finishedNotified = true
-            _tabFinishedEvents.tryEmit(
-                TabFinishedEvent(
-                    tab.id, tab.title, tab.command, completedExitCode, tab.sourceSessionId,
-                    tailOutput = getTabOutput(tab.id)?.takeTailLines(TAIL_LINES),
-                    sourceMode = tab.sourceMode,
-                    channelGeneration = tab.channelGeneration
-                )
-            )
+        val notify = tab.ownerPluginId == null && tab.notifyOnExit && !tab.finishedNotified
+        if (notify) tab.finishedNotified = true
+        if (tab.historyId == null) {
+            if (notify) emitFinished(tab, completedExitCode, output)
+            return
         }
+        monitorScope.launch(Dispatchers.Main.immediate, start = CoroutineStart.UNDISPATCHED) {
+            withContext(NonCancellable) {
+                try {
+                    historyRepository.finish(tab.historyId, output, revision, completedExitCode)
+                    tab.historyError = null
+                } catch (_: Exception) {
+                    tab.historyError = TERMINAL_HISTORY_IO_ERROR
+                } finally {
+                    bumpRevision()
+                    if (notify) emitFinished(tab, completedExitCode, output)
+                }
+            }
+        }
+    }
+
+    private fun emitFinished(tab: TerminalTab, exitCode: Int, output: String) {
+        _tabFinishedEvents.tryEmit(TabFinishedEvent(
+            tab.id, tab.title, tab.command, exitCode, tab.sourceSessionId,
+            tailOutput = output.takeTailLines(TAIL_LINES),
+            sourceMode = tab.sourceMode,
+            channelGeneration = tab.channelGeneration,
+            historyId = tab.historyId,
+            historyError = tab.historyError
+        ))
     }
 
     private fun addTab(tab: TerminalTab) {

@@ -1344,11 +1344,14 @@ class AIAgentViewModel @Inject constructor(
 
     fun setSessionProviderModel(providerId: String, model: String) {
         val sid = _currentSessionId.value ?: return
+        val running = agentRunManager.isSessionRunning(sid)
         viewModelScope.launch {
-            sessionUseCase.updateProviderModel(sid, providerId, model)
-            agentRunManager.resetModelRuntime(sid)
-            // 空会话中的选择视为「新会话默认模型」，供下次新建会话沿用
-            if (sessionUseCase.isSessionEmpty(sid)) {
+            val updated = sessionUseCase.updateProviderModelWithDirectChildren(sid, providerId, model)
+            if (updated.isEmpty()) return@launch
+            updated.forEach { agentRunManager.resetModelRuntime(it) }
+            val session = sessionUseCase.getSessionById(sid) ?: return@launch
+            // 空闲根会话仍保留新会话默认值；运行中的选择只作用于该会话范围。
+            if (!running && session.parentId == null && sessionUseCase.isSessionEmpty(sid)) {
                 defaultModelSettingsRepository.setDefaultModel(providerId, model)
             }
         }

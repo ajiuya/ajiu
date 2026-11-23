@@ -174,6 +174,10 @@ interface AIProvider {
      */
     var maxOutputTokens: Int?
 
+    var requestOutputTokenLimit: Int?
+        get() = null
+        set(_) {}
+
     /**
      * 当前模型的思考控制能力，调用前由工作流按模型元数据注入（见 [com.aicode.feature.agent.domain.provider.toReasoningCapability]）。
      * 为 null 表示未知，此时 adapter 按协议经 [ReasoningResolver] 保守兜底，不会发可能被 400 的档位。

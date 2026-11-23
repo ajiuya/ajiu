@@ -5,12 +5,14 @@ import com.aicode.core.util.FileLogger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.InternalCoroutinesApi
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeoutOrNull
 import retrofit2.HttpException
 import retrofit2.await
@@ -45,6 +47,12 @@ private const val NETWORK_WAIT_TIMEOUT_MS = 30_000L
  * 故放宽到 5 分钟以容纳慢启动与长思考模型。
  */
 const val FIRST_BYTE_TIMEOUT_MS = 300_000L
+
+class FirstContentTimeoutException(val timeoutMs: Long) : SocketTimeoutException("First content timeout after ${timeoutMs}ms")
+
+class StreamIdleTimeoutException(val timeoutMs: Long) : SocketTimeoutException("Stream idle timeout after ${timeoutMs}ms")
+
+class UnexpectedStreamEndException(message: String) : IOException(message)
 
 class FirstContentGuard(private val nanoTime: () -> Long = System::nanoTime) {
     private var requestStartedAtNanos: Long? = null
@@ -123,43 +131,71 @@ suspend fun withFirstContentTimeout(
         }
     } catch (e: Throwable) {
         coroutineContext.ensureActive()
-        if (timedOut.get()) throw SocketTimeoutException("First content timeout after ${timeoutMs}ms")
+        if (timedOut.get()) throw FirstContentTimeoutException(timeoutMs)
         throw e
     }
 }
 
-/**
- * 流式响应「数据块间隔」watchdog：相邻两个数据块之间超过 [timeoutMs] 未到达即调用 [close]，
- * 使阻塞中的读取抛出 IOException，交给重试机制处理。
- *
- * 每收到一个数据块调用一次 [touch] 重新计时；流结束（正常或异常）时调用 [cancel]。
- * [timeoutMs] <= 0 表示不限制，此时两个方法均为空操作。
- */
+/** 只计算等待网络读取的时间，解析或向下游发送内容的耗时不属于网络空闲。 */
 class StreamIdleWatchdog(
     private val scope: CoroutineScope,
     private val timeoutMs: Long,
     private val close: () -> Unit
 ) {
     private var timer: Job? = null
+    private var generation = 0L
+    private var expired = false
+    private var cancelled = false
 
+    init {
+        touch()
+    }
+
+    @Synchronized
     fun touch() {
-        if (timeoutMs <= 0) return
+        if (timeoutMs <= 0 || expired || cancelled) return
         timer?.cancel()
+        val current = ++generation
         timer = scope.launch {
             delay(timeoutMs)
-            runCatching { close() }
+            val shouldClose = synchronized(this@StreamIdleWatchdog) {
+                if (generation != current || cancelled || expired) false else {
+                    expired = true
+                    true
+                }
+            }
+            if (shouldClose) runCatching { close() }
         }
     }
 
+    fun <T> read(block: () -> T): T {
+        scope.coroutineContext.ensureActive()
+        touch()
+        try {
+            return block()
+        } finally {
+            val timedOut = synchronized(this) {
+                generation++
+                timer?.cancel()
+                timer = null
+                expired
+            }
+            scope.coroutineContext.ensureActive()
+            if (timedOut) throw StreamIdleTimeoutException(timeoutMs)
+        }
+    }
+
+    @Synchronized
     fun cancel() {
+        cancelled = true
+        generation++
         timer?.cancel()
         timer = null
     }
 }
 
-/** 在当前协程下创建 [StreamIdleWatchdog]；[timeoutMs] <= 0 时创建的实例不做任何事。 */
 suspend fun launchStreamIdleWatchdog(timeoutMs: Long, close: () -> Unit): StreamIdleWatchdog =
-    StreamIdleWatchdog(CoroutineScope(coroutineContext[Job]!!), timeoutMs, close)
+    StreamIdleWatchdog(CoroutineScope(coroutineContext[Job]!! + Dispatchers.Default), timeoutMs, close)
 
 private val TRANSIENT_MESSAGES = listOf(
     "load failed",
@@ -183,15 +219,44 @@ fun exponentialDelayMillis(retryIndex: Int): Long {
     return min(wait, maxDelay)
 }
 
-/**
- * 网络不可用时先等待恢复（最长 [NETWORK_WAIT_TIMEOUT_MS]），避免把有限的重试次数消耗在
- * 完全断网的窗口内（如切后台后网络被系统短暂收回）。超时后照常继续，交由重试逻辑自行失败。
- */
-private suspend fun awaitNetworkIfOffline() {
-    if (NetworkStatus.isOnline) return
-    withTimeoutOrNull(NETWORK_WAIT_TIMEOUT_MS) {
-        while (!NetworkStatus.isOnline) delay(500)
+private suspend fun awaitRetryDelay(waitMillis: Long, error: Throwable, recoveryVersion: Long) {
+    if (!NetworkStatus.isOnline) {
+        withTimeoutOrNull(NETWORK_WAIT_TIMEOUT_MS) {
+            NetworkStatus.states.first { it.isOnline }
+        }
     }
+    if (waitMillis <= 0) return
+    val canWakeOnRecovery = error is IOException && error !is SSLException
+    if (canWakeOnRecovery) {
+        withTimeoutOrNull(waitMillis) {
+            NetworkStatus.states.first { it.isOnline && it.recoveryVersion > recoveryVersion }
+        }
+    } else {
+        delay(waitMillis)
+    }
+}
+
+private fun logFailure(error: Throwable, attempt: Int, maxRetries: Int, receivedContent: Boolean? = null) {
+    val timeoutMillis = when (error) {
+        is FirstContentTimeoutException -> error.timeoutMs
+        is StreamIdleTimeoutException -> error.timeoutMs
+        else -> null
+    }
+    val phase = when (error) {
+        is FirstContentTimeoutException -> "first_content"
+        is StreamIdleTimeoutException -> "stream_data"
+        is UnexpectedStreamEndException -> "stream_termination"
+        is UnknownHostException -> "dns"
+        is ConnectException -> "connect"
+        is SSLException -> "tls"
+        else -> if (receivedContent == true) "stream" else "request"
+    }
+    FileLogger.w(
+        TAG,
+        "Request failure phase=$phase attempt=$attempt/$maxRetries kind=${error.toRetryErrorInfo().kind} " +
+            "exception=${error.javaClass.simpleName} receivedContent=$receivedContent timeoutMs=$timeoutMillis " +
+            NetworkStatus.states.value.diagnosticSummary()
+    )
 }
 
 /**
@@ -304,6 +369,9 @@ enum class RetryErrorKind {
     SERVER_ERROR,
     /** 连接/读取超时（含首字节 watchdog 触发的断流）。 */
     TIMEOUT,
+    FIRST_CONTENT_TIMEOUT,
+    STREAM_IDLE_TIMEOUT,
+    STREAM_INTERRUPTED,
     /** 目标端口无服务，连接被拒绝。 */
     CONNECTION_REFUSED,
     /** DNS 解析失败（域名不存在或网络不可达）。 */
@@ -341,6 +409,9 @@ fun Throwable.toRetryErrorInfo(): RetryErrorInfo = when {
         "server_error", "internal_error" -> RetryErrorInfo(RetryErrorKind.SERVER_ERROR)
         else -> RetryErrorInfo(RetryErrorKind.UNKNOWN)
     }
+    this is FirstContentTimeoutException -> RetryErrorInfo(RetryErrorKind.FIRST_CONTENT_TIMEOUT)
+    this is StreamIdleTimeoutException -> RetryErrorInfo(RetryErrorKind.STREAM_IDLE_TIMEOUT)
+    this is UnexpectedStreamEndException -> RetryErrorInfo(RetryErrorKind.STREAM_INTERRUPTED)
     this is SocketTimeoutException || this is InterruptedIOException -> RetryErrorInfo(RetryErrorKind.TIMEOUT)
     this is UnknownHostException -> RetryErrorInfo(RetryErrorKind.DNS_FAILED)
     this is ConnectException -> RetryErrorInfo(RetryErrorKind.CONNECTION_REFUSED)
@@ -452,12 +523,14 @@ suspend fun <T> retryStaircase(
 ): T {
     var attempt = 0
     while (true) {
+        val recoveryVersion = NetworkStatus.states.value.recoveryVersion
         try {
             return block()
         } catch (e: CancellationException) {
             throw e
         } catch (e: Throwable) {
             coroutineContext.ensureActive()
+            logFailure(e, attempt, maxRetries)
             if (!isRetriableNetworkError(e)) {
                 if (onKeyFailure?.invoke(e, true) == true) {
                     attempt = 0
@@ -470,9 +543,8 @@ suspend fun <T> retryStaircase(
             val wait = retryDelayMillis(attempt, e)
             FileLogger.w(TAG, "网络请求失败，第 ${attempt + 1}/$maxRetries 次重试（等待 ${wait}ms）: ${e.describeForRetryLog()}")
             onRetry?.invoke(attempt + 1, maxRetries, e.toRetryErrorInfo())
-            awaitNetworkIfOffline()
             attempt++
-            if (wait > 0) delay(wait)
+            awaitRetryDelay(wait, e, recoveryVersion)
         }
     }
 }
@@ -498,6 +570,7 @@ suspend fun streamWithStaircaseRetry(
 ) {
     var attempt = 0
     while (true) {
+        val recoveryVersion = NetworkStatus.states.value.recoveryVersion
         var receivedContent = false
         try {
             attemptOnce { receivedContent = true }
@@ -506,6 +579,7 @@ suspend fun streamWithStaircaseRetry(
             throw e
         } catch (e: Throwable) {
             coroutineContext.ensureActive()
+            logFailure(e, attempt, maxRetries, receivedContent)
             if (!isRetriableNetworkError(e)) {
                 if (onKeyFailure?.invoke(e, !receivedContent) == true) {
                     attempt = 0
@@ -518,9 +592,8 @@ suspend fun streamWithStaircaseRetry(
             val wait = retryDelayMillis(attempt, e)
             FileLogger.w(TAG, "流式请求失败，第 ${attempt + 1}/$maxRetries 次重试（等待 ${wait}ms）: ${e.describeForRetryLog()}")
             onRetry?.invoke(attempt + 1, maxRetries, e.toRetryErrorInfo())
-            awaitNetworkIfOffline()
             attempt++
-            if (wait > 0) delay(wait)
+            awaitRetryDelay(wait, e, recoveryVersion)
         }
     }
 }

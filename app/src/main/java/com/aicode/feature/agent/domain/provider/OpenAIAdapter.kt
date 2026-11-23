@@ -4,7 +4,6 @@ import com.aicode.core.util.AILogger
 import com.aicode.feature.agent.data.remote.openai.OpenAIApi
 import com.aicode.feature.settings.domain.model.ProviderType
 import com.aicode.feature.settings.domain.model.defaultProviderApiPath
-import java.io.IOException
 import com.aicode.feature.agent.data.remote.openai.ChatCompletionRequest
 import com.aicode.feature.agent.data.remote.openai.OpenAIChatMessage
 import com.aicode.feature.agent.domain.model.AgentImage
@@ -75,8 +74,9 @@ class OpenAIAdapter @Inject constructor(
     /** 自定义请求头：占位符替换后写出，完全覆盖同名默认头。 */
     override var customHeaders: Map<String, String> = emptyMap()
 
-    // OpenAI 系不发输出上限参数（用服务端默认），仅为接口完整性保留。
+    // 模型元数据上限不直接写入请求，普通聊天维持服务端默认。
     override var maxOutputTokens: Int? = null
+    override var requestOutputTokenLimit: Int? = null
 
     /** 当前模型的思考能力，由工作流按元数据注入；null 时由 [ReasoningResolver] 按模型名兜底。 */
     override var reasoningCapability: ReasoningCapability? = null
@@ -130,6 +130,7 @@ class OpenAIAdapter @Inject constructor(
         val url = resolveApiUrl()
         val reasoningPlan = chatReasoningPlan(reasoningEffort)
         val disableToggle = reasoningPlan.wire as? ReasoningWire.DisableToggle
+        val useMaxCompletionTokens = usesMaxCompletionTokens()
         val request = ChatCompletionRequest(
             model = model,
             messages = openAIMessages,
@@ -141,7 +142,9 @@ class OpenAIAdapter @Inject constructor(
             tool_choice = if (toolDefs != null) "auto" else null,
             stream = false,
             prompt_cache_key = if (chatCacheKeyEnabled) logSessionId else null,
-            service_tier = serviceTier()
+            service_tier = serviceTier(),
+            max_tokens = if (useMaxCompletionTokens) null else requestOutputTokenLimit,
+            max_completion_tokens = if (useMaxCompletionTokens) requestOutputTokenLimit else null
         )
         val seq = AILogger.logRequest(logSessionId, "OpenAI", model, "POST", url, request)
 
@@ -174,6 +177,11 @@ class OpenAIAdapter @Inject constructor(
         val usage = response.usage
 
         return AIResponse(content = content, toolCalls = toolCalls, stopReason = finishReason, reasoning = reasoning, inputTokens = usage?.prompt_tokens ?: 0, outputTokens = usage?.completion_tokens ?: 0, cachedInputTokens = usage?.prompt_tokens_details?.cached_tokens ?: 0, cacheCreationTokens = usage?.prompt_tokens_details?.cache_write_tokens ?: 0, images = images)
+    }
+
+    private fun usesMaxCompletionTokens(): Boolean {
+        val id = model.lowercase().substringAfterLast('/')
+        return id.startsWith("gpt-") || (id.length > 1 && id[0] == 'o' && id[1].isDigit())
     }
 
     /**
@@ -232,6 +240,7 @@ class OpenAIAdapter @Inject constructor(
             request["tool_choice"] = "auto"
         }
         if (stream) request["stream"] = true
+        requestOutputTokenLimit?.let { request["max_output_tokens"] = it }
         // Responses 端点的思考字段：effort 走 reasoning.effort；厂商私有开关走 thinking / enable_thinking。
         when (val wire = responsesReasoningPlan(reasoningEffort).wire) {
             is ReasoningWire.Effort -> {
@@ -353,6 +362,7 @@ class OpenAIAdapter @Inject constructor(
 
         val streamReasoningPlan = chatReasoningPlan(reasoningEffort)
         val streamDisableToggle = streamReasoningPlan.wire as? ReasoningWire.DisableToggle
+        val useMaxCompletionTokens = usesMaxCompletionTokens()
         val request = ChatCompletionRequest(
             model = model,
             messages = openAIMessages,
@@ -365,7 +375,9 @@ class OpenAIAdapter @Inject constructor(
             stream = true,
             stream_options = StreamOptions(include_usage = true),
             prompt_cache_key = if (chatCacheKeyEnabled) logSessionId else null,
-            service_tier = serviceTier()
+            service_tier = serviceTier(),
+            max_tokens = if (useMaxCompletionTokens) null else requestOutputTokenLimit,
+            max_completion_tokens = if (useMaxCompletionTokens) requestOutputTokenLimit else null
         )
         val seq = AILogger.logRequest(logSessionId, "OpenAI", model, "POST", url, request)
         // 原始 SSE 分批落盘（见 AILogger.beginRawSse），本轮结束在 finally 收尾。
@@ -419,9 +431,8 @@ class OpenAIAdapter @Inject constructor(
                     // （收到 [DONE] 即 break，故走到 readLine()==null 时必然未收到过结束标记。）
                     while (true) {
                         coroutineContext.ensureActive()
-                        val line = reader.readLine()
-                            ?: throw IOException("SSE 流被中断：未收到 [DONE] 结束标记（疑似网络断开）")
-                        idleWatchdog.touch()
+                        val line = idleWatchdog.read { reader.readLine() }
+                            ?: throw UnexpectedStreamEndException("OpenAI Chat stream ended without [DONE]")
                         if (!line.startsWith("data:")) continue
                         val data = line.removePrefix("data:").trim()
                         if (data.isEmpty()) continue
@@ -603,9 +614,8 @@ class OpenAIAdapter @Inject constructor(
                             val reader = rb.charStream().buffered()
                             while (!acc.terminated) {
                                 coroutineContext.ensureActive()
-                                val line = reader.readLine()
-                                    ?: throw IOException("SSE 流被中断：未收到 response.completed 结束事件（疑似网络断开）")
-                                idleWatchdog.touch()
+                                val line = idleWatchdog.read { reader.readLine() }
+                                    ?: throw UnexpectedStreamEndException("OpenAI Responses stream ended without a terminal event")
                                 if (!line.startsWith("data:")) continue
                                 val data = line.removePrefix("data:").trim()
                                 if (data.isEmpty()) continue

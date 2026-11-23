@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="mobile_build_title">Mobile builds</string>
+    <string name="mobile_build_enable">Optimize builds for this phone</string>
+    <string name="mobile_build_enable_hint">Use phone-friendly memory and concurrency options for local Gradle builds</string>
+    <string name="mobile_build_options">Build options</string>
+    <string name="mobile_build_summary">Heap %1$s · Daemon %2$s · Parallel %3$s · Workers %4$d · Tests %5$s</string>
+    <string name="mobile_build_on">On</string>
+    <string name="mobile_build_off">Off</string>
+    <string name="mobile_build_scope_hint">Applies only to the default Gradle user home on this device, starting with the next build. Turning this off restores project/user defaults and keeps your selections here. Custom Gradle user homes or explicit build arguments take priority.</string>
+    <string name="mobile_build_options_title">Mobile build options</string>
+    <string name="mobile_build_options_hint">Choose options and tap Save. Canceling or dismissing this panel changes nothing. You can save options even while optimization is off.</string>
+    <string name="mobile_build_gradle_heap">Gradle heap limit</string>
+    <string name="mobile_build_gradle_heap_hint">Maximum Gradle JVM heap, not a total build memory limit. Compilers and other processes use additional memory.</string>
+    <string name="mobile_build_daemon">Persistent Gradle process</string>
+    <string name="mobile_build_daemon_hint">Prefer reusing the Gradle process. Survival after PRoot exits or the system reclaims it is not guaranteed.</string>
+    <string name="mobile_build_parallel">Parallel builds</string>
+    <string name="mobile_build_parallel_hint">Allow eligible project tasks to run concurrently, potentially using more memory.</string>
+    <string name="mobile_build_workers">Maximum workers</string>
+    <string name="mobile_build_workers_hint">Limit the number of concurrent Gradle workers.</string>
+    <string name="mobile_build_worker_option">%1$d</string>
+    <string name="mobile_build_option_description">%1$s: %2$s</string>
+    <string name="mobile_build_test_heap">Unit test heap limit</string>
+    <string name="mobile_build_test_heap_hint">Maximum JVM heap for Gradle Test tasks. Test processes still use additional memory.</string>
+    <string name="mobile_build_heap_512_mb">512 MB</string>
+    <string name="mobile_build_heap_768_mb">768 MB</string>
+    <string name="mobile_build_heap_1_gb">1 GB</string>
+    <string name="mobile_build_heap_1_5_gb">1.5 GB</string>
+    <string name="mobile_build_heap_2_gb">2 GB</string>
+    <string name="mobile_build_heap_2_5_gb">2.5 GB</string>
+    <string name="mobile_build_heap_3_gb">3 GB</string>
+    <string name="mobile_build_heap_mb">%1$d MB</string>
+    <string name="mobile_build_saving">Saving…</string>
+    <string name="mobile_build_save_failed">Could not save mobile build settings due to a possible configuration conflict or write failure. Check the local container and Gradle configuration, then try again.</string>
+</resources>

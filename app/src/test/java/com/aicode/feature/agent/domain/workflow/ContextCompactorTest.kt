@@ -73,6 +73,7 @@ class ContextCompactorTest {
         every { prompts.resolvePrompt(any()) } returns "{{INSTRUCTION}}"
         every { provider.completeStream(any(), any(), any(), any()) } returns complete()
         every { persistence.nextTimestamp() } returnsMany listOf(300L, 301L)
+        coEvery { persistence.matchesCompactionSource(any(), any()) } returns true
         compactor.streamPolicy = CompactionStreamPolicy(retryDelayMs = 0)
     }
 
@@ -310,7 +311,7 @@ class ContextCompactorTest {
         assertEquals(CompactionPhase.FAILED, events.progress().last().phase)
         assertEquals(90, events.progress().last().percent)
         assertTrue(events.last() is AgentEvent.CompactionFinished)
-        coVerify(exactly = 0) { dao.commitCompaction(any(), any(), any(), any()) }
+        coVerify(exactly = 0) { dao.commitCompaction(any(), any(), any(), any(), any(), any()) }
     }
 
     @Test fun summaryBeyondSoftTargetIsReturnedWhole() = runTest {
@@ -340,7 +341,7 @@ class ContextCompactorTest {
             assertSame(original, compactor.compactIfNeeded(original, provider, force = true).messages)
         }
         coVerify(exactly = 8) { records.insert(match { it.status == "error" }) }
-        coVerify(exactly = 0) { dao.commitCompaction(any(), any(), any(), any()) }
+        coVerify(exactly = 0) { dao.commitCompaction(any(), any(), any(), any(), any(), any()) }
         assertRestored()
     }
 
@@ -354,7 +355,7 @@ class ContextCompactorTest {
         assertEquals("compaction_no_final", events.progress().last().lastErrorCode)
         assertTrue(events.last() is AgentEvent.CompactionFinished)
         coVerify(exactly = 1) { records.insert(match { it.status == "error" && it.inputTokens == 0 && it.outputTokens == 0 }) }
-        coVerify(exactly = 0) { dao.commitCompaction(any(), any(), any(), any()) }
+        coVerify(exactly = 0) { dao.commitCompaction(any(), any(), any(), any(), any(), any()) }
     }
 
     @Test fun unreachableSmallWindowFailsBeforeAnyModelRequest() = runTest {
@@ -385,7 +386,7 @@ class ContextCompactorTest {
         assertTrue((result.messages[1] as AgentMessage.AssistantMessage).isContextSummary)
         coVerify(exactly = 1) { dao.commitCompaction("session", listOf("old"), match {
             it.map { row -> row.timestamp } == listOf(300L, 301L) && it[0].isCompactionMarker && it[1].isContextSummary
-        }, any()) }
+        }, any(), any(), any()) }
         verify(exactly = 1) { persistence.invalidateHistory("session") }
     }
 
@@ -423,7 +424,7 @@ class ContextCompactorTest {
 
     @Test fun transactionFailureIsFailedAtNinetyFiveAndNeverInvalidates() = runTest {
         prepare(); persistedHistory()
-        coEvery { dao.commitCompaction(any(), any(), any(), any()) } throws IllegalStateException("private transaction detail")
+        coEvery { dao.commitCompaction(any(), any(), any(), any(), any(), any()) } throws IllegalStateException("private transaction detail")
         val events = mutableListOf<AgentEvent>()
         val original = history()
         assertSame(original, compactor.compactIfNeeded(original, provider, sessionId = "session", force = true, onEvent = { events.add(it) }).messages)
@@ -446,7 +447,7 @@ class ContextCompactorTest {
         assertEquals(100, events.progress().last().percent)
         assertTrue(events.none { it is AgentEvent.CompactionFailed })
         assertTrue(events.last() is AgentEvent.CompactionFinished)
-        coVerify(exactly = 0) { dao.commitCompaction(any(), any(), any(), any()) }
+        coVerify(exactly = 0) { dao.commitCompaction(any(), any(), any(), any(), any(), any()) }
     }
 
     @Test fun streamBypassDisablesHiddenRetriesAndRestoresEveryProperty() = runTest {
@@ -521,7 +522,7 @@ class ContextCompactorTest {
         assertFalse(compactor.isSessionCompacting("session"))
         assertRestored()
         coVerify(exactly = 1) { records.insert(match { it.errorMessage == "compaction_cancelled" }) }
-        coVerify(exactly = 0) { dao.commitCompaction(any(), any(), any(), any()) }
+        coVerify(exactly = 0) { dao.commitCompaction(any(), any(), any(), any(), any(), any()) }
     }
 
     @Test fun providerCancellationAndClosedCollectorPreserveOriginalCancellation() = runTest {
@@ -560,7 +561,7 @@ class ContextCompactorTest {
             assertEquals(CompactionPhase.CANCELLED, events.progress().last().phase)
             assertTrue(events.last() is AgentEvent.CompactionFinished)
         }
-        coVerify(exactly = 0) { dao.commitCompaction(any(), any(), any(), any()) }
+        coVerify(exactly = 0) { dao.commitCompaction(any(), any(), any(), any(), any(), any()) }
         assertRestored()
     }
 
@@ -599,7 +600,7 @@ class ContextCompactorTest {
         prepare(); persistedHistory()
         val entered = CompletableDeferred<Unit>()
         val release = CompletableDeferred<Unit>()
-        coEvery { dao.commitCompaction(any(), any(), any(), any()) } coAnswers { entered.complete(Unit); release.await() }
+        coEvery { dao.commitCompaction(any(), any(), any(), any(), any(), any()) } coAnswers { entered.complete(Unit); release.await() }
         val events = mutableListOf<AgentEvent>()
         val job = async { compactor.compactIfNeeded(history(), provider, sessionId = "session", force = true, onEvent = { events.add(it) }) }
         entered.await()
@@ -619,7 +620,7 @@ class ContextCompactorTest {
         prepare(); persistedHistory()
         val entered = CompletableDeferred<Unit>()
         val release = CompletableDeferred<Unit>()
-        coEvery { dao.commitCompaction(any(), any(), any(), any()) } coAnswers { entered.complete(Unit); release.await() }
+        coEvery { dao.commitCompaction(any(), any(), any(), any(), any(), any()) } coAnswers { entered.complete(Unit); release.await() }
         val job = async { compactor.compactIfNeeded(history(), provider, sessionId = "session", force = true) }
         entered.await()
         val error = runCatching { compactor.compactIfNeeded(history(), provider, sessionId = "session", force = true) }.exceptionOrNull()

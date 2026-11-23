@@ -2,6 +2,7 @@ package com.aicode.feature.agent.domain.workflow
 
 import com.aicode.core.util.FileLogger
 import com.aicode.feature.agent.data.local.dao.AgentMessageDao
+import com.aicode.feature.agent.data.local.dao.CompactionSourceFingerprint
 import com.aicode.feature.agent.data.local.dao.LlmCallRecordDao
 import com.aicode.feature.agent.data.local.entity.AgentMessageEntity
 import com.aicode.feature.agent.data.local.entity.LlmCallRecordEntity
@@ -60,8 +61,14 @@ class ContextCompactor @Inject constructor(
 
     private val streamOwners = CompactionStreamOwners()
     internal var streamPolicy = CompactionStreamPolicy()
+    private val checkpoints = CompactionCheckpoints()
 
-    fun cancelSession(sessionId: String): Boolean = streamOwners.cancel(sessionId)
+    fun discardCheckpoint(sessionId: String) = checkpoints.clear(sessionId)
+
+    fun cancelSession(sessionId: String): Boolean {
+        discardCheckpoint(sessionId)
+        return streamOwners.cancel(sessionId)
+    }
 
     fun isSessionCompacting(sessionId: String): Boolean = streamOwners.isActive(sessionId)
 
@@ -72,6 +79,8 @@ class ContextCompactor @Inject constructor(
         val blocks: Int,
         val markerTimestamp: Long?,
         val summaryTimestamp: Long?,
+        val expectedSource: Map<String, String>?,
+        val expectedGeneration: Long?,
     )
 
     private data class SummaryBlock(
@@ -202,6 +211,8 @@ class ContextCompactor @Inject constructor(
                 }
                 val persistedHead = head.filterNot { it is AgentMessage.UserMessage && it.isTransient }
                 val headIds = persistedHead.map { it.id }.filter { it.isNotBlank() }.distinct()
+                var expectedSource: Map<String, String>? = null
+                val expectedGeneration = sessionId?.let { agentMessageDao.compactionGeneration(it) }
                 if (sessionId != null) {
                     check(headIds.isNotEmpty() && persistedHead.all { it.id.isNotBlank() }) { "History has no stable persistence IDs" }
                     val entities = agentMessageDao.getMessagesBySessionOnce(sessionId).filter { it.sessionId == sessionId }
@@ -210,6 +221,14 @@ class ContextCompactor @Inject constructor(
                     val tailIds = tail.filterNot { it is AgentMessage.UserMessage && it.isTransient }
                         .map { it.id }.filter { it.isNotBlank() }.toSet()
                     check(entities.any { it.id in tailIds }) { "Retained history has no persisted timestamp anchor" }
+                    val sourceHead = head.filterNot {
+                        it is AgentMessage.UserMessage && it.isTransient && it.modelInputOwnerId == null
+                    }
+                    if (!messagePersistenceUseCase.matchesCompactionSource(sourceHead, entities)) {
+                        throw CancellationException("Compaction source changed")
+                    }
+                    val headSet = headIds.toHashSet()
+                    expectedSource = entities.filter { it.id in headSet }.associate { it.id to CompactionSourceFingerprint.of(it) }
                 }
 
                 val summaryMetadata = modelMetadataService.resolve(aiProvider.providerId, inferProviderType(aiProvider), aiProvider.model)
@@ -237,6 +256,23 @@ class ContextCompactor @Inject constructor(
                 val longHistory = CompactionSummaryPolicy.useLongHistory(
                     summaryBudget, contextKnown, streamPolicy.materialTokens, projectedTokens,
                 )
+                fun restoreCheckpoint(vararg templates: String) {
+                    if (sessionId == null) return
+                    val fingerprint = CompactionFingerprint()
+                        .add(aiProvider.javaClass.name).add(aiProvider.providerId).add(aiProvider.model)
+                        .add(aiProvider.baseUrl).add(aiProvider.useFullUrl.toString()).add(aiProvider.useResponseApi.toString())
+                        .add(aiProvider.temperature.toString()).add(aiProvider.reasoningCapability.toString())
+                        .add(expectedGeneration.toString()).add(inputBudget.toString()).add(summaryBudget.toString())
+                        .add(outputLimit.toString()).add(aiProvider.requestOutputTokenLimit.toString())
+                        .add(streamPolicy.toString()).add(systemPrompt)
+                        .add(hierarchicalHistory.toString()).add(longHistory.toString()).add(previousSummary.orEmpty())
+                    aiProvider.customHeaders.toSortedMap().forEach { (key, value) -> fingerprint.add(key).add(value) }
+                    templates.forEach { fingerprint.add(it) }
+                    messages.forEach { fingerprint.add(it.id).add(CompactionText.project(it)) }
+                    expectedSource?.toSortedMap()?.forEach { (id, hash) -> fingerprint.add(id).add(hash) }
+                    val work = checkpoints.open(sessionId, fingerprint.finish())
+                    streamSession.restore(work) { checkpoints.updated(sessionId, work) }
+                }
                 val cursor = CompactionText.Cursor(units)
                 reportProgress(CompactionProgressPolicy.summarizing(cursor.totalCharacters))
                 var block = 0
@@ -248,6 +284,7 @@ class ContextCompactor @Inject constructor(
                     val mergePrompt = withContext(Dispatchers.IO) {
                         systemPromptProvider.resolvePrompt("agent/compact-merge.md").replace(LEADING_COMMENT, "")
                     }
+                    restoreCheckpoint(leafPrompt, mergePrompt)
                     val result = HierarchicalCompaction.summarize(
                         source = units,
                         previousSummary = previousSummary,
@@ -301,11 +338,12 @@ class ContextCompactor @Inject constructor(
                     block = result.leafBlocks
                     summary = result.summary
                 } else {
+                    restoreCheckpoint(prompt)
                     var rollingSummary = previousSummary
                     var materialLimit = streamPolicy.materialTokens
                     while (!cursor.finished) {
                         currentCoroutineContext().ensureActive()
-                        if (streamSession.attempts >= streamPolicy.maxAttempts) throw CompactionStreamException("compaction_attempt_limit")
+                        if (!streamSession.replaying && streamSession.attempts >= streamPolicy.maxAttempts) throw CompactionStreamException("compaction_attempt_limit")
                         if (block >= MAX_SUMMARY_BLOCKS) throw CompactionStreamException("compaction_block_limit")
                         fun prepareBlock(limit: Int): SummaryBlock {
                             val plan = CompactionSummaryPolicy.plan(
@@ -328,7 +366,8 @@ class ContextCompactor @Inject constructor(
                             check(CompactionText.estimateRequest(SUMMARY_SYSTEM, emptyList(), request) <= summaryBudget) { "Summary block exceeds the input budget" }
                             return SummaryBlock(candidate, plan.materialBudget, CompactionText.tokens(chunk), request)
                         }
-                        var pending = prepareBlock(materialLimit)
+                        var pendingLimit = streamSession.materialBudget(materialLimit)
+                        var pending = prepareBlock(pendingLimit)
                         rollingSummary = streamSession.summarize(
                             stream = { aiProvider.completeStream(SUMMARY_SYSTEM, pending.request, emptyList(), reasoningEffort = "none") },
                             onUpdate = { update ->
@@ -342,6 +381,9 @@ class ContextCompactor @Inject constructor(
                                 ))
                             },
                             onAttempt = { recordAttempt(aiProvider, sessionId, it) },
+                            requestFingerprint = { CompactionFingerprint().add(SUMMARY_SYSTEM)
+                                .add((pending.request.single() as AgentMessage.UserMessage).content).finish() },
+                            materialBudget = { pendingLimit },
                             onRetry = { error ->
                                 if (error.code == "compaction_http_499" || error.code == "compaction_truncated") {
                                     val halfLimit = maxOf(MIN_RETRY_MATERIAL_TOKENS,
@@ -350,6 +392,7 @@ class ContextCompactor @Inject constructor(
                                         val smaller = prepareBlock(halfLimit)
                                         if (smaller.cursor.consumedCharacters < pending.cursor.consumedCharacters) {
                                             pending = smaller
+                                            pendingLimit = halfLimit
                                             materialLimit = minOf(materialLimit, halfLimit)
                                         } else throw error
                                     } else throw error
@@ -358,6 +401,7 @@ class ContextCompactor @Inject constructor(
                         )
                         currentCoroutineContext().ensureActive()
                         cursor.commitFrom(pending.cursor)
+                        streamSession.commitBlock()
                         block++
                         reportProgress(CompactionProgressPolicy.summarized(
                             previous = progress,
@@ -368,7 +412,7 @@ class ContextCompactor @Inject constructor(
                     }
                     summary = requireNotNull(rollingSummary)
                 }
-                PreparedSummary(summary, tail, headIds, block, markerTimestamp, summaryTimestamp)
+                PreparedSummary(summary, tail, headIds, block, markerTimestamp, summaryTimestamp, expectedSource, expectedGeneration)
             }
             streamOwners.finishCancelable(sessionId, currentCoroutineContext().job)
             currentCoroutineContext().ensureActive()
@@ -385,6 +429,7 @@ class ContextCompactor @Inject constructor(
             val compactedTokens = ContextTokenEstimator.estimate(systemPrompt, compacted, tools)
             currentCoroutineContext().ensureActive()
             if (compactedTokens >= estimatedTokens) {
+                sessionId?.let(::discardCheckpoint)
                 FileLogger.i(TAG, "压缩未缩减 token（$estimatedTokens → $compactedTokens），保留原历史")
                 notifyBestEffort { reportProgress(CompactionProgressPolicy.withPhase(progress, CompactionPhase.UNCHANGED)) }
                 return unchanged
@@ -405,20 +450,25 @@ class ContextCompactor @Inject constructor(
                             AgentMessageEntity(id = summaryId, sessionId = sessionId, role = MessageRole.ASSISTANT.name,
                                 content = summary, timestamp = requireNotNull(summaryTimestamp), isContextSummary = true)
                         ),
-                        summaryId = summaryId
+                        summaryId = summaryId,
+                        expectedSource = prepared.expectedSource,
+                        expectedGeneration = prepared.expectedGeneration
                     )
                     savedResult = readyResult
+                    discardCheckpoint(sessionId)
                 }
                 messagePersistenceUseCase.invalidateHistory(sessionId)
             } else {
                 currentCoroutineContext().ensureActive()
                 savedResult = readyResult
             }
+            sessionId?.let(::discardCheckpoint)
             FileLogger.i(TAG, "上下文压缩完成：$block 块，$estimatedTokens → $compactedTokens tokens")
             reportSavedBestEffort()
             currentCoroutineContext().ensureActive()
             return readyResult
         } catch (e: CancellationException) {
+            sessionId?.let(::discardCheckpoint)
             if (savedResult != null) {
                 reportSavedBestEffort()
                 throw e
@@ -437,6 +487,7 @@ class ContextCompactor @Inject constructor(
                 return it
             }
             val code = CompactionStreamErrors.classify(e).code
+            if (code == "compaction_checkpoint_mismatch") sessionId?.let(::discardCheckpoint)
             FileLogger.w(TAG, "压缩上下文失败，保留原历史：$code")
             notifyBestEffort {
                 reportProgress(CompactionProgressPolicy.withPhase(progress.copy(

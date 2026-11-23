@@ -9,6 +9,7 @@ import com.aicode.feature.agent.data.remote.openai.ChatCompletionRequest
 import com.aicode.feature.agent.data.remote.openai.OpenAIApi
 import com.aicode.feature.agent.domain.model.AgentContext
 import com.aicode.feature.agent.domain.model.AgentMessage
+import com.aicode.feature.agent.domain.model.CONTEXT_COMPACTION_MARKER
 import com.aicode.feature.agent.domain.notification.AgentEventInjector
 import com.aicode.feature.agent.domain.notification.AgentNotificationCenter
 import com.aicode.feature.agent.domain.notification.AgentNotificationKind
@@ -403,6 +404,51 @@ class WorkflowToolTimingTest {
         assertTrue(speeds.isNotEmpty())
         assertTrue(speeds.all { it.estimated })
         assertTrue(speeds.last().tokensPerSecond > 0)
+    }
+
+    @Test
+    fun automaticCompactionContinuesTheLatestRequestInsteadOfAskingForAProgressReport() = runBlocking {
+        withTimeout(10_000) {
+            val tool = GatedTool("nextStep")
+            tool.release.complete(Unit)
+            register(tool)
+            val marker = AgentMessage.UserMessage(
+                id = "compaction-marker",
+                content = CONTEXT_COMPACTION_MARKER,
+                isCompactionMarker = true
+            )
+            val summary = AgentMessage.AssistantMessage(
+                id = "compaction-summary",
+                content = "The requested implementation is not finished yet.",
+                isContextSummary = true
+            )
+            var compactedOnce = false
+            coEvery {
+                compactor.compactIfNeeded(any(), any(), any(), any(), any(), any(), any(), any(), any())
+            } answers {
+                if (compactedOnce) CompactionResult(firstArg<List<AgentMessage>>(), compacted = false)
+                else {
+                    compactedOnce = true
+                    CompactionResult(listOf(marker, summary) + firstArg<List<AgentMessage>>(), compacted = true)
+                }
+            }
+            responses(
+                AIResponse("I will continue with the next step.", listOf(ToolCall("next-step", tool.name, emptyMap()))),
+                AIResponse("The task is complete.")
+            )
+            val events = mutableListOf<AgentEvent>()
+
+            collect(listOf(tool), events)
+
+            assertEquals(2, modelRequests.size)
+            val firstRequest = modelRequests.first()
+            val markerSent = firstRequest.filterIsInstance<AgentMessage.UserMessage>().single { it.isCompactionMarker }
+            assertEquals(CONTEXT_COMPACTION_MARKER, markerSent.content)
+            assertTrue(markerSent.content.contains("Continue the latest user request"))
+            assertTrue(firstRequest.any { it is AgentMessage.AssistantMessage && it.isContextSummary })
+            assertEquals(listOf("next-step"), events.filterIsInstance<AgentEvent.ToolExecutionStarted>().map { it.id })
+            assertTrue(events.last() is AgentEvent.Completed)
+        }
     }
 
     @Test

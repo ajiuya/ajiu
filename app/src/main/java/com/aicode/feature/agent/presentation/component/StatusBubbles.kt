@@ -318,6 +318,9 @@ private fun retryErrorLabel(error: RetryErrorInfo): String {
             RetryErrorKind.SERVER_OVERLOADED -> R.string.retry_error_server_overloaded
             RetryErrorKind.SERVER_ERROR -> R.string.retry_error_server
             RetryErrorKind.TIMEOUT -> R.string.retry_error_timeout
+            RetryErrorKind.FIRST_CONTENT_TIMEOUT -> R.string.retry_error_first_content_timeout
+            RetryErrorKind.STREAM_IDLE_TIMEOUT -> R.string.retry_error_stream_idle_timeout
+            RetryErrorKind.STREAM_INTERRUPTED -> R.string.retry_error_stream_interrupted
             RetryErrorKind.CONNECTION_REFUSED -> R.string.retry_error_connection_refused
             RetryErrorKind.DNS_FAILED -> R.string.retry_error_dns_failed
             RetryErrorKind.CONNECTION_RESET -> R.string.retry_error_connection_reset

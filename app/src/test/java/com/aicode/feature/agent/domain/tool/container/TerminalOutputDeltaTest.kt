@@ -7,7 +7,7 @@ import org.junit.Test
 
 class TerminalOutputDeltaTest {
 
-    private val tool = TerminalSessionTool(mockk<TerminalSessionProvider>())
+    private val tool = TerminalSessionTool(mockk<TerminalSessionProvider>(), mockk(), mockk())
     private val outputDelta = TerminalSessionTool::class.java.getDeclaredMethod(
         "outputDelta",
         String::class.java,

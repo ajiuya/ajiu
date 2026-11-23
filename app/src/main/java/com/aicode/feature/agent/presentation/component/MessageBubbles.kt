@@ -720,11 +720,10 @@ private fun BackgroundNotificationBar(message: AgentUIMessage) {
         it.kind == "subagent" && it.subSessionId in representedIds
     }
     if (notices.isEmpty()) return
-    Column(modifier = Modifier.fillMaxWidth().padding(vertical = Spacing.xs)) {
+    Column(modifier = Modifier.fillMaxWidth()) {
         notices.forEach { notice ->
             ChatNotificationRow(
                 model = notificationRowModel(notice, formatClockTime(message.timestamp)),
-                modifier = Modifier.padding(bottom = Spacing.sm),
             )
         }
     }

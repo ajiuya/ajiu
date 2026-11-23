@@ -2,6 +2,7 @@ package com.aicode.feature.terminal.domain
 
 import android.content.ContextWrapper
 import com.aicode.core.util.FileLogger
+import com.aicode.feature.agent.domain.container.ContainerProfile
 import com.aicode.feature.agent.domain.container.LinuxContainerEngine
 import com.aicode.feature.agent.domain.container.ProotInvocation
 import com.aicode.feature.agent.domain.container.RemoteConnectionIdentity
@@ -9,6 +10,10 @@ import com.aicode.feature.agent.domain.container.RemoteSshConnection
 import com.aicode.feature.settings.data.repository.ExecutionMode
 import com.aicode.feature.settings.data.repository.ExecutionModeHolder
 import com.aicode.feature.workspace.data.repository.WorkspaceRepository
+import com.aicode.feature.workspace.domain.WorkspaceExecutionContext
+import com.aicode.feature.workspace.domain.WorkspacePathMapper
+import com.aicode.feature.terminal.data.repository.TerminalTaskHistoryFiles
+import com.aicode.feature.terminal.data.repository.TerminalTaskHistoryRepository
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
 import com.termux.terminal.TerminalEmulator
@@ -24,6 +29,9 @@ import io.mockk.unmockkConstructor
 import io.mockk.unmockkObject
 import io.mockk.verify
 import java.io.File
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -37,6 +45,7 @@ import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
 import kotlinx.coroutines.yield
+import kotlinx.coroutines.withTimeout
 import net.schmizz.sshj.connection.channel.direct.Session
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -45,10 +54,16 @@ import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.TemporaryFolder
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class TabFinishedEventTest {
+    @get:Rule val temporary = TemporaryFolder()
+    private val historyFiles = HistoryFiles()
+    private val history = TerminalTaskHistoryRepository(historyFiles, Dispatchers.Unconfined)
+    private lateinit var execution: WorkspaceExecutionContext
     private val dispatcher = StandardTestDispatcher()
     private val context = FakeContext()
     private val engine = mockk<LinuxContainerEngine>()
@@ -90,7 +105,12 @@ class TabFinishedEventTest {
         every { connection.startShellSession() } returns shellSession
         every { identity.owner.startSession() } returns shellSession
         every { shellSession.startShell() } returns shell
-        local = TerminalSessionManager(context, engine, workspace)
+        val rootfs = temporary.newFolder("rootfs")
+        File(rootfs, ".installed").writeText("version")
+        val mapping = WorkspacePathMapper.ExecutionMapping(ContainerProfile.BUILTIN_ALPINE,
+            temporary.newFolder("workspace"), rootfs, temporary.newFolder("aicode"), "/root")
+        execution = WorkspaceExecutionContext(ExecutionMode.LOCAL_PROOT, "fixture", mockk(), mapping, null) {}
+        local = TerminalSessionManager(context, engine, workspace, history)
         remote = RemoteTerminalSessionManager(connection, holder, workspace, context)
     }
 
@@ -114,11 +134,16 @@ class TabFinishedEventTest {
             listOf(tabId, title, command, exitCode, sourceSessionId, tailOutput))
         assertNull(event.sourceMode)
         assertNull(event.channelGeneration)
+        assertNull(event.historyId)
+        assertNull(event.historyError)
+        val info = TabInfo("term-1", "Build", true, false, "build")
+        assertNull(info.historyId)
+        assertNull(info.historyError)
         assertNull(TabFinishedEvent("term-1", "Build", "build", 0, null).tailOutput)
     }
 
     @Test
-    fun localStartFreezesSourceAndFinishesOnlyOnceAfterModeSwitch() = runBlocking {
+    fun localStartFreezesSourceAndFinishesOnlyOnceAfterModeSwitch() = runBlocking(execution) {
         val received = mutableListOf<TabFinishedEvent>()
         val collector = launch(start = CoroutineStart.UNDISPATCHED) {
             local.tabFinishedEvents.collect { received += it }
@@ -133,7 +158,7 @@ class TabFinishedEventTest {
             finish(local, tab, 0)
             yield()
             assertEquals(listOf(TabFinishedEvent(id, "Build", "build", 17, "session-1", "",
-                sourceMode = "LOCAL_PROOT", channelGeneration = null)), received)
+                sourceMode = "LOCAL_PROOT", channelGeneration = null, historyId = tab.historyId)), received)
             verify(exactly = 0) { connection.captureIdentity() }
         } finally {
             collector.cancelAndJoin()
@@ -202,7 +227,7 @@ class TabFinishedEventTest {
     }
 
     @Test
-    fun markerResultIsFrozenBeforeBackendStopsAndLateCallbacksDoNotNotifyAgain() = runBlocking {
+    fun markerResultIsFrozenBeforeBackendStopsAndLateCallbacksDoNotNotifyAgain() = runBlocking(execution) {
         val received = mutableListOf<TabFinishedEvent>()
         val collector = launch(start = CoroutineStart.UNDISPATCHED) {
             local.tabFinishedEvents.collect { received += it }
@@ -221,6 +246,164 @@ class TabFinishedEventTest {
             assertEquals(listOf(23), received.map { it.exitCode })
             verify(exactly = 1) { tab.session.finishIfRunning() }
         } finally { collector.cancelAndJoin() }
+    }
+
+    @Test
+    fun protectedTasksPersistBeforeSessionConstructionAndUseNonRecycledIds() = runBlocking(execution) {
+        every { engine.buildProotInvocation(any(), any()) } answers {
+            assertEquals(TerminalTaskStatus.RUNNING, historyFiles.records.values.last().status)
+            ProotInvocation(listOf("/fixture/proot"), emptyMap())
+        }
+        val first = local.startBackgroundCommand("build", "Build", true, "session-1")
+        val second = local.startBackgroundCommand("build", "Build", true, "session-1")
+        assertNotEquals(first, second)
+        for (id in listOf(first, second)) {
+            val tab = local.tab(id)!!
+            requireTerminalHistoryId(tab.historyId!!)
+            assertEquals("term-${tab.historyId}", id)
+            assertEquals(tab.historyId, local.listTabs().single { it.id == id }.historyId)
+        }
+        every { engine.buildProotInvocation(any(), any()) } returns ProotInvocation(listOf("/fixture/proot"), emptyMap())
+        assertEquals("term-1", local.startBackgroundCommand("server", null, false, "session-1"))
+        assertEquals("term-2", local.startBackgroundCommand("anonymous", null, true, null))
+        assertEquals(2, historyFiles.records.size)
+    }
+
+    @Test
+    fun failedInitialHistoryWritePreventsExecutingTheCommand() = runBlocking(execution) {
+        historyFiles.failWrites = true
+        assertTrue(runCatching { local.startBackgroundCommand("must-not-run", null, true, "session-1") }
+            .exceptionOrNull() is java.io.IOException)
+        assertTrue(local.listTabs().isEmpty())
+        assertEquals(TERMINAL_HISTORY_IO_ERROR, history.state.value.error)
+        assertTrue(historyFiles.records.isEmpty())
+        assertTrue(history.state.value.records.isEmpty())
+        verify(exactly = 0) { engine.buildProotInvocation(any(), any()) }
+    }
+
+    @Test
+    fun cancellationDuringHistoryCreateMarksSavedRecordUnknownWithoutExecutingOrNotifying() = runBlocking {
+        val repository = TerminalTaskHistoryRepository(historyFiles, Dispatchers.IO)
+        local = TerminalSessionManager(context, engine, workspace, repository)
+        val persisted = CompletableDeferred<TerminalTaskRecord>()
+        val releaseWrite = CountDownLatch(1)
+        historyFiles.afterWrite = { record ->
+            if (record.status == TerminalTaskStatus.RUNNING) {
+                persisted.complete(record)
+                check(releaseWrite.await(10, TimeUnit.SECONDS)) { "Timed out waiting to release history write" }
+            }
+        }
+        val received = mutableListOf<TabFinishedEvent>()
+        val collector = launch(start = CoroutineStart.UNDISPATCHED) { local.tabFinishedEvents.collect { received += it } }
+        val caller = launch(Dispatchers.Default + execution) {
+            local.startBackgroundCommand("must-not-run", null, true, "session-1")
+        }
+        try {
+            val saved = withTimeout(10_000L) { persisted.await() }
+            assertEquals(TerminalTaskStatus.RUNNING, historyFiles.records.getValue(saved.historyId).status)
+            caller.cancel()
+            releaseWrite.countDown()
+            withTimeout(10_000L) { caller.join() }
+            yield()
+            assertTrue(caller.isCancelled)
+            assertTrue(local.listTabs().isEmpty())
+            verify(exactly = 0) { engine.buildProotInvocation(any(), any()) }
+            assertTrue(received.isEmpty())
+            assertEquals(TerminalTaskStatus.UNKNOWN, repository.state.value.records.single().status)
+            assertEquals(TerminalTaskStatus.UNKNOWN, historyFiles.records.getValue(saved.historyId).status)
+            assertNull(historyFiles.records.getValue(saved.historyId).exitCode)
+        } finally {
+            releaseWrite.countDown()
+            caller.cancelAndJoin()
+            collector.cancelAndJoin()
+            historyFiles.afterWrite = null
+        }
+    }
+
+    @Test
+    fun protectedStartWithoutCapturedScopeDoesNotExecuteOrCreateARecord() = runBlocking {
+        assertTrue(runCatching { local.startBackgroundCommand("must-not-run", null, true, "session-1") }.isFailure)
+        assertTrue(local.listTabs().isEmpty())
+        assertTrue(historyFiles.records.isEmpty())
+        verify(exactly = 0) { engine.buildProotInvocation(any(), any()) }
+    }
+
+    @Test
+    fun finalHistoryIoFailureStillNotifiesExactlyOnceWithObservedExitAndVisibleError() = runBlocking(execution) {
+        val received = mutableListOf<TabFinishedEvent>()
+        val collector = launch(start = CoroutineStart.UNDISPATCHED) { local.tabFinishedEvents.collect { received += it } }
+        try {
+            val tab = local.tab(local.startBackgroundCommand("build", null, true, "session-1"))!!
+            historyFiles.failWrites = true
+            finish(local, tab, 37)
+            finish(local, tab, 0)
+            dispatcher.scheduler.runCurrent()
+            yield()
+            assertEquals(listOf(37), received.map { it.exitCode })
+            assertEquals(TERMINAL_HISTORY_IO_ERROR, received.single().historyError)
+            assertEquals(tab.historyId, received.single().historyId)
+            assertEquals(TERMINAL_HISTORY_IO_ERROR, local.listTabs().single().historyError)
+            assertTrue(tab.finishedNotified)
+            assertEquals(TerminalTaskStatus.FINISHED, history.state.value.records.single().status)
+            assertEquals(37, history.state.value.records.single().exitCode)
+            historyFiles.failWrites = false
+            val reopened = TerminalTaskHistoryRepository(historyFiles, Dispatchers.Unconfined).load()
+            assertEquals(TerminalTaskStatus.UNKNOWN, reopened.records.single().status)
+            assertNull(reopened.records.single().exitCode)
+            assertEquals(1, received.size)
+        } finally { collector.cancelAndJoin() }
+    }
+
+    @Test
+    fun closingARunningProtectedTaskRecordsUnknownAndDoesNotNotifyForcedKillSuccess() = runBlocking(execution) {
+        val received = mutableListOf<TabFinishedEvent>()
+        val collector = launch(start = CoroutineStart.UNDISPATCHED) { local.tabFinishedEvents.collect { received += it } }
+        try {
+            val tab = local.tab(local.startBackgroundCommand("build", null, true, "session-1"))!!
+            every { tab.session.finishIfRunning() } answers { finish(local, tab, 0) }
+            assertTrue(local.closeTab(tab.id))
+            dispatcher.scheduler.runCurrent()
+            yield()
+            assertTrue(received.isEmpty())
+            assertTrue(local.listTabs().isEmpty())
+            assertFalse(tab.finishedNotified)
+            assertEquals(TerminalTaskStatus.UNKNOWN, history.state.value.records.single().status)
+            assertNull(history.state.value.records.single().exitCode)
+        } finally { collector.cancelAndJoin() }
+    }
+
+    @Test
+    fun closingWithAnObservedCommandExitPreservesAndNotifiesThatRealResult() = runBlocking(execution) {
+        val received = mutableListOf<TabFinishedEvent>()
+        val collector = launch(start = CoroutineStart.UNDISPATCHED) { local.tabFinishedEvents.collect { received += it } }
+        try {
+            val tab = local.tab(local.startBackgroundCommand("build", null, true, "session-1"))!!
+            tab.markerExitCode = 41
+            assertTrue(local.closeTab(tab.id))
+            dispatcher.scheduler.runCurrent()
+            yield()
+            assertEquals(listOf(41), received.map { it.exitCode })
+            assertEquals(41, history.state.value.records.single().exitCode)
+        } finally { collector.cancelAndJoin() }
+    }
+
+    @Test
+    fun historyCoalescesRevisionBurstsAndDoesNotRewriteSilentOutput() = runBlocking(execution) {
+        val tab = local.tab(local.startBackgroundCommand("build", null, true, "session-1"))!!
+        dispatcher.scheduler.runCurrent()
+        repeat(100) { tab.outputState.changed() }
+        assertEquals(1, historyFiles.writes)
+        dispatcher.scheduler.advanceTimeBy(1_499)
+        assertEquals(1, historyFiles.writes)
+        dispatcher.scheduler.advanceTimeBy(1)
+        dispatcher.scheduler.runCurrent()
+        assertEquals(2, historyFiles.writes)
+        dispatcher.scheduler.advanceTimeBy(3_000)
+        dispatcher.scheduler.runCurrent()
+        assertEquals(2, historyFiles.writes)
+        finish(local, tab, 0)
+        dispatcher.scheduler.runCurrent()
+        assertEquals(3, historyFiles.writes)
     }
 
     @Test
@@ -313,6 +496,22 @@ class TabFinishedEventTest {
     private fun finish(manager: Any, tab: TerminalTab, exitCode: Int) {
         manager.javaClass.getDeclaredMethod("finishTab", TerminalTab::class.java, Int::class.javaPrimitiveType)
             .apply { isAccessible = true }.invoke(manager, tab, exitCode)
+    }
+
+    private class HistoryFiles : TerminalTaskHistoryFiles {
+        val records = linkedMapOf<String, TerminalTaskRecord>()
+        var failWrites = false
+        var writes = 0
+        var afterWrite: ((TerminalTaskRecord) -> Unit)? = null
+        override fun ids(): List<String> = records.keys.toList()
+        override fun read(historyId: String): TerminalTaskRecord = records.getValue(historyId)
+        override fun write(record: TerminalTaskRecord) {
+            if (failWrites) throw java.io.IOException("disk full")
+            writes++
+            records[record.historyId] = record
+            afterWrite?.invoke(record)
+        }
+        override fun delete(historyId: String) { records.remove(historyId) }
     }
 
     private class FakeContext : ContextWrapper(null) {

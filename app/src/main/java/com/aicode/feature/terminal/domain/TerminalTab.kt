@@ -21,13 +21,23 @@ const val MAX_TERMINAL_OUTPUT_CHARS = 256 * 1024
 internal fun boundTerminalOutput(output: String, maxChars: Int = MAX_TERMINAL_OUTPUT_CHARS): String {
     require(maxChars > 0)
     if (output.length <= maxChars) return output
-    val headChars = maxChars / 2
-    val tailChars = maxChars - headChars
+    var headEnd = maxChars / 2
+    var tailStart = output.length - (maxChars - headEnd)
+    if (headEnd > 0 && output[headEnd - 1].isHighSurrogate() && output[headEnd].isLowSurrogate()) headEnd--
+    if (tailStart > 0 && output[tailStart - 1].isHighSurrogate() && output[tailStart].isLowSurrogate()) tailStart++
     return buildString(maxChars + 64) {
-        append(output, 0, headChars)
+        append(output, 0, headEnd)
         append("\n\n…[terminal output truncated; head and tail kept]…\n\n")
-        append(output, output.length - tailChars, output.length)
+        append(output, tailStart, output.length)
     }
+}
+
+internal fun String.takeTerminalChars(maxChars: Int): String {
+    require(maxChars >= 0)
+    if (length <= maxChars) return this
+    var end = maxChars
+    if (end > 0 && this[end - 1].isHighSurrogate() && this[end].isLowSurrogate()) end--
+    return substring(0, end)
 }
 
 /** 截取终端 transcript 的最后 n 行；null 输入返回 null。 */
@@ -47,7 +57,9 @@ data class TabFinishedEvent(
     /** 结束时终端 transcript 的最后 [TAIL_LINES] 行快照。事件可能被缓存到会话空闲才合并发送，期间标签可能已关闭，故在 emit 处提前截取。 */
     val tailOutput: String? = null,
     val sourceMode: String? = null,
-    val channelGeneration: String? = null
+    val channelGeneration: String? = null,
+    val historyId: String? = null,
+    val historyError: String? = null
 )
 
 /**
@@ -73,8 +85,14 @@ class TerminalTab(
     val sourceMode: String? = null,
     val channelGeneration: String? = null,
     val ownerPluginId: String? = null,
-    val ownerResourceId: String? = null
+    val ownerResourceId: String? = null,
+    val historyId: String? = null,
+    historyError: String? = null
 ) {
+    var historyError: String? = historyError
+        internal set
+
+    internal var historyDetached: Boolean = false
     var title: String = title
         internal set
 
@@ -132,5 +150,7 @@ data class TabInfo(
     val title: String,
     val isBackground: Boolean,
     val running: Boolean,
-    val command: String?
+    val command: String?,
+    val historyId: String? = null,
+    val historyError: String? = null
 )

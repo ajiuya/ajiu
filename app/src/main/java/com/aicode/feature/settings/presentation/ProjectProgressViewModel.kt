@@ -40,6 +40,7 @@ data class ProjectProgressUiState(
     val sessionId: String? = null,
     val loading: Boolean = true,
     val targetChanged: Boolean = false,
+    val projectsLoaded: Boolean = false,
     val projects: List<ProjectMemoryProject> = emptyList(),
     val associations: ProjectMemoryAssociations? = null,
     val capacity: ProjectMemoryCapacity? = null,
@@ -62,6 +63,10 @@ data class ProjectProgressUiState(
     val error: ProjectProgressError? = null
 ) {
     val selectedProject: ProjectMemoryProject? get() = projects.firstOrNull { it.id == selectedProjectId }
+    val currentWorkspaceProject: ProjectMemoryProject? get() = workspaceRoot?.let { root ->
+        projects.firstOrNull { it.identity.projectRoot == root }
+    }
+    val projectListReady: Boolean get() = projectsLoaded && !loading && !targetChanged
     val canBindSelected: Boolean get() = selectedProject?.identity?.projectRoot?.let { projectRoot ->
         workspaceRoot?.let { ProjectMemoryIdentityResolver.containsRoot(it, projectRoot) }
     } == true
@@ -178,7 +183,7 @@ class ProjectProgressViewModel internal constructor(
     private fun refresh(captured: Page, selectProjectId: String? = _state.value.selectedProjectId) {
         val generation = ++projectsGeneration
         val selectionAtStart = selectionGeneration
-        _state.update { it.copy(loading = true, error = null) }
+        _state.update { it.copy(loading = true, projectsLoaded = false, error = null) }
         viewModelScope.launch {
             try {
                 val projects = withContext(ioDispatcher) {
@@ -198,7 +203,7 @@ class ProjectProgressViewModel internal constructor(
                 val requestedSelection = if (selectionAtStart == selectionGeneration) selectProjectId else _state.value.selectedProjectId
                 val selected = requestedSelection?.takeIf { id -> projects.any { it.id == id } }
                 _state.update {
-                    it.copy(projects = projects, associations = associations, capacity = capacity, loading = false,
+                    it.copy(projects = projects, projectsLoaded = true, associations = associations, capacity = capacity, loading = false,
                         selectedProjectId = selected,
                         entries = if (selected == null) emptyList() else it.entries,
                         latestHandoff = if (selected == null) null else it.latestHandoff,
@@ -219,7 +224,7 @@ class ProjectProgressViewModel internal constructor(
                 invalidate(captured.generation)
             } catch (_: Exception) {
                 if (accepts(captured) && generation == projectsGeneration) {
-                    _state.update { it.copy(loading = false, error = ProjectProgressError.READ_FAILED) }
+                    _state.update { it.copy(loading = false, projectsLoaded = false, error = ProjectProgressError.READ_FAILED) }
                 }
             }
         }
@@ -371,7 +376,13 @@ class ProjectProgressViewModel internal constructor(
 
     fun startRegister() {
         val captured = page ?: return
-        if (accepts(captured) && !_state.value.busy) _state.update { it.copy(form = ProjectProgressForm.REGISTER, error = null) }
+        val state = _state.value
+        if (!accepts(captured) || state.busy || !state.projectListReady) return
+        state.currentWorkspaceProject?.let {
+            selectProject(it)
+            return
+        }
+        _state.update { it.copy(form = ProjectProgressForm.REGISTER, error = null) }
     }
 
     fun startHandoff() {
@@ -388,7 +399,13 @@ class ProjectProgressViewModel internal constructor(
 
     fun register(name: String) {
         val captured = page ?: return
-        if (_state.value.form != ProjectProgressForm.REGISTER || _state.value.busy) return
+        val state = _state.value
+        if (state.form != ProjectProgressForm.REGISTER || state.busy || !state.projectListReady) return
+        state.currentWorkspaceProject?.let { project ->
+            _state.update { it.copy(form = null, formProjectId = null, error = null) }
+            selectProject(project)
+            return
+        }
         if (name.isBlank() || name.length > 200) {
             _state.update { it.copy(error = ProjectProgressError.INVALID_INPUT) }
             return
@@ -411,11 +428,28 @@ class ProjectProgressViewModel internal constructor(
                 invalidate(captured.generation)
             } catch (failure: Exception) {
                 if (accepts(captured)) {
-                    _state.update { it.copy(busy = false, error = when {
-                        registered != null -> ProjectProgressError.REGISTERED_BINDING_FAILED
-                        failure is IllegalArgumentException -> ProjectProgressError.INVALID_INPUT
-                        else -> ProjectProgressError.SAVE_FAILED
-                    }) }
+                    val project = registered
+                    _state.update { state ->
+                        state.copy(
+                            projects = project?.let { saved ->
+                                if (state.projects.any { it.id == saved.id }) state.projects else state.projects + saved
+                            } ?: state.projects,
+                            selectedProjectId = project?.id ?: state.selectedProjectId,
+                            form = if (project == null) state.form else null,
+                            formProjectId = if (project == null) state.formProjectId else null,
+                            busy = false,
+                            error = when {
+                                project != null -> ProjectProgressError.REGISTERED_BINDING_FAILED
+                                failure is IllegalArgumentException -> ProjectProgressError.INVALID_INPUT
+                                else -> ProjectProgressError.SAVE_FAILED
+                            }
+                        )
+                    }
+                    project?.let {
+                        loadLatestHandoff(captured, it.id)
+                        loadHistory(captured, it.id, more = false)
+                        _state.update { state -> state.copy(error = ProjectProgressError.REGISTERED_BINDING_FAILED) }
+                    }
                 }
             }
         }

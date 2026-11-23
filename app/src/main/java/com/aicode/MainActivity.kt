@@ -865,22 +865,12 @@ fun AppNavigation(
                         }
                     }
                     if (projectToolsOpen) {
-                        androidx.compose.foundation.layout.BoxWithConstraints(Modifier.fillMaxSize()) {
-                            var toolsWidth by remember { mutableStateOf(0.8f) }
-                            androidx.compose.material3.Surface(
-                                modifier = Modifier.align(androidx.compose.ui.Alignment.CenterEnd).fillMaxHeight().width(maxWidth * toolsWidth),
-                                tonalElevation = Spacing.xs,
-                                shadowElevation = Spacing.md
-                            ) {
-                                com.aicode.feature.plugin.presentation.PluginProjectTools(onOpen = { key ->
-                                    pluginToolKey = key
-                                    projectToolsOpen = false
-                                    if (expanded) editorLeaveGuard.requestLeave { paneKind = WorkbenchPaneKind.PLUGIN }
-                                }, onClose = { projectToolsOpen = false })
-                            }
-                            Box(Modifier.align(androidx.compose.ui.Alignment.CenterEnd).fillMaxHeight().width(maxWidth * toolsWidth)) {
-                                VerticalSplitHandle(anchorX = 0, onDragDelta = { dx -> toolsWidth = (toolsWidth - dx / rowWidthPx.coerceAtLeast(1)).coerceIn(0.35f, 0.95f) })
-                            }
+                        com.aicode.feature.plugin.presentation.PluginProjectToolsDialog(onClose = { projectToolsOpen = false }) {
+                            com.aicode.feature.plugin.presentation.PluginProjectTools(onOpen = { key ->
+                                pluginToolKey = key
+                                projectToolsOpen = false
+                                if (expanded) editorLeaveGuard.requestLeave { paneKind = WorkbenchPaneKind.PLUGIN }
+                            }, onClose = { projectToolsOpen = false })
                         }
                     }
                     if (!expanded && pluginToolKey != null && !projectToolsOpen) {

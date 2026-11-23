@@ -126,6 +126,8 @@ interface AgentWorkflow {
         tools: List<AgentTool>
     ): Flow<AgentEvent>
 
+    fun discardCompactionCheckpoint(sessionId: String) {}
+
     /**
      * 手动触发指定会话的上下文压缩（供 /compress 命令调用）。
      * 复用自动压缩逻辑：解析当前生效 provider，对历史消息调用 ContextCompactor。

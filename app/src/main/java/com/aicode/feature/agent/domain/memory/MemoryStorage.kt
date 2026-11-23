@@ -21,7 +21,8 @@ data class MemoryEntry(
     val name: String,
     val description: String,
     val preview: String,
-    val version: String
+    val version: String,
+    val modifiedAt: Long? = null
 ) {
     val id: String get() = "${scope.name}:$fileName"
 }
@@ -165,7 +166,8 @@ internal class MemoryFileStore(val rootDirectory: File, private val scope: Memor
         val digest = MessageDigest.getInstance("SHA-256").digest(text.toByteArray(Charsets.UTF_8))
             .joinToString("") { "%02x".format(it) }
         return MemoryDocument(
-            MemoryEntry(scope, fileName, memory.name, memory.description, memory.content.take(160), "${stamp(after)}:$digest"),
+            MemoryEntry(scope, fileName, memory.name, memory.description, memory.content.take(160), "${stamp(after)}:$digest",
+                modifiedAt = after.lastModifiedTime().toMillis().takeIf { it > 0 }),
             memory.content
         )
     }

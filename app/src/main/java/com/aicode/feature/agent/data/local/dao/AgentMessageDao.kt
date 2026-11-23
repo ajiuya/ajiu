@@ -23,6 +23,9 @@ interface AgentMessageDao {
     @Query("SELECT EXISTS(SELECT 1 FROM chat_sessions WHERE id = :sessionId AND (:generation IS NULL OR executionGeneration = :generation))")
     suspend fun sessionGenerationMatches(sessionId: String, generation: Long?): Boolean
 
+    @Query("SELECT executionGeneration FROM chat_sessions WHERE id = :sessionId")
+    suspend fun compactionGeneration(sessionId: String): Long?
+
     @Query("""
         UPDATE agent_messages SET modelInputSnapshotJson = :snapshotJson
         WHERE sessionId = :sessionId AND id = :messageId AND role = 'USER' AND modelInputSnapshotJson IS NULL
@@ -192,19 +195,36 @@ interface AgentMessageDao {
         sessionId: String,
         headIds: List<String>,
         messages: List<AgentMessageEntity>,
-        summaryId: String
+        summaryId: String,
+        expectedSource: Map<String, String>? = null,
+        expectedGeneration: Long? = null
     ) {
         if (!sessionExists(sessionId)) throw CancellationException("Target session deleted")
+        if (expectedGeneration != null && !sessionGenerationMatches(sessionId, expectedGeneration)) {
+            throw CancellationException("Compaction generation changed")
+        }
         require(messages.all { it.sessionId == sessionId } && messages.map { it.id }.distinct().size == messages.size) {
             "Compaction messages must belong to the target session and have distinct IDs"
         }
         require(messages.any { it.id == summaryId && it.role == "ASSISTANT" && it.isContextSummary }) {
             "Compaction summary is missing"
         }
-        val headChunks = headIds.distinct().chunked(900)
+        val distinctHeadIds = headIds.distinct()
+        if (expectedSource != null && expectedSource.keys != distinctHeadIds.toSet()) {
+            throw CancellationException("Compaction source IDs changed")
+        }
+        val headChunks = distinctHeadIds.chunked(900)
         for (ids in headChunks) {
             if (countActiveCompactionMessages(sessionId, ids) != ids.size) {
                 throw CancellationException("Compaction history changed")
+            }
+        }
+        if (expectedSource != null) {
+            for (id in distinctHeadIds) {
+                val current = getMessageById(id)
+                if (current == null || current.sessionId != sessionId ||
+                    CompactionSourceFingerprint.of(current) != expectedSource[id]
+                ) throw CancellationException("Compaction source changed")
             }
         }
         for (message in messages) {
@@ -220,12 +240,18 @@ interface AgentMessageDao {
     @Query("DELETE FROM agent_messages WHERE sessionId = :sessionId AND (isCompactionMarker = 1 OR isContextSummary = 1)")
     suspend fun deleteCompactionMessages(sessionId: String)
 
-    @Query("UPDATE agent_messages SET isCompacted = 0, compactedBySummaryId = NULL WHERE sessionId = :sessionId AND timestamp < :cutoff AND isCompacted = 1 AND isContextExcluded = 0 AND isContextSummary = 0 AND isCompactionMarker = 0")
+    @Query("""
+        UPDATE agent_messages SET isCompacted = 0, compactedBySummaryId = NULL
+        WHERE sessionId = :sessionId AND timestamp < :cutoff AND isCompacted = 1 AND isContextExcluded = 0
+          AND compactedBySummaryId IN (
+              SELECT id FROM agent_messages
+              WHERE sessionId = :sessionId AND timestamp >= :cutoff AND isContextSummary = 1
+          )
+    """)
     suspend fun restoreCompactedMessagesBefore(sessionId: String, cutoff: Long)
 
     @Transaction
     suspend fun rewindConversation(sessionId: String, cutoff: Long) {
-        deleteCompactionMessages(sessionId)
         restoreCompactedMessagesBefore(sessionId, cutoff)
         deleteMessagesFromTimestamp(sessionId, cutoff)
         resetLastInputTokens(sessionId)

@@ -47,8 +47,6 @@ import com.aicode.feature.settings.data.repository.TitleModelSettingsRepository
 import com.aicode.feature.settings.domain.model.AIProviderConfig
 import com.aicode.feature.agent.domain.provider.AnthropicAdapter
 import com.aicode.feature.agent.domain.provider.ProviderInstanceFactory
-import com.aicode.feature.agent.domain.provider.GeminiAdapter
-import com.aicode.feature.settings.domain.model.ProviderType
 import com.aicode.feature.settings.domain.model.ModelContextPolicy
 import com.aicode.feature.agent.domain.provider.StreamApiException
 import com.aicode.feature.agent.domain.provider.clampedFrom
@@ -224,12 +222,15 @@ class StatefulAgentWorkflow @Inject constructor(
         object PlanRejected : AgentSideEffect
     }
 
-    private suspend fun getEffectiveProvider(sessionId: String?): AIProvider {
+    private suspend fun getEffectiveProvider(sessionId: String?): AIProvider =
+        createStandaloneProvider(getEffectiveProviderConfig(sessionId), sessionId)
+
+    private suspend fun getEffectiveProviderConfig(sessionId: String?): AIProviderConfig {
         val config = resolveProviderConfig(sessionId)
             ?: throw IllegalStateException("尚未配置 AI 供应商，请到设置中添加并选择一个")
         if (!config.hasUsableApiKey) throw IllegalStateException("「${config.name}」未填写 API Key")
         if (config.effectiveModel.isBlank()) throw IllegalStateException("「${config.name}」未选择模型")
-        return createStandaloneProvider(config, sessionId)
+        return config
     }
 
     /**
@@ -261,6 +262,8 @@ class StatefulAgentWorkflow @Inject constructor(
         }
         return null
     }
+
+    override fun discardCompactionCheckpoint(sessionId: String) = contextCompactor.discardCheckpoint(sessionId)
 
     override suspend fun compactSession(
         sessionId: String,
@@ -505,25 +508,20 @@ class StatefulAgentWorkflow @Inject constructor(
         )
         val providerStartedNs = System.nanoTime()
         FileLogger.memoryCheckpoint(TAG, "provider.start", details = "operation=$providerStartedNs")
-        val aiProvider = getEffectiveProvider(currentContext.sessionId)
+        var providerConfig = getEffectiveProviderConfig(currentContext.sessionId)
+        var aiProvider = createStandaloneProvider(providerConfig, currentContext.sessionId)
         FileLogger.memoryCheckpoint(
             TAG,
             "provider.ready",
             elapsedMs = (System.nanoTime() - providerStartedNs) / 1_000_000,
             details = "operation=$providerStartedNs"
         )
-        // 压缩失败后本轮（本次用户请求内）不再重复尝试压缩，避免每次 LLM 调用都白试一次。
+        // 同一模型压缩失败后不反复重试；切换模型后需按新窗口重新评估。
         var compactionAttemptFailed = false
-        val metadata = modelMetadataService.resolve(aiProvider.providerId, when (aiProvider) {
-            is AnthropicAdapter -> ProviderType.ANTHROPIC
-            is GeminiAdapter -> ProviderType.GEMINI
-            else -> ProviderType.OPENAI
-        }, aiProvider.model)
-        // 思考能力随模型走：每次请求刷新，切模型后档位集合立即变化（resolver 用它判断能否关闭与降级目标）。
+        var metadata = modelMetadataService.resolve(providerConfig.id, providerConfig.type, providerConfig.effectiveModel)
         aiProvider.reasoningCapability = metadata.toReasoningCapability()
-        val inputBudget = ModelContextPolicy.effectiveInputBudget(metadata)
-        if (aiProvider is AnthropicAdapter) {
-            aiProvider.maxOutputTokens = ModelContextPolicy.outputReserveTokens(metadata)
+        (aiProvider as? AnthropicAdapter)?.let {
+            it.maxOutputTokens = ModelContextPolicy.outputReserveTokens(metadata)
         }
         val lastAssistantIndex = currentContext.history.indexOfLast { it is AgentMessage.AssistantMessage && it.inputTokens > 0 }
         var baselineEstimate = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
@@ -559,6 +557,31 @@ class StatefulAgentWorkflow @Inject constructor(
                     }
                     is AgentSideEffect.CallLlm -> {
                         currentContext.projectMemoryCapture?.assertCurrent()
+                        val selectedConfig = getEffectiveProviderConfig(currentContext.sessionId)
+                        if (selectedConfig.id != providerConfig.id || selectedConfig.effectiveModel != providerConfig.effectiveModel) {
+                            currentContext.sessionId?.let(contextCompactor::discardCheckpoint)
+                            val nextProvider = createStandaloneProvider(selectedConfig, currentContext.sessionId)
+                            val nextMetadata = modelMetadataService.resolve(selectedConfig.id, selectedConfig.type, selectedConfig.effectiveModel)
+                            nextProvider.reasoningCapability = nextMetadata.toReasoningCapability()
+                            if (nextProvider is AnthropicAdapter) {
+                                nextProvider.maxOutputTokens = ModelContextPolicy.outputReserveTokens(nextMetadata)
+                            }
+                            providerConfig = selectedConfig
+                            aiProvider = nextProvider
+                            metadata = nextMetadata
+                            baselineUsage = 0
+                            baselineEstimate = 0
+                            compactionAttemptFailed = false
+                            // 原生思考签名只属于生成它的模型；只改本次运行的回放副本，不改已保存历史。
+                            state = state.copy(messages = state.messages.map { message ->
+                                if (message is AgentMessage.AssistantMessage) {
+                                    message.copy(signature = "", thinkingBlocksJson = "")
+                                } else message
+                            })
+                        }
+                        val providerInUse = aiProvider
+                        val requestMetadata = metadata
+                        val inputBudget = ModelContextPolicy.effectiveInputBudget(requestMetadata)
                         var recoveryStep = currentContext.recoveryRunId?.let { runId ->
                             val previous = overflowRecoveryStep
                             overflowRecoveryStep = null
@@ -573,7 +596,6 @@ class StatefulAgentWorkflow @Inject constructor(
                                 baselineEstimate = 0
                             }
                         }
-                        val providerInUse = aiProvider
                         // 压缩轮：若配置了压缩专用模型，使用独立压缩模型压缩
                         val compactionProvider = resolveCompactionFallbackProvider(currentContext.sessionId) ?: providerInUse
                         var compactedMessages = state.messages
@@ -583,7 +605,7 @@ class StatefulAgentWorkflow @Inject constructor(
                             }
                             val predictedInput = ContextTokenEstimator.calibrated(estimate, baselineEstimate, baselineUsage)
                             val compaction = contextCompactor.compactIfNeeded(state.messages, compactionProvider, context.sessionId,
-                                windowProvider = aiProvider, systemPrompt = systemPrompt, tools = currentTools,
+                                windowProvider = providerInUse, systemPrompt = systemPrompt, tools = currentTools,
                                 currentInputTokens = predictedInput) { event ->
                                 if (event is AgentEvent.CompactionFailed) compactionAttemptFailed = true
                                 send(event)
@@ -623,8 +645,7 @@ class StatefulAgentWorkflow @Inject constructor(
 
                         try {
                             // 发送前按实际模型的视觉能力处理图片（同 execute 路径）。
-                            val supportsVision = activeModelSupportsVision(currentContext.sessionId)
-                            val messagesToSend = sanitizeImagesForModel(compactedMessages, supportsVision)
+                            val messagesToSend = sanitizeImagesForModel(compactedMessages, requestMetadata.supportsVision)
                             coroutineScope {
                                 val speedUpdates = launch {
                                     while (isActive) {
@@ -673,7 +694,7 @@ class StatefulAgentWorkflow @Inject constructor(
                             if (aiResponse.stopReason == "model_context_window_exceeded" && !overflowRecoveryAttempted) {
                                 overflowRecoveryAttempted = true
                                 val recovery = contextCompactor.compactIfNeeded(state.messages, compactionProvider,
-                                    currentContext.sessionId, force = true, windowProvider = aiProvider,
+                                    currentContext.sessionId, force = true, windowProvider = providerInUse,
                                     systemPrompt = systemPrompt, tools = currentTools, currentInputTokens = predictedInput) { send(it) }
                                 if (recovery.compacted) {
                                     pluginHooks.observe(PluginHookEvents.AGENT_COMPACTION, currentContext, buildJsonObject { put("compacted", true); put("estimatedInputTokens", predictedInput) })
@@ -751,7 +772,7 @@ class StatefulAgentWorkflow @Inject constructor(
                             if (!overflowRecoveryAttempted && stream.text.isEmpty() && stream.reasoning.isEmpty() && isContextOverflow(e)) {
                                 overflowRecoveryAttempted = true
                                 val recovery = contextCompactor.compactIfNeeded(state.messages, compactionProvider,
-                                    currentContext.sessionId, force = true, windowProvider = aiProvider,
+                                    currentContext.sessionId, force = true, windowProvider = providerInUse,
                                     systemPrompt = systemPrompt, tools = currentTools, currentInputTokens = predictedInput) { send(it) }
                                 if (recovery.compacted) {
                                     pluginHooks.observe(PluginHookEvents.AGENT_COMPACTION, currentContext, buildJsonObject { put("compacted", true); put("estimatedInputTokens", predictedInput) })
@@ -1201,12 +1222,6 @@ class StatefulAgentWorkflow @Inject constructor(
         return ToolRunResult(processed.toTransportString(), processed is ToolResult.Error, (fileAttachments + previewAttachments).distinct(), images)
     }
 
-    private suspend fun activeModelSupportsVision(sessionId: String?): Boolean {
-        val config = resolveProviderConfig(sessionId) ?: return false
-        val metadata = modelMetadataService.resolve(config.id, config.type, config.effectiveModel)
-        return metadata.supportsVision
-    }
-
     /**
      * 发送前按模型视觉能力处理消息中的图片：
      * - 支持 vision：原样返回。
@@ -1225,7 +1240,8 @@ class StatefulAgentWorkflow @Inject constructor(
                     else msg.copy(images = emptyList(), content = msg.content.ifBlank { "（图片已省略：当前模型不支持图片输入）" })
                 is AgentMessage.ToolResultMessage ->
                     if (msg.images.isEmpty()) msg else msg.copy(images = emptyList())
-                is AgentMessage.AssistantMessage -> msg
+                is AgentMessage.AssistantMessage ->
+                    if (msg.images.isEmpty()) msg else msg.copy(images = emptyList(), thinkingBlocksJson = "")
             }
         }
     }

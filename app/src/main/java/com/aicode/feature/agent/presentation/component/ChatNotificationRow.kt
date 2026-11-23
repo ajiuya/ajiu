@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -24,7 +25,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.aicode.R
@@ -62,6 +63,9 @@ internal data class ChatNotificationRowModel(
     val icon: ImageVector,
     val isBackgroundTask: Boolean = false,
     val backgroundTaskExitCode: String? = null,
+    val backgroundTaskOutcome: NotificationOutcome? = null,
+    val agentSender: String? = null,
+    val agentOutcome: NotificationOutcome? = null,
 )
 
 internal fun subAgentInstructionNotification(
@@ -332,6 +336,12 @@ internal fun notificationRowModel(
                 icon = if (notice.status == "completed") FeatherIcons.Check else FeatherIcons.Tool,
                 isBackgroundTask = true,
                 backgroundTaskExitCode = exit,
+                backgroundTaskOutcome = when (notice.status) {
+                    "completed" -> NotificationOutcome.COMPLETED
+                    "failed" -> NotificationOutcome.FAILED
+                    "stopped" -> NotificationOutcome.STOPPED
+                    else -> null
+                },
             )
         }
         "subagent" -> ChatNotificationRowModel(
@@ -343,10 +353,21 @@ internal fun notificationRowModel(
                     else -> "子代理任务已结束"
                 }
             },
-            detail = notice.body.ifBlank { notice.detail },
+            detail = if (notice.status in setOf("completed", "failed", "stopped")) {
+                notice.body.ifBlank { notice.detail }
+            } else {
+                listOf(notice.summary, notice.body.ifBlank { notice.detail }).filter { it.isNotBlank() }.joinToString(" · ")
+            },
             time = time,
             tone = if (notice.status == "completed") ChatNotificationTone.AGENT else ChatNotificationTone.TASK_FAILURE,
             icon = if (notice.status == "completed") FeatherIcons.MessageSquare else FeatherIcons.Tool,
+            agentSender = notice.title.ifBlank { notice.sourceTitle.ifBlank { "子代理" } },
+            agentOutcome = when (notice.status) {
+                "completed" -> NotificationOutcome.COMPLETED
+                "failed" -> NotificationOutcome.FAILED
+                "stopped" -> NotificationOutcome.STOPPED
+                else -> null
+            },
         )
         "agent_message" -> {
             val target = (notice.targetTitle.ifBlank { notice.title.ifBlank { "子代理" } }).removeSuffix("代理")
@@ -370,6 +391,9 @@ internal fun notificationRowModel(
                     AgentMessageAction.CORRECTION -> FeatherIcons.Send
                     AgentMessageAction.MESSAGE -> FeatherIcons.MessageSquare
                 },
+                agentSender = if (notice.action == AgentMessageAction.MESSAGE) {
+                    if (notice.fromParent) "主代理" else sourceTitle.ifBlank { "子代理" }
+                } else null,
             )
         }
         "user_message" -> ChatNotificationRowModel(
@@ -397,19 +421,44 @@ internal fun ChatNotificationRow(
     modifier: Modifier = Modifier,
 ) {
     val palette = notificationPalette(model.tone)
-    val title = if (model.isBackgroundTask) {
-        val taskTitle = model.title.ifBlank { stringResource(R.string.chat_notification_background_task_default_name) }
-        model.backgroundTaskExitCode?.let {
-            stringResource(R.string.chat_notification_background_task_finished_with_exit, taskTitle, it)
-        } ?: stringResource(R.string.chat_notification_background_task_finished, taskTitle)
-    } else model.title
+    val title = if (model.agentSender != null) {
+        stringResource(R.string.chat_notification_agent_message, model.agentSender)
+    } else if (model.isBackgroundTask) {
+        model.title.ifBlank { stringResource(R.string.chat_notification_background_task_default_name) }
+    } else if (model.source.isBlank() || model.title.startsWith(model.source)) {
+        model.title
+    } else {
+        "${model.source} ${model.title}"
+    }
+    val outcome = model.agentOutcome?.let {
+        stringResource(when (it) {
+            NotificationOutcome.COMPLETED -> R.string.chat_notification_agent_completed
+            NotificationOutcome.FAILED -> R.string.chat_notification_agent_failed
+            NotificationOutcome.STOPPED -> R.string.chat_notification_agent_stopped
+        })
+    }
+    val detail = listOfNotNull(outcome, model.detail.takeIf { it.isNotBlank() }).joinToString(" · ")
+    val backgroundTaskStatus = if (model.isBackgroundTask) {
+        val status = stringResource(when (model.backgroundTaskOutcome) {
+            NotificationOutcome.COMPLETED -> R.string.chat_notification_background_task_completed
+            NotificationOutcome.FAILED -> R.string.chat_notification_background_task_failed
+            NotificationOutcome.STOPPED -> R.string.chat_notification_background_task_stopped
+            null -> R.string.chat_notification_background_task_status_unknown
+        })
+        val exitCode = model.backgroundTaskExitCode?.takeIf { it.isNotBlank() && !it.equals("unknown", ignoreCase = true) }
+            ?: stringResource(R.string.chat_notification_background_task_exit_unknown)
+        stringResource(R.string.chat_notification_background_task_status_with_exit, status, exitCode)
+    } else null
     Row(
         modifier = modifier
             .fillMaxWidth()
+            .padding(bottom = Spacing.sm)
+            .testTag("chat_notification_card")
             .clip(RoundedCornerShape(8.dp))
             .background(palette.container)
+            .heightIn(min = 52.dp)
             .height(IntrinsicSize.Min),
-        verticalAlignment = Alignment.Top,
+        verticalAlignment = if (detail.isBlank() && !model.isBackgroundTask) Alignment.CenterVertically else Alignment.Top,
     ) {
         Box(
             modifier = Modifier
@@ -420,11 +469,11 @@ internal fun ChatNotificationRow(
         Column(
             modifier = Modifier
                 .weight(1f)
-                .padding(horizontal = 8.dp, vertical = 10.dp),
-            verticalArrangement = Arrangement.spacedBy(3.dp),
+                .padding(horizontal = Spacing.sm, vertical = 6.dp),
+            verticalArrangement = Arrangement.spacedBy(2.dp),
         ) {
             Row(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth().testTag("chat_notification_header"),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Row(
@@ -434,7 +483,7 @@ internal fun ChatNotificationRow(
                 ) {
                     Row(
                         modifier = Modifier
-                            .size(23.dp)
+                            .size(20.dp)
                             .clip(RoundedCornerShape(6.dp))
                             .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.72f)),
                         verticalAlignment = Alignment.CenterVertically,
@@ -447,22 +496,12 @@ internal fun ChatNotificationRow(
                             tint = palette.accent,
                         )
                     }
-                    if (model.source.isNotBlank()) {
-                        Text(
-                            text = model.source,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            style = MaterialTheme.typography.labelSmall,
-                            fontWeight = FontWeight.Bold,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
                     Text(
                         text = title,
-                        modifier = Modifier.weight(1f),
+                        modifier = Modifier.weight(1f).testTag("chat_notification_title"),
                         color = MaterialTheme.colorScheme.onSurface,
                         style = MaterialTheme.typography.bodySmall,
-                        maxLines = 2,
+                        maxLines = if (model.isBackgroundTask) 2 else 1,
                         overflow = TextOverflow.Ellipsis,
                     )
                 }
@@ -470,21 +509,31 @@ internal fun ChatNotificationRow(
                     Spacer(Modifier.width(Spacing.sm))
                     Text(
                         text = it,
+                        modifier = Modifier.testTag("chat_notification_time"),
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         style = MaterialTheme.typography.labelSmall,
                         maxLines = 1,
                     )
                 }
             }
-            model.detail.takeIf { it.isNotBlank() }?.let {
+            if (backgroundTaskStatus != null) {
                 Text(
-                    text = it,
-                    modifier = Modifier.padding(start = 30.dp),
+                    text = backgroundTaskStatus,
+                    modifier = Modifier.padding(start = 27.dp).testTag("chat_notification_status"),
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     style = MaterialTheme.typography.labelSmall,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
                 )
+            } else {
+                detail.takeIf { it.isNotBlank() }?.let {
+                    Text(
+                        text = it,
+                        modifier = Modifier.padding(start = 27.dp).testTag("chat_notification_detail"),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.labelSmall,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
             }
         }
     }

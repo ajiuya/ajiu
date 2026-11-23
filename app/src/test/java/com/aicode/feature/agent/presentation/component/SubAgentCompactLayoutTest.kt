@@ -4,15 +4,21 @@ import android.app.Application
 import android.view.View
 import androidx.activity.ComponentActivity
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.BroadcastFrameClock
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.Recomposer
 import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.ui.InternalComposeUiApi
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.ViewCompositionStrategy
@@ -25,7 +31,11 @@ import androidx.compose.ui.semantics.getAllSemanticsNodes
 import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextLayoutResult
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.TextUnit
+import androidx.compose.ui.unit.dp
 import com.aicode.R
 import com.aicode.core.theme.AIEditorTheme
 import com.aicode.core.theme.Spacing
@@ -94,11 +104,11 @@ class SubAgentCompactLayoutTest {
                 val name = textNode(summary.agentName!!)
                 val task = textNode(summary.title)
                 val status = textNode(labels.getValue(summary.status))
-                assertTrue(name.boundsInRoot.left < status.boundsInRoot.left)
-                assertTrue(name.boundsInRoot.center.y in status.boundsInRoot.top..status.boundsInRoot.bottom)
-                assertEquals(name.boundsInRoot.left, task.boundsInRoot.left, 0.01f)
-                assertTrue(task.boundsInRoot.top >= name.boundsInRoot.bottom)
-                assertTrue(task.boundsInRoot.top >= status.boundsInRoot.bottom)
+                assertTrue(name.boundsInRoot.left < status.layoutBounds().left)
+                assertTrue(name.boundsInRoot.center.y in status.layoutBounds().top..status.layoutBounds().bottom)
+                assertEquals(name.boundsInRoot.left, task.layoutBounds().left, 0.01f)
+                assertTrue(task.layoutBounds().top >= name.boundsInRoot.bottom)
+                assertTrue(task.layoutBounds().top >= status.layoutBounds().bottom)
                 assertTrue(hasText(activity.getString(R.string.subagent_interaction_counts, summary.exchangeCount, summary.toolCallCount)))
                 val preview = if (summary.status.isActiveExecution()) {
                     activity.getString(R.string.subagent_interaction_current_tool, summary.currentToolTitle)
@@ -152,16 +162,32 @@ class SubAgentCompactLayoutTest {
             }
             assertEquals(0, sourceReads)
             click(group)
-            awaitUi { summaries.all { hasText("${it.title} · ${labels.getValue(it.status)}") } }
+            awaitUi { summaries.all { hasText(it.title) && hasTag("subagent_status:${it.subSessionId}") } }
             assertEquals(8, summaries.count { hasText(it.agentName!!) })
+            summaries.forEach { summary ->
+                val role = textNode(summary.agentName!!)
+                val task = taggedNode("subagent_task:${summary.subSessionId}")
+                val status = taggedNode("subagent_status:${summary.subSessionId}")
+                assertEquals(listOf(summary.title), task.texts())
+                assertEquals(listOf(labels.getValue(summary.status)), status.texts())
+                assertTrue(role.layoutBounds().right + 8f <= task.layoutBounds().left + 0.01f)
+                assertTrue(task.layoutBounds().right + 8f <= status.layoutBounds().left + 0.01f)
+                assertEquals(task.layoutBounds().center.y, status.layoutBounds().center.y, 0.01f)
+                assertFalse(hasText("${summary.title} · ${labels.getValue(summary.status)}"))
+            }
+            assertTrue(hasText(activity.getString(R.string.subagent_group_working_count, 3)))
+            assertTrue(hasText(activity.getString(R.string.subagent_group_completed_count, 1)))
             assertTrue(nodes().none { it.config.contains(SemanticsProperties.ProgressBarRangeInfo) })
             assertFalse(hasText(activity.getString(R.string.subagent_interaction_counts, 2, 5)))
             assertEquals(0, sourceReads)
             clickText(activity.getString(R.string.subagent_group_title))
             awaitUi {
                 hasText("+3") && nodes().count { "A" in it.texts() } == 5 &&
-                    summaries.none { hasText("${it.title} · ${labels.getValue(it.status)}") }
+                    summaries.none { hasTag("subagent_task:${it.subSessionId}") || hasTag("subagent_status:${it.subSessionId}") }
             }
+            assertFalse(hasText(activity.getString(R.string.subagent_group_working_count, 3)))
+            assertFalse(hasText(activity.getString(R.string.subagent_group_completed_count, 1)))
+            assertEquals(0, sourceReads)
         }
     }
 
@@ -320,7 +346,233 @@ class SubAgentCompactLayoutTest {
         }
     }
 
+    @Test
+    @Config(qualifiers = "en-rUS")
+    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
+    fun englishExpandedCountsIncludeApprovalAndExcludeFailedOrStoppedMembers() = assertExpandedCounts()
+
+    @Test
+    @Config(qualifiers = "zh-rCN")
+    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
+    fun chineseExpandedCountsIncludeApprovalAndExcludeFailedOrStoppedMembers() = assertExpandedCounts()
+
+    @Test
+    @Config(qualifiers = "en-rUS")
+    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
+    fun englishEightStatesKeepSeparateReadableColumnsAtNormalAndNarrowLargeFontSizes() =
+        assertGroupColumns("Tester", "Fix", "Inspect the very long task title without moving the status column ")
+
+    @Test
+    @Config(qualifiers = "zh-rCN")
+    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
+    fun chineseEightStatesKeepSeparateReadableColumnsAtNormalAndNarrowLargeFontSizes() =
+        assertGroupColumns("测试员", "查", "核对真实任务标题并且始终保留完整状态栏的位置")
+
+    @Test
+    @Config(qualifiers = "en-rUS")
+    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
+    fun englishSingleMemberStatusChangesUseTheSlotMeasuredAcrossAllEightStates() =
+        assertChangingStatusSlot("Coder", "Fix", "Keep this much longer task from moving any status ")
+
+    @Test
+    @Config(qualifiers = "zh-rCN")
+    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
+    fun chineseSingleMemberStatusChangesUseTheSlotMeasuredAcrossAllEightStates() =
+        assertChangingStatusSlot("编码员", "查", "变更任务标题长度不能挤压或移动真实状态")
+
+    @Test
+    @Config(qualifiers = "en-rUS")
+    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
+    fun forcedNarrowEnglishMembersActuallyStackTasksBelowTheirCompleteStatus() =
+        assertGroupColumns("Coder", "Fix", "Force the second task line and retain the whole status ", forcedWidth = 140)
+
+    @Test
+    @Config(qualifiers = "zh-rCN")
+    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
+    fun forcedNarrowChineseMembersActuallyStackTasksBelowTheirCompleteStatus() =
+        assertGroupColumns("编码员", "查", "强制第二行标题并且保留完整状态", forcedWidth = 140)
+
+    private fun assertExpandedCounts() {
+        val cases = listOf(
+            Triple(SubAgentInteractionStatus.entries.toList(), 3, 1),
+            Triple(listOf(SubAgentInteractionStatus.AWAITING_CONFIRMATION), 1, 0),
+            Triple(listOf(SubAgentInteractionStatus.FAILED, SubAgentInteractionStatus.INTERRUPTED,
+                SubAgentInteractionStatus.DELETED, SubAgentInteractionStatus.HISTORY), 0, 0),
+            Triple(List(3) { SubAgentInteractionStatus.COMPLETED }, 0, 3),
+            Triple(listOf(SubAgentInteractionStatus.QUEUED, SubAgentInteractionStatus.RUNNING,
+                SubAgentInteractionStatus.AWAITING_CONFIRMATION), 3, 0),
+        )
+        for ((statuses, working, completed) in cases) {
+            var conversationReads = 0
+            var executionReads = 0
+            val summaries = statuses.mapIndexed { index, status ->
+                SubAgentInteractionSummary("member-$index", title = "Task $index", agentName = "Agent $index", status = status)
+            }
+            val host = SubAgentCardHost(
+                summaries = summaries.associateBy { it.subSessionId },
+                conversation = { conversationReads++; flowOf(SubAgentInteractionPage(loaded = true)) },
+                execution = { executionReads++; flowOf(SubAgentExecutionPage(loaded = true)) },
+            )
+            render(width = 320, fontScale = 1.5f, content = {
+                CompositionLocalProvider(LocalSubAgentCardHost provides host) {
+                    val capsules = summaries.map { SubAgentTimelineCapsule(it.subSessionId, null, it.title, fallbackAgentName = it.agentName) }
+                    SubAgentGroupCapsule(capsules + capsules.first(), expanded = true, onToggle = {})
+                }
+            }) {
+                val workingNode = textNode(activity.getString(R.string.subagent_group_working_count, working))
+                val completedNode = textNode(activity.getString(R.string.subagent_group_completed_count, completed))
+                assertTrue(hasText(activity.getString(R.string.subagent_group_total_count, statuses.size)))
+                for (node in listOf(workingNode, completedNode)) {
+                    assertFullTextFits(node)
+                    assertEquals(1, textLayout(node).lineCount)
+                    assertTrue(node.layoutBounds().left >= 0f && node.layoutBounds().right <= 320f)
+                }
+                val a = workingNode.layoutBounds()
+                val b = completedNode.layoutBounds()
+                assertTrue("Count chips must not overlap: $a, $b",
+                    a.right <= b.left || b.right <= a.left || a.bottom <= b.top || b.bottom <= a.top)
+                assertEquals(0, conversationReads)
+                assertEquals(0, executionReads)
+            }
+        }
+    }
+
+    private fun assertGroupColumns(rolePrefix: String, shortTask: String, longTask: String, forcedWidth: Int? = null) {
+        val cases = forcedWidth?.let { listOf(Triple(it, 1.5f, 0)) } ?: listOf(
+            Triple(400, 1f, 0), Triple(320, 1f, 16), Triple(320, 1.5f, 16),
+            Triple(320, 2f, 16), Triple(360, 2f, 16),
+        )
+        for ((width, fontScale, horizontalInset) in cases) {
+            val useLongTasks = mutableStateOf(false)
+            val labels = mutableMapOf<SubAgentInteractionStatus, String>()
+            var expectedFontSize = TextUnit.Unspecified
+            render(width = width, fontScale = fontScale, content = {
+                expectedFontSize = MaterialTheme.typography.labelSmall.fontSize
+                val summaries = SubAgentInteractionStatus.entries.map { status ->
+                    labels[status] = subAgentStatusLabel(status)
+                    SubAgentInteractionSummary(status.name, title = if (useLongTasks.value) longTask.repeat(64) else shortTask,
+                        agentName = "$rolePrefix${status.ordinal}", status = status)
+                }
+                CompositionLocalProvider(LocalSubAgentCardHost provides SubAgentCardHost(summaries = summaries.associateBy { it.subSessionId })) {
+                    Box(Modifier.padding(horizontal = horizontalInset.dp)) {
+                        SubAgentGroupCapsule(summaries.map {
+                            SubAgentTimelineCapsule(it.subSessionId, null, it.title, fallbackAgentName = it.agentName)
+                        }, expanded = true, onToggle = {})
+                    }
+                }
+            }) {
+                val initialStatuses = mutableMapOf<SubAgentInteractionStatus, Rect>()
+                val initialTasks = mutableMapOf<SubAgentInteractionStatus, Rect>()
+                for (long in listOf(false, true)) {
+                    useLongTasks.value = long
+                    val taskText = if (long) longTask.repeat(64) else shortTask
+                    awaitUi { taggedNode("subagent_task:QUEUED").texts() == listOf(taskText) }
+                    var statusLeft: Float? = null
+                    var statusRight: Float? = null
+                    val stackedRows = mutableSetOf<Boolean>()
+                    SubAgentInteractionStatus.entries.forEach { state ->
+                        val role = textNode("$rolePrefix${state.ordinal}")
+                        val task = taggedNode("subagent_task:${state.name}")
+                        val status = taggedNode("subagent_status:${state.name}")
+                        assertEquals(listOf(taskText), task.texts())
+                        assertEquals(listOf(labels.getValue(state)), status.texts())
+                        val stacked = task.layoutBounds().top >= maxOf(role.layoutBounds().bottom, status.layoutBounds().bottom)
+                        stackedRows += stacked
+                        assertTrue("Role and status must not overlap", role.layoutBounds().right + 8f <= status.layoutBounds().left + 0.01f)
+                        if (stacked) {
+                            assertEquals(role.layoutBounds().left, task.layoutBounds().left, 0.01f)
+                            assertEquals(status.layoutBounds().right, task.layoutBounds().right, 0.01f)
+                            assertTrue("Second-line task must retain its vertical gap",
+                                task.layoutBounds().top >= maxOf(role.layoutBounds().bottom, status.layoutBounds().bottom) + Spacing.xs.value - 0.01f)
+                        } else {
+                            assertTrue("Role and task must not overlap", role.layoutBounds().right + 8f <= task.layoutBounds().left + 0.01f)
+                            assertTrue("Task and status must not overlap", task.layoutBounds().right + 8f <= status.layoutBounds().left + 0.01f)
+                            assertEquals(role.layoutBounds().center.y, task.layoutBounds().center.y, 0.01f)
+                            assertEquals(task.layoutBounds().center.y, status.layoutBounds().center.y, 0.01f)
+                        }
+                        assertTrue("Task must retain usable width", task.layoutBounds().width > 0f)
+                        assertEquals(width - horizontalInset - Spacing.md.value, status.layoutBounds().right, 0.01f)
+                        assertEquals(TextAlign.End, textLayout(status).layoutInput.style.textAlign)
+                        listOf(role, status).forEach { node ->
+                            val layout = textLayout(node)
+                            assertFullTextFits(node)
+                            assertFalse(layout.isLineEllipsized(0))
+                            assertTrue("Text metrics must remain nonzero", layout.size.height > 0)
+                            if (node == role || !stacked) assertEquals(1, layout.lineCount)
+                            assertEquals(expectedFontSize, layout.layoutInput.style.fontSize)
+                            assertEquals(fontScale, layout.layoutInput.density.fontScale, 0f)
+                            assertTrue(node.layoutBounds().height >= layout.size.height - 0.01f)
+                        }
+                        val taskLayout = textLayout(task)
+                        assertEquals(1, taskLayout.lineCount)
+                        assertEquals(TextOverflow.Ellipsis, taskLayout.layoutInput.overflow)
+                        assertEquals(expectedFontSize, taskLayout.layoutInput.style.fontSize)
+                        assertTrue("Task glyph height must fit", task.layoutBounds().height >= taskLayout.size.height - 0.01f)
+                        if (long) {
+                            assertTrue("Long fixture must exceed the measured task slot",
+                                taskLayout.multiParagraph.intrinsics.maxIntrinsicWidth > task.layoutBounds().width)
+                            assertEquals("Long tasks must request one line rather than draw outside the slot", 1, taskLayout.layoutInput.maxLines)
+                            assertTrue("Long task layout must remain bounded by its allocated slot",
+                                taskLayout.size.width <= task.layoutBounds().width + 0.01f)
+                        } else assertFullTextFits(task)
+                        statusLeft?.let { assertEquals(it, status.layoutBounds().left, 0.01f) }
+                        statusRight?.let { assertEquals(it, status.layoutBounds().right, 0.01f) }
+                        statusLeft = status.layoutBounds().left
+                        statusRight = status.layoutBounds().right
+                        if (long) {
+                            assertEquals("Task length must not move status", initialStatuses.getValue(state), status.layoutBounds())
+                            assertEquals("Task column must keep its geometry", initialTasks.getValue(state), task.layoutBounds())
+                        } else {
+                            initialStatuses[state] = status.layoutBounds()
+                            initialTasks[state] = task.layoutBounds()
+                        }
+                    }
+                    assertEquals("Every member must use the same responsive row arrangement", 1, stackedRows.size)
+                    if (width == 400 && fontScale == 1f) assertEquals(setOf(false), stackedRows)
+                    if (forcedWidth != null) assertEquals("The forced narrow composable must exercise the stacked branch", setOf(true), stackedRows)
+                }
+            }
+        }
+    }
+
+    private fun assertChangingStatusSlot(role: String, shortTask: String, longTask: String) {
+        for ((width, fontScale) in listOf(400 to 1f, 320 to 1.5f)) {
+            val currentStatus = mutableStateOf(SubAgentInteractionStatus.QUEUED)
+            val currentTask = mutableStateOf(shortTask)
+            val labels = mutableMapOf<SubAgentInteractionStatus, String>()
+            render(width = width, fontScale = fontScale, content = {
+                SubAgentInteractionStatus.entries.forEach { labels[it] = subAgentStatusLabel(it) }
+                val summary = SubAgentInteractionSummary("changing", title = currentTask.value,
+                    agentName = role, status = currentStatus.value)
+                CompositionLocalProvider(LocalSubAgentCardHost provides SubAgentCardHost(summaries = mapOf("changing" to summary))) {
+                    SubAgentGroupCapsule(listOf(SubAgentTimelineCapsule("changing", null, summary.title, fallbackAgentName = role)), expanded = true, onToggle = {})
+                }
+            }) {
+                val original = taggedNode("subagent_status:changing").layoutBounds()
+                for ((index, status) in SubAgentInteractionStatus.entries.withIndex()) {
+                    currentStatus.value = status
+                    currentTask.value = if (index % 2 == 0) longTask.repeat(64) else shortTask
+                    awaitUi {
+                        taggedNode("subagent_status:changing").texts() == listOf(labels.getValue(status)) &&
+                            taggedNode("subagent_task:changing").texts() == listOf(currentTask.value)
+                    }
+                    val node = taggedNode("subagent_status:changing")
+                    val layout = textLayout(node)
+                    assertEquals("Status=$status must not resize or move the fixed slot", original, node.layoutBounds())
+                    assertEquals(TextAlign.End, layout.layoutInput.style.textAlign)
+                    assertFullTextFits(node)
+                    assertFalse(layout.isLineEllipsized(0))
+                    assertEquals(1, layout.lineCount)
+                }
+            }
+        }
+    }
+
     private fun SemanticsNode.texts(): List<String> = config.getOrNull(SemanticsProperties.Text)?.map { it.text }.orEmpty()
+
+    private fun SemanticsNode.layoutBounds(): Rect = if (size.height == 0) {
+        Rect(positionInRoot, Size(size.width.toFloat(), size.height.toFloat()))
+    } else boundsInRoot
 
     private inner class CompactUi(
         val activity: ComponentActivity,
@@ -330,11 +582,23 @@ class SubAgentCompactLayoutTest {
         fun nodes(merged: Boolean = false): List<SemanticsNode> =
             (view.getChildAt(0) as? ViewRootForTest)?.semanticsOwner?.getAllSemanticsNodes(mergingEnabled = merged).orEmpty()
         fun hasText(text: String): Boolean = nodes().any { text in it.texts() }
+        fun hasTag(tag: String): Boolean = nodes().any { it.config.getOrNull(SemanticsProperties.TestTag) == tag }
+        fun taggedNode(tag: String): SemanticsNode = nodes().single { it.config.getOrNull(SemanticsProperties.TestTag) == tag }
         fun textNode(text: String): SemanticsNode = nodes().single { text in it.texts() }
         fun textLayout(node: SemanticsNode): TextLayoutResult {
             val result = mutableListOf<TextLayoutResult>()
             assertTrue(requireNotNull(node.config.getOrNull(SemanticsActions.GetTextLayoutResult)?.action).invoke(result))
             return result.single()
+        }
+        fun assertFullTextFits(node: SemanticsNode) {
+            val layout = textLayout(node)
+            val bounds = node.layoutBounds()
+            val description = "text=${node.texts()}, intrinsic=${layout.multiParagraph.intrinsics.maxIntrinsicWidth}, " +
+                "paragraph=${layout.multiParagraph.width}x${layout.multiParagraph.height}, size=${layout.size}, bounds=$bounds"
+            assertTrue(description, layout.multiParagraph.intrinsics.maxIntrinsicWidth <= layout.size.width + 0.01f)
+            assertTrue(description, layout.multiParagraph.height <= layout.size.height + 0.01f)
+            assertTrue(description, bounds.width >= layout.size.width - 0.01f)
+            assertTrue(description, bounds.height >= layout.size.height - 0.01f)
         }
         fun clickNode(text: String): SemanticsNode = nodes(merged = true).single {
             text in it.texts() && it.config.contains(SemanticsActions.OnClick)
@@ -366,6 +630,7 @@ class SubAgentCompactLayoutTest {
 
     private fun render(
         width: Int = 1_000,
+        fontScale: Float = 1f,
         content: @Composable () -> Unit,
         inspect: CompactUi.() -> Unit,
     ) = runTest(timeout = 15.seconds) {
@@ -393,7 +658,7 @@ class SubAgentCompactLayoutTest {
             view.setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed)
             view.setParentCompositionContext(recomposer)
             view.setContent {
-                CompositionLocalProvider(LocalDensity provides Density(1f, 1f)) { AIEditorTheme(darkTheme = false, content = content) }
+                CompositionLocalProvider(LocalDensity provides Density(1f, fontScale)) { AIEditorTheme(darkTheme = false, content = content) }
             }
             activity.setContentView(view)
             ui.awaitUi { ui.nodes().isNotEmpty() }

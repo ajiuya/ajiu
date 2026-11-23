@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="chat_notification_background_task_completed">任务已完成</string>
+    <string name="chat_notification_background_task_failed">任务失败</string>
+    <string name="chat_notification_background_task_stopped">任务已中断</string>
+    <string name="chat_notification_background_task_status_unknown">任务状态未知</string>
+    <string name="chat_notification_background_task_exit_unknown">未知</string>
+    <string name="chat_notification_background_task_status_with_exit">%1$s · 退出码 %2$s</string>
+</resources>

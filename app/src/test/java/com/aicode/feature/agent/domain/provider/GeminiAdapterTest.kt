@@ -1,6 +1,7 @@
 package com.aicode.feature.agent.domain.provider
 
 import com.aicode.feature.agent.data.remote.gemini.GeminiApi
+import com.aicode.feature.agent.domain.model.AgentImage
 import com.aicode.feature.agent.domain.model.AgentMessage
 import com.aicode.feature.agent.domain.tool.ToolCall
 import com.google.gson.JsonObject
@@ -240,6 +241,51 @@ class GeminiAdapterTest {
         val parts = model["parts"] as com.google.gson.JsonArray
         assertEquals("sig-a", parts[0].asJsonObject.get("thoughtSignature").asString)
         assertEquals("call-1", parts[1].asJsonObject.getAsJsonObject("functionCall").get("id").asString)
+    }
+
+    @Test
+    fun assistantImagesAreRebuiltAlongsideTextAndToolCallsWithoutNativeSnapshots() = runTest {
+        val api = FakeApi(textResponse())
+        val image = AgentImage("image/png", "aW1hZ2U=")
+        val call = ToolCall("call-image", "readFile", emptyMap())
+        adapter(api).complete(
+            "sys",
+            listOf(
+                user("hi"),
+                AgentMessage.AssistantMessage(content = "Generated image", images = listOf(image), toolCalls = listOf(call)),
+                AgentMessage.ToolResultMessage(id = call.id, toolName = call.name, result = "body")
+            )
+        )
+
+        val sent = JsonParser.parseString(com.google.gson.Gson().toJson(api.lastRequest)).asJsonObject
+        val model = sent.getAsJsonArray("contents")[1].asJsonObject
+        assertEquals("model", model.get("role").asString)
+        val parts = model.getAsJsonArray("parts")
+        assertEquals(3, parts.size())
+        assertEquals("Generated image", parts[0].asJsonObject.get("text").asString)
+        val inline = parts[1].asJsonObject.getAsJsonObject("inline_data")
+        assertEquals(image.mimeType, inline.get("mime_type").asString)
+        assertEquals(image.base64Data, inline.get("data").asString)
+        assertEquals(call.name, parts[2].asJsonObject.getAsJsonObject("functionCall").get("name").asString)
+        assertEquals(call.id, parts[2].asJsonObject.getAsJsonObject("functionCall").get("id").asString)
+        assertFalse(model.toString().contains("thoughtSignature"))
+        val result = sent.getAsJsonArray("contents")[2].asJsonObject.getAsJsonArray("parts")[0].asJsonObject
+        assertEquals(call.id, result.getAsJsonObject("functionResponse").get("id").asString)
+    }
+
+    @Test
+    fun imageOnlyAssistantHistoryIsNotDroppedWithoutNativeSnapshots() = runTest {
+        val api = FakeApi(textResponse())
+        val image = AgentImage("image/png", "aW1hZ2U=")
+        adapter(api).complete("sys", listOf(user("hi"),
+            AgentMessage.AssistantMessage(content = "", images = listOf(image))))
+
+        val sent = JsonParser.parseString(com.google.gson.Gson().toJson(api.lastRequest)).asJsonObject
+        val model = sent.getAsJsonArray("contents")[1].asJsonObject
+        assertEquals("model", model.get("role").asString)
+        val parts = model.getAsJsonArray("parts")
+        assertEquals(1, parts.size())
+        assertEquals(image.base64Data, parts[0].asJsonObject.getAsJsonObject("inline_data").get("data").asString)
     }
 
     @Test

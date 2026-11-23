@@ -18,7 +18,6 @@ import com.aicode.feature.agent.domain.tool.modelToolResultText
 import com.aicode.feature.settings.domain.model.ProviderType
 import com.aicode.feature.settings.domain.model.defaultProviderApiPath
 import com.google.gson.JsonParser
-import java.io.IOException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import javax.inject.Inject
@@ -237,9 +236,8 @@ class AnthropicAdapter @Inject constructor(
                     // （收到 message_stop 即 break，故走到 readLine()==null 时必然未收到过结束标记。）
                     while (true) {
                         coroutineContext.ensureActive()
-                        val line = reader.readLine()
-                            ?: throw IOException("SSE 流被中断：未收到 message_stop 结束标记（疑似网络断开）")
-                        idleWatchdog.touch()
+                        val line = idleWatchdog.read { reader.readLine() }
+                            ?: throw UnexpectedStreamEndException("Anthropic stream ended without message_stop")
                         if (!line.startsWith("data:")) continue
                         val data = line.removePrefix("data:").trim()
                         if (data.isEmpty()) continue

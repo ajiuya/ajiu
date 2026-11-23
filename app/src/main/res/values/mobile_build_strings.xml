@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="mobile_build_title">手机构建</string>
+    <string name="mobile_build_enable">启用手机构建优化</string>
+    <string name="mobile_build_enable_hint">为本机 Gradle 使用适合手机的内存与并发参数</string>
+    <string name="mobile_build_options">构建参数</string>
+    <string name="mobile_build_summary">堆 %1$s · Daemon %2$s · 并行 %3$s · %4$d worker · 单测 %5$s</string>
+    <string name="mobile_build_on">开</string>
+    <string name="mobile_build_off">关</string>
+    <string name="mobile_build_scope_hint">仅作用于本机默认 Gradle 用户目录，下次构建生效。关闭后恢复项目／用户默认设置，并保留本页选择。自定义 Gradle 用户目录或显式构建参数优先。</string>
+    <string name="mobile_build_options_title">手机构建参数</string>
+    <string name="mobile_build_options_hint">调整后点击保存；取消或关闭面板不会更改设置。未启用时也可先保存选项。</string>
+    <string name="mobile_build_gradle_heap">Gradle 堆上限</string>
+    <string name="mobile_build_gradle_heap_hint">仅为 Gradle JVM 最大堆，不是构建总内存上限；编译器等进程还会额外占用内存</string>
+    <string name="mobile_build_daemon">常驻 Gradle 进程</string>
+    <string name="mobile_build_daemon_hint">偏好复用 Gradle 构建进程，不保证在 PRoot 退出或系统回收后存活</string>
+    <string name="mobile_build_parallel">并行构建</string>
+    <string name="mobile_build_parallel_hint">允许可并行的项目任务同时执行，可能增加内存占用</string>
+    <string name="mobile_build_workers">最大 worker 数</string>
+    <string name="mobile_build_workers_hint">限制 Gradle 并发 worker 数量</string>
+    <string name="mobile_build_worker_option">%1$d</string>
+    <string name="mobile_build_option_description">%1$s：%2$s</string>
+    <string name="mobile_build_test_heap">单元测试堆上限</string>
+    <string name="mobile_build_test_heap_hint">限制 Gradle Test 任务 JVM 的最大堆，测试进程仍会额外占用内存</string>
+    <string name="mobile_build_heap_512_mb">512 MB</string>
+    <string name="mobile_build_heap_768_mb">768 MB</string>
+    <string name="mobile_build_heap_1_gb">1 GB</string>
+    <string name="mobile_build_heap_1_5_gb">1.5 GB</string>
+    <string name="mobile_build_heap_2_gb">2 GB</string>
+    <string name="mobile_build_heap_2_5_gb">2.5 GB</string>
+    <string name="mobile_build_heap_3_gb">3 GB</string>
+    <string name="mobile_build_heap_mb">%1$d MB</string>
+    <string name="mobile_build_saving">正在保存…</string>
+    <string name="mobile_build_save_failed">无法保存手机构建设置，可能存在配置冲突或写入失败。请检查本机容器与 Gradle 配置后重试。</string>
+</resources>

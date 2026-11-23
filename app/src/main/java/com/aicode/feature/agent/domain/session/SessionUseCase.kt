@@ -206,6 +206,10 @@ class SessionUseCase @Inject constructor(
         chatSessionDao.updateProviderModel(sessionId, providerId, model)
     }
 
+    suspend fun updateProviderModelWithDirectChildren(sessionId: String, providerId: String?, model: String?): List<String> {
+        return chatSessionDao.updateProviderModelWithDirectChildren(sessionId, providerId, model)
+    }
+
     suspend fun updateReasoningEffort(sessionId: String, effort: String) {
         chatSessionDao.updateReasoningEffort(sessionId, effort)
     }

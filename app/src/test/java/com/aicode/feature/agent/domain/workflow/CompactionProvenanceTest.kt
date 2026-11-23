@@ -43,6 +43,7 @@ class CompactionProvenanceTest {
             compactor.streamPolicy = CompactionStreamPolicy(retryDelayMs = 0)
             coEvery { metadata.resolve(any(), any(), any()) } returns ModelMetadata("summary", contextTokens = 16_000)
             coEvery { settings.compactionThresholdPercent() } returns 90
+            coEvery { persistence.matchesCompactionSource(any(), any()) } returns true
             every { prompts.resolvePrompt(any()) } returns "{{INSTRUCTION}}"
             every { provider.providerId } returns "provider"
             every { provider.model } returns "summary"
@@ -52,7 +53,7 @@ class CompactionProvenanceTest {
                 flowOf(AIStreamChunk.Final(AIResponse("Short handoff", stopReason = "stop")))
             }
             coEvery { dao.getMessagesBySessionOnce("s") } answers { entities }
-            coEvery { dao.commitCompaction("s", any(), any(), any()) } coAnswers { committedIds = secondArg(); committedRows = thirdArg() }
+            coEvery { dao.commitCompaction("s", any(), any(), any(), any(), any()) } coAnswers { committedIds = secondArg(); committedRows = thirdArg() }
         }
 
         fun rows(history: List<AgentMessage>) {
@@ -66,7 +67,7 @@ class CompactionProvenanceTest {
         suspend fun compact(history: List<AgentMessage>) = compactor.compactIfNeeded(history, provider, sessionId = "s", force = true)
         fun assertNoDispatchOrCommit() {
             assertTrue(requests.isEmpty())
-            coVerify(exactly = 0) { dao.commitCompaction(any(), any(), any(), any()) }
+            coVerify(exactly = 0) { dao.commitCompaction(any(), any(), any(), any(), any(), any()) }
         }
     }
     private fun history() = listOf(

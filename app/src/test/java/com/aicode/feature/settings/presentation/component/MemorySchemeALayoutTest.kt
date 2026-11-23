@@ -7,17 +7,14 @@ import android.os.Looper
 import android.view.View
 import android.view.ViewGroup
 import androidx.activity.ComponentActivity
-import androidx.compose.foundation.layout.Column
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.BroadcastFrameClock
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.Recomposer
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.runtime.saveable.rememberSaveableStateHolder
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.ui.InternalComposeUiApi
@@ -51,7 +48,17 @@ import com.aicode.feature.agent.domain.memory.MemoryEntry
 import com.aicode.feature.agent.domain.memory.MemoryManagementError
 import com.aicode.feature.agent.domain.memory.MemoryScope
 import com.aicode.feature.settings.presentation.MemoryUiState
+import com.aicode.feature.agent.domain.memory.ProjectMemoryAssociations
+import com.aicode.feature.agent.domain.memory.ProjectMemoryEntry
+import com.aicode.feature.agent.domain.memory.ProjectMemoryIdentity
+import com.aicode.feature.agent.domain.memory.ProjectMemoryProject
 import com.aicode.feature.settings.presentation.MemoryViewModel
+import com.aicode.feature.settings.presentation.ProjectProgressConfirmation
+import com.aicode.feature.settings.presentation.ProjectProgressEntryAction
+import com.aicode.feature.settings.presentation.ProjectProgressForm
+import com.aicode.feature.settings.presentation.ProjectProgressFilter
+import com.aicode.feature.settings.presentation.ProjectProgressUiState
+import com.aicode.feature.settings.presentation.ProjectProgressViewModel
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.verify
@@ -241,43 +248,191 @@ class MemorySchemeALayoutTest {
     }
 
     @Test(timeout = 90_000)
-    fun projectProgressComesAfterTheListAndTheHolderRestoresFiltersOnReturn(): Unit = render {
+    fun hubTabsRenderBothPagesAndRestoreMemoryStateWithoutReopeningEitherViewModel(): Unit = render {
         val entries = listOf(entry(MemoryScope.PROJECT, "project"), entry(MemoryScope.GLOBAL, "global"))
         val route = RouteFixture(entries)
-        showRoute(route, holderHosted = true)
+        showRoute(route)
         settle()
+        assertTrue(hasTag("memory-tabs"))
+        assertEquals(Role.Tab, tag("memory-tab-long-term").config[SemanticsProperties.Role])
+        assertEquals(Role.Tab, tag("memory-tab-project-progress").config[SemanticsProperties.Role])
+        assertEquals(true, tag("memory-tab-long-term").config[SemanticsProperties.Selected])
+        assertFalse(hasTag("memory-project-progress"))
+        assertTrue(hasText(label(R.string.memory_long_term_title)))
+        assertTrue(hasText(label(R.string.memory_long_term_hint)))
+        val memoryTabs = tag("memory-tabs")
+        assertTrue(memoryTabs.size.height <= 56f)
+        assertTrue(memoryTabs.bounds().bottom <= tag("memory-search").bounds().top)
+        assertVisible(tag("memory-list"))
         clickTag("memory-scope-global")
         editSearch("global")
-        val row = tag("memory-row-${entries.last().id}")
-        val progress = visibleTag("memory-project-progress")
-        assertTrue(row.bounds().bottom <= progress.bounds().top)
-        assertTrue(progress.containsText(label(R.string.memory_a_progress_title)))
-        assertTrue(hasText(label(R.string.memory_a_progress_hint)))
-        val end = visibleTag("memory-range-end")
-        assertTrue(progress.bounds().bottom <= end.bounds().top)
-        clickTag("memory-project-progress")
-        assertFalse(hasTag("memory-list"))
+        clickTag("memory-tab-project-progress")
+        assertEquals(true, tag("memory-tab-project-progress").config[SemanticsProperties.Selected])
         assertTrue(hasText(label(R.string.project_progress_title)))
-        clickLabel(R.string.common_back)
+        assertTrue(hasText(label(R.string.project_progress_current_workspace)))
+        val progressTabs = tag("memory-tabs")
+        assertTrue(progressTabs.size.height <= 56f)
+        val openCurrent = tag("project-progress-open-current")
+        assertTrue(progressTabs.bounds().bottom <= openCurrent.bounds().top)
+        assertVisible(openCurrent)
+        assertFalse(hasTag("project-progress-register"))
+        assertFalse(hasTag("memory-list"))
+        clickTag("project-progress-open-current")
+        assertEquals(route.project.id, route.projectState.value.selectedProjectId)
+        verify(exactly = 1) { route.viewModel.open() }
+        verify(exactly = 1) { route.projectViewModel.open(null) }
+        verify(exactly = 0) { route.viewModel.close() }
+        clickTag("memory-tab-long-term")
+        assertEquals(true, tag("memory-tab-long-term").config[SemanticsProperties.Selected])
         assertEquals(true, tag("memory-scope-global").config[SemanticsProperties.Selected])
         assertEquals("global", searchValue())
         assertEquals(setOf(entries.last().id), rowIds())
-        verify(exactly = 2) { route.viewModel.open() }
+        clickTag("memory-tab-project-progress")
+        verify(exactly = 1) { route.viewModel.open() }
+        verify(exactly = 1) { route.projectViewModel.open(null) }
+        verify(exactly = 0) { route.projectViewModel.close() }
+        clickTag("memory-tab-long-term")
+        clickDescription(R.string.common_back)
         verify(exactly = 1) { route.viewModel.close() }
+        verify(exactly = 1) { route.projectViewModel.close() }
+        assertEquals(1, route.exitCount)
+    }
+
+    @Test(timeout = 90_000)
+    fun projectStateAndCallbacksSurviveTabSwitchesWhileRecordDetailsHideTabs(): Unit = render {
+        val route = RouteFixture(emptyList())
+        showRoute(route)
+        settle()
+        clickTag("memory-tab-project-progress")
+        clickTag("project-progress-open-current")
+        assertEquals(route.project.id, route.projectState.value.selectedProjectId)
+        assertEquals(true, tag("memory-tab-project-progress").config[SemanticsProperties.Selected])
+        clickTabLabel(R.string.project_progress_handoff_kind)
+        assertEquals(ProjectProgressFilter.HANDOFF, route.projectState.value.filter)
+        assertEquals(listOf(route.recentEntry), route.projectState.value.entries)
+        verify(exactly = 1) { route.projectViewModel.selectProject(route.project) }
+        verify(exactly = 1) { route.projectViewModel.setFilter(ProjectProgressFilter.HANDOFF) }
+        clickLabel(R.string.project_progress_view_archive)
+        assertTrue(route.projectState.value.showingArchive)
+        assertEquals(listOf(route.archiveEntry), route.projectState.value.entries)
+        verify(exactly = 1) { route.projectViewModel.showArchive(true) }
+        assertTrue(hasTag("memory-tab-project-progress"))
+        clickTag("memory-tab-long-term")
+        assertEquals(true, tag("memory-tab-long-term").config[SemanticsProperties.Selected])
+        clickTag("memory-tab-project-progress")
+        assertEquals(route.project.id, route.projectState.value.selectedProjectId)
+        assertEquals(ProjectProgressFilter.HANDOFF, route.projectState.value.filter)
+        assertTrue(route.projectState.value.showingArchive)
+        assertTrue(hasText(route.archiveEntry.summary))
+        clickText(route.archiveEntry.summary)
+        assertEquals(route.archiveEntry.id, route.projectState.value.selectedEntryId)
+        assertTrue(hasText(route.archiveEntry.body))
+        val detailBody = nodes().single { it.config.getOrNull(SemanticsProperties.Text)?.any { text -> text.text == route.archiveEntry.body } == true }
+        assertVisible(detailBody)
+        assertFalse(hasTag("memory-tabs"))
+        activity.onBackPressedDispatcher.onBackPressed()
+        settle()
+        assertNull(route.projectState.value.selectedEntryId)
+        assertEquals(true, tag("memory-tab-project-progress").config[SemanticsProperties.Selected])
+        assertTrue(hasText(route.archiveEntry.summary))
+        clickLabel(R.string.project_progress_all_projects)
+        assertNull(route.projectState.value.selectedProjectId)
+        assertTrue(hasText(label(R.string.project_progress_current_workspace)))
+        verify(exactly = 1) { route.projectViewModel.openEntry(route.archiveEntry) }
+        verify(exactly = 1) { route.projectViewModel.closeEntry() }
+        verify(exactly = 1) { route.projectViewModel.closeProject() }
+    }
+
+    @Test(timeout = 90_000)
+    fun memoryDetailsHideTabsAndBackReturnsToTheSameSelectedTab(): Unit = render {
+        val entry = entry(MemoryScope.GLOBAL, "detail")
+        val route = RouteFixture(listOf(entry))
+        showRoute(route)
+        settle()
+        clickTag("memory-scope-global")
+        clickTag("memory-row-${entry.id}")
+        assertTrue(hasTag("memory-detail-body"))
+        assertFalse(hasTag("memory-tabs"))
+        activity.onBackPressedDispatcher.onBackPressed()
+        settle()
+        assertNull(route.state.value.selectedEntry)
+        assertEquals(true, tag("memory-tab-long-term").config[SemanticsProperties.Selected])
+        assertEquals(true, tag("memory-scope-global").config[SemanticsProperties.Selected])
+    }
+
+    @Test(timeout = 90_000)
+    fun busyFormsAndDeleteConfirmationsDisableHubTabs(): Unit = render {
+        val entry = entry(MemoryScope.GLOBAL, "busy")
+        val route = RouteFixture(listOf(entry))
+        showRoute(route)
+        settle()
+        fun assertTabsDisabled(expected: Boolean) {
+            listOf("memory-tab-long-term", "memory-tab-project-progress").forEach { tab ->
+                assertEquals(expected, tag(tab).config.contains(SemanticsProperties.Disabled))
+            }
+        }
+        route.state.value = route.state.value.copy(saving = true)
+        settle()
+        assertTabsDisabled(true)
+        route.state.value = route.state.value.copy(saving = false, pendingDelete = entry)
+        settle()
+        assertTabsDisabled(true)
+        route.state.value = route.state.value.copy(pendingDelete = null)
+        settle()
+        assertTabsDisabled(false)
+        clickTag("memory-tab-project-progress")
+        route.projectState.value = route.projectState.value.copy(form = ProjectProgressForm.HANDOFF)
+        settle()
+        assertTabsDisabled(true)
+        route.projectState.value = route.projectState.value.copy(form = null, busy = true)
+        settle()
+        assertTabsDisabled(true)
+        route.projectState.value = route.projectState.value.copy(busy = false,
+            confirmation = ProjectProgressConfirmation(route.recentEntry, ProjectProgressEntryAction.ARCHIVE))
+        settle()
+        assertTabsDisabled(true)
+        route.projectState.value = route.projectState.value.copy(confirmation = null)
+        settle()
+        assertTabsDisabled(false)
+        verify(exactly = 1) { route.projectViewModel.open(null) }
+        verify(exactly = 0) { route.viewModel.close() }
+    }
+
+    @Test(timeout = 90_000)
+    fun targetChangedStatesKeepProtectedPagesReadOnly(): Unit = render {
+        val route = RouteFixture(listOf(entry(MemoryScope.GLOBAL, "protected")))
+        showRoute(route)
+        settle()
+        route.state.value = route.state.value.copy(targetChanged = true, loading = false)
+        settle()
+        assertTrue(hasText(label(R.string.memory_management_target_changed)))
+        assertFalse(hasTag("memory-list"))
+        val add = nodes().single { it.config.getOrNull(SemanticsProperties.ContentDescription)?.contains(label(R.string.memory_management_add)) == true }
+        var addButton: SemanticsNode? = add
+        while (addButton != null && !addButton.config.contains(SemanticsProperties.Disabled)) addButton = addButton.parent
+        assertTrue(requireNotNull(addButton).config.contains(SemanticsProperties.Disabled))
+        clickTag("memory-tab-project-progress")
+        route.projectState.value = route.projectState.value.copy(targetChanged = true, loading = false)
+        settle()
+        assertTrue(hasText(label(R.string.project_progress_target_changed)))
+        assertTrue(hasText(label(R.string.project_progress_reload)))
+        assertFalse(hasText(label(R.string.project_progress_register)))
+        assertFalse(hasText(label(R.string.project_progress_write_handoff)))
+        assertEquals(true, tag("memory-tab-project-progress").config[SemanticsProperties.Selected])
+        verify(exactly = 0) { route.projectViewModel.startRegister() }
+        verify(exactly = 0) { route.projectViewModel.startHandoff() }
     }
 
     @Test(timeout = 90_000)
     @Config(qualifiers = "w400dp-h640dp")
-    fun projectProgressReturnRetainsTheActualScrollThroughEmptyLoadingBeforeTheEntriesArrive(): Unit = render(height = 640) {
+    fun switchingTabsRestoresTheActualMemoryLazyScrollWithoutReopeningMemory(): Unit = render(height = 640) {
         val entries = MemoryScope.entries.flatMap { scope -> (0 until 36).map { entry(scope, "Shared-$it") } }
         val route = RouteFixture(entries)
-        showRoute(route, holderHosted = true)
+        showRoute(route)
         settle()
         clickTag("memory-scope-global")
         editSearch("Shared")
         scrollList(10_000f)
-        val progress = visibleTag("memory-project-progress")
-        assertVisible(progress)
         val before = listScroll()
         assertTrue(before > 0f)
         val visibleRows = nodes().filter { node ->
@@ -285,30 +440,19 @@ class MemorySchemeALayoutTest {
                 node.boundsInRoot.height > 0f
         }.associate { it.config[SemanticsProperties.TestTag] to it.positionInRoot.y }
         assertTrue(visibleRows.isNotEmpty())
-        clickTag("memory-project-progress")
-        assertFalse(hasTag("memory-list"))
+        clickTag("memory-tab-project-progress")
         assertTrue(hasText(label(R.string.project_progress_title)))
-        every { route.viewModel.open() } answers {
-            route.state.value = MemoryUiState(hasWorkspace = true, projectName = PROJECT, loading = true)
-        }
-        clickLabel(R.string.common_back)
-        assertTrue(route.state.value.loading)
-        assertTrue(route.state.value.entries.isEmpty())
-        assertFalse(hasTag("memory-list"))
-        assertTrue(nodes().any { it.config.contains(SemanticsProperties.ProgressBarRangeInfo) })
-        assertFalse(hasText(label(R.string.memory_management_empty)))
-        assertFalse(hasTag("memory-project-progress"))
-        pump(12)
-        route.state.value = route.state.value.copy(entries = entries, loading = false)
-        settle()
+        verify(exactly = 1) { route.viewModel.open() }
+        verify(exactly = 1) { route.projectViewModel.open(null) }
+        clickTag("memory-tab-long-term")
         assertEquals(before, listScroll(), 1f)
         visibleRows.forEach { (value, top) -> assertEquals(top, tag(value).positionInRoot.y, 1f) }
         scrollList(-10_000f)
         assertEquals(true, tag("memory-scope-global").config[SemanticsProperties.Selected])
         assertEquals("Shared", searchValue())
         assertCount(36)
-        verify(exactly = 2) { route.viewModel.open() }
-        verify(exactly = 1) { route.viewModel.close() }
+        verify(exactly = 1) { route.viewModel.open() }
+        verify(exactly = 0) { route.viewModel.close() }
     }
 
     @Test(timeout = 90_000)
@@ -532,7 +676,7 @@ class MemorySchemeALayoutTest {
 
     @Test(timeout = 90_000)
     @Config(qualifiers = "w320dp-h640dp")
-    fun narrowLargeFontDarkDetailKeepsMetadataInTwoRowsAndFooterFixedWhileTheBodyScrolls(): Unit = render(
+    fun narrowLargeFontDarkDetailKeepsMetadataInThreeRowsAndFooterFixedWhileTheBodyScrolls(): Unit = render(
         width = 320, height = 640, fontScale = 1.5f, darkTheme = true
     ) {
         val document = MemoryDocument(entry(MemoryScope.PROJECT, "Long file name ".repeat(20)),
@@ -582,13 +726,19 @@ class MemorySchemeALayoutTest {
         val info = tag("memory-detail-info")
         val scope = tag("memory-detail-scope")
         val file = tag("memory-detail-file")
+        val updated = tag("memory-detail-updated")
         val scopeLabel = textNode(R.string.memory_management_scope)
         val fileLabel = textNode(R.string.memory_management_file)
+        val updatedLabel = textNode(R.string.memory_management_updated)
         assertSameBand(scopeLabel, scope)
         assertSameBand(fileLabel, file)
+        assertSameBand(updatedLabel, updated)
         assertTrue(scopeLabel.bounds().right <= scope.bounds().left)
         assertTrue(fileLabel.bounds().right <= file.bounds().left)
+        assertTrue(updatedLabel.bounds().right <= updated.bounds().left)
+        assertTrue(updated.containsText(label(R.string.memory_management_time_unknown)))
         assertTrue(scope.bounds().bottom <= file.bounds().top)
+        assertTrue(file.bounds().bottom <= updated.bounds().top)
         assertTrue(info.bounds().bottom <= tag("memory-detail-description").bounds().top)
         assertTrue(tag("memory-detail-description").bounds().bottom <= tag("memory-detail-body").bounds().top)
         val copy = tag("memory-copy-body")
@@ -616,10 +766,62 @@ class MemorySchemeALayoutTest {
         assertEquals(document.content, clipboardText())
     }
 
+    @Test(timeout = 90_000)
+    fun hubTabsStayDistinctAt320dpLargeFontAndWithinBoundsOnWideScreens() {
+        render(width = 320, height = 640, fontScale = 1.5f) {
+            val route = RouteFixture(emptyList())
+            showRoute(route)
+            settle()
+            val longTerm = tag("memory-tab-long-term")
+            val progress = tag("memory-tab-project-progress")
+            assertEquals(Role.Tab, longTerm.config[SemanticsProperties.Role])
+            assertEquals(Role.Tab, progress.config[SemanticsProperties.Role])
+            assertTrue(longTerm.bounds().right <= progress.bounds().left)
+            listOf(longTerm, progress, tag("memory-tabs")).forEach(::assertVisible)
+            assertTrue(tag("memory-tabs").size.height <= 56f)
+            val title = descendants(longTerm).single { node ->
+                node.config.getOrNull(SemanticsProperties.Text)?.any { it.text == label(R.string.memory_long_term_title) } == true
+            }
+            val progressTitle = descendants(progress).single { node ->
+                node.config.getOrNull(SemanticsProperties.Text)?.any { it.text == label(R.string.project_progress_title) } == true
+            }
+            listOf(title to longTerm, progressTitle to progress).forEach { (text, tab) ->
+                assertTrue(text.bounds().left >= tab.bounds().left)
+                assertTrue(text.bounds().right <= tab.bounds().right)
+                assertTrue(text.bounds().top >= tab.bounds().top)
+                assertTrue(text.bounds().bottom <= tab.bounds().bottom)
+            }
+        }
+        render(width = 840, height = 1000) {
+            val route = RouteFixture(emptyList())
+            showRoute(route)
+            settle()
+            val tabs = tag("memory-tabs")
+            val longTerm = tag("memory-tab-long-term")
+            val progress = tag("memory-tab-project-progress")
+            assertTrue(tabs.size.width > 320f)
+            assertTrue(tabs.bounds().left >= 0f && tabs.bounds().right <= view.width)
+            assertTrue(longTerm.bounds().right <= progress.bounds().left)
+            assertVisible(tabs)
+            assertVisible(longTerm)
+            assertVisible(progress)
+        }
+    }
+
     private class RouteFixture(entries: List<MemoryEntry>, hasWorkspace: Boolean = true) {
         val state = MutableStateFlow(MemoryUiState(entries = entries, hasWorkspace = hasWorkspace,
             projectName = if (hasWorkspace) PROJECT else null, loading = false))
         val viewModel = mockk<MemoryViewModel>()
+        val project = ProjectMemoryProject("project-id", "Project", identity = ProjectMemoryIdentity("local_proot", projectRoot = "/workspace"))
+        val recentEntry = ProjectMemoryEntry("recent-id", project.id, createdAt = 1_700_000_000_000L, kind = "handoff",
+            summary = "Recent handoff", body = "Recent body", status = "recorded")
+        val archiveEntry = recentEntry.copy(id = "archive-id", summary = "Archived handoff", archived = true)
+        val projectState = MutableStateFlow(ProjectProgressUiState(
+            workspaceName = PROJECT, workspaceRoot = "/workspace", loading = false, projectsLoaded = true, projects = listOf(project),
+            associations = ProjectMemoryAssociations(false, null, true, null)
+        ))
+        val projectViewModel = mockk<ProjectProgressViewModel>()
+        var exitCount = 0
         init {
             every { viewModel.state } returns state
             every { viewModel.open() } returns Unit
@@ -640,6 +842,44 @@ class MemorySchemeALayoutTest {
             every { viewModel.requestDelete(any()) } answers { state.value = state.value.copy(pendingDelete = firstArg()) }
             every { viewModel.dismissDelete() } answers { state.value = state.value.copy(pendingDelete = null) }
             every { viewModel.confirmDelete() } returns Unit
+            every { projectViewModel.state } returns projectState
+            every { projectViewModel.open(any()) } returns Unit
+            every { projectViewModel.close() } returns Unit
+            every { projectViewModel.checkEnvironment() } returns Unit
+            every { projectViewModel.refresh() } returns Unit
+            every { projectViewModel.selectProject(any()) } answers {
+                projectState.value = projectState.value.copy(selectedProjectId = firstArg<ProjectMemoryProject>().id,
+                    entries = listOf(recentEntry))
+            }
+            every { projectViewModel.setFilter(any()) } answers {
+                val filter = firstArg<ProjectProgressFilter>()
+                projectState.value = projectState.value.copy(filter = filter,
+                    entries = if (filter == ProjectProgressFilter.HANDOFF) listOf(recentEntry) else emptyList())
+            }
+            every { projectViewModel.showArchive(any()) } answers {
+                val archived = firstArg<Boolean>()
+                projectState.value = projectState.value.copy(showingArchive = archived,
+                    entries = if (archived) listOf(archiveEntry) else listOf(recentEntry))
+            }
+            every { projectViewModel.openEntry(any()) } answers {
+                val selected = firstArg<ProjectMemoryEntry>()
+                projectState.value = projectState.value.copy(selectedEntryId = selected.id, detail = selected, detailLoading = false)
+            }
+            every { projectViewModel.closeEntry() } answers {
+                projectState.value = projectState.value.copy(selectedEntryId = null, detail = null, detailLoading = false)
+            }
+            every { projectViewModel.closeProject() } answers {
+                projectState.value = projectState.value.copy(selectedProjectId = null, selectedEntryId = null, detail = null)
+            }
+            every { projectViewModel.startRegister() } answers {
+                projectState.value = projectState.value.copy(form = ProjectProgressForm.REGISTER)
+            }
+            every { projectViewModel.startHandoff() } answers {
+                projectState.value = projectState.value.copy(form = ProjectProgressForm.HANDOFF)
+            }
+            every { projectViewModel.dismissForm() } answers { projectState.value = projectState.value.copy(form = null) }
+            every { projectViewModel.confirmEntryAction() } returns Unit
+            every { projectViewModel.dismissConfirmation() } answers { projectState.value = projectState.value.copy(confirmation = null) }
         }
     }
 
@@ -653,28 +893,16 @@ class MemorySchemeALayoutTest {
         fun showList(entries: List<MemoryEntry>) {
             screen = {
                 MemorySection(MemoryUiState(entries = entries, hasWorkspace = true, projectName = PROJECT, loading = false),
-                    { opened += it }, { deletionRequests += it }, scope, query, { scope = it }, { query = it },
-                    onOpenProjectProgress = {})
+                    { opened += it }, { deletionRequests += it }, scope, query, { scope = it }, { query = it })
             }
         }
 
-        fun showRoute(route: RouteFixture, holderHosted: Boolean = false) {
+        fun showRoute(route: RouteFixture) {
             screen = {
-                if (holderHosted) {
-                    val holder = rememberSaveableStateHolder()
-                    var progress by rememberSaveable { mutableStateOf(false) }
-                    if (progress) {
-                        Column {
-                            Text(stringResource(R.string.project_progress_title))
-                            TextButton(onClick = { progress = false }) { Text(stringResource(R.string.common_back)) }
-                        }
-                    } else {
-                        holder.SaveableStateProvider("Memory") {
-                            MemorySettingsRoute(route.viewModel, true, {}, { progress = true })
-                        }
-                    }
-                } else {
-                    MemorySettingsRoute(route.viewModel, true, {}, {})
+                var routeVisible by remember { mutableStateOf(true) }
+                if (routeVisible) MemorySettingsRoute(route.viewModel, route.projectViewModel, null, true) {
+                    route.exitCount++
+                    routeVisible = false
                 }
             }
         }
@@ -732,6 +960,23 @@ class MemorySchemeALayoutTest {
                 current = current.parent
             }
             error("No clickable parent for ${label(resource)}")
+        }
+        fun clickTabLabel(resource: Int) {
+            val text = label(resource)
+            clickNode(visibleNode("tab $text") {
+                it.config.getOrNull(SemanticsProperties.Role) == Role.Tab && it.containsText(text)
+            })
+        }
+        fun clickText(text: String) {
+            val labelNode = visibleNode("label $text") { node ->
+                node.config.getOrNull(SemanticsProperties.Text)?.any { it.text == text } == true
+            }
+            var actionNode: SemanticsNode? = labelNode
+            while (actionNode != null && actionNode.config.getOrNull(SemanticsActions.OnClick)?.action == null) {
+                actionNode = actionNode.parent
+            }
+            val actionId = requireNotNull(actionNode) { "No clickable ancestor for $text" }.id
+            clickNode(visibleNode("action for $text") { it.id == actionId })
         }
         fun clickLabel(resource: Int) {
             val text = label(resource)

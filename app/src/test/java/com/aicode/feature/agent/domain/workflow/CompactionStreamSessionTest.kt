@@ -108,7 +108,8 @@ class CompactionStreamSessionTest {
         failure("compaction_total_timeout") { session().call({ flow {
             while (true) { delay(60_000); emit(AIStreamChunk.TextDelta("progress")) }
         } }, records = records) }
-        assertEquals(1_200_000L, testScheduler.currentTime)
+        assertEquals(2_100_000L, CompactionStreamPolicy().totalTimeoutMs)
+        assertEquals(2_100_000L, testScheduler.currentTime)
         assertEquals("compaction_total_timeout", records.single().errorCode)
     }
 
@@ -137,7 +138,9 @@ class CompactionStreamSessionTest {
             "compaction_tools" to AIResponse("text", stopReason = "stop", toolCalls = listOf(ToolCall("id", "read", emptyMap()))),
             "compaction_images" to AIResponse("text", stopReason = "stop", images = listOf(AgentImage("image/png", "secret"))),
             "compaction_invalid_response" to AIResponse("text", stopReason = "incomplete"),
-            "compaction_invalid_response" to AIResponse("text"),
+            "compaction_missing_stop" to AIResponse("text"),
+            "compaction_missing_stop" to AIResponse("text", stopReason = ""),
+            "compaction_missing_stop" to AIResponse("text", stopReason = "  "),
         )) {
             val s = session()
             val records = mutableListOf<CompactionStreamAttempt>()

@@ -164,6 +164,44 @@ class KeepaliveLeaseRegistryTest {
         assertFalse(registry.snapshot().protected)
     }
 
+    @Test
+    fun recoveryStateDoesNotConfirmProtectionOrChangePowerRequirements() {
+        registry.acquire("job", true, false)
+        registry.setRecoveryState(attempts = 2, pending = true)
+        val recovering = registry.snapshot()
+        assertTrue(recovering.activeRequired)
+        assertEquals(2, recovering.recoveryAttempts)
+        assertTrue(recovering.recoveryPending)
+        assertFalse(recovering.recoveryExhausted)
+        assertFalse(recovering.protected)
+        assertTrue(recovering.cpuRequired)
+        assertFalse(recovering.wifiRequired)
+        registry.setRecoveryState(attempts = 3, pending = false, exhausted = true)
+        assertTrue(registry.snapshot().recoveryExhausted)
+        assertFalse(registry.snapshot().protected)
+        registry.markForeground()
+        assertTrue(registry.snapshot().protected)
+        assertEquals(3, registry.snapshot().recoveryAttempts)
+    }
+
+    @Test
+    fun onlyUnsuspendedCpuOrNetworkLeasesCreateActiveDemand() {
+        registry.setPersistent(true)
+        registry.acquire("display", false, false)
+        assertFalse(registry.snapshot().activeRequired)
+        registry.acquire("network", false, true)
+        assertTrue(registry.snapshot().activeRequired)
+        registry.acquire("cpu", true, false)
+        registry.release("network")
+        assertTrue(registry.snapshot().activeRequired)
+        registry.setSuspended(true)
+        assertFalse(registry.snapshot().activeRequired)
+        registry.setSuspended(false)
+        registry.release("cpu")
+        assertFalse(registry.snapshot().activeRequired)
+        assertTrue(registry.snapshot().serviceRequired)
+    }
+
     @Test(expected = IllegalArgumentException::class)
     fun rejectsBlankOwner() {
         registry.acquire(" ", true, true)

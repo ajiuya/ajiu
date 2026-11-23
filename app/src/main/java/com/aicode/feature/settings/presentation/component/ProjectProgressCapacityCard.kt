@@ -33,7 +33,7 @@ import java.util.Locale
 internal fun ProjectProgressCapacityCard(capacity: ProjectMemoryCapacity?, enabled: Boolean) {
     var detailsExpanded by rememberSaveable { mutableStateOf(false) }
     val locale = LocalConfiguration.current.locales[0]
-    SettingsGroupHeader(stringResource(R.string.project_progress_capacity))
+    ProjectProgressGroupHeader(stringResource(R.string.project_progress_capacity))
     SettingsGroup(Modifier.testTag("project-settings-capacity")) {
         Column(
             Modifier.fillMaxWidth().padding(Spacing.lg),

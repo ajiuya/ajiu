@@ -172,7 +172,8 @@ internal fun ChatHeader(
                         onDismissRequest = {
                             moreActionsExpanded = false
                             speedTierMenuExpanded = false
-                        }
+                        },
+                        shape = RoundedCornerShape(Radius.mdLarge)
                     ) {
                         if (speedTierMenuExpanded) {
                             SpeedTierMenu(

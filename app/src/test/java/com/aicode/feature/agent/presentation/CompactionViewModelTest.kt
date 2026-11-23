@@ -37,6 +37,7 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
@@ -503,6 +504,28 @@ class CompactionViewModelTest {
     }
 
     @Test
+    fun compressionFailuresDistinguishTotalFirstContentIdleAndMissingTerminal() = runTest(dispatcher, timeout = 15.seconds) {
+        val cases = listOf(
+            "compaction_total_timeout" to R.string.compaction_error_total_timeout,
+            "compaction_first_chunk_timeout" to R.string.compaction_error_first_content_timeout,
+            "compaction_idle_timeout" to R.string.compaction_error_idle_timeout,
+            "compaction_no_final" to R.string.compaction_error_missing_terminal,
+            "compaction_missing_stop" to R.string.compaction_error_missing_terminal
+        )
+        for ((code, resource) in cases) {
+            val manual = startManual(PARENT)
+            manual.send(AgentEvent.CompactionStarted(18_000, ATTEMPT))
+            manual.send(AgentEvent.CompactionFailed(code, ATTEMPT))
+            manual.send(AgentEvent.CompactionFinished(ATTEMPT))
+            finish(manual, changed = false)
+            assertEquals(listOf(safeFailure().copy(content = context.getString(resource))), persisted)
+            assertFalse(PARENT in vm.completedSessions.value)
+            assertHidden(PARENT)
+            persisted.clear()
+        }
+    }
+
+    @Test
     fun unchangedAndIncompleteFinishedKeepUsageAndNeverPretendToHaveCompacted() = runTest(dispatcher, timeout = 15.seconds) {
         seedUsage(PARENT, USAGE)
         for (unchanged in listOf(true, false)) {
@@ -710,6 +733,7 @@ class CompactionViewModelTest {
     private suspend fun seedUsage(sid: String, usage: AgentEvent.ContextUsage) {
         val run = startAutomatic(sid)
         run.send(usage)
+        vm.contextUsages.first { it[sid] == usage }
         cancel(run.owner)
         assertEquals(usage, vm.contextUsages.value[sid])
     }

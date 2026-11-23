@@ -6,17 +6,31 @@ import androidx.lifecycle.viewModelScope
 import com.aicode.R
 import com.aicode.core.util.FileLogger
 import com.aicode.feature.agent.domain.container.ContainerInitState
+import com.aicode.feature.agent.domain.container.ContainerProfile
 import com.aicode.feature.agent.domain.container.LinuxContainerEngine
+import com.aicode.feature.settings.data.repository.ContainerSettingsRepository
 import com.aicode.feature.settings.data.repository.ExecutionMode
 import com.aicode.feature.settings.data.repository.ExecutionModeHolder
+import com.aicode.feature.terminal.data.repository.TerminalTaskHistoryRepository
 import com.aicode.feature.terminal.domain.RemoteTerminalSessionManager
+import com.aicode.feature.terminal.domain.TerminalTaskRecord
+import com.aicode.feature.terminal.domain.TerminalTaskScopeResolver
+import com.aicode.feature.workspace.data.repository.WorkspaceRepository
 import com.aicode.feature.terminal.domain.TerminalSessionManager
 import com.aicode.feature.terminal.presentation.component.TerminalKeyModifiers
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import com.aicode.feature.terminal.data.repository.TerminalSettings
 import com.aicode.feature.terminal.data.repository.TerminalSettingsRepository
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.StateFlow
@@ -38,7 +52,11 @@ class TerminalViewModel @Inject constructor(
     private val remoteManager: RemoteTerminalSessionManager,
     private val modeHolder: ExecutionModeHolder,
     private val containerEngine: LinuxContainerEngine,
-    private val terminalSettingsRepository: TerminalSettingsRepository
+    private val terminalSettingsRepository: TerminalSettingsRepository,
+    private val historyRepository: TerminalTaskHistoryRepository,
+    private val historyScopeResolver: TerminalTaskScopeResolver,
+    private val workspaceRepository: WorkspaceRepository,
+    private val containerSettingsRepository: ContainerSettingsRepository
 ) : ViewModel() {
 
     private companion object { const val TAG = "TerminalViewModel" }
@@ -47,6 +65,108 @@ class TerminalViewModel @Inject constructor(
 
     /** 当前是否远程 SSH 模式（UI 据此隐藏本地容器专属入口，如环境工具）。 */
     val isRemoteMode: Boolean get() = isRemote()
+    val executionMode: StateFlow<ExecutionMode> = modeHolder.mode
+
+    private val _historyState = MutableStateFlow(TerminalHistoryUiState())
+    val historyState: StateFlow<TerminalHistoryUiState> = _historyState.asStateFlow()
+    private var historyJob: Job? = null
+
+    private data class HistoryEnvironment(
+        val mode: ExecutionMode,
+        val modeRevision: Long,
+        val workspace: WorkspaceRepository.Selection,
+        val profileRevision: Long,
+        val profile: ContainerProfile
+    )
+
+    private fun HistoryEnvironment.isCurrent(): Boolean =
+        mode == modeHolder.currentMode() && modeRevision == modeHolder.modeSelectionRevision &&
+            workspace === workspaceRepository.selection.value &&
+            profileRevision == containerSettingsRepository.activeProfileSelectionRevision
+
+    fun showHistory() {
+        if (isRemote() || _historyState.value.visible) return
+        _historyState.value = TerminalHistoryUiState(visible = true, loading = true)
+        historyJob = viewModelScope.launch {
+            try {
+                combine(
+                    modeHolder.mode,
+                    modeHolder.modeSelectionRevisions,
+                    workspaceRepository.selection,
+                    containerSettingsRepository.activeProfileSelectionRevisions,
+                    containerSettingsRepository.activeProfileFlow
+                ) { mode, modeRevision, workspace, profileRevision, profile ->
+                    HistoryEnvironment(mode, modeRevision, workspace, profileRevision, profile)
+                }.collectLatest { environment ->
+                    _historyState.value = TerminalHistoryUiState(visible = true, loading = true)
+                    if (environment.mode != ExecutionMode.LOCAL_PROOT) {
+                        _historyState.value = TerminalHistoryUiState(visible = true, unavailable = true)
+                        return@collectLatest
+                    }
+                    try {
+                        val scope = historyScopeResolver.capture()
+                        if (!environment.isCurrent()) return@collectLatest
+                        if (scope == null || environment.workspace.workspace == null ||
+                            scope.profileId != environment.profile.id) {
+                            _historyState.value = TerminalHistoryUiState(visible = true, unavailable = true)
+                            return@collectLatest
+                        }
+                        coroutineScope {
+                            launch { historyRepository.load() }
+                            historyRepository.state.collect { saved ->
+                                if (!environment.isCurrent()) {
+                                    _historyState.value = TerminalHistoryUiState(visible = true, loading = true)
+                                    return@collect
+                                }
+                                val currentScope = historyScopeResolver.capture()
+                                if (!environment.isCurrent() || currentScope != scope) {
+                                    _historyState.value = TerminalHistoryUiState(visible = true, unavailable = true)
+                                    return@collect
+                                }
+                                val records = saved.records.filter { it.scope == scope }
+                                    .sortedWith(compareByDescending<TerminalTaskRecord> { it.startedAt }.thenBy { it.historyId })
+                                val selectedId = _historyState.value.selectedHistoryId
+                                    ?.takeIf { id -> records.any { it.historyId == id } }
+                                _historyState.value = TerminalHistoryUiState(
+                                    visible = true,
+                                    loading = !saved.loaded && saved.error == null,
+                                    storageError = saved.error != null,
+                                    records = records,
+                                    selectedHistoryId = selectedId
+                                )
+                            }
+                        }
+                    } catch (_: CancellationException) {
+                        currentCoroutineContext().ensureActive()
+                        _historyState.value = TerminalHistoryUiState(visible = true, unavailable = true)
+                    } catch (_: Exception) {
+                        _historyState.value = TerminalHistoryUiState(visible = true, storageError = true)
+                    }
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                _historyState.value = TerminalHistoryUiState(visible = true, storageError = true)
+            }
+        }
+    }
+
+    fun hideHistory() {
+        historyJob?.cancel()
+        historyJob = null
+        _historyState.value = TerminalHistoryUiState()
+    }
+
+    fun selectHistory(historyId: String) {
+        val state = _historyState.value
+        if (state.visible && state.records.any { it.historyId == historyId }) {
+            _historyState.value = state.copy(selectedHistoryId = historyId)
+        }
+    }
+
+    fun backToHistoryList() {
+        _historyState.value = _historyState.value.copy(selectedHistoryId = null)
+    }
 
     /** 容器准备阶段的整体状态：仅用于首个标签创建前的 Loading/Error 提示。 */
     sealed interface PrepareState {
@@ -139,4 +259,16 @@ class TerminalViewModel @Inject constructor(
     fun writeBytes(vararg bytes: Int) = if (isRemote()) remoteManager.writeBytesToActive(*bytes) else localManager.writeBytesToActive(*bytes)
 
     // 注意：故意不在 onCleared 里销毁会话——会话归 Singleton 管理器所有，需常驻后台。
+}
+
+data class TerminalHistoryUiState(
+    val visible: Boolean = false,
+    val loading: Boolean = false,
+    val unavailable: Boolean = false,
+    val storageError: Boolean = false,
+    val records: List<TerminalTaskRecord> = emptyList(),
+    val selectedHistoryId: String? = null
+) {
+    val selectedRecord: TerminalTaskRecord?
+        get() = records.firstOrNull { it.historyId == selectedHistoryId }
 }

@@ -14,6 +14,7 @@ import com.aicode.feature.agent.presentation.component.RewindOption
 import com.aicode.feature.terminal.domain.TaskKeepaliveController
 import io.mockk.Runs
 import io.mockk.coEvery
+import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.just
 import io.mockk.mockkObject
@@ -258,7 +259,7 @@ class GenerationSpeedViewModelTest {
     }
 
     @Test
-    fun changingModelAndRewindingInvalidateOnlySelectedSession() = runTest(dispatcher) {
+    fun changingModelInvalidatesCurrentSessionAndDirectChildrenWhileRewindStaysLocal() = runTest(dispatcher) {
         val speed = AgentEvent.GenerationSpeed(23.0, estimated = false)
         every { fixture.workflow.executeEvents(any(), any(), any()) } returns flow {
             emit(speed)
@@ -272,6 +273,11 @@ class GenerationSpeedViewModelTest {
         assertNull(vm.generationSpeed.value)
         vm.selectSession(CHILD)
         runCurrent()
+        assertNull(vm.generationSpeed.value)
+        assertEquals("new-model", fixture.sessionRows.getValue(CHILD).model)
+        coVerify(exactly = 1) { fixture.sessions.updateProviderModelWithDirectChildren(PARENT, "new-provider", "new-model") }
+        vm.executeAgentRequestStream("child-again", targetSessionId = CHILD).join()
+        runCurrent()
         assertEquals(speed, vm.generationSpeed.value)
 
         coEvery { fixture.messages.getMessageById("rewind-target") } returns AgentMessageEntity(
@@ -280,6 +286,62 @@ class GenerationSpeedViewModelTest {
         vm.executeRewindOption("rewind-target", RewindOption.RESTORE_CONVERSATION) { _, _ -> }.join()
         runCurrent()
         assertNull(vm.generationSpeed.value)
+    }
+
+    @Test
+    fun modelSelectionTargetsTheCapturedSessionAndNeverUnrelatedOrGrandchildReadings() = runTest(dispatcher) {
+        val other = "other-root"
+        val grandchild = "grandchild"
+        fixture.sessionRows[other] = fixture.sessionRows.getValue(PARENT).copy(id = other, title = "Other")
+        fixture.sessionRows[grandchild] = fixture.sessionRows.getValue(CHILD).copy(id = grandchild, parentId = CHILD)
+        val speed = AgentEvent.GenerationSpeed(23.0, estimated = false)
+        every { fixture.workflow.executeEvents(any(), any(), any()) } returns flow {
+            emit(speed)
+            emit(AgentEvent.Completed)
+        }
+        for (id in listOf(PARENT, CHILD, other, grandchild)) {
+            vm.executeAgentRequestStream("sample-$id", targetSessionId = id).join()
+        }
+        vm.selectSession(PARENT)
+        runCurrent()
+        vm.setSessionProviderModel("new-provider", "new-model")
+        vm.selectSession(other)
+        runCurrent()
+
+        assertEquals(speed, vm.generationSpeed.value)
+        assertEquals("model", fixture.sessionRows.getValue(other).model)
+        assertEquals("model", fixture.sessionRows.getValue(grandchild).model)
+        assertEquals("new-model", fixture.sessionRows.getValue(PARENT).model)
+        assertEquals("new-model", fixture.sessionRows.getValue(CHILD).model)
+        vm.selectSession(grandchild)
+        runCurrent()
+        assertEquals(speed, vm.generationSpeed.value)
+        vm.selectSession(CHILD)
+        runCurrent()
+        assertNull(vm.generationSpeed.value)
+        coVerify(exactly = 1) { fixture.sessions.updateProviderModelWithDirectChildren(PARENT, "new-provider", "new-model") }
+        coVerify(exactly = 0) { fixture.sessions.updateProviderModelWithDirectChildren(other, any(), any()) }
+    }
+
+    @Test
+    fun modelSelectionWhileRunningDoesNotChangeTheGlobalDefault() = runTest(dispatcher) {
+        val started = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        every { fixture.workflow.executeEvents(any(), any(), any()) } returns flow {
+            started.complete(Unit)
+            release.await()
+            emit(AgentEvent.Completed)
+        }
+        val run = vm.executeAgentRequestStream("running", targetSessionId = PARENT)
+        started.await()
+        vm.selectSession(PARENT)
+        runCurrent()
+        vm.setSessionProviderModel("new-provider", "new-model")
+        runCurrent()
+        coVerify(exactly = 0) { fixture.dependencies.defaultModelSettingsRepository.setDefaultModel(any(), any()) }
+        assertEquals("new-model", fixture.sessionRows.getValue(CHILD).model)
+        release.complete(Unit)
+        run.join()
     }
 
     @Test

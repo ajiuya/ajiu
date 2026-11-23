@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.os.Build
 import com.aicode.core.util.FileLogger
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -15,58 +16,122 @@ import kotlinx.coroutines.flow.asStateFlow
 import javax.inject.Inject
 import javax.inject.Singleton
 
-/**
- * 全局默认网络的可用性监听。
- *
- * 网络恢复或切换到另一条链路（Wi-Fi ⇄ 移动网络）时推送 [recovered]，供 SSH、同步与 Agent 即时重连——
- * 此前项目没有任何网络状态监听，断线恢复只能等各处轮询，后台状态下窗口可达数十秒。
- * 切换网络同样需要重连：旧 TCP 通道的 NAT 映射已失效，继续使用只会表现为「连不上」。
- */
 @Singleton
-class NetworkConnectivityObserver @Inject constructor(
-    @param:ApplicationContext private val context: Context
+class NetworkConnectivityObserver internal constructor(
+    private val context: Context,
+    private val status: NetworkStatusStore
 ) {
+    @Inject
+    constructor(@ApplicationContext context: Context) : this(context, NetworkStatus.store)
+
     private val connectivityManager by lazy {
         context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
     }
 
-    private val _isOnline = MutableStateFlow(currentlyOnline()).also { NetworkStatus.update(it.value) }
-    /** 当前默认网络是否具备互联网能力。 */
-    val isOnline: StateFlow<Boolean> = _isOnline.asStateFlow()
+    private val lock = Any()
+    private var currentNetwork: Network? = null
+    private var hasInternet: Boolean? = null
+    private var validated: Boolean? = null
+    private var blocked: Boolean? = null
+    private var transports: Set<NetworkStatus.Transport> = emptySet()
 
-    private val _recovered = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
-    /** 网络可用性发生变化（恢复 / 切换链路）时发射，消费方据此立即重建连接。 */
-    val recovered: SharedFlow<Unit> = _recovered.asSharedFlow()
+    private val mutableIsOnline = MutableStateFlow(status.states.value.isOnline)
+    val isOnline: StateFlow<Boolean> = mutableIsOnline.asStateFlow()
 
-    /** 上一次已知的默认网络，用于区分「同一网络重复回调」与「真的换网/恢复」。 */
-    private var lastNetwork: Network? = null
+    private val mutableRecovered = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+    val recovered: SharedFlow<Unit> = mutableRecovered.asSharedFlow()
 
     init {
+        synchronized(lock) {
+            runCatching {
+                currentNetwork = connectivityManager.activeNetwork
+                val capabilities = currentNetwork?.let(connectivityManager::getNetworkCapabilities)
+                if (capabilities != null) readCapabilities(capabilities)
+                publish(networkChanged = currentNetwork != null, notifyRecovery = false)
+            }.onFailure {
+                FileLogger.w(TAG, "读取初始默认网络状态失败", it)
+            }
+        }
         runCatching {
             connectivityManager.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
-                    val changed = network != lastNetwork
-                    lastNetwork = network
-                    _isOnline.value = true
-                    NetworkStatus.update(true)
-                    if (changed) {
-                        FileLogger.i(TAG, "默认网络可用，触发重连")
-                        _recovered.tryEmit(Unit)
+                    synchronized(lock) {
+                        if (network == currentNetwork) return
+                        currentNetwork = network
+                        clearDetails()
+                        publish(networkChanged = true)
+                    }
+                }
+
+                override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
+                    synchronized(lock) {
+                        if (network != currentNetwork) return
+                        readCapabilities(capabilities)
+                        publish()
+                    }
+                }
+
+                override fun onBlockedStatusChanged(network: Network, isBlocked: Boolean) {
+                    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+                    synchronized(lock) {
+                        if (network != currentNetwork) return
+                        blocked = isBlocked
+                        publish()
                     }
                 }
 
                 override fun onLost(network: Network) {
-                    _isOnline.value = currentlyOnline()
-                    NetworkStatus.update(_isOnline.value)
-                    FileLogger.w(TAG, "默认网络断开，isOnline=${_isOnline.value}")
+                    synchronized(lock) {
+                        if (network != currentNetwork) return
+                        currentNetwork = null
+                        clearDetails()
+                        publish()
+                    }
                 }
             })
-        }.onFailure { FileLogger.e(TAG, "注册网络回调失败", it) }
+        }.onFailure {
+            FileLogger.e(TAG, "注册默认网络回调失败，${status.states.value.diagnosticSummary()}", it)
+        }
     }
 
-    private fun currentlyOnline(): Boolean {
-        val caps = connectivityManager.getNetworkCapabilities(connectivityManager.activeNetwork)
-        return caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
+    private fun clearDetails() {
+        hasInternet = null
+        validated = null
+        blocked = null
+        transports = emptySet()
+    }
+
+    private fun readCapabilities(capabilities: NetworkCapabilities) {
+        hasInternet = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        validated = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+        transports = buildSet {
+            if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) add(NetworkStatus.Transport.WIFI)
+            if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) add(NetworkStatus.Transport.CELLULAR)
+            if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) add(NetworkStatus.Transport.ETHERNET)
+            if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) add(NetworkStatus.Transport.VPN)
+            if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_BLUETOOTH)) add(NetworkStatus.Transport.BLUETOOTH)
+            if (isEmpty()) add(NetworkStatus.Transport.OTHER)
+        }
+    }
+
+    private fun publish(networkChanged: Boolean = false, notifyRecovery: Boolean = true) {
+        val (previous, snapshot) = status.updateNetwork(
+            online = currentNetwork != null && hasInternet == true && blocked != true,
+            networkChanged = networkChanged,
+            hasInternet = hasInternet,
+            validated = validated,
+            blocked = blocked,
+            transports = transports
+        )
+        mutableIsOnline.value = snapshot.isOnline
+        if (snapshot == previous) return
+        val summary = snapshot.diagnosticSummary()
+        if (notifyRecovery && snapshot.recoveryVersion > previous.recoveryVersion) {
+            FileLogger.i(TAG, "默认网络恢复或切换，$summary")
+            mutableRecovered.tryEmit(Unit)
+        } else {
+            FileLogger.d(TAG, "默认网络状态变化，$summary")
+        }
     }
 
     private companion object {

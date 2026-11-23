@@ -53,7 +53,9 @@
     <string name="project_settings_capacity_details">查看精确明细</string>
     <string name="project_settings_record_options">记录选项</string>
     <string name="project_settings_capacity_summary">活动 %1$d / %2$d · %3$s / %4$s</string>
-    <string name="memory_a_global">全局</string>
+    <string name="memory_long_term_title">长期记忆</string>
+    <string name="memory_long_term_hint">保存稳定偏好与项目约定，AI 需要时再读取正文</string>
+    <string name="memory_a_global">个人</string>
     <string name="memory_a_current_project">当前项目</string>
     <string name="memory_a_search">搜索名称、描述或预览</string>
     <string name="memory_a_count">%1$d 条记忆</string>
@@ -61,8 +63,6 @@
     <string name="memory_a_no_results">此范围内没有符合条件的记忆</string>
     <string name="memory_a_more">更多</string>
     <string name="memory_a_delete">删除记忆</string>
-    <string name="memory_a_progress_title">项目进度</string>
-    <string name="memory_a_progress_hint">独立查看，不混入记忆列表</string>
     <string name="plugin_title">插件</string>
     <string name="plugin_details">插件详情</string>
     <string name="plugin_center_mine">我的插件</string>
@@ -641,7 +641,7 @@
     <string name="provider_preset_empty">未找到匹配的预设</string>
     <string name="provider_register_now">立即注册</string>
     <string name="settings_keepalive_title">后台运行保活</string>
-    <string name="settings_keepalive_subtitle">显示前台通知，防止后台被杀</string>
+    <string name="settings_keepalive_subtitle">通过前台保护降低后台任务被中断的风险</string>
     <string name="settings_screen_on_title">屏幕常亮</string>
     <string name="settings_screen_on_subtitle">App 在前台时不自动息屏</string>
     <string name="settings_network_guide_title">后台断网排查</string>
@@ -669,6 +669,10 @@
     <string name="chat_notification_background_task_finished_with_exit">后台任务 %1$s 已结束（退出码 %2$s）</string>
     <string name="chat_notification_background_task_finished">后台任务 %1$s 已结束</string>
     <string name="chat_notification_background_task_default_name">未命名终端任务</string>
+    <string name="chat_notification_agent_message">%1$s发来一条消息</string>
+    <string name="chat_notification_agent_completed">已执行完成</string>
+    <string name="chat_notification_agent_failed">已执行失败</string>
+    <string name="chat_notification_agent_stopped">已停止</string>
     <string name="notification_channel_terminal_service">终端服务</string>
     <string name="notification_channel_terminal_service_desc">后台终端任务通知</string>
     <string name="notification_keepalive_persistent_sessions">后台保活 · 终端任务: %1$d</string>
@@ -1310,6 +1314,9 @@
     <string name="retry_error_server">服务端错误</string>
     <string name="retry_error_network">网络连接断开</string>
     <string name="retry_error_timeout">连接超时</string>
+    <string name="retry_error_first_content_timeout">首内容等待超时</string>
+    <string name="retry_error_stream_idle_timeout">响应数据等待超时</string>
+    <string name="retry_error_stream_interrupted">响应流意外结束</string>
     <string name="retry_error_connection_refused">连接被拒绝</string>
     <string name="retry_error_dns_failed">DNS 解析失败</string>
     <string name="retry_error_connection_reset">连接中断</string>
@@ -2147,6 +2154,19 @@
 
     <!-- Terminal -->
     <string name="terminal_title">终端</string>
+    <string name="terminal_history_title">任务历史</string>
+    <string name="terminal_history_empty">当前本地工作区暂无已保存任务</string>
+    <string name="terminal_history_loading">正在读取已保存任务</string>
+    <string name="terminal_history_unavailable">任务历史暂不可用，请核对当前容器与工作区</string>
+    <string name="terminal_history_storage_error">任务历史保存或读取失败，最后输出可能尚未保存</string>
+    <string name="terminal_history_running">运行中 · 已保存快照</string>
+    <string name="terminal_history_finished">已结束 · 退出码 %1$d</string>
+    <string name="terminal_history_unknown">结果未知 · 需要核验</string>
+    <string name="terminal_history_boundary">历史只供查看，不会恢复终端、重新执行命令或恢复旧审批。未记录退出码不代表任务成功、失败或仍在运行。</string>
+    <string name="terminal_history_output_empty">尚无已保存输出</string>
+    <string name="terminal_history_snapshot_note">此处是最后成功保存的有界终端快照，可能不包含最后尚未写盘的输出。</string>
+    <string name="terminal_history_times">开始：%1$s\n更新：%2$s</string>
+    <string name="terminal_history_id">历史 ID：%1$s</string>
     <string name="terminal_prepare_error_unknown">未知错误</string>
     <string name="terminal_start_failed">无法启动终端：\n%1$s</string>
     <string name="terminal_retry">重试</string>

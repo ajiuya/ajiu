@@ -7,8 +7,8 @@
     <string name="subagent_group_compact_completed">done</string>
     <string name="subagent_group_compact_waiting">waiting</string>
     <string name="subagent_group_member_status">%1$s: %2$s</string>
-    <string name="subagent_group_working_count">Working %1$d</string>
-    <string name="subagent_group_completed_count">Completed %1$d</string>
+    <string name="subagent_group_working_count">Working agents %1$d</string>
+    <string name="subagent_group_completed_count">Completed agents %1$d</string>
     <string name="subagent_group_confirmation_count">Approval needed %1$d</string>
     <string name="subagent_group_failed_count">Failed %1$d</string>
     <string name="subagent_group_interrupted_count">Interrupted %1$d</string>

@@ -78,7 +78,8 @@ class LinuxContainerEngine @Inject constructor(
     private val containerInstaller: ContainerInstaller,
     private val containerOsDetector: ContainerOsDetector,
     private val containerSettingsRepository: com.aicode.feature.settings.data.repository.ContainerSettingsRepository,
-    private val pathHomeResolver: com.aicode.feature.workspace.domain.PathHomeResolver
+    private val pathHomeResolver: com.aicode.feature.workspace.domain.PathHomeResolver,
+    private val mobileBuildConfigurator: MobileBuildConfigurator
 ) : CommandEngine {
     /** 容器初始化的实时进度，供所有入口（终端页/AI/后台终端/MCP）共享同一份状态。 */
     private val _initProgress = MutableStateFlow<ContainerInitState>(ContainerInitState.Idle)
@@ -736,6 +737,8 @@ class LinuxContainerEngine @Inject constructor(
     private fun buildBaseProotArgv(projectPath: String?, profile: ContainerProfile): MutableList<String> {
         val execution = WorkspaceExecutionContext.current()
         execution?.requireMode(ExecutionMode.LOCAL_PROOT)
+        runCatching { mobileBuildConfigurator.prepare(profile) }
+            .onFailure { FileLogger.w(TAG, "同步手机构建配置失败", it) }
         val rootfs = execution?.localMapping?.rootfsRoot?.absolutePath ?: containerInstaller.rootfsDirFor(profile).absolutePath
         val prootBin = containerInstaller.prootBin.absolutePath
         if (!containerInstaller.prootBin.exists()) {

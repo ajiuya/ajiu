@@ -23,7 +23,6 @@ import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
-import java.io.IOException
 
 class GeminiAdapter @Inject constructor(
     private val api: GeminiApi
@@ -252,9 +251,8 @@ class GeminiAdapter @Inject constructor(
                         val reader = rb.charStream().buffered()
                         while (true) {
                             coroutineContext.ensureActive()
-                            val line = reader.readLine()
-                                ?: throw IOException("SSE 流被中断（疑似网络断开）")
-                            idleWatchdog.touch()
+                            val line = idleWatchdog.read { reader.readLine() }
+                                ?: throw UnexpectedStreamEndException("Gemini stream ended without finishReason")
                             if (!line.startsWith("data:")) continue
                             val data = line.removePrefix("data:").trim()
                             if (data.isEmpty()) continue
@@ -509,9 +507,8 @@ class GeminiAdapter @Inject constructor(
                             val reader = rb.charStream().buffered()
                             while (!acc.terminated) {
                                 coroutineContext.ensureActive()
-                                val line = reader.readLine()
-                                    ?: throw IOException("SSE 流被中断：interaction 未到终态（疑似网络断开）")
-                                idleWatchdog.touch()
+                                val line = idleWatchdog.read { reader.readLine() }
+                                    ?: throw UnexpectedStreamEndException("Gemini interaction stream ended without a terminal event")
                                 if (!line.startsWith("data:")) continue
                                 val data = line.removePrefix("data:").trim()
                                 if (data.isEmpty()) continue
@@ -752,15 +749,18 @@ class GeminiAdapter @Inject constructor(
                     if (message.content.isNotEmpty()) {
                         parts.add(mapOf("text" to message.content))
                     }
+                    message.images.forEach { image ->
+                        parts.add(image.toGeminiInlineDataPart())
+                    }
                     for (toolCall in message.toolCalls) {
-                        parts.add(
-                            mapOf(
-                                "functionCall" to mapOf(
-                                    "name" to toolCall.name,
-                                    "args" to toolCall.arguments
-                                )
-                            )
+                        val functionCall = mutableMapOf<String, Any>(
+                            "name" to toolCall.name,
+                            "args" to toolCall.arguments
                         )
+                        if (toolCall.id.isNotBlank() && toolCall.id != toolCall.name) {
+                            functionCall["id"] = toolCall.id
+                        }
+                        parts.add(mapOf("functionCall" to functionCall))
                     }
                     if (parts.isNotEmpty()) {
                         result.add(

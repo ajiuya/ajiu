@@ -7,8 +7,8 @@
     <string name="subagent_group_compact_completed">完成</string>
     <string name="subagent_group_compact_waiting">待确认</string>
     <string name="subagent_group_member_status">%1$s：%2$s</string>
-    <string name="subagent_group_working_count">工作中 %1$d</string>
-    <string name="subagent_group_completed_count">已完成 %1$d</string>
+    <string name="subagent_group_working_count">工作代理 %1$d</string>
+    <string name="subagent_group_completed_count">已完成代理 %1$d</string>
     <string name="subagent_group_confirmation_count">待确认 %1$d</string>
     <string name="subagent_group_failed_count">失败 %1$d</string>
     <string name="subagent_group_interrupted_count">已中断 %1$d</string>
