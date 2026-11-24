@@ -380,12 +380,14 @@ class AIAgentViewModel @Inject constructor(
         scopedRecovery, agentRunManager.recoveryBusySessions, agentRunManager.agentStates,
         agentRunManager.compactingSessions, agentRunManager.runningCommandSessions
     ) { snapshot, preparing, states, compacting, commands ->
-        val sessions = snapshot.batch.map { it.target.sessionId }
+        val runningSessions = snapshot.items.map { it.target.sessionId }.filterTo(mutableSetOf()) { sid ->
+            sid in compacting || sid in commands || states[sid] == AgentUIState.Loading || states[sid] == AgentUIState.Streaming
+        }
+        val items = snapshot.items.filterNot { it.target.sessionId in runningSessions }
         snapshot.copy(
-            busy = sessions.any { it in preparing },
-            runningSessions = sessions.filterTo(mutableSetOf()) { sid ->
-                sid in compacting || sid in commands || states[sid] == AgentUIState.Loading || states[sid] == AgentUIState.Streaming
-            }
+            items = items,
+            busy = items.distinctBy { it.target.sessionId }.any { it.target.sessionId in preparing },
+            runningSessions = runningSessions
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), RecoveryBubbleUi())
 
@@ -1151,7 +1153,13 @@ class AIAgentViewModel @Inject constructor(
     internal fun abandonRecovery(snapshot: RecoveryBubbleUi) {
         val scope = snapshot.scope ?: return
         if (snapshot.busy || scope.sessionId != _currentSessionId.value || scope.workspacePath != _currentWorkspace.value) return
-        agentRunManager.abandonRecovery(scope, snapshot.batch.map { it.target })
+        val targets = snapshot.batch.map { it.target }.filterNot { target ->
+            agentRunManager.isSessionRunning(target.sessionId) ||
+                target.sessionId in agentRunManager.runningCommandSessions.value ||
+                target.sessionId in agentRunManager.compactingSessions.value ||
+                target.sessionId in agentRunManager.recoveryBusySessions.value
+        }
+        agentRunManager.abandonRecovery(scope, targets)
     }
 
     fun enqueueAgentRequest(

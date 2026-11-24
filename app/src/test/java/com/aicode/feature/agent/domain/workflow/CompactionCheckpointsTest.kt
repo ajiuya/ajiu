@@ -2,6 +2,7 @@ package com.aicode.feature.agent.domain.workflow
 
 import com.aicode.feature.agent.domain.provider.AIResponse
 import com.aicode.feature.agent.domain.provider.AIStreamChunk
+import com.aicode.feature.agent.domain.provider.StreamApiException
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -273,6 +274,36 @@ class CompactionCheckpointsTest {
         failure("compaction_io") { session(work).call(records = records, stream = { error("Exhausted block must not restart") }) }
         assertEquals(2, records.size)
         assertEquals(2, work.attempts)
+    }
+
+    @Test fun upstreamOutcomeUnknownKeepsCompletedPrefixAndCannotResetFailedBlockBudget() = runTest {
+        val work = CompactionCheckpoints(now = { testScheduler.currentTime }).open("s", "f")
+        val records = mutableListOf<CompactionStreamAttempt>()
+        val first = session(work)
+        assertEquals("PREFIX", first.call(request = "prefix", records = records, stream = { complete("PREFIX") }))
+        first.commitBlock()
+        failure("compaction_upstream_interrupted") {
+            first.call(request = "unfinished", records = records, stream = { flow {
+                emit(AIStreamChunk.TextDelta("REJECTED_PARTIAL"))
+                throw StreamApiException("upstream_ws_outcome_unknown", "private upstream detail")
+            } })
+        }
+        first.commitBlock()
+        assertEquals(1, work.completedCount)
+        assertEquals("PREFIX", work.block(0)!!.summary)
+        assertEquals(2, work.failure!!.retryable)
+        assertEquals("compaction_upstream_interrupted", work.failure!!.code)
+        val resumed = session(work)
+        assertEquals("PREFIX", resumed.call(request = "prefix", records = records,
+            stream = { error("Committed prefix must not be requested again") }))
+        failure("compaction_upstream_interrupted") {
+            resumed.call(request = "unfinished", records = records,
+                stream = { error("Exhausted block must not restart") })
+        }
+        assertEquals(3, work.attempts)
+        assertEquals(3, records.size)
+        assertEquals(1, work.completedCount)
+        assertFalse(work.block(0)!!.summary.contains("REJECTED_PARTIAL"))
     }
 
     @Test fun exhaustedTruncationBudgetIsNotResetAcrossResume() = runTest {

@@ -11,6 +11,8 @@ Entries marked with a version (e.g. "since 1.11.0") were introduced in that vers
 | Feature | Description |
 | --- | --- |
 | Chat & workspace | Title bar, sidebar, toolbar, message queue, workspace switching |
+| Context compression | Known upstream connection interruptions are retried within the existing budget: at most two ordinary attempts per block, 32 model calls and 35 minutes per compression. Partial or unconfirmed summaries never replace the original history. |
+| Confirmed recovery | Continue accepts the earliest pending request in each idle session. Pending items for running sessions are temporarily hidden; the input bubble disappears when no other items need a decision. Unaccepted requests remain stored and reappear when idle or interrupted. Discard only affects the visible batch, not running tasks or hidden later requests. |
 | Checkpoints & undo | Automatic snapshot before AI edits, one-tap safe rollback |
 | Terminal | Multi-tab sessions, auxiliary key bar, color and font settings; background task notices show the terminal tab title and exit code without command paths |
 | File browsing & code editing | Indented tree view, syntax highlighting, built-in code editor (since 1.11.0) |

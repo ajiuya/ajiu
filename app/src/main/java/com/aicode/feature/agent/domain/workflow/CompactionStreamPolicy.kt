@@ -58,6 +58,7 @@ internal object CompactionStreamErrors {
                     CompactionStreamException("compaction_http_429", true)
                 "server_error", "internal_error", "server_is_overloaded", "overloaded" ->
                     CompactionStreamException("compaction_http_503", true)
+                "upstream_ws_outcome_unknown" -> CompactionStreamException("compaction_upstream_interrupted", true)
                 else -> CompactionStreamException("compaction_invalid_response")
             }
         }

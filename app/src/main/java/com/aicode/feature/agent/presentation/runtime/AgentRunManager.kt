@@ -546,6 +546,7 @@ class AgentRunManager internal constructor(
         code == "compaction_http_429" -> R.string.compaction_error_rate_limit
         code.startsWith("compaction_http_") -> R.string.compaction_error_service
         code == "compaction_io" -> R.string.compaction_error_network
+        code == "compaction_upstream_interrupted" -> R.string.compaction_error_upstream_interrupted
         code == "compaction_truncated" -> R.string.compaction_error_truncated
         code in setOf("compaction_attempt_limit", "compaction_block_limit", "compaction_budget_unreachable") -> R.string.compaction_error_budget
         code == "compaction_busy" -> R.string.compaction_error_busy

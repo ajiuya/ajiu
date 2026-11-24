@@ -510,7 +510,8 @@ class CompactionViewModelTest {
             "compaction_first_chunk_timeout" to R.string.compaction_error_first_content_timeout,
             "compaction_idle_timeout" to R.string.compaction_error_idle_timeout,
             "compaction_no_final" to R.string.compaction_error_missing_terminal,
-            "compaction_missing_stop" to R.string.compaction_error_missing_terminal
+            "compaction_missing_stop" to R.string.compaction_error_missing_terminal,
+            "compaction_upstream_interrupted" to R.string.compaction_error_upstream_interrupted
         )
         for ((code, resource) in cases) {
             val manual = startManual(PARENT)
@@ -523,6 +524,21 @@ class CompactionViewModelTest {
             assertHidden(PARENT)
             persisted.clear()
         }
+    }
+
+    @Test
+    fun automaticUpstreamInterruptionKeepsUsageAndReportsNoCompressionSuccess() = runTest(dispatcher, timeout = 15.seconds) {
+        val automatic = startAutomatic(PARENT)
+        automatic.send(USAGE)
+        automatic.send(AgentEvent.CompactionStarted(18_000, ATTEMPT))
+        automatic.send(progress(37))
+        automatic.send(AgentEvent.CompactionFailed("compaction_upstream_interrupted", ATTEMPT))
+        automatic.send(AgentEvent.CompactionFinished(ATTEMPT))
+        assertHidden(PARENT)
+        assertEquals(USAGE, vm.contextUsages.value[PARENT])
+        assertEquals(listOf(safeFailure().copy(content = context.getString(R.string.compaction_error_upstream_interrupted))), persisted)
+        assertFalse(PARENT in vm.completedSessions.value)
+        cancel(automatic.owner)
     }
 
     @Test

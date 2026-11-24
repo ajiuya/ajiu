@@ -3,10 +3,12 @@ package com.aicode.feature.agent.presentation
 import android.app.Application
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
+import com.aicode.feature.agent.data.local.dao.CallSummary
 import com.aicode.feature.agent.data.local.dao.RecoveryDaoFixture
 import com.aicode.feature.agent.data.local.database.AgentDatabase
 import com.aicode.feature.agent.data.local.entity.AgentMessageEntity
 import com.aicode.feature.agent.data.local.entity.ChatSessionEntity
+import com.aicode.feature.agent.domain.command.SlashCommandContext
 import com.aicode.feature.agent.domain.memory.ProjectMemoryCapture
 import com.aicode.feature.agent.domain.memory.ProjectMemoryIdentity
 import com.aicode.feature.agent.domain.model.AgentContext
@@ -152,6 +154,12 @@ class RecoveryViewModelTest {
         assertEquals("Request queued", ledger.messages.getValue(request.inputMessageId).content)
         assertEquals(setOf(request.inputMessageId), ledger.messages.keys)
         assertNotNull(run.context.recoveryRunId)
+        val hidden = vm.recoveryBubble.first { it.scope == bubble.scope && it.items.isEmpty() }
+        assertTrue(hidden.batch.isEmpty())
+        assertTrue(hidden.continueTargets.isEmpty())
+        assertFalse(hidden.busy)
+        assertEquals("RUNNING", ledger.requests.getValue(request.id).status)
+        assertTrue(run.owner.isActive)
         complete(run)
         assertEquals("COMPLETED", ledger.requests.getValue(request.id).status)
         assertEquals(1, backendCalls.size)
@@ -268,6 +276,10 @@ class RecoveryViewModelTest {
         loadingAttachments.await()
         runCurrent()
         assertTrue(vm.recovering.value)
+        val preparing = vm.recoveryBubble.first { it.scope == bubble.scope && it.busy }
+        assertEquals(bubble.items, preparing.items)
+        assertEquals(bubble.continueTargets, preparing.continueTargets)
+        vm.abandonRecovery(preparing)
         vm.continueRecovery(bubble)
         runCurrent()
         assertEquals(2, ledger.runs.size)
@@ -291,6 +303,138 @@ class RecoveryViewModelTest {
         assertEquals(1, backendCalls.size)
         assertFalse(vm.recovering.value)
         verify(exactly = 1) { fixture.workflow.executeEvents(any(), any(), any()) }
+    }
+
+    @Test
+    fun loadingAndStreamingHideOnlyTheirSessionWithoutDisablingIdleChildDuringPreparation() = runTest(dispatcher, timeout = 15.seconds) {
+        val parent = seedPending("preparing-parent")
+        val parentLater = seedPending("preparing-parent-later")
+        val initial = snapshot(parent.id, parentLater.id)
+        val loadingAttachments = CompletableDeferred<Unit>()
+        val releaseAttachments = CompletableDeferred<Unit>()
+        coEvery { fixture.persistence.loadAttachmentImages(any()) } coAnswers {
+            loadingAttachments.complete(Unit)
+            releaseAttachments.await()
+            emptyList()
+        }
+        vm.continueRecovery(initial)
+        loadingAttachments.await()
+        val child = seedPending("idle-child", CHILD)
+        val preparing = snapshot(parentLater.id, child.id)
+        assertTrue(preparing.busy)
+        assertTrue(vm.recovering.value)
+        val stored = ledger.requests.toMap()
+        val writes = ledger.writes.toList()
+
+        for (state in listOf(AgentUIState.Loading, AgentUIState.Streaming)) {
+            fixture.agentStates.value += PARENT to state
+            runCurrent()
+            val visible = vm.recoveryBubble.first { bubble ->
+                bubble.scope == initial.scope && bubble.items.map { it.target.requestId } == listOf(child.id)
+            }
+            assertEquals(1, visible.items.size)
+            assertEquals(listOf(child.id), visible.batch.map { it.target.requestId })
+            assertEquals(visible.batch.map { it.target }, visible.continueTargets)
+            assertEquals(setOf(PARENT), visible.runningSessions)
+            assertFalse(visible.busy)
+            assertTrue(vm.recovering.value)
+            assertEquals(stored, ledger.requests)
+            assertEquals(writes, ledger.writes)
+        }
+
+        fixture.agentStates.value += PARENT to AgentUIState.Error("Preparation is still pending")
+        runCurrent()
+        val visibleAgain = vm.recoveryBubble.first { bubble ->
+            bubble.scope == initial.scope && bubble.items == preparing.items
+        }
+        assertTrue(visibleAgain.busy)
+        assertTrue(visibleAgain.runningSessions.isEmpty())
+        releaseAttachments.complete(Unit)
+        val run = backendRuns.receive()
+        assertRecoveryRun(parent, run)
+        val childOnly = snapshot(child.id)
+        assertFalse(childOnly.busy)
+        assertEquals(childOnly.batch.map { it.target }, childOnly.continueTargets)
+        complete(run)
+        val idle = snapshot(parentLater.id, child.id)
+        assertFalse(idle.busy)
+        assertTrue(idle.runningSessions.isEmpty())
+        assertEquals("AWAITING_CONFIRMATION", ledger.requests.getValue(parentLater.id).status)
+        assertEquals("AWAITING_CONFIRMATION", ledger.requests.getValue(child.id).status)
+        assertEquals(1, backendCalls.size)
+    }
+
+    @Test
+    fun failedPreparationRestoresTheClaimedRequestAndItsLaterPendingItem() = runTest(dispatcher, timeout = 15.seconds) {
+        val interrupted = seedInterrupted("handoff-failed")
+        val later = seedPending("handoff-later")
+        val bubble = snapshot(interrupted.request.id, later.id)
+        val loadingAttachments = CompletableDeferred<Unit>()
+        val releaseAttachments = CompletableDeferred<Unit>()
+        coEvery { fixture.persistence.loadAttachmentImages(any()) } coAnswers {
+            loadingAttachments.complete(Unit)
+            releaseAttachments.await()
+            throw IllegalStateException("Attachment unavailable")
+        }
+
+        vm.continueRecovery(bubble)
+        loadingAttachments.await()
+        val claimed = requireNotNull(ledger.requests.getValue(interrupted.request.id).activeRunId)
+        assertNotEquals(interrupted.run.id, claimed)
+        val preparing = vm.recoveryBubble.first { it.scope == bubble.scope && it.busy }
+        assertEquals(bubble.items, preparing.items)
+        assertTrue(backendCalls.isEmpty())
+        val pendingOnly = snapshot(later.id)
+        assertTrue(pendingOnly.busy)
+        assertEquals("RUNNING", ledger.requests.getValue(interrupted.request.id).status)
+
+        releaseAttachments.complete(Unit)
+        vm.recovering.first { !it }
+        ledger.refreshPendingScopeRows()
+        val restored = vm.recoveryBubble.first { current ->
+            current.scope == bubble.scope && !current.busy &&
+                current.items.map { it.target.requestId } == listOf(interrupted.request.id, later.id) &&
+                current.items.first().target.activeRunId == claimed
+        }
+        assertEquals("INTERRUPTED", ledger.requests.getValue(interrupted.request.id).status)
+        assertEquals("INTERRUPTED", ledger.runs.getValue(claimed).status)
+        assertEquals("AWAITING_CONFIRMATION", ledger.requests.getValue(later.id).status)
+        assertEquals(listOf(interrupted.request.id), restored.batch.map { it.target.requestId })
+        assertEquals(restored.batch.map { it.target }, restored.continueTargets)
+        assertTrue(restored.runningSessions.isEmpty())
+        assertTrue(vm.agentStates.value[PARENT] is AgentUIState.Error)
+        assertTrue(fixture.jobs.isEmpty())
+        assertTrue(backendCalls.isEmpty())
+        verify(exactly = 0) { fixture.workflow.executeEvents(any(), any(), any()) }
+    }
+
+    @Test
+    fun failedConfirmedRunRestoresItsPendingItemsWithoutStartingTheLaterRequest() = runTest(dispatcher, timeout = 15.seconds) {
+        val interrupted = seedInterrupted("failed-confirmed")
+        val later = seedPending("after-failure")
+        vm.continueRecovery(snapshot(interrupted.request.id, later.id))
+        val run = backendRuns.receive()
+        val activeRunId = requireNotNull(run.context.recoveryRunId)
+        val hidden = snapshot()
+        assertEquals(setOf(PARENT), hidden.runningSessions)
+        assertEquals("RUNNING", ledger.requests.getValue(interrupted.request.id).status)
+        assertEquals("AWAITING_CONFIRMATION", ledger.requests.getValue(later.id).status)
+
+        run.send(AgentEvent.Failed("Network unavailable"))
+        run.events.close()
+        run.owner.join()
+        runCurrent()
+        val restored = snapshot(interrupted.request.id, later.id)
+        assertFalse(restored.busy)
+        assertTrue(restored.runningSessions.isEmpty())
+        assertEquals(activeRunId, restored.items.first().target.activeRunId)
+        assertEquals(listOf(interrupted.request.id), restored.batch.map { it.target.requestId })
+        assertEquals(restored.batch.map { it.target }, restored.continueTargets)
+        assertEquals("FAILED", ledger.requests.getValue(interrupted.request.id).status)
+        assertEquals("AWAITING_CONFIRMATION", ledger.requests.getValue(later.id).status)
+        assertTrue(vm.agentStates.value[PARENT] is AgentUIState.Error)
+        assertEquals(1, backendCalls.size)
+        assertTrue(fixture.jobs.isEmpty())
     }
 
     @Test
@@ -588,10 +732,20 @@ class RecoveryViewModelTest {
         assertEquals("AWAITING_CONFIRMATION", ledger.requests.getValue(childLater.id).status)
         assertEquals(setOf(parentFirst.id, childFirst.id), ledger.runs.values.map { it.requestId }.toSet())
         assertEquals(2, backendCalls.size)
+        val hidden = snapshot()
+        assertTrue(hidden.items.isEmpty())
+        assertTrue(hidden.batch.isEmpty())
+        assertTrue(hidden.continueTargets.isEmpty())
+        assertEquals(setOf(PARENT, CHILD), hidden.runningSessions)
+        assertFalse(hidden.busy)
 
         complete(parentRun)
-        val next = snapshot(parentLater.id, childLater.id)
+        val next = snapshot(parentLater.id)
+        assertEquals(1, next.items.size)
+        assertEquals(listOf(parentLater.id), next.batch.map { it.target.requestId })
+        assertEquals(next.batch.map { it.target }, next.continueTargets)
         assertEquals(setOf(CHILD), next.runningSessions)
+        assertEquals("AWAITING_CONFIRMATION", ledger.requests.getValue(childLater.id).status)
         assertEquals(2, backendCalls.size)
         vm.continueRecovery(next)
         val secondParentRun = backendRuns.receive()
@@ -602,7 +756,111 @@ class RecoveryViewModelTest {
         assertEquals("RUNNING", ledger.requests.getValue(childFirst.id).status)
         assertEquals("AWAITING_CONFIRMATION", ledger.requests.getValue(childLater.id).status)
         assertEquals(3, backendCalls.size)
-        childRun.owner.cancelAndJoin()
+
+        complete(childRun)
+        val remaining = snapshot(childLater.id)
+        assertEquals(listOf(childLater.id), remaining.batch.map { it.target.requestId })
+        assertEquals(remaining.batch.map { it.target }, remaining.continueTargets)
+        assertTrue(remaining.runningSessions.isEmpty())
+        assertFalse(remaining.busy)
+        assertEquals("AWAITING_CONFIRMATION", ledger.requests.getValue(childLater.id).status)
+        assertEquals(setOf(parentFirst.id, parentLater.id, childFirst.id), ledger.runs.values.map { it.requestId }.toSet())
+        assertEquals(3, backendCalls.size)
+    }
+
+    @Test
+    fun manualCompactionTemporarilyHidesOnlyItsSessionsPendingItems() = runTest(dispatcher, timeout = 15.seconds) {
+        val parent = seedPending("compacting-parent")
+        val stale = snapshot(parent.id)
+        val child = seedPending("compacting-child", CHILD)
+        val initial = snapshot(parent.id, child.id)
+        val compacting = CompletableDeferred<Unit>()
+        val releaseCompaction = CompletableDeferred<Unit>()
+        coEvery { fixture.workflow.compactSession(any(), any(), any(), any()) } coAnswers {
+            compacting.complete(Unit)
+            releaseCompaction.await()
+            true
+        }
+        val stored = ledger.requests.toMap()
+
+        vm.compactCurrentSession()
+        compacting.await()
+        val owner = fixture.jobs.getValue(PARENT)
+        val visible = snapshot(child.id)
+        assertEquals(listOf(child.id), visible.batch.map { it.target.requestId })
+        assertEquals(visible.batch.map { it.target }, visible.continueTargets)
+        assertEquals(setOf(PARENT), visible.runningSessions)
+        assertFalse(visible.busy)
+        assertFalse(vm.agentStates.value[PARENT] == AgentUIState.Loading)
+        assertFalse(vm.agentStates.value[PARENT] == AgentUIState.Streaming)
+        assertEquals(stored, ledger.requests)
+        assertTrue(backendCalls.isEmpty())
+        val writes = ledger.writes.toList()
+        vm.abandonRecovery(stale)
+        runCurrent()
+        assertEquals(writes, ledger.writes)
+        assertEquals(stored, ledger.requests)
+        assertTrue(owner.isActive)
+
+        releaseCompaction.complete(Unit)
+        owner.join()
+        runCurrent()
+        val restored = snapshot(parent.id, child.id)
+        assertEquals(initial.items, restored.items)
+        assertEquals(initial.continueTargets, restored.continueTargets)
+        assertTrue(restored.runningSessions.isEmpty())
+        assertFalse(restored.busy)
+        assertEquals(stored, ledger.requests)
+        assertTrue(fixture.jobs.isEmpty())
+    }
+
+    @Test
+    fun runningCommandHidesItsPendingItemsAndAbandonTargetsOnlyTheVisibleChild() = runTest(dispatcher, timeout = 15.seconds) {
+        val parent = seedPending("command-parent")
+        val stale = snapshot(parent.id)
+        val child = seedPending("command-child", CHILD)
+        snapshot(parent.id, child.id)
+        val loadingUsage = CompletableDeferred<Unit>()
+        val releaseUsage = CompletableDeferred<Unit>()
+        every { fixture.dependencies.llmCallRecordDao.getSummary(any()) } returns flow {
+            loadingUsage.complete(Unit)
+            releaseUsage.await()
+            emit(CallSummary(0, 0, 0, 0, 0, 0, null, null))
+        }
+        val handler = fixture.installCommand("/usage")
+        every { handler.execute(any(), any()) } answers { firstArg<SlashCommandContext>().showUsage() }
+
+        val command = vm.executeAgentRequestStream("/usage", projectRoot = WORKSPACE, targetSessionId = PARENT)
+        loadingUsage.await()
+        val visible = snapshot(child.id)
+        assertEquals(listOf(child.id), visible.batch.map { it.target.requestId })
+        assertEquals(visible.batch.map { it.target }, visible.continueTargets)
+        assertEquals(setOf(PARENT), visible.runningSessions)
+        assertFalse(visible.busy)
+        assertFalse(vm.agentStates.value[PARENT] == AgentUIState.Loading)
+        assertFalse(vm.agentStates.value[PARENT] == AgentUIState.Streaming)
+        val writes = ledger.writes.toList()
+        vm.abandonRecovery(stale)
+        runCurrent()
+        assertEquals(writes, ledger.writes)
+        assertEquals("AWAITING_CONFIRMATION", ledger.requests.getValue(parent.id).status)
+        vm.abandonRecovery(visible)
+        runCurrent()
+        vm.recovering.first { !it }
+        assertEquals("ABANDONED", ledger.requests.getValue(child.id).status)
+        assertEquals("AWAITING_CONFIRMATION", ledger.requests.getValue(parent.id).status)
+        assertTrue(command.isActive)
+        assertTrue(backendCalls.isEmpty())
+
+        releaseUsage.complete(Unit)
+        command.join()
+        runCurrent()
+        val restored = snapshot(parent.id)
+        assertEquals(listOf(parent.id), restored.batch.map { it.target.requestId })
+        assertEquals(restored.batch.map { it.target }, restored.continueTargets)
+        assertTrue(restored.runningSessions.isEmpty())
+        assertFalse(restored.busy)
+        assertEquals("AWAITING_CONFIRMATION", ledger.requests.getValue(parent.id).status)
     }
 
     @Test
@@ -635,17 +893,21 @@ class RecoveryViewModelTest {
         val running = backendRuns.receive()
         val runId = requireNotNull(running.context.recoveryRunId)
         val runningRequest = ledger.runs.getValue(runId).requestId
-        val parent = seedPending("abandon-parent")
+        val parent = seedPending("keep-pending-parent")
         val parentLater = seedPending("keep-later-parent")
         val child = seedPending("abandon-child", CHILD, fixture.projectIdentity.copy(profileId = "different-profile"))
         val childLater = seedPending("keep-later-child", CHILD)
         val other = seedPending("keep-other", OTHER)
         val nested = seedPending("keep-grandchild", grandchild.id)
         val foreign = seedPending("keep-foreign", foreignChild.id)
-        val bubble = snapshot(parent.id, parentLater.id, child.id, childLater.id)
-        assertTrue(bubble.items.first().environmentMatches)
+        val bubble = snapshot(child.id, childLater.id)
+        assertEquals(2, bubble.items.size)
+        assertEquals(listOf(child.id), bubble.batch.map { it.target.requestId })
+        assertTrue(bubble.continueTargets.isEmpty())
+        assertEquals(setOf(PARENT), bubble.runningSessions)
+        assertFalse(bubble.busy)
         assertFalse(bubble.items.single { it.target.requestId == child.id }.environmentMatches)
-        val unaffected = listOf(runningRequest, parentLater.id, childLater.id, other.id, nested.id, foreign.id)
+        val unaffected = listOf(runningRequest, parent.id, parentLater.id, childLater.id, other.id, nested.id, foreign.id)
             .associateWith { ledger.requests.getValue(it) }
         val messages = ledger.messages.toMap()
 
@@ -653,7 +915,7 @@ class RecoveryViewModelTest {
         runCurrent()
         vm.recovering.first { !it }
 
-        assertEquals("ABANDONED", ledger.requests.getValue(parent.id).status)
+        assertEquals("AWAITING_CONFIRMATION", ledger.requests.getValue(parent.id).status)
         assertEquals("ABANDONED", ledger.requests.getValue(child.id).status)
         assertEquals(unaffected, unaffected.keys.associateWith { ledger.requests.getValue(it) })
         assertEquals("RUNNING", ledger.runs.getValue(runId).status)
@@ -662,6 +924,40 @@ class RecoveryViewModelTest {
         assertEquals(messages, ledger.messages)
         verify(exactly = 1) { fixture.workflow.executeEvents(any(), any(), any()) }
         complete(running)
+        val restored = snapshot(parent.id, parentLater.id, childLater.id)
+        assertEquals(3, restored.items.size)
+        assertEquals(listOf(parent.id, childLater.id), restored.batch.map { it.target.requestId })
+        assertEquals(restored.batch.map { it.target }, restored.continueTargets)
+        assertFalse(restored.busy)
+    }
+
+    @Test
+    fun staleAbandonCannotConsumeAPendingHeadHiddenByANewExplicitRun() = runTest(dispatcher, timeout = 15.seconds) {
+        val parent = seedPending("stale-pending-parent")
+        val parentLater = seedPending("stale-pending-parent-later")
+        val stale = snapshot(parent.id, parentLater.id)
+        vm.executeAgentRequestStream("New explicit request", projectRoot = WORKSPACE, targetSessionId = PARENT)
+        val running = backendRuns.receive()
+        val runId = requireNotNull(running.context.recoveryRunId)
+        val hidden = snapshot()
+        assertEquals(setOf(PARENT), hidden.runningSessions)
+        val writes = ledger.writes.toList()
+
+        vm.abandonRecovery(stale)
+        runCurrent()
+
+        assertEquals(writes, ledger.writes)
+        assertEquals("AWAITING_CONFIRMATION", ledger.requests.getValue(parent.id).status)
+        assertEquals("AWAITING_CONFIRMATION", ledger.requests.getValue(parentLater.id).status)
+        assertTrue(repository.isCurrent(runId))
+        assertSame(running.owner, fixture.jobs[PARENT])
+        assertEquals(1, backendCalls.size)
+        complete(running)
+        val restored = snapshot(parent.id, parentLater.id)
+        assertEquals(stale.items, restored.items)
+        assertEquals(stale.continueTargets, restored.continueTargets)
+        assertTrue(restored.runningSessions.isEmpty())
+        assertEquals(1, backendCalls.size)
     }
 
     @Test

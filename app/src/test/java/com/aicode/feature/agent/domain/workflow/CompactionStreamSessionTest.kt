@@ -208,6 +208,92 @@ class CompactionStreamSessionTest {
         assertEquals(5L, updates.last().receivedCharacters)
     }
 
+    @Test fun upstreamOutcomeUnknownRetriesOnceAndDiscardsPartialSummary() = runTest {
+        var calls = 0
+        val updates = mutableListOf<CompactionStreamUpdate>()
+        val records = mutableListOf<CompactionStreamAttempt>()
+        val s = session()
+        assertEquals("fresh", s.call({ flow {
+            if (++calls == 1) {
+                emit(AIStreamChunk.TextDelta("REJECTED_PARTIAL"))
+                throw StreamApiException("upstream_ws_outcome_unknown", "private upstream detail")
+            }
+            emit(AIStreamChunk.TextDelta("fresh"))
+            emit(AIStreamChunk.Final(AIResponse("fresh", stopReason = "stop", inputTokens = 99, outputTokens = 20)))
+        } }, updates, records))
+        assertEquals(2, calls)
+        assertEquals(2, s.attempts)
+        assertEquals(listOf("compaction_upstream_interrupted", null), records.map { it.errorCode })
+        assertNull(records.first().response)
+        assertEquals(0, records.first().outputTokens)
+        assertEquals(20, records.last().outputTokens)
+        assertEquals(1, records.last().retryCount)
+        assertEquals(0L, updates.single { it.state == CompactionStreamState.RETRYING }.receivedCharacters)
+        assertEquals(5L, updates.last().receivedCharacters)
+        assertFalse((updates.toString() + records.toString()).contains("private upstream detail"))
+        assertFalse(records.toString().contains("REJECTED_PARTIAL"))
+    }
+
+    @Test fun repeatedUpstreamOutcomeUnknownExhaustsExistingBlockBudget() = runTest {
+        var calls = 0
+        val records = mutableListOf<CompactionStreamAttempt>()
+        val s = session()
+        failure("compaction_upstream_interrupted") {
+            s.call({ flow {
+                calls++
+                emit(AIStreamChunk.TextDelta("REJECTED_PARTIAL"))
+                throw StreamApiException("upstream_ws_outcome_unknown", "private upstream detail")
+            } }, records = records)
+        }
+        assertEquals(2, calls)
+        assertEquals(2, s.attempts)
+        assertEquals(listOf(0, 1), records.map { it.retryCount })
+        assertTrue(records.all { it.errorCode == "compaction_upstream_interrupted" && it.response == null && it.outputTokens == 0 })
+    }
+
+    @Test fun upstreamOutcomeUnknownCannotStartCallBeyondGlobalBudget() = runTest {
+        var calls = 0
+        val records = mutableListOf<CompactionStreamAttempt>()
+        val s = session(CompactionStreamPolicy(maxAttempts = 1))
+        failure("compaction_attempt_limit") {
+            s.call({ flow {
+                calls++
+                throw StreamApiException("upstream_ws_outcome_unknown", "private upstream detail")
+            } }, records = records)
+        }
+        assertEquals(1, calls)
+        assertEquals("compaction_upstream_interrupted", records.single().errorCode)
+    }
+
+    @Test fun upstreamOutcomeUnknownRetrySharesTotalDeadline() = runTest {
+        var calls = 0
+        val records = mutableListOf<CompactionStreamAttempt>()
+        val s = session(CompactionStreamPolicy(totalTimeoutMs = 50))
+        failure("compaction_total_timeout") {
+            s.call({ flow {
+                calls++
+                throw StreamApiException("upstream_ws_outcome_unknown", "private upstream detail")
+            } }, records = records)
+        }
+        assertEquals(50L, testScheduler.currentTime)
+        assertEquals(1, calls)
+        assertEquals("compaction_upstream_interrupted", records.single().errorCode)
+    }
+
+    @Test fun upstreamOutcomeUnknownClassificationIsExactAndDoesNotExposeItsCause() {
+        val classified = CompactionStreamErrors.classify(IllegalStateException("private wrapper",
+            StreamApiException("upstream_ws_outcome_unknown", "private upstream detail")))
+        assertEquals("compaction_upstream_interrupted", classified.code)
+        assertTrue(classified.retryable)
+        assertNull(classified.cause)
+        assertEquals("compaction_upstream_interrupted", classified.message)
+        for (code in listOf("invalid_request_error", "private-provider-detail", "upstream_ws_outcome_unknown_extra")) {
+            val rejected = CompactionStreamErrors.classify(StreamApiException(code, "upstream_ws_outcome_unknown"))
+            assertEquals("compaction_invalid_response", rejected.code)
+            assertFalse(rejected.retryable)
+        }
+    }
+
     @Test fun globalBudgetCountsRetriesAndNeverStartsThirtyThirdCall() = runTest {
         val s = session()
         val records = mutableListOf<CompactionStreamAttempt>()

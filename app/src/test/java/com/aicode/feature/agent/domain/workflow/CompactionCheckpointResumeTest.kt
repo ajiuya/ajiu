@@ -15,6 +15,7 @@ import com.aicode.feature.agent.domain.prompt.SystemPromptProvider
 import com.aicode.feature.agent.domain.provider.AIProvider
 import com.aicode.feature.agent.domain.provider.AIResponse
 import com.aicode.feature.agent.domain.provider.AIStreamChunk
+import com.aicode.feature.agent.domain.provider.StreamApiException
 import com.aicode.feature.agent.domain.session.MessagePersistenceUseCase
 import com.aicode.feature.agent.domain.tool.ToolCall
 import com.aicode.feature.agent.domain.tool.modelToolResultText
@@ -186,6 +187,34 @@ class CompactionCheckpointResumeTest {
         CompactionSummaryFixture.assertComplete(CompactionText.units(listOf(original.first())), f.accepted.map(Sent::material))
         assertEquals(0, f.store.size())
         assertEquals(1, f.commits.size)
+    }
+
+    @Test fun upstreamOutcomeUnknownRetriesFailedBlockWithoutRepeatingCompletedPrefix() = runTest {
+        val f = Fixture(this)
+        val original = history()
+        f.persist(original)
+        f.respond = { sent -> if (sent.ordinal == 2) flow {
+            emit(AIStreamChunk.TextDelta("REJECTED_PARTIAL"))
+            throw StreamApiException("upstream_ws_outcome_unknown", "private upstream detail")
+        } else complete("SUMMARY_${sent.ordinal}") }
+        val events = mutableListOf<AgentEvent>()
+        val result = f.run(original, onEvent = { events += it })
+        assertTrue(result.compacted)
+        assertEquals(f.requests[1].key, f.requests[2].key)
+        assertEquals(1, f.requests.count { it.key == f.requests.first().key })
+        assertEquals("compaction_upstream_interrupted", f.records[1].errorMessage)
+        assertEquals("error", f.records[1].status)
+        assertEquals("success", f.records[2].status)
+        assertEquals(f.requests.size, f.records.size)
+        assertTrue(events.none { it is AgentEvent.CompactionFailed })
+        assertTrue(events.filterIsInstance<AgentEvent.CompactionProgress>().any {
+            it.progress.lastErrorCode == "compaction_upstream_interrupted"
+        })
+        assertTrue(f.requests.none { "REJECTED_PARTIAL" in it.content || "private upstream detail" in it.content })
+        assertEquals(1, f.commits.size)
+        assertTrue(f.commits.single().rows.none { "REJECTED_PARTIAL" in it.content })
+        assertEquals(0, f.store.size())
+        CompactionSummaryFixture.assertComplete(CompactionText.units(listOf(original.first())), f.accepted.map(Sent::material))
     }
 
     @Test fun smallWindowLargePromptCachesConfiguredLimitInsteadOfEffectiveBudget() = runTest {
