@@ -256,6 +256,10 @@ class BackupContentManagerTest {
         val result = manager.import(ByteArrayInputStream(archive(coreMetadata(emptyList()), coreEntries() + undeclared)), null)
 
         assertTrue(result.isFailure)
+        val failure = result.exceptionOrNull()
+        assertTrue(failure is IllegalArgumentException)
+        assertTrue(failure?.cause is IOException)
+        assertEquals("Content section is not declared", failure?.cause?.message)
         assertNoCoreWrites()
         assertCacheClean()
     }

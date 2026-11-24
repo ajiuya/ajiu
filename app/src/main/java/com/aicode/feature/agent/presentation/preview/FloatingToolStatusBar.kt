@@ -42,6 +42,7 @@ import compose.icons.feathericons.AlertCircle
 import compose.icons.feathericons.Check
 import compose.icons.feathericons.ChevronLeft
 import compose.icons.feathericons.ChevronRight
+import kotlin.math.ceil
 
 @Composable
 internal fun FloatingToolStatusBar(
@@ -92,8 +93,10 @@ internal fun FloatingToolStatusBar(
         ) { measurables, constraints ->
             val loose = constraints.copy(minWidth = 0, minHeight = 0)
             val status = measurables[0].measure(loose)
-            val navigation = measurables[2].measure(loose)
             val gap = ToolPreviewMetrics.statusGap.roundToPx()
+            val titleReserve = ceil(ToolPreviewMetrics.titleSize.toPx()).toInt()
+            val navigationMaxWidth = (constraints.maxWidth - status.width - gap * 2 - titleReserve).coerceAtLeast(0)
+            val navigation = measurables[2].measure(loose.copy(maxWidth = navigationMaxWidth))
             val titleStart = status.width + gap
             val titleEnd = constraints.maxWidth - navigation.width - if (navigation.width > 0) gap else 0
             val titleWidth = (titleEnd - titleStart).coerceAtLeast(0)
@@ -134,8 +137,11 @@ internal fun ToolPreviewNavigation(
             onClick = { targets.getOrNull(index - 1)?.let { onSelect(it.id) } },
             onLongClick = { onSelect(targets.first().id) })
         Text(stringResource(if (detail) R.string.tool_preview_detail_page else R.string.tool_preview_page, index + 1, targets.size),
+            modifier = if (detail) Modifier else Modifier.weight(1f, fill = false),
             fontSize = if (detail) ToolPreviewMetrics.detailPageSize else ToolPreviewMetrics.pageSize,
-            fontWeight = FontWeight.Medium, fontFamily = FontFamily.Monospace, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            fontWeight = FontWeight.Medium, fontFamily = FontFamily.Monospace, color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = if (detail) Int.MAX_VALUE else 1, softWrap = detail,
+            overflow = if (detail) TextOverflow.Clip else TextOverflow.Ellipsis)
         PreviewPageArrow(previous = false, enabled = index < targets.lastIndex, detail = detail,
             onClick = { targets.getOrNull(index + 1)?.let { onSelect(it.id) } },
             onLongClick = { onSelect(targets.last().id) })

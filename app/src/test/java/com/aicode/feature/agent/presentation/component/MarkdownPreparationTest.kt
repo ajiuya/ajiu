@@ -18,6 +18,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.aicode.feature.agent.presentation.preview.ToolPreviewWorkVisibility
 import io.mockk.every
 import io.mockk.mockk
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -25,13 +26,22 @@ import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.test.setMain
+import org.junit.After
 import org.junit.Assert.*
+import org.junit.Before
 import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class MarkdownPreparationTest {
+    private val dispatcher = StandardTestDispatcher()
+
+    @Before fun setUp() { Dispatchers.setMain(dispatcher) }
+    @After fun tearDown() { Dispatchers.resetMain() }
+
     private class Owner : LifecycleOwner {
         val registry = LifecycleRegistry.createUnsafe(this).apply { currentState = Lifecycle.State.STARTED }
         override val lifecycle: Lifecycle get() = registry
@@ -81,10 +91,9 @@ class MarkdownPreparationTest {
     }
 
     @Test
-    fun continuousPrefixesKeepPublishingWhenPreparationTakesLongerThanTheUpdateInterval() = runTest {
+    fun continuousPrefixesKeepPublishingWhenPreparationTakesLongerThanTheUpdateInterval() = runTest(dispatcher) {
         val owner = Owner()
         val cache = MarkdownRenderCache()
-        val dispatcher = StandardTestDispatcher(testScheduler)
         var text by mutableStateOf("文")
         var displayed = MarkdownPreparation()
         val started = mutableListOf<String>()
@@ -117,10 +126,9 @@ class MarkdownPreparationTest {
     }
 
     @Test
-    fun replacingTextNeverPublishesAnIncompatibleInFlightPrefix() = runTest {
+    fun replacingTextNeverPublishesAnIncompatibleInFlightPrefix() = runTest(dispatcher) {
         val owner = Owner()
         val cache = MarkdownRenderCache()
-        val dispatcher = StandardTestDispatcher(testScheduler)
         var text by mutableStateOf("old response")
         val published = mutableListOf<String>()
         var displayed = MarkdownPreparation()
@@ -148,10 +156,9 @@ class MarkdownPreparationTest {
     }
 
     @Test
-    fun styleChangesAndVisibilityCancelOldWorkAndResumeWithTheCurrentInput() = runTest {
+    fun styleChangesAndVisibilityCancelOldWorkAndResumeWithTheCurrentInput() = runTest(dispatcher) {
         val owner = Owner()
         val cache = MarkdownRenderCache()
-        val dispatcher = StandardTestDispatcher(testScheduler)
         var text by mutableStateOf("old")
         var size by mutableStateOf(16f)
         var visible by mutableStateOf(true)

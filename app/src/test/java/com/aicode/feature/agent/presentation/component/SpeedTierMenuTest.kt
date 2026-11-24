@@ -42,13 +42,11 @@ import org.robolectric.annotation.Config
 import org.robolectric.annotation.ConscryptMode
 import org.robolectric.annotation.GraphicsMode
 import org.robolectric.annotation.LooperMode
-import org.robolectric.annotation.TextLayoutMode
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [28], qualifiers = "zh-rCN", application = Application::class, manifest = Config.NONE)
 @ConscryptMode(ConscryptMode.Mode.OFF)
 @GraphicsMode(GraphicsMode.Mode.LEGACY)
-@TextLayoutMode(TextLayoutMode.Mode.LEGACY)
 @LooperMode(LooperMode.Mode.PAUSED)
 @OptIn(InternalComposeUiApi::class, ExperimentalCoroutinesApi::class)
 class SpeedTierMenuTest {

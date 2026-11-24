@@ -296,6 +296,11 @@ if (providers.gradleProperty("mobileBuild").orNull == "true") {
     tasks.withType<Test>().configureEach {
         maxHeapSize = mobileTestHeap
         maxParallelForks = 1
+        forkEvery = 20
+        // Android 宿主目录会覆盖 Robolectric 自带的 ICU 数据路径。
+        setEnvironment(environment.filterKeys {
+            it !in setOf("ANDROID_ROOT", "ANDROID_DATA", "ANDROID_I18N_ROOT", "ANDROID_TZDATA_ROOT")
+        })
     }
 }
 
@@ -427,7 +432,7 @@ dependencies {
     androidTestImplementation("junit:junit:4.13.2")
     // 迁移测试：MigrationTestHelper + Robolectric（在 JVM 上跑 Room 迁移，需真实 resources）
     testImplementation("androidx.room:room-testing:2.7.1")
-    testImplementation("org.robolectric:robolectric:4.15.1")
+    testImplementation("org.robolectric:robolectric:4.18")
     testImplementation("androidx.test:core-ktx:1.6.1")
     testImplementation("androidx.test.ext:junit:1.1.5")
     // 协程测试：runTest 虚拟时间（替代 runBlocking）+ Dispatchers.setMain（ViewModel 测试基建）

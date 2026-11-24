@@ -26,7 +26,6 @@ import org.robolectric.annotation.Implementation
 import org.robolectric.annotation.Implements
 import org.robolectric.annotation.RealObject
 import org.robolectric.annotation.LooperMode
-import org.robolectric.annotation.TextLayoutMode
 import org.robolectric.shadows.ShadowPaint
 
 @RunWith(RobolectricTestRunner::class)
@@ -34,7 +33,6 @@ import org.robolectric.shadows.ShadowPaint
     shadows = [TerminalFontResizeTest.SizedPaintShadow::class])
 @ConscryptMode(ConscryptMode.Mode.OFF)
 @GraphicsMode(GraphicsMode.Mode.LEGACY)
-@TextLayoutMode(TextLayoutMode.Mode.LEGACY)
 @LooperMode(LooperMode.Mode.PAUSED)
 class TerminalFontResizeTest {
     // LEGACY 的测宽与字号无关；为真实网格重排提供确定性度量，不验证系统字体光栅化。

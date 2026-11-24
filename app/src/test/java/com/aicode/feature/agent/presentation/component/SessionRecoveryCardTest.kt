@@ -55,7 +55,6 @@ import org.robolectric.annotation.Config
 import org.robolectric.annotation.ConscryptMode
 import org.robolectric.annotation.GraphicsMode
 import org.robolectric.annotation.LooperMode
-import org.robolectric.annotation.TextLayoutMode
 import org.robolectric.shadows.ShadowDialog
 
 private const val BUBBLE = "session_recovery_bubble"
@@ -73,7 +72,6 @@ private const val FOOTER = "recovery_test_footer"
 )
 @ConscryptMode(ConscryptMode.Mode.OFF)
 @GraphicsMode(GraphicsMode.Mode.LEGACY)
-@TextLayoutMode(TextLayoutMode.Mode.LEGACY)
 @LooperMode(LooperMode.Mode.PAUSED)
 @OptIn(InternalComposeUiApi::class, ExperimentalCoroutinesApi::class)
 class SessionRecoveryCardTest {
@@ -102,6 +100,7 @@ class SessionRecoveryCardTest {
     }
 
     @Test(timeout = 30_000)
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
     fun bubbleFitsTheExistingComposerRowAndEachHalfDispatchesImmediately() {
         val pendingCount = mutableStateOf(0)
         val callbacks = mutableListOf<String>()
@@ -191,7 +190,6 @@ class SessionRecoveryCardTest {
     }
 
     @Test(timeout = 30_000)
-    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
     fun narrowLargeFontComposerStillEditsAndExpandsWithoutCrossingTheRecoveryTargets() {
         val value = mutableStateOf(List(20) { "Draft line" }.joinToString("\n"))
         val fullScreen = mutableListOf<Boolean>()

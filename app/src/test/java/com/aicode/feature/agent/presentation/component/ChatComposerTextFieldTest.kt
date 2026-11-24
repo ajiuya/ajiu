@@ -76,19 +76,17 @@ import org.robolectric.annotation.Config
 import org.robolectric.annotation.ConscryptMode
 import org.robolectric.annotation.GraphicsMode
 import org.robolectric.annotation.LooperMode
-import org.robolectric.annotation.TextLayoutMode
 import org.robolectric.shadows.ShadowDialog
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [28], qualifiers = "zh-rCN-w400dp-h1000dp", application = Application::class, manifest = Config.NONE)
 @ConscryptMode(ConscryptMode.Mode.OFF)
 @GraphicsMode(GraphicsMode.Mode.LEGACY)
-// REALISTIC 固定返回 35px 字体高度；LEGACY 让主题 lineHeight 驱动容器尺寸，不作字形验收。
-@TextLayoutMode(TextLayoutMode.Mode.LEGACY)
 @LooperMode(LooperMode.Mode.PAUSED)
 @OptIn(InternalComposeUiApi::class, ExperimentalCoroutinesApi::class)
 class ChatComposerTextFieldTest {
     @Test(timeout = 30_000)
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
     fun emptyEditorMeasures36DpWithoutChangingItsWidthOrHorizontalInsets() {
         val value = mutableStateOf(TextFieldValue())
         render(content = { Composer(value) }) {
@@ -106,6 +104,7 @@ class ChatComposerTextFieldTest {
     }
 
     @Test(timeout = 30_000)
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
     fun singleLineKeeps36DpAndTheThemeBodyLargeFont() {
         val value = mutableStateOf(TextFieldValue("Hello"))
         var expectedStyle = TextStyle.Default
@@ -126,7 +125,6 @@ class ChatComposerTextFieldTest {
     }
 
     @Test(timeout = 30_000)
-    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
     fun multipleLinesGrowNaturallyUntilThe120DpViewportLimit() {
         val value = mutableStateOf(TextFieldValue("First\nSecond"))
         render(content = { Composer(value) }) {
@@ -147,7 +145,6 @@ class ChatComposerTextFieldTest {
     }
 
     @Test(timeout = 30_000)
-    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
     fun enlargedFontGrowsTheMinimumWithoutShrinkingOrClippingTheLine() {
         val value = mutableStateOf(TextFieldValue("Large text"))
         var expectedStyle = TextStyle.Default
@@ -171,7 +168,6 @@ class ChatComposerTextFieldTest {
     }
 
     @Test(timeout = 30_000)
-    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
     fun fractionalDensityUsesTheExactRoundedPaddingAndHeightConstraints() {
         val value = mutableStateOf(TextFieldValue("Hello"))
         render(widthPx = 413, density = 1.3f, content = { Composer(value) }) {
@@ -198,6 +194,7 @@ class ChatComposerTextFieldTest {
     }
 
     @Test(timeout = 30_000)
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
     fun placeholderSharesTheEditorTypographyAndTracksEmptyText() {
         val value = mutableStateOf(TextFieldValue())
         render(content = { Composer(value) }) {
@@ -268,6 +265,7 @@ class ChatComposerTextFieldTest {
     }
 
     @Test(timeout = 30_000)
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
     fun emptyAndSingleLineCardsMeasure84DpWithoutTheMaskInflatingTheReportedHeight() {
         for (width in listOf(400, 320)) {
             val value = mutableStateOf("")
@@ -300,7 +298,6 @@ class ChatComposerTextFieldTest {
     }
 
     @Test(timeout = 30_000)
-    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
     fun narrowCardsGrowWithMultilineTextAtNormalAndEnlargedFontScales() {
         for (fontScale in listOf(1f, 1.5f)) {
             val value = mutableStateOf("")
@@ -443,6 +440,7 @@ class ChatComposerTextFieldTest {
     }
 
     @Test(timeout = 30_000)
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
     fun attachmentSheetKeepsAllThreeUploadCallbacksAndPreviewRemovalGrowsTheCardNaturally() {
         val value = mutableStateOf("")
         val attachment = PendingUploadAttachment("notes.txt", "notes.txt", "", "text/plain", 12L)
@@ -480,6 +478,7 @@ class ChatComposerTextFieldTest {
     }
 
     @Test(timeout = 30_000)
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
     @Config(sdk = [30])
     fun imeInsetAddsOnlyItsOwnHeightAndKeepsTheCompactCardAboveIt() {
         val value = mutableStateOf("")
@@ -522,7 +521,6 @@ class ChatComposerTextFieldTest {
     }
 
     @Test(timeout = 30_000)
-    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
     fun expandTracksTheMeasuredBodyLargeHeightAndDisappearsAfterShrinking() {
         val value = mutableStateOf("Line")
         render(content = { InputBar(value) }) {
@@ -550,7 +548,6 @@ class ChatComposerTextFieldTest {
     }
 
     @Test(timeout = 30_000)
-    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
     fun longUnbrokenTextKeepsItsConstrainedWidthAndWrappingPolicyAndStaysEditable() {
         val unbrokenDraft = "wrapped words ".repeat(1_000)
         val value = mutableStateOf(unbrokenDraft)
@@ -638,7 +635,6 @@ class ChatComposerTextFieldTest {
     }
 
     @Test(timeout = 30_000)
-    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
     fun fullScreenAndCollapsedEditorsShareTheSameLiveDraftInBothDirections() {
         val value = mutableStateOf(longDraft())
         val fullScreenStates = mutableListOf<Boolean>()

@@ -201,7 +201,7 @@ ANDROID_HOME=/root/android/sdk \
 ./scripts/gradle-mobile.sh :app:assembleUniversalDebug
 ```
 
-以下脚本固定手机档只影响本次命令，不修改项目或全局 `gradle.properties`；脚本自身不会改变普通 `./gradlew` 和 CI 的默认配置。若已启用设置中的手机构建，脚本显式指定的选项会覆盖对应面板选择；希望使用面板参数时，改用普通 `./gradlew`：
+以下脚本固定手机档只影响本次命令，不修改项目或全局 `gradle.properties`；脚本自身不会改变普通 `./gradlew` 和 CI 的默认配置。脚本显式指定的 Gradle 选项覆盖对应面板选择，但已开启面板的测试堆可能被托管初始化脚本后置设置。严格按固定脚本的测试堆验证时，在本次命令加 `-PaicodeMobileBuild=false`，不需要关闭面板或修改全局文件；希望使用面板参数时，改用普通 `./gradlew`：
 
 | 项目 | 手机档默认值 |
 | --- | --- |
@@ -210,12 +210,12 @@ ANDROID_HOME=/root/android/sdk \
 | Gradle worker | `1` |
 | 并行、常驻 daemon、配置缓存 | `--no-parallel --no-daemon --no-configuration-cache` |
 | Kotlin 编译 | 保持 `in-process`，不另开 Kotlin 编译 daemon |
-| 本仓库 app JVM 单测 | 每个测试进程最大堆 `1g`，最多同时运行 `1` 个测试进程 |
+| 本仓库 app JVM 单测 | 每个测试进程最大堆 `1g`，最多同时运行 `1` 个测试进程，每处理 20 个测试类重启 worker |
 
 例如，只运行通用 debug 变体的单元测试：
 
 ```bash
-./scripts/gradle-mobile.sh :app:testUniversalDebugUnitTest
+./scripts/gradle-mobile.sh -PaicodeMobileBuild=false :app:testUniversalDebugUnitTest
 ```
 
 脚本以 `-PmobileBuild=true` 启用 app 单测的手机档；未传该属性或其值不是 `true` 时，不设置这些测试限制。脚本不指定应用版本，版本仍由 tag / 提交推导，或由调用方显式传入 `-PappVersionName` 与 `-PappVersionCode`。
@@ -224,7 +224,7 @@ ANDROID_HOME=/root/android/sdk \
 
 ```bash
 MOBILE_GRADLE_HEAP=2560m MOBILE_TEST_HEAP=768m \
-./scripts/gradle-mobile.sh :app:testUniversalDebugUnitTest \
+./scripts/gradle-mobile.sh -PaicodeMobileBuild=false :app:testUniversalDebugUnitTest \
   --tests 'com.aicode.feature.agent.domain.provider.GeminiAdapterTest'
 ```
 
@@ -235,6 +235,16 @@ MOBILE_GRADLE_HEAP=2560m MOBILE_TEST_HEAP=768m \
 :::
 
 其他 Android 项目没有本仓库的手机脚本时，使用各自的 wrapper 和任务；不要直接假定支持 `mobileBuild` 或上述脚本。
+
+### 本仓库的测试运行环境
+
+测试依赖采用官方 Robolectric 4.18，原生 SQLite 与原生图形运行时支持 Linux ARM64。旧 4.15.1 在该架构缺少原生运行时，可能在进入 Room 业务断言前就失败；仅升级 Java 不能补齐该原生库。首次运行新版测试需要从项目既有仓库准备对应测试依赖与 Android SDK JAR，不需要为此更换系统或安装非官方原生补丁。
+
+布局测试中，正常字号的几何检查采用原生字体度量；旧图形模式仍用于明确的模拟度量及异常增高覆盖，不把35px模拟字体当作真实设备字号。持续动画的测试使用暂停的模拟帧调度和明确的时间步，避免立即续帧让消息循环无法结束；产品动画不会因此关闭。
+
+项目保留 Jetifier，仅对不引用 Android 支持库的纯 JVM 多版本依赖使用转换例外。Bouncy Castle 1.86 包含 Java25 专用类，旧 Jetifier 不能解析这些条目；保留官方 JAR 原字节即可，不需要把手机 Java 升到25、删除条目或关闭所有依赖的转换。
+
+手机脚本启用的测试档按 **20 个测试类**回收并重新启动测试 worker，保持单进程并发和原堆上限，避免整套测试长时间复用一个 JVM；不是每 20 个测试方法，也不会减少或跳过测试。这个设置仅作用于本仓库显式手机档，不改变其他项目、普通未启用该档的构建或 CI 默认值。手机档还会仅从测试 worker 移除继承的 Android 系统目录变量，避免它们覆盖 Robolectric 自带的 ICU 数据位置；不会修改 App、终端、构建主进程或全局环境。分批进程会增加启动耗时，仍不能保证手机系统不回收构建。
 
 ### 依赖下载与输出
 

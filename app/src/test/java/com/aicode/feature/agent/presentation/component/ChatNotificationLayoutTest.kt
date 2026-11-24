@@ -52,18 +52,16 @@ import org.robolectric.annotation.Config
 import org.robolectric.annotation.ConscryptMode
 import org.robolectric.annotation.GraphicsMode
 import org.robolectric.annotation.LooperMode
-import org.robolectric.annotation.TextLayoutMode
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [28], qualifiers = "en-rUS", application = Application::class, manifest = Config.NONE)
 @ConscryptMode(ConscryptMode.Mode.OFF)
 @GraphicsMode(GraphicsMode.Mode.LEGACY)
-@TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
 @LooperMode(LooperMode.Mode.PAUSED)
 @OptIn(InternalComposeUiApi::class)
 class ChatNotificationLayoutTest {
     @Test
-    @TextLayoutMode(TextLayoutMode.Mode.LEGACY)
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
     fun consecutiveRowsKeep52DpCardsAndOnlyOne8DpFooterWithoutShrinkingFonts() {
         val models = listOf(
             metadata(kind = "subagent", status = "completed"),
@@ -84,7 +82,7 @@ class ChatNotificationLayoutTest {
     }
 
     @Test
-    @TextLayoutMode(TextLayoutMode.Mode.LEGACY)
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
     fun legacyCombinedAndSeparateCarriersAndProjectedToolNoticesShareTheSame8DpSpacing() {
         val notices = listOf(
             PendingNotification(AgentNotificationKind.SUBAGENT, "coder", "Coder", NotificationOutcome.COMPLETED,

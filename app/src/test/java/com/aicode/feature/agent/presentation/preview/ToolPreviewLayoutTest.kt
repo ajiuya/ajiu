@@ -49,14 +49,13 @@ import org.robolectric.annotation.Config
 import org.robolectric.annotation.ConscryptMode
 import org.robolectric.annotation.GraphicsMode
 import org.robolectric.annotation.LooperMode
-import org.robolectric.annotation.TextLayoutMode
 import java.time.Duration
+import kotlin.math.ceil
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [28], application = Application::class, manifest = Config.NONE)
 @ConscryptMode(ConscryptMode.Mode.OFF)
 @GraphicsMode(GraphicsMode.Mode.LEGACY)
-@TextLayoutMode(TextLayoutMode.Mode.LEGACY)
 @LooperMode(LooperMode.Mode.PAUSED)
 @OptIn(InternalComposeUiApi::class)
 class ToolPreviewLayoutTest {
@@ -181,11 +180,9 @@ class ToolPreviewLayoutTest {
     }
 
     @GraphicsMode(GraphicsMode.Mode.NATIVE)
-    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
     @Test fun narrowThumbnailBarsCenterEllipsizedTitlesInTheActualSlotWithScaledFontsAndBothDirections() =
         measureNarrowTitleSlots(requireEllipsisGlyph = true)
 
-    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
     @Test fun narrowThumbnailBarsUseTheWholeMeasuredControlSlotWithScaledFontsAndBothDirections() =
         measureNarrowTitleSlots(requireEllipsisGlyph = false)
 
@@ -199,24 +196,52 @@ class ToolPreviewLayoutTest {
                     val nodes = root.semanticsOwner.getAllSemanticsNodes(mergingEnabled = false)
                     val title = nodes.single { target.actionTitle in it.texts() }
                     val bounds = title.layoutBounds()
+                    val context = (root as View).context
                     val status = nodes.single {
-                        it.config.getOrNull(SemanticsProperties.ContentDescription)?.contains((root as View).context.getString(R.string.tool_preview_completed)) == true
+                        it.config.getOrNull(SemanticsProperties.ContentDescription)?.contains(context.getString(R.string.tool_preview_completed)) == true
                     }.layoutBounds()
-                    val page = nodes.single { "$count/$count" in it.texts() }.layoutBounds()
-                    val pagerLeft = page.left - ToolPreviewMetrics.arrowSize.value
-                    val pagerRight = page.right + ToolPreviewMetrics.arrowSize.value
+                    val previous = nodes.single {
+                        it.config.getOrNull(SemanticsProperties.ContentDescription)?.contains(context.getString(R.string.tool_preview_previous)) == true
+                    }.layoutBounds()
+                    val next = nodes.single {
+                        it.config.getOrNull(SemanticsProperties.ContentDescription)?.contains(context.getString(R.string.tool_preview_next)) == true
+                    }.layoutBounds()
+                    val pageText = "$count/$count"
+                    val pageNode = nodes.single { pageText in it.texts() }
+                    val page = pageNode.layoutBounds()
+                    val leftArrow = if (direction == LayoutDirection.Ltr) previous else next
+                    val rightArrow = if (direction == LayoutDirection.Ltr) next else previous
+                    val pagerLeft = leftArrow.left
+                    val pagerRight = rightArrow.right
                     val gap = ToolPreviewMetrics.statusGap.value
                     val remainingLeft = if (direction == LayoutDirection.Ltr) status.right + gap else pagerRight + gap
                     val remainingRight = if (direction == LayoutDirection.Ltr) pagerLeft - gap else status.left - gap
-                    val diagnostic = "width=$width; page=$count; fontScale=$fontScale; direction=$direction; title=$bounds; status=$status; pager=$pagerLeft..$pagerRight"
+                    val diagnostic = "width=$width; page=$count; fontScale=$fontScale; direction=$direction; title=$bounds; status=$status; previous=$previous; next=$next; pageBounds=$page; pager=$pagerLeft..$pagerRight"
+                    for (arrow in listOf(previous, next)) {
+                        assertEquals(diagnostic, 18f, arrow.width, 0.01f)
+                        assertEquals(diagnostic, 18f, arrow.height, 0.01f)
+                    }
+                    assertTrue(diagnostic, page.width > 0f)
+                    assertTrue(diagnostic, page.left >= leftArrow.right)
+                    assertTrue(diagnostic, page.right <= rightArrow.left)
+                    assertEquals(diagnostic, listOf(pageText), pageNode.texts())
+                    val pageLayout = pageNode.textLayout()
+                    val pageInput = pageLayout.layoutInput
+                    assertEquals(diagnostic, pageText, pageInput.text.text)
+                    assertEquals(diagnostic, 11.sp, pageInput.style.fontSize)
+                    assertEquals(diagnostic, 1, pageLayout.lineCount)
+                    assertEquals(diagnostic, 1, pageInput.maxLines)
+                    assertFalse(diagnostic, pageInput.softWrap)
+                    assertEquals(diagnostic, TextOverflow.Ellipsis, pageInput.overflow)
                     assertTrue(diagnostic, bounds.width > 0f)
+                    assertTrue(diagnostic, bounds.width >= ceil(13f * fontScale))
                     assertTrue(diagnostic, bounds.left >= remainingLeft - 0.51f)
                     assertTrue(diagnostic, bounds.right <= remainingRight + 0.51f)
                     assertEquals(diagnostic, (remainingLeft + remainingRight) / 2, bounds.center.x, 0.51f)
                     assertEquals(diagnostic, remainingRight - remainingLeft, bounds.width, 1f)
                     val layout = title.textLayout()
                     if (requireEllipsisGlyph) assertTrue(diagnostic, layout.isLineEllipsized(0))
-                    val input = title.textLayout().layoutInput
+                    val input = layout.layoutInput
                     assertEquals(TextAlign.Center, input.style.textAlign)
                     assertEquals(13.sp, input.style.fontSize)
                     assertEquals(fontScale, input.density.fontScale, 0f)

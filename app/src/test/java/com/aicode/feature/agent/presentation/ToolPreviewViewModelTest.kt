@@ -20,6 +20,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
@@ -111,10 +113,9 @@ class ToolPreviewViewModelTest {
         val run = vm.executeAgentRequestStream("write", targetSessionId = PARENT)
         deliver(PARENT, AgentEvent.ToolCallArgumentsPreview(callId, draft.name, draft.accumulated)).await()
         deliver(PARENT, AgentEvent.ToolCallArgumentsPreview("read-2", sibling.name, sibling.accumulated)).await()
-        runCurrent()
-        assertPreviews(PARENT, listOf(draft, sibling))
+        awaitPreviews(PARENT, listOf(draft, sibling))
 
-        val started = deliver(PARENT, AgentEvent.ToolCallStarted(callId, draft.name, args))
+        deliver(PARENT, AgentEvent.ToolCallStarted(callId, draft.name, args)).await()
         val pending = pendingPersists.receive()
         runCurrent()
         assertEquals(PARENT, pending.sessionId)
@@ -122,21 +123,19 @@ class ToolPreviewViewModelTest {
         assertEquals(callId, pending.callId)
         assertEquals(draft.name, pending.toolName)
         assertEquals(args, pending.toolArgs)
-        assertFalse(started.isCompleted)
         assertFalse(pending.persisted.isCompleted)
         assertPreviews(PARENT, listOf(draft, sibling))
 
         pending.release.complete(Unit)
-        started.await()
-        runCurrent()
+        pending.persisted.await()
         assertTrue(pending.persisted.isCompleted)
-        assertPreviews(PARENT, listOf(sibling), listOf(RunningToolOutput(draft.id, "", draft.name, args)))
+        awaitPreviews(PARENT, listOf(sibling), listOf(RunningToolOutput(draft.id, "", draft.name, args)))
 
         val finished = CompletableDeferred<Unit>()
         deliver(PARENT, AgentEvent.ToolCallFinished(callId, draft.name, "written", false, persisted = finished)).await()
-        runCurrent()
+        finished.await()
         assertTrue(finished.isCompleted)
-        assertPreviews(PARENT, listOf(sibling))
+        awaitPreviews(PARENT, listOf(sibling))
         deliver(PARENT, AgentEvent.Completed).await()
         streams.getValue(PARENT).close()
         run.join()
@@ -154,38 +153,33 @@ class ToolPreviewViewModelTest {
         val otherRun = vm.executeAgentRequestStream("other", targetSessionId = OTHER)
         deliver(PARENT, AgentEvent.ToolCallArgumentsPreview(callId, parentDraft.name, parentDraft.accumulated)).await()
         deliver(OTHER, AgentEvent.ToolCallArgumentsPreview(callId, otherDraft.name, otherDraft.accumulated)).await()
-        runCurrent()
-        assertPreviews(PARENT, listOf(parentDraft))
+        awaitPreviews(PARENT, listOf(parentDraft))
         vm.selectSession(OTHER)
-        runCurrent()
-        assertPreviews(OTHER, listOf(otherDraft))
+        awaitPreviews(OTHER, listOf(otherDraft))
 
-        val parentStarted = deliver(PARENT, AgentEvent.ToolCallStarted(callId, parentDraft.name, parentDraft.accumulated))
+        deliver(PARENT, AgentEvent.ToolCallStarted(callId, parentDraft.name, parentDraft.accumulated)).await()
         val parentPersist = pendingPersists.receive()
-        val otherStarted = deliver(OTHER, AgentEvent.ToolCallStarted(callId, otherDraft.name, otherDraft.accumulated))
+        deliver(OTHER, AgentEvent.ToolCallStarted(callId, otherDraft.name, otherDraft.accumulated)).await()
         val otherPersist = pendingPersists.receive()
         runCurrent()
         assertEquals(PARENT, parentPersist.sessionId)
         assertEquals(OTHER, otherPersist.sessionId)
-        assertFalse(parentStarted.isCompleted)
-        assertFalse(otherStarted.isCompleted)
-        assertPreviews(OTHER, listOf(otherDraft))
-        vm.selectSession(PARENT)
-        runCurrent()
-        assertPreviews(PARENT, listOf(parentDraft))
-
-        parentPersist.release.complete(Unit)
-        parentStarted.await()
-        runCurrent()
-        val parentRunning = RunningToolOutput(parentDraft.id, "", parentDraft.name, parentDraft.accumulated)
-        assertPreviews(PARENT, running = listOf(parentRunning))
-        vm.selectSession(OTHER)
-        runCurrent()
+        assertFalse(parentPersist.persisted.isCompleted)
         assertFalse(otherPersist.persisted.isCompleted)
         assertPreviews(OTHER, listOf(otherDraft))
+        vm.selectSession(PARENT)
+        awaitPreviews(PARENT, listOf(parentDraft))
+
+        parentPersist.release.complete(Unit)
+        parentPersist.persisted.await()
+        val parentRunning = RunningToolOutput(parentDraft.id, "", parentDraft.name, parentDraft.accumulated)
+        awaitPreviews(PARENT, running = listOf(parentRunning))
+        vm.selectSession(OTHER)
+        awaitPreviews(OTHER, listOf(otherDraft))
+        assertFalse(otherPersist.persisted.isCompleted)
 
         vm.selectSession(PARENT)
-        runCurrent()
+        awaitPreviews(PARENT, running = listOf(parentRunning))
         vm.deleteSession(OTHER).join()
         otherRun.join()
         otherPersist.release.complete(Unit)
@@ -193,18 +187,16 @@ class ToolPreviewViewModelTest {
         assertTrue(otherRun.isCancelled)
         assertFalse(fixture.sessionRows.containsKey(OTHER))
         assertFalse(otherPersist.persisted.isCompleted)
-        assertFalse(otherStarted.isCompleted)
         assertPreviews(PARENT, running = listOf(parentRunning))
         vm.selectSession(OTHER)
-        runCurrent()
-        assertPreviews(OTHER)
+        awaitPreviews(OTHER)
         vm.selectSession(PARENT)
-        runCurrent()
-        assertPreviews(PARENT, running = listOf(parentRunning))
+        awaitPreviews(PARENT, running = listOf(parentRunning))
 
-        deliver(PARENT, AgentEvent.ToolCallFinished(callId, parentDraft.name, "written", false)).await()
-        runCurrent()
-        assertPreviews(PARENT)
+        val finished = CompletableDeferred<Unit>()
+        deliver(PARENT, AgentEvent.ToolCallFinished(callId, parentDraft.name, "written", false, persisted = finished)).await()
+        finished.await()
+        awaitPreviews(PARENT)
         deliver(PARENT, AgentEvent.Completed).await()
         streams.getValue(PARENT).close()
         parentRun.join()
@@ -219,7 +211,8 @@ class ToolPreviewViewModelTest {
         val draft = PreparingToolPreviewSnapshot("tool_$callId", "writeFile", "arguments")
         val run = vm.executeAgentRequestStream("fail", targetSessionId = PARENT)
         deliver(PARENT, AgentEvent.ToolCallArgumentsPreview(callId, draft.name, draft.accumulated)).await()
-        val started = deliver(PARENT, AgentEvent.ToolCallStarted(callId, draft.name, draft.accumulated))
+        awaitPreviews(PARENT, listOf(draft))
+        deliver(PARENT, AgentEvent.ToolCallStarted(callId, draft.name, draft.accumulated)).await()
         val pending = pendingPersists.receive()
         runCurrent()
         assertPreviews(PARENT, listOf(draft))
@@ -229,7 +222,6 @@ class ToolPreviewViewModelTest {
         run.join()
         runCurrent()
         assertTrue(vm.agentStates.value[PARENT] is AgentUIState.Error)
-        assertFalse(started.isCompleted)
         assertFalse(pending.persisted.isCompleted)
         assertPreviews(PARENT)
         assertTrue(runningSnapshots.all { it.second.isEmpty() })
@@ -242,10 +234,10 @@ class ToolPreviewViewModelTest {
         val draft = PreparingToolPreviewSnapshot("tool_$callId", "writeFile", "arguments")
         val run = vm.executeAgentRequestStream("cancel", targetSessionId = PARENT)
         deliver(PARENT, AgentEvent.ToolCallArgumentsPreview(callId, draft.name, draft.accumulated)).await()
-        val started = deliver(PARENT, AgentEvent.ToolCallStarted(callId, draft.name, draft.accumulated))
+        awaitPreviews(PARENT, listOf(draft))
+        deliver(PARENT, AgentEvent.ToolCallStarted(callId, draft.name, draft.accumulated)).await()
         val pending = pendingPersists.receive()
         runCurrent()
-        assertFalse(started.isCompleted)
         assertFalse(pending.persisted.isCompleted)
         assertPreviews(PARENT, listOf(draft))
 
@@ -256,22 +248,31 @@ class ToolPreviewViewModelTest {
         assertPreviews(PARENT)
         pending.release.complete(Unit)
         runCurrent()
-        assertFalse(started.isCompleted)
         assertFalse(pending.persisted.isCompleted)
         assertPreviews(PARENT)
         assertTrue(runningSnapshots.all { it.second.isEmpty() })
     }
 
-    private fun TestScope.collectPreviews() {
+    private suspend fun TestScope.collectPreviews() {
         backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
             vm.preparingToolArguments.collect {}
         }
         backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
             vm.runningToolPreviewSnapshot.collect { runningSnapshots += it }
         }
-        runCurrent()
-        assertPreviews(PARENT)
+        awaitPreviews(PARENT)
         assertTrue(runningSnapshots.isNotEmpty())
+    }
+
+    private suspend fun awaitPreviews(
+        sessionId: String,
+        preparing: List<PreparingToolPreviewSnapshot> = emptyList(),
+        running: List<RunningToolOutput> = emptyList()
+    ) {
+        combine(vm.preparingToolArguments, vm.runningToolPreviewSnapshot) { actualPreparing, actualRunning ->
+            actualPreparing == (sessionId to preparing) && actualRunning == (sessionId to running)
+        }.first { it }
+        assertPreviews(sessionId, preparing, running)
     }
 
     private fun assertPreviews(

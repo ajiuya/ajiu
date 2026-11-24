@@ -68,7 +68,6 @@ import org.robolectric.annotation.GraphicsMode
 import org.robolectric.annotation.Implementation
 import org.robolectric.annotation.Implements
 import org.robolectric.annotation.LooperMode
-import org.robolectric.annotation.TextLayoutMode
 import org.robolectric.shadows.ShadowLegacyBitmap
 
 @RunWith(RobolectricTestRunner::class)
@@ -80,7 +79,6 @@ import org.robolectric.shadows.ShadowLegacyBitmap
 )
 @ConscryptMode(ConscryptMode.Mode.OFF)
 @GraphicsMode(GraphicsMode.Mode.LEGACY)
-@TextLayoutMode(TextLayoutMode.Mode.LEGACY)
 @LooperMode(LooperMode.Mode.PAUSED)
 @OptIn(InternalComposeUiApi::class, ExperimentalCoroutinesApi::class)
 class ChatStatusMotionTest {

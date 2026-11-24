@@ -53,14 +53,12 @@ import org.robolectric.annotation.Config
 import org.robolectric.annotation.ConscryptMode
 import org.robolectric.annotation.GraphicsMode
 import org.robolectric.annotation.LooperMode
-import org.robolectric.annotation.TextLayoutMode
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [28], qualifiers = "zh-rCN", application = Application::class, manifest = Config.NONE)
 @ConscryptMode(ConscryptMode.Mode.OFF)
 @GraphicsMode(GraphicsMode.Mode.LEGACY)
 // Legacy 字宽不是实际字形度量；窄屏大字体只检查容器、样式输入和完整语义。
-@TextLayoutMode(TextLayoutMode.Mode.LEGACY)
 @LooperMode(LooperMode.Mode.PAUSED)
 @OptIn(InternalComposeUiApi::class, ExperimentalCoroutinesApi::class)
 class CompactionProgressBubbleTest {
@@ -78,6 +76,7 @@ class CompactionProgressBubbleTest {
     }
 
     @Test(timeout = 30_000)
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
     fun progressKeepsOriginalBusyIndicatorStylePositionHeightAndThreeDots() {
         lateinit var progressBody: Rect
         lateinit var originalBody: Rect

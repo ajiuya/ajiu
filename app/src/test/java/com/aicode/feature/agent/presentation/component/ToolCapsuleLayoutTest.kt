@@ -47,14 +47,13 @@ import org.robolectric.annotation.Config
 import org.robolectric.annotation.ConscryptMode
 import org.robolectric.annotation.GraphicsMode
 import org.robolectric.annotation.LooperMode
-import org.robolectric.annotation.TextLayoutMode
+import org.robolectric.shadows.ShadowChoreographer
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [28], application = Application::class, manifest = Config.NONE)
 @ConscryptMode(ConscryptMode.Mode.OFF)
 @GraphicsMode(GraphicsMode.Mode.LEGACY)
 // Legacy graphics 以字符数模拟字宽；这里只验证真实 Compose 的尺寸与语义，不作字形渲染验收。
-@TextLayoutMode(TextLayoutMode.Mode.LEGACY)
 @LooperMode(LooperMode.Mode.PAUSED)
 @OptIn(InternalComposeUiApi::class)
 class ToolCapsuleLayoutTest {
@@ -79,7 +78,6 @@ class ToolCapsuleLayoutTest {
     }
 
     @Test
-    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
     fun timerDigitChangesKeepTitleAndDurationBoundsStableOnNarrowScreens() {
         val actionTitle = "检查工具胶囊标题与计时读数的布局，确保长标题在窄屏中显示稳定"
         for (fontScale in listOf(1f, 1.5f)) {
@@ -105,14 +103,12 @@ class ToolCapsuleLayoutTest {
 
     @Test
     @Config(qualifiers = "en-rUS")
-    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
     fun englishPendingAndElapsedTimeKeepTheSameSlots() {
         assertStatusTransition("Pending")
     }
 
     @Test
     @Config(qualifiers = "zh-rCN")
-    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
     fun chinesePendingAndElapsedTimeKeepTheSameSlots() {
         assertStatusTransition("等待执行")
     }
@@ -144,6 +140,7 @@ class ToolCapsuleLayoutTest {
     }
 
     @Test
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
     fun collapsedToolBodyHas32DpHeightWithTheThemeLabelSize() {
         lateinit var body: Rect
         var expectedLabelSize = TextUnit.Unspecified
@@ -161,7 +158,6 @@ class ToolCapsuleLayoutTest {
     }
 
     @Test
-    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
     fun enlargedFontKeepsItsSizeAndFitsVerticallyInTheGrowingBody() {
         lateinit var body: Rect
         var expectedLabelSize = TextUnit.Unspecified
@@ -186,6 +182,7 @@ class ToolCapsuleLayoutTest {
     }
 
     @Test
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
     fun adjacentToolItemsKeepAn8DpFooterAnd40DpItemHeight() {
         lateinit var standaloneBody: Rect
         lateinit var first: Rect
@@ -213,7 +210,6 @@ class ToolCapsuleLayoutTest {
     }
 
     @Test
-    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
     fun collapsedSubAgentGroupShowsCompactActivityAndCounts() {
         val summaries = listOf(
             SubAgentInteractionSummary("coder", title = "Implement layout", agentName = "编码员", status = SubAgentInteractionStatus.COMPLETED),
@@ -247,7 +243,6 @@ class ToolCapsuleLayoutTest {
     }
 
     @Test
-    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
     fun childCardAndSidebarShowTheSameRealNameAboveTheTaskWhileRootTitleStaysUnchanged() {
         val summary = SubAgentInteractionSummary("coder", title = "Implement compact tools", agentName = "编码员",
             status = SubAgentInteractionStatus.COMPLETED)
@@ -325,6 +320,8 @@ class ToolCapsuleLayoutTest {
         width: Int = 1_000,
         content: @Composable () -> Unit
     ): List<MeasuredText> {
+        val choreographerPaused = ShadowChoreographer.isPaused()
+        ShadowChoreographer.setPaused(true)
         val controller = Robolectric.buildActivity(ComponentActivity::class.java).setup().visible()
         val activity = controller.get()
         val view = ComposeView(activity)
@@ -355,9 +352,13 @@ class ToolCapsuleLayoutTest {
                 MeasuredText(node.boundsInRoot, layouts.single())
             }
         } finally {
-            view.disposeComposition()
-            controller.pause().stop().destroy()
-            shadowOf(Looper.getMainLooper()).idle()
+            try {
+                view.disposeComposition()
+                controller.pause().stop().destroy()
+                shadowOf(Looper.getMainLooper()).idle()
+            } finally {
+                ShadowChoreographer.setPaused(choreographerPaused)
+            }
         }
     }
 }

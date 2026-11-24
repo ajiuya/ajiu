@@ -68,18 +68,15 @@ import org.robolectric.annotation.Config
 import org.robolectric.annotation.ConscryptMode
 import org.robolectric.annotation.GraphicsMode
 import org.robolectric.annotation.LooperMode
-import org.robolectric.annotation.TextLayoutMode
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [28], qualifiers = "en", application = Application::class, manifest = Config.NONE)
 @ConscryptMode(ConscryptMode.Mode.OFF)
 @GraphicsMode(GraphicsMode.Mode.LEGACY)
-@TextLayoutMode(TextLayoutMode.Mode.LEGACY)
 @LooperMode(LooperMode.Mode.PAUSED)
 @OptIn(InternalComposeUiApi::class, ExperimentalCoroutinesApi::class)
 class SubAgentCompactLayoutTest {
     @Test
-    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
     fun allEightStatesKeepTheRecordedNameBesideStatusAndTaskOnTheNextLine() {
         val summaries = SubAgentInteractionStatus.entries.map { status ->
             SubAgentInteractionSummary(
@@ -122,6 +119,7 @@ class SubAgentCompactLayoutTest {
     }
 
     @Test
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
     fun collapsedGroupExpandsToCompactMemberRowsInsideTheSameCard() {
         val summaries = SubAgentInteractionStatus.entries.map { status ->
             SubAgentInteractionSummary(
@@ -216,6 +214,7 @@ class SubAgentCompactLayoutTest {
     }
 
     @Test
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
     fun expandedCardKeepsScopedOpenStopSendTechnicalDetailsAndIndependentExecutionSubscription() {
         val summary = SubAgentInteractionSummary("coder", agentName = "Recorded coder", title = "Implement compact rows",
             model = "actual-model", status = SubAgentInteractionStatus.RUNNING, currentToolTitle = "Read real source")
@@ -287,6 +286,7 @@ class SubAgentCompactLayoutTest {
     }
 
     @Test
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
     fun executionToolsKeep32DpRows8DpSpacingPagingAndRealRunningOutput() {
         val tools = (1..6).map { number ->
             AgentUIMessage(id = "tool$number", role = MessageRole.TOOL, content = "Actual output $number",
@@ -348,47 +348,39 @@ class SubAgentCompactLayoutTest {
 
     @Test
     @Config(qualifiers = "en-rUS")
-    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
     fun englishExpandedCountsIncludeApprovalAndExcludeFailedOrStoppedMembers() = assertExpandedCounts()
 
     @Test
     @Config(qualifiers = "zh-rCN")
-    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
     fun chineseExpandedCountsIncludeApprovalAndExcludeFailedOrStoppedMembers() = assertExpandedCounts()
 
     @Test
     @Config(qualifiers = "en-rUS")
-    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
     fun englishEightStatesKeepSeparateReadableColumnsAtNormalAndNarrowLargeFontSizes() =
         assertGroupColumns("Tester", "Fix", "Inspect the very long task title without moving the status column ")
 
     @Test
     @Config(qualifiers = "zh-rCN")
-    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
     fun chineseEightStatesKeepSeparateReadableColumnsAtNormalAndNarrowLargeFontSizes() =
         assertGroupColumns("测试员", "查", "核对真实任务标题并且始终保留完整状态栏的位置")
 
     @Test
     @Config(qualifiers = "en-rUS")
-    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
     fun englishSingleMemberStatusChangesUseTheSlotMeasuredAcrossAllEightStates() =
         assertChangingStatusSlot("Coder", "Fix", "Keep this much longer task from moving any status ")
 
     @Test
     @Config(qualifiers = "zh-rCN")
-    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
     fun chineseSingleMemberStatusChangesUseTheSlotMeasuredAcrossAllEightStates() =
         assertChangingStatusSlot("编码员", "查", "变更任务标题长度不能挤压或移动真实状态")
 
     @Test
     @Config(qualifiers = "en-rUS")
-    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
     fun forcedNarrowEnglishMembersActuallyStackTasksBelowTheirCompleteStatus() =
         assertGroupColumns("Coder", "Fix", "Force the second task line and retain the whole status ", forcedWidth = 140)
 
     @Test
     @Config(qualifiers = "zh-rCN")
-    @TextLayoutMode(TextLayoutMode.Mode.REALISTIC)
     fun forcedNarrowChineseMembersActuallyStackTasksBelowTheirCompleteStatus() =
         assertGroupColumns("编码员", "查", "强制第二行标题并且保留完整状态", forcedWidth = 140)
 

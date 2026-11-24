@@ -36,7 +36,9 @@ import org.robolectric.Shadows.shadowOf
 import org.robolectric.android.controller.ServiceController
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.ConscryptMode
+import org.robolectric.shadow.api.Shadow
 import org.robolectric.shadows.ShadowPowerManager
+import org.robolectric.shadows.ShadowWifiManager
 
 @RunWith(RobolectricTestRunner::class)
 @ConscryptMode(ConscryptMode.Mode.OFF)
@@ -494,7 +496,7 @@ class TerminalKeepaliveServiceTest {
         val networkLock = wifi.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "test:wifi")
             .apply { setReferenceCounted(false) }
         val cpuShadow = shadowOf(cpuLock)
-        val networkShadow = shadowOf(networkLock)
+        val networkShadow = Shadow.extract<ShadowWifiManager.ShadowWifiLock>(networkLock)
         service.javaClass.getDeclaredField("wakeLock").apply { isAccessible = true }.set(service, cpuLock)
         service.javaClass.getDeclaredField("wifiLock").apply { isAccessible = true }.set(service, networkLock)
         mockkObject(cpuShadow, networkShadow, FileLogger, recordPrivateCalls = true)
