@@ -3,11 +3,19 @@ package com.aicode.feature.terminal.domain
 import android.content.Context
 import com.aicode.core.util.FileLogger
 import com.aicode.feature.agent.domain.container.LinuxContainerEngine
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeCommands
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeCleanup
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeProcess
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeTaskResult
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwner
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwnerKind
 import com.aicode.feature.settings.data.repository.ExecutionMode
 import com.aicode.feature.terminal.data.repository.TerminalTaskHistoryRepository
 import com.aicode.feature.terminal.presentation.component.AppTerminalSessionClient
 import com.aicode.feature.workspace.data.repository.WorkspaceRepository
 import com.aicode.feature.workspace.domain.WorkspaceExecutionContext
+import com.aicode.feature.workspace.domain.WorkspaceExecutionContextFactory
+import com.aicode.feature.agent.domain.tool.explorer.shellQuote
 import com.termux.terminal.TerminalSession
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CoroutineScope
@@ -19,6 +27,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -51,7 +60,9 @@ class TerminalSessionManager @Inject constructor(
     @param:ApplicationContext private val appContext: Context,
     private val containerEngine: LinuxContainerEngine,
     private val workspaceRepository: WorkspaceRepository,
-    private val historyRepository: TerminalTaskHistoryRepository
+    private val historyRepository: TerminalTaskHistoryRepository,
+    private val runtimeCommands: LocalRuntimeCommands,
+    private val executionFactory: WorkspaceExecutionContextFactory
 ) : TerminalSessionProvider {
     private companion object {
         const val TAG = "TerminalSessionManager"
@@ -66,6 +77,7 @@ class TerminalSessionManager @Inject constructor(
         const val EXIT_MARKER_POLL_MS = 1_000L
         /** 交互标签创建后多久仍无任何输出就 dump 容器诊断（proot 没起来/卡住时的主动取证）。 */
         const val SILENT_DIAGNOSTIC_DELAY_MS = 10_000L
+        const val PLUGIN_CLEANUP_TIMEOUT_MS = 6_000L
     }
 
     private val _tabs = MutableStateFlow<List<TerminalTab>>(emptyList())
@@ -82,6 +94,7 @@ class TerminalSessionManager @Inject constructor(
     override val tabFinishedEvents: SharedFlow<TabFinishedEvent> = _tabFinishedEvents.asSharedFlow()
 
     private val idCounter = AtomicInteger(0)
+    private var pendingInteractiveTabId: String? = null
 
     private val monitorScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -107,12 +120,21 @@ class TerminalSessionManager @Inject constructor(
      *
      * 首次会触发 rootfs/proot 解压（幂等）；失败抛异常由调用方处理。
      */
-    suspend fun createInteractiveTab(): String = createTab()
+    suspend fun createInteractiveTab(): String {
+        val id = pendingInteractiveTabId ?: nextId().also { pendingInteractiveTabId = it }
+        val owner = RuntimeOwner(RuntimeOwnerKind.TERMINAL, id)
+        val execution = executionFactory.freeze(runtimeOwner = owner)
+        return withContext(execution) {
+            execution.requireMode(ExecutionMode.LOCAL_PROOT)
+            if (isChrootExecution(execution)) {
+                createChrootTab(id, null, null, false, null, owner, execution).also { _activeTabId.value = it }
+            } else createTab(id)
+        }.also { pendingInteractiveTabId = null }
+    }
 
-    private suspend fun createTab(): String {
+    private suspend fun createTab(id: String): String {
         FileLogger.i(TAG, "新建交互终端标签：开始准备容器")
         ensureContainer()
-        val id = nextId()
         val shellCommand = buildInteractiveCommand()
         FileLogger.i(TAG, "交互 shell 命令（$id）：$shellCommand")
         val (session, client) = try {
@@ -130,7 +152,8 @@ class TerminalSessionManager @Inject constructor(
                 isBackground = false,
                 command = null,
                 client = client,
-                runState = RunState.Running
+                runState = RunState.Running,
+                capturedExecution = WorkspaceExecutionContext.current()
             )
         )
         _activeTabId.value = id
@@ -183,8 +206,14 @@ class TerminalSessionManager @Inject constructor(
         notify: Boolean,
         sourceSessionId: String?
     ): String {
-        val protectedTask = terminalTaskHistoryEligible(notify, sourceSessionId)
+        sourceSessionId?.let { RuntimeOwner(RuntimeOwnerKind.AGENT, it) }
         val execution = WorkspaceExecutionContext.current()
+        if (isChrootExecution(execution)) {
+            val id = nextId()
+            val owner = terminalRuntimeOwner(id, sourceSessionId)
+            return createChrootTab(id, command, title, notify, sourceSessionId, owner, requireNotNull(execution))
+        }
+        val protectedTask = terminalTaskHistoryEligible(notify, sourceSessionId)
         if (protectedTask) {
             requireTerminalHistorySession(requireNotNull(sourceSessionId))
             requireNotNull(execution) { "Captured local execution required for terminal history" }
@@ -240,7 +269,8 @@ class TerminalSessionManager @Inject constructor(
                     runState = RunState.Running,
                     sourceMode = ExecutionMode.LOCAL_PROOT.name,
                     channelGeneration = null,
-                    historyId = historyId
+                    historyId = historyId,
+                    capturedExecution = execution
                 )
             )
             if (historyId != null && !session.isRunning) finishTab(requireNotNull(tab(id)), session.exitStatus)
@@ -260,9 +290,73 @@ class TerminalSessionManager @Inject constructor(
         return id
     }
 
+    override suspend fun startOwnedBackgroundCommand(command: String, title: String?, notify: Boolean, owner: RuntimeOwner): String {
+        require(owner.kind == RuntimeOwnerKind.AGENT)
+        val execution = WorkspaceExecutionContext.current() ?: executionFactory.freeze(runtimeOwner = owner)
+        require(execution.runtimeOwner == owner) { "Terminal execution owner mismatch" }
+        return withContext(execution) { startBackgroundCommand(command, title, notify, owner.scopeId) }
+    }
+
+    private suspend fun createChrootTab(
+        id: String,
+        command: String?,
+        title: String?,
+        notify: Boolean,
+        sourceSessionId: String?,
+        owner: RuntimeOwner,
+        execution: WorkspaceExecutionContext,
+        pluginOwner: TerminalResourceOwner? = null,
+        onOutput: ((ByteArray) -> Unit)? = null
+    ): String {
+        execution.requireMode(ExecutionMode.LOCAL_PROOT)
+        require(execution.runtimeOwner == owner) { "Terminal execution owner mismatch" }
+        val capture = requireNotNull(execution.localRuntimeCapture) { "CHROOT execution capture required" }
+        require(capture.owner == owner) { "Terminal runtime owner mismatch" }
+        val shell = execution.profileSnapshot?.activeProfile?.shellPath ?: execution.localMapping?.profile?.shellPath ?: "/bin/sh"
+        val argv = if (command == null) listOf(shell, "-i") else {
+            val script = if (notify || pluginOwner != null) command else "$command; exec ${shellQuote(shell)} -i"
+            listOf(shell, "-c", script)
+        }
+        val task = runtimeCommands.startPty(capture, argv, columns = DEFAULT_COLUMNS, rows = DEFAULT_ROWS)
+        try {
+            execution.checkCurrent()
+            val (session, client) = openSession(onOutput) { inputClient ->
+                TerminalSession(TRANSCRIPT_ROWS, inputClient, ChrootSessionBackend(task))
+            }
+            execution.checkCurrent()
+            val tab = TerminalTab(
+                id, title ?: id, session, command != null, command,
+                notifyOnExit = notify, sourceSessionId = sourceSessionId, client = client,
+                runState = RunState.Running, sourceMode = ExecutionMode.LOCAL_PROOT.name,
+                runtimeOwner = owner, runtimeTask = task,
+                ownerPluginId = pluginOwner?.pluginId, ownerResourceId = pluginOwner?.resourceId,
+                capturedExecution = execution
+            )
+            addTab(tab)
+            if (pluginOwner == null && _activeTabId.value == null) _activeTabId.value = id
+            if (task.taskState.value != null) finishTab(tab, task.exitValue())
+            monitorScope.launch(Dispatchers.Main.immediate) {
+                task.awaitCleanup()
+                if (tab(id) === tab) bumpRevision()
+            }
+            return id
+        } catch (failure: Throwable) {
+            withContext(NonCancellable) {
+                task.stop()
+                if (pluginOwner == null) task.awaitCleanup() else awaitPluginCleanup(task)
+            }
+            throw failure
+        }
+    }
+
     override suspend fun startPluginCommand(command: String, title: String?, owner: TerminalResourceOwner, onOutput: (ByteArray) -> Unit): String {
         val execution = WorkspaceExecutionContext.current() ?: error("Captured execution required")
         execution.requireMode(ExecutionMode.LOCAL_PROOT)
+        val runtimeOwner = requireNotNull(execution.runtimeOwner) { "Plugin execution owner required" }
+        require(runtimeOwner.kind == RuntimeOwnerKind.PLUGIN) { "Plugin execution owner mismatch" }
+        if (isChrootExecution(execution)) {
+            return createChrootTab(nextId(), command, title, false, null, runtimeOwner, execution, owner, onOutput)
+        }
         ensureContainer()
         execution.checkCurrent()
         val id = nextId()
@@ -272,7 +366,8 @@ class TerminalSessionManager @Inject constructor(
             execution.checkCurrent()
             addTab(TerminalTab(id, title ?: id, session, true, command, client = client,
                 runState = RunState.Running, sourceMode = ExecutionMode.LOCAL_PROOT.name,
-                ownerPluginId = owner.pluginId, ownerResourceId = owner.resourceId))
+                ownerPluginId = owner.pluginId, ownerResourceId = owner.resourceId, runtimeOwner = runtimeOwner,
+                capturedExecution = execution))
             return id
         } catch (failure: Throwable) {
             withContext(kotlinx.coroutines.NonCancellable) {
@@ -284,21 +379,46 @@ class TerminalSessionManager @Inject constructor(
     }
 
     override fun pluginTabStatus(id: String, owner: TerminalResourceOwner): TerminalTabStatus? =
-        tab(id)?.takeIf { it.isOwnedBy(owner) }?.let { TerminalTabStatus(it.session.isRunning, (it.runState as? RunState.Finished)?.exitCode) }
+        tab(id)?.takeIf { it.isOwnedBy(owner) }?.let { tab ->
+            val task = tab.runtimeTask
+            if (task == null) TerminalTabStatus(tab.session.isRunning, (tab.runState as? RunState.Finished)?.exitCode)
+            else when (val result = task.taskState.value) {
+                null -> TerminalTabStatus(true, null, exitKnown = false, taskStatus = "RUNNING",
+                    cleanupStatus = task.cleanupState.value?.name ?: "PENDING")
+                LocalRuntimeTaskResult.Unknown -> TerminalTabStatus(tab.session.isRunning, null, exitKnown = false, taskStatus = "UNKNOWN",
+                    cleanupStatus = task.cleanupState.value?.name ?: "PENDING")
+                is LocalRuntimeTaskResult.Exited -> TerminalTabStatus(tab.session.isRunning, result.terminalStatus, taskStatus = "EXITED",
+                    cleanupStatus = task.cleanupState.value?.name ?: "PENDING")
+            }
+        }
 
     override fun writePluginInput(id: String, owner: TerminalResourceOwner, text: String, appendNewline: Boolean): Boolean =
-        tab(id)?.takeIf { it.isOwnedBy(owner) }?.let { sendInput(id, text, appendNewline) } ?: false
+        tab(id)?.takeIf { it.isOwnedBy(owner) && it.runtimeTask?.taskState?.value == null }
+            ?.let { sendInput(id, text, appendNewline) } ?: false
 
     override fun interruptPluginTab(id: String, owner: TerminalResourceOwner): Boolean =
-        tab(id)?.takeIf { it.isOwnedBy(owner) }?.let { writeBytesToTab(id, 3) } ?: false
+        tab(id)?.takeIf { it.isOwnedBy(owner) && it.runtimeTask?.taskState?.value == null }
+            ?.let { writeBytesToTab(id, 3) } ?: false
 
     override suspend fun closePluginTab(id: String, owner: TerminalResourceOwner): Boolean {
         val tab = tab(id)?.takeIf { it.isOwnedBy(owner) } ?: return false
+        tab.runtimeTask?.let { task ->
+            tab.onUserInput = {}
+            tab.session.setRawOutputListener(null)
+            if (task.taskState.value == null) task.stop()
+            val cleanup = awaitPluginCleanup(task)
+            closeTab(id)
+            return cleanup == LocalRuntimeCleanup.VERIFIED
+        }
         tab.session.finishIfRunning()
         while (tab.session.isRunning) delay(25)
         tab.session.setRawOutputListener(null)
         closeTab(id)
         return true
+    }
+
+    private suspend fun awaitPluginCleanup(task: LocalRuntimeProcess): LocalRuntimeCleanup = withContext(NonCancellable) {
+        withTimeoutOrNull(PLUGIN_CLEANUP_TIMEOUT_MS) { task.awaitCleanup() } ?: LocalRuntimeCleanup.UNKNOWN
     }
 
     private fun runningTab(id: String): TerminalTab? {
@@ -330,6 +450,18 @@ class TerminalSessionManager @Inject constructor(
         return true
     }
 
+    private fun ownedInputTab(id: String, owner: RuntimeOwner): TerminalTab? =
+        runningTab(id)?.takeIf { it.isAccessibleTo(owner) }?.also { it.checkOwnedInputExecution() }
+
+    override fun sendOwnedInput(id: String, owner: RuntimeOwner, input: String, appendNewline: Boolean): Boolean =
+        ownedInputTab(id, owner)?.let { sendInput(it.id, input, appendNewline) } ?: false
+
+    override fun writeOwnedText(id: String, owner: RuntimeOwner, text: String): Boolean =
+        ownedInputTab(id, owner)?.let { writeToTab(it.id, text) } ?: false
+
+    override fun writeOwnedBytes(id: String, owner: RuntimeOwner, vararg bytes: Int): Boolean =
+        ownedInputTab(id, owner)?.let { writeBytesToTab(it.id, *bytes) } ?: false
+
     /** 向当前活动标签写入文本（额外按键行：方向键/Tab 等）。 */
     fun writeToActive(text: String) {
         _activeTabId.value?.let { writeToTab(it, text) }
@@ -358,8 +490,37 @@ class TerminalSessionManager @Inject constructor(
             running = it.runState is RunState.Running,
             command = it.command,
             historyId = it.historyId,
-            historyError = it.historyError
+            historyError = it.historyError,
+            runtimeOwner = it.runtimeOwner,
+            taskStatus = it.runtimeTask?.let { task -> when (task.taskState.value) {
+                null -> "RUNNING"
+                LocalRuntimeTaskResult.Unknown -> "UNKNOWN"
+                is LocalRuntimeTaskResult.Exited -> "EXITED"
+            } },
+            cleanupStatus = it.runtimeTask?.let { task -> task.cleanupState.value?.name ?: "PENDING" },
+            exitCode = (it.runState as? RunState.Finished)?.takeIf { state -> state.exitKnown }?.exitCode,
+            exitKnown = (it.runState as? RunState.Finished)?.exitKnown ?: true
         )
+    }
+
+    override fun resizeOwnedTab(id: String, owner: RuntimeOwner, columns: Int, rows: Int): Boolean {
+        require(columns in 1..4096 && rows in 1..4096)
+        val tab = runningTab(id)?.takeIf { it.isAccessibleTo(owner) } ?: return false
+        tab.session.updateSize(columns, rows)
+        return true
+    }
+
+    override fun signalOwnedTab(id: String, owner: RuntimeOwner, signal: Int): Boolean {
+        val tab = runningTab(id)?.takeIf { it.isAccessibleTo(owner) } ?: return false
+        if (tab.runtimeTask != null) return tab.runtimeTask.signal(signal)
+        return signal == 2 && writeBytesToTab(id, 3)
+    }
+
+    override suspend fun closeOwnedTab(id: String, owner: RuntimeOwner): TerminalCloseResult? {
+        val tab = tab(id)?.takeIf { it.isAccessibleTo(owner) } ?: return null
+        if (!closeTab(id)) return null
+        val cleanup = tab.runtimeTask?.let { task -> withContext(NonCancellable) { task.awaitCleanup() } }
+        return TerminalCloseResult(cleanup)
     }
 
     /** 切换当前标签。 */
@@ -389,6 +550,9 @@ class TerminalSessionManager @Inject constructor(
         tab.onUserInput = {}
         tab.session.setRawOutputListener(null)
         runCatching { tab.session.finishIfRunning() }
+        tab.runtimeTask?.let { task ->
+            monitorScope.launch { task.awaitCleanup() }
+        }
         tab.view = null
         val remaining = _tabs.value.filterNot { it.id == id }
         _tabs.value = remaining
@@ -408,7 +572,14 @@ class TerminalSessionManager @Inject constructor(
         }
     }
 
+    private fun isChrootExecution(execution: WorkspaceExecutionContext?): Boolean =
+        execution?.localRuntimeCapture != null || execution?.profileSnapshot?.activeProfile?.isChroot == true ||
+            execution?.localMapping?.profile?.isChroot == true
+
     private suspend fun ensureContainer() {
+        check(!isChrootExecution(WorkspaceExecutionContext.current())) {
+            "CHROOT cannot use PRoot installation"
+        }
         val startedAt = System.currentTimeMillis()
         containerEngine.ensureInstalled()
         if (!containerEngine.isContainerInstalled()) {
@@ -435,7 +606,7 @@ class TerminalSessionManager @Inject constructor(
             var lastRevision = -1L
             while (true) {
                 val tab = tab(tabId) ?: return@launch
-                if (tab.runState !is RunState.Running) return@launch
+                if (tab.runState !is RunState.Running || tab.runtimeTask != null) return@launch
                 if (seenExitCode == null) {
                     if (tab.outputRevision != lastRevision) {
                         val output = getTabOutput(tabId) ?: return@launch
@@ -491,7 +662,8 @@ class TerminalSessionManager @Inject constructor(
         val output = getTabOutput(tab.id).orEmpty()
         val revision = tab.outputRevision
         if (!tab.finish(exitCode)) return
-        val completedExitCode = (tab.runState as RunState.Finished).exitCode
+        val completed = tab.runState as RunState.Finished
+        val completedExitCode = completed.exitCode
         releaseKeepalive(tab.id)
         bumpRevision()
         val notify = tab.ownerPluginId == null && tab.notifyOnExit && !tab.finishedNotified
@@ -522,7 +694,8 @@ class TerminalSessionManager @Inject constructor(
             sourceMode = tab.sourceMode,
             channelGeneration = tab.channelGeneration,
             historyId = tab.historyId,
-            historyError = tab.historyError
+            historyError = tab.historyError,
+            exitKnown = (tab.runState as? RunState.Finished)?.exitKnown ?: true
         ))
     }
 
@@ -558,6 +731,7 @@ class TerminalSessionManager @Inject constructor(
     private fun buildSession(shellCommand: String, onOutput: ((ByteArray) -> Unit)? = null): Pair<TerminalSession, AppTerminalSessionClient> {
         val execution = WorkspaceExecutionContext.current()
         execution?.requireMode(ExecutionMode.LOCAL_PROOT)
+        check(!isChrootExecution(execution)) { "CHROOT cannot use a PRoot session" }
         val workspace = execution?.localMapping?.workspaceRoot?.absolutePath ?: workspaceRepository.currentPath()
         val invocation = containerEngine.buildProotInvocation(shellCommand, workspace)
         FileLogger.i(
@@ -566,13 +740,29 @@ class TerminalSessionManager @Inject constructor(
                 "（存在=${java.io.File(invocation.executable).exists()}）argv=${invocation.argv.joinToString(" ")}"
         )
         FileLogger.d(TAG, "PTY 环境变量键：${invocation.env.keys.joinToString(",")}")
+        return openSession(onOutput) { inputClient ->
+            TerminalSession(
+                invocation.executable,
+                appContext.filesDir.absolutePath,
+                invocation.argv.toTypedArray(),
+                invocation.ptyEnvArray,
+                TRANSCRIPT_ROWS,
+                inputClient
+            )
+        }
+    }
+
+    private fun openSession(
+        onOutput: ((ByteArray) -> Unit)? = null,
+        create: (com.termux.terminal.TerminalSessionClient) -> TerminalSession
+    ): Pair<TerminalSession, AppTerminalSessionClient> {
         lateinit var session: TerminalSession
         val client = AppTerminalSessionClient(
             context = appContext,
             viewProvider = { _tabs.value.firstOrNull { it.session === session }?.view },
             onFinished = { finished ->
                 _tabs.value.firstOrNull { it.session === finished }?.let { target ->
-                    val exitCode = if (target.isBackground && target.notifyOnExit) {
+                    val exitCode = if (target.runtimeTask == null && target.isBackground && target.notifyOnExit) {
                         target.markerExitCode ?: extractExitCode(getTabOutput(target.id).orEmpty()) ?: finished.exitStatus
                     } else finished.exitStatus
                     finishTab(target, exitCode)
@@ -591,15 +781,8 @@ class TerminalSessionManager @Inject constructor(
                 if (text.isNotEmpty() && target != null) writeToSession(target, text)
             }
         }
-        execution?.checkCurrent()
-        session = TerminalSession(
-            invocation.executable,
-            appContext.filesDir.absolutePath,
-            invocation.argv.toTypedArray(),
-            invocation.ptyEnvArray,
-            TRANSCRIPT_ROWS,
-            inputTrackingClient
-        )
+        WorkspaceExecutionContext.current()?.checkCurrent()
+        session = create(inputTrackingClient)
         if (onOutput != null) session.setRawOutputListener { _, data, length -> onOutput(data.copyOf(length)) }
         session.updateSize(DEFAULT_COLUMNS, DEFAULT_ROWS)
         FileLogger.i(TAG, "PTY 会话已创建：pid=${session.pid} 运行中=${session.isRunning}")

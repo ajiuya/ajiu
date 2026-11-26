@@ -3,6 +3,7 @@ package com.aicode.feature.agent.domain.prompt
 import android.content.Context
 import com.aicode.core.util.FileLogger
 import com.aicode.feature.agent.domain.container.ContainerInstaller
+import com.aicode.feature.agent.domain.container.ContainerProfile
 import com.aicode.feature.agent.domain.memory.MemoryRepository
 import com.aicode.feature.agent.domain.memory.MemoryScope
 import com.aicode.feature.agent.domain.model.AgentContext
@@ -11,13 +12,18 @@ import com.aicode.feature.agent.domain.skill.SkillRepository
 import com.aicode.feature.agent.domain.subagent.AgentDefinition
 import com.aicode.feature.agent.domain.subagent.AgentDefinitionRepository
 import com.aicode.feature.agent.domain.subagent.InjectPart
+import com.aicode.feature.settings.data.repository.ContainerProfileSnapshot
+import com.aicode.feature.settings.data.repository.ContainerSettingsRepository
 import com.aicode.feature.settings.data.repository.ExecutionMode
 import com.aicode.feature.settings.data.repository.ExecutionModeHolder
+import com.aicode.feature.workspace.domain.WorkspaceExecutionContext
 import dagger.hilt.android.qualifiers.ApplicationContext
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runBlocking
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -40,7 +46,8 @@ class SystemPromptProvider @Inject constructor(
     private val promptFragmentCatalog: PromptFragmentCatalog,
     private val containerInstaller: ContainerInstaller,
     private val agentDefinitionRepository: AgentDefinitionRepository,
-    private val executionModeHolder: ExecutionModeHolder
+    private val executionModeHolder: ExecutionModeHolder,
+    private val containerSettingsRepository: ContainerSettingsRepository
 ) {
     private val restoredContentRevision = AtomicLong()
 
@@ -218,12 +225,79 @@ class SystemPromptProvider @Inject constructor(
             if (ctx.projectRoot.isNotBlank()) "~/workspace" else "（未选择工作区）"
     }
 
-    private inner class EnvironmentSource : PromptSource {
-        override fun build(ctx: AgentContext): String =
-            when (executionModeHolder.currentMode()) {
-                ExecutionMode.LOCAL_PROOT -> "本地容器（PRoot）"
-                ExecutionMode.REMOTE_SSH -> "远程 SSH 服务器"
+    private class EnvironmentCapture(val content: String, val checkCurrent: () -> Unit)
+
+    /** 每次 build 只读一次配置元数据；描述运行时不需要创建实例、冻结执行或申请 Root。 */
+    private inner class EnvironmentSource {
+        fun capture(): EnvironmentCapture {
+            val execution = WorkspaceExecutionContext.current()
+            if (execution != null) {
+                execution.checkCurrent()
+                val content = when (execution.mode) {
+                    ExecutionMode.REMOTE_SSH -> "远程 SSH 服务器"
+                    ExecutionMode.LOCAL_PROOT -> describeLocal(
+                        execution.localRuntimeCapture?.profile ?: execution.localMapping?.profile
+                            ?: execution.profileSnapshot?.let(::selectedProfile)
+                    )
+                }
+                return EnvironmentCapture(content, execution::checkCurrent).also { it.checkCurrent() }
             }
+
+            // LOCAL_PROOT 是历史上的本地通道标识，具体运行时必须来自同一份 profile 快照。
+            val modeRevision = executionModeHolder.modeSelectionRevision
+            val mode = executionModeHolder.currentMode()
+            fun checkMode() {
+                if (executionModeHolder.modeSelectionRevision != modeRevision || executionModeHolder.currentMode() != mode) {
+                    throw CancellationException("Prompt execution mode changed")
+                }
+            }
+            checkMode()
+            if (mode == ExecutionMode.REMOTE_SSH) {
+                return EnvironmentCapture("远程 SSH 服务器", ::checkMode)
+            }
+
+            val selectionRevision = containerSettingsRepository.activeProfileSelectionRevision
+            val configurationRevision = containerSettingsRepository.profileConfigurationRevision
+            val snapshot = try {
+                runBlocking(Dispatchers.IO) { containerSettingsRepository.captureProfileSnapshot() }
+            } catch (failure: Exception) {
+                if (failure is CancellationException) throw failure
+                null
+            }
+            fun checkSource() {
+                checkMode()
+                if (snapshot != null) {
+                    containerSettingsRepository.checkProfileSnapshot(snapshot)
+                } else if (containerSettingsRepository.activeProfileSelectionRevision != selectionRevision ||
+                    containerSettingsRepository.profileConfigurationRevision != configurationRevision) {
+                    throw CancellationException("Prompt container configuration changed")
+                }
+                checkMode()
+            }
+            checkSource()
+            val content = if (snapshot == null) {
+                "本地容器（运行时未知：配置不可读或尚未加载）"
+            } else {
+                describeLocal(selectedProfile(snapshot))
+            }
+            return EnvironmentCapture(content, ::checkSource).also { it.checkCurrent() }
+        }
+
+        // 不使用 snapshot.activeProfile 的首项兜底，以免把缺失的自选 profile 冒充为 PRoot。
+        private fun selectedProfile(snapshot: ContainerProfileSnapshot): ContainerProfile? =
+            snapshot.profiles.firstOrNull { it.id == snapshot.selectedProfileId }
+                ?: ContainerProfile.BUILTIN_ALPINE.takeIf { snapshot.selectedProfileId == ContainerProfile.BUILTIN_ID }
+
+        private fun describeLocal(profile: ContainerProfile?): String = when {
+            profile == null -> "本地容器（运行时未知：所选配置缺失或尚未加载）"
+            profile.mode != ExecutionMode.LOCAL_PROOT -> "本地容器（运行时未知：所选配置与本地执行模式不一致）"
+            profile.isChroot -> {
+                val instance = if (profile.chrootInstance == null) "实例未创建，尚不可运行" else "配置已记录实例，健康状态未核验"
+                "本地容器（CHROOT）；$instance。运行时语义：容器内为真实 guest UID 0，rootfs 可写；" +
+                    "不等于宿主执行或 Root 沙箱，也不代表系统 su 已授权。"
+            }
+            else -> "本地容器（PRoot）；guest 显示 root 不代表宿主 Root；运行状态未核验。"
+        }
     }
 
     /** 记忆清单拆分为全局/项目两组纯列表，供 `{{AICODE_MEMORY_GLOBAL}}` / `{{AICODE_MEMORY_PROJECT}}` 变量使用。 */
@@ -293,12 +367,18 @@ class SystemPromptProvider @Inject constructor(
     }
 
     fun build(agentContext: AgentContext): String {
-        agentContext.agentDefinition?.let { return buildForSubAgent(it, agentContext) }
-
-        if (PromptFragmentResolver.isBuiltinDisabled(customDir)) {
-            return buildCustomOnly(agentContext)
+        val environment = environmentSource.capture()
+        val definition = agentContext.agentDefinition
+        val content = when {
+            definition != null -> buildForSubAgent(definition, agentContext, environment.content)
+            PromptFragmentResolver.isBuiltinDisabled(customDir) -> buildCustomOnly(agentContext, environment.content)
+            else -> buildForMainAgent(agentContext, environment.content)
         }
+        environment.checkCurrent()
+        return content
+    }
 
+    private fun buildForMainAgent(agentContext: AgentContext, environmentContent: String): String {
         // 1. 获取各个 Source 的基线快照。
         val rawStatic = staticRuleSource.build(agentContext)
         val skillsContent = activeSkillsSource.build(agentContext)
@@ -306,7 +386,6 @@ class SystemPromptProvider @Inject constructor(
         val memories = memoryListSource.build(agentContext)
         val projectRules = projectRuleSource.build(agentContext)
         val workspaceContent = workspaceSource.build(agentContext)
-        val environmentContent = environmentSource.build(agentContext)
 
         // 2. 变量就地展开：`{{AICODE_*}}` 替换为纯数据；未写变量的片段原样保留。
         val staticContent = renderVariables(
@@ -331,7 +410,7 @@ class SystemPromptProvider @Inject constructor(
      * [PromptFragmentResolver.DISABLE_BUILTIN_FILE] 生效时：只输出 `prompts.custom/` 顶层的数字片段，
      * 不注入任何内置来源；动态内容仅通过 `{{AICODE_*}}` 变量按需取回。
      */
-    private fun buildCustomOnly(ctx: AgentContext): String {
+    private fun buildCustomOnly(ctx: AgentContext, environmentContent: String): String {
         val content = promptFragmentCatalog.renderCustomOnly(ctx.projectRoot)
         if (content.isEmpty()) {
             FileLogger.w(
@@ -351,7 +430,7 @@ class SystemPromptProvider @Inject constructor(
             projectRules?.global,
             projectRules?.project,
             workspaceSource.build(ctx),
-            environmentSource.build(ctx),
+            environmentContent,
             currentDate(),
             goal = renderGoalBlock(ctx)
         )
@@ -363,14 +442,16 @@ class SystemPromptProvider @Inject constructor(
      */
     private fun buildForSubAgent(
         definition: AgentDefinition,
-        agentContext: AgentContext
+        agentContext: AgentContext,
+        environmentContent: String
     ): String = buildString {
+        // 已选基线只补环境变量展开，保留其它变量和 InjectPart 的既有语义。
         if (InjectPart.MAIN_RULES in definition.inject) {
-            append(staticRuleSource.build(agentContext))
+            append(staticRuleSource.build(agentContext).replace(ENVIRONMENT_VAR, environmentContent))
             append("\n\n")
         }
         if (InjectPart.BASE in definition.inject) {
-            append(subAgentBaseSource.build(agentContext))
+            append(subAgentBaseSource.build(agentContext).replace(ENVIRONMENT_VAR, environmentContent))
             append("\n\n")
         }
 
@@ -388,7 +469,7 @@ class SystemPromptProvider @Inject constructor(
                 projectRules?.global,
                 projectRules?.project,
                 workspaceSource.build(agentContext),
-                environmentSource.build(agentContext),
+                environmentContent,
                 currentDate()
             )
         )
@@ -424,7 +505,7 @@ class SystemPromptProvider @Inject constructor(
                 null,
                 null,
                 workspaceSource.build(agentContext),
-                environmentSource.build(agentContext),
+                environmentContent,
                 currentDate(),
                 definition.name
             )

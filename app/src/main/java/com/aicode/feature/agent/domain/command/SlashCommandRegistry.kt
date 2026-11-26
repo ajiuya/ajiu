@@ -3,18 +3,17 @@ package com.aicode.feature.agent.domain.command
 import android.content.Context
 import com.aicode.feature.agent.domain.skill.Skill
 import com.aicode.feature.agent.domain.skill.SkillRepository
+import com.aicode.feature.agent.domain.skill.SkillDefinitionSourceChanged
 import com.aicode.feature.workspace.domain.WorkspaceExecutionContextFactory
 import dagger.hilt.android.qualifiers.ApplicationContext
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.withContext
 
 /**
  * 斜杠命令注册表：聚合内置命令（[ActionCommandHandler]）与已启用技能，
@@ -43,7 +42,11 @@ class SlashCommandRegistry @Inject constructor(
     private var refreshOwner = 0L
     private var skillsSource: String? = null
 
-    private val _commands = MutableStateFlow<List<SlashCommand>>(emptyList())
+    enum class RefreshState { Idle, Loading, Ready, Unavailable, Failed }
+
+    private val _refreshState = MutableStateFlow(RefreshState.Idle)
+    val refreshState: StateFlow<RefreshState> = _refreshState.asStateFlow()
+    private val _commands = MutableStateFlow(buildCommands())
 
     /** `/` 菜单展示的命令列表。 */
     val commands: StateFlow<List<SlashCommand>>
@@ -52,21 +55,39 @@ class SlashCommandRegistry @Inject constructor(
             return _commands.asStateFlow()
         }
 
-    /** 重新扫描技能并重建菜单。涉及文件 IO，调用方应在 IO 上下文调用。 */
     suspend fun refresh() {
-        val owner = synchronized(refreshLock) { ++refreshOwner }
-        val execution = executionContextFactory.freeze()
-        withContext(Dispatchers.IO + execution) {
-            discardChangedSkills()
-            val source = skillRepository.sourceIdentity()
-            val updated = skillRepository.listSkills()
+        discardChangedSkills()
+        val owner = synchronized(refreshLock) {
+            _refreshState.value = RefreshState.Loading
+            ++refreshOwner
+        }
+        try {
+            val snapshot = skillRepository.readDefinitionSnapshot(executionContextFactory)
             currentCoroutineContext().ensureActive()
             synchronized(refreshLock) {
                 if (owner != refreshOwner) return@synchronized
-                skillRepository.checkSourceIdentity(source)
-                skills = updated
-                skillsSource = source
+                skillRepository.checkSourceIdentity(snapshot.sourceIdentity)
+                skills = snapshot.enabled.map { it.skill }
+                skillsSource = snapshot.sourceIdentity
                 _commands.value = buildCommands()
+                _refreshState.value = RefreshState.Ready
+            }
+        } catch (_: SkillDefinitionSourceChanged) {
+            currentCoroutineContext().ensureActive()
+            synchronized(refreshLock) {
+                if (owner == refreshOwner) clearSkills(RefreshState.Unavailable)
+            }
+        } catch (cancelled: CancellationException) {
+            synchronized(refreshLock) {
+                if (owner == refreshOwner) {
+                    _refreshState.value = if (skillsSource == null) RefreshState.Idle else RefreshState.Ready
+                }
+            }
+            throw cancelled
+        } catch (_: Exception) {
+            currentCoroutineContext().ensureActive()
+            synchronized(refreshLock) {
+                if (owner == refreshOwner) clearSkills(RefreshState.Failed)
             }
         }
     }
@@ -74,19 +95,21 @@ class SlashCommandRegistry @Inject constructor(
     private fun discardChangedSkills() {
         synchronized(refreshLock) {
             val source = skillsSource ?: return
-            try {
-                if (source == skillRepository.sourceIdentity()) return
-            } catch (e: Exception) {
-                skills = emptyList()
-                skillsSource = null
-                _commands.value = buildCommands()
-                if (e is CancellationException) throw e
+            val current = try {
+                skillRepository.sourceIdentity()
+            } catch (_: Exception) {
+                clearSkills(RefreshState.Unavailable)
                 return
             }
-            skills = emptyList()
-            skillsSource = null
-            _commands.value = buildCommands()
+            if (source != current) clearSkills(RefreshState.Unavailable)
         }
+    }
+
+    private fun clearSkills(state: RefreshState) {
+        skills = emptyList()
+        skillsSource = null
+        _commands.value = buildCommands()
+        _refreshState.value = state
     }
 
     private fun buildCommands(): List<SlashCommand> = buildList {
@@ -133,7 +156,12 @@ class SlashCommandRegistry @Inject constructor(
         discardChangedSkills()
         return synchronized(refreshLock) {
             val source = skillsSource ?: return@synchronized null
-            skillRepository.checkSourceIdentity(source)
+            try {
+                skillRepository.checkSourceIdentity(source)
+            } catch (_: Exception) {
+                clearSkills(RefreshState.Unavailable)
+                return@synchronized null
+            }
             val skill = skills.firstOrNull { it.name.equals(name, ignoreCase = true) } ?: return@synchronized null
             ResolvedCommand.SkillCommand(skill, args)
         }

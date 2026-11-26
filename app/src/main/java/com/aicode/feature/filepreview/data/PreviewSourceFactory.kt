@@ -6,6 +6,7 @@ import com.aicode.feature.filepreview.domain.PreviewRequest
 import com.aicode.feature.workspace.data.repository.WorkspaceRepository
 import com.aicode.feature.workspace.domain.WorkspaceExecutionContextFactory
 import com.aicode.feature.workspace.domain.WorkspaceRootRead
+import com.aicode.feature.workspace.domain.UiFileExecutionSource
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -26,8 +27,35 @@ internal class PreviewSourceFactory @Inject constructor(
     private val executionFactory: WorkspaceExecutionContextFactory,
     private val rootReader: WorkspaceRootRead,
 ) {
+    private var sourceKey: List<Any>? = null
+    private var uiSource: UiFileExecutionSource? = null
+
+    @Synchronized
+    private fun sourceFor(path: String, scopeJob: Job): UiFileExecutionSource {
+        val selection = workspace.selection.value
+        val workspacePath = workspace.currentPath()
+        val key = listOf(selection.id, workspacePath, path, scopeJob)
+        if (sourceKey != key) {
+            uiSource?.close()
+            sourceKey = key
+            uiSource = UiFileExecutionSource("file-preview", "${selection.id}:$workspacePath:$path", scopeJob) {
+                if (workspace.selection.value !== selection || workspace.currentPath() != workspacePath) {
+                    throw CancellationException("Preview workspace changed")
+                }
+            }
+        }
+        return requireNotNull(uiSource).also { it.checkCurrent() }
+    }
+
+    @Synchronized
+    fun close() {
+        uiSource?.close()
+        uiSource = null
+        sourceKey = null
+    }
+
     @OptIn(InternalCoroutinesApi::class)
-    suspend fun open(request: PreviewRequest): PreviewSource {
+    suspend fun open(request: PreviewRequest, scopeJob: Job): PreviewSource {
         val sessionJob = Job()
         var opened: PreviewSource? = null
         val cancellation = currentCoroutineContext()[Job]?.invokeOnCompletion(
@@ -58,10 +86,11 @@ internal class PreviewSourceFactory @Inject constructor(
                     PreviewSource(paths, size, sessionJob, null, null, snapshot, cacheRoot) {}
                 } else {
                     val paths = PreviewPaths.entry(request.path)
-                    val workspacePath = workspace.currentPath()
-                    val execution = executionFactory.freeze()
+                    val ui = sourceFor(paths.entry, scopeJob)
+                    val execution = executionFactory.freezeForPaths(listOf(paths.entry), runtimeOwner = ui.runtimeOwner,
+                        checkSource = ui::checkCurrent)
                     fun checkWorkspace() {
-                        if (workspace.currentPath() != workspacePath) throw CancellationException("Preview workspace changed")
+                        ui.checkCurrent()
                         execution.checkCurrent()
                     }
                     checkWorkspace()

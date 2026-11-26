@@ -33,6 +33,8 @@ class PluginRuntimeManagerTest {
         return PluginCoreFixtures.activate(manager, id)
     }
     private fun context(session: String = "one", check: () -> Unit = {}) = PluginRuntimeContext("/workspace", session, "invocation", check)
+        .withExecutionSource("test-source:$session", com.aicode.feature.agent.domain.container.runtime.RuntimeOwner(
+            com.aicode.feature.agent.domain.container.runtime.RuntimeOwnerKind.PLUGIN, "test-source:$session"), null, null)
     private suspend fun invoke(runtime: PluginRuntimeManager, capture: PluginCapture, context: PluginRuntimeContext = context(),
         host: suspend (String, JsonObject) -> JsonElement = { _, _ -> JsonPrimitive("host") }): JsonElement =
         runtime.invoke(capture, requireNotNull(capture.content.runtime), "run", empty, context, host)

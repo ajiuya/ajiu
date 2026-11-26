@@ -13,6 +13,10 @@ import kotlinx.coroutines.flow.asStateFlow
 class ToolPermissionManager @Inject constructor(
     private val sessionPermissionGrants: SessionPermissionGrantRepository
 ) {
+    companion object {
+        const val HOST_WRITE_GRANT_PREFIX = SessionPermissionGrantRepository.HOST_WRITE_GRANT_PREFIX
+    }
+
     /**
      * 所有待决授权请求，按插入顺序保存（key = 请求 id）。多会话并行时每个会话可各自挂起一个请求，
      * 互不阻塞——这样侧边栏才能同时点亮所有等待授权的会话。同一会话内的权限请求由 workflow 串行处理，
@@ -38,8 +42,13 @@ class ToolPermissionManager @Inject constructor(
         }
         try {
             val choice = decision.await()
-            if (choice == PermissionChoice.ALWAYS_SESSION && request.sessionGrant != null && request.sessionId.isNotBlank()) {
-                sessionPermissionGrants.allow(request.sessionId, request.sessionGrant)
+            val grant = request.sessionGrant
+            // Legacy exact-command grants keep their original persistence contract. A host-write
+            // scope is only a choice here: the workflow must validate its frozen proof first.
+            if (choice == PermissionChoice.ALWAYS_SESSION && !grant.isNullOrBlank() &&
+                request.sessionId.isNotBlank() && !grant.startsWith(HOST_WRITE_GRANT_PREFIX)
+            ) {
+                sessionPermissionGrants.allow(request.sessionId, grant)
             }
             return choice
         } finally {
@@ -48,6 +57,14 @@ class ToolPermissionManager @Inject constructor(
                 publish()
             }
         }
+    }
+
+    /** Only the workflow calls this, after immediately rechecking the reviewed source/evidence. */
+    suspend fun confirmHostWriteSessionGrant(sessionId: String?, grant: String) {
+        if (sessionId.isNullOrBlank() || !grant.startsWith(HOST_WRITE_GRANT_PREFIX) ||
+            grant.removePrefix(HOST_WRITE_GRANT_PREFIX).isBlank()
+        ) return
+        sessionPermissionGrants.allow(sessionId, grant)
     }
 
     /** UI 回传用户选择，唤醒对应 id 的挂起请求。 */

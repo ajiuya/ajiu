@@ -4,9 +4,17 @@ import com.aicode.core.util.FileLogger
 import com.aicode.feature.agent.domain.plugin.PluginDefinitionReadOnlyException
 import com.aicode.feature.agent.domain.plugin.PluginDefinitionSource
 import com.aicode.feature.workspace.domain.FileAccessProvider
+import com.aicode.feature.workspace.domain.WorkspaceExecutionContext
+import com.aicode.feature.workspace.domain.WorkspaceExecutionContextFactory
 import java.io.InputStream
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -14,8 +22,8 @@ import javax.inject.Singleton
  * Skill 仓库，聚合各 [SkillSource]（全局目录 + 项目目录）提供的技能，
  * 并按 [SkillConfigRepository] 的禁用名单过滤注入清单。
  *
- * 全局技能 `~/.aicode/skills`、项目级技能 `<workspace>/.aicode/skills`，两者都经 [FileAccessProvider]
- * 以容器路径读写，跟随当前执行环境（本地宿主目录或远程 SSH 工作区）。
+ * CHROOT 定义从固定宿主配置读取；其余定义与所有技能文件修改仍经 [FileAccessProvider]
+ * 跟随当前执行环境（本地宿主目录或远程 SSH 工作区）。
  */
 @Singleton
 class SkillRepository @Inject constructor(
@@ -23,7 +31,8 @@ class SkillRepository @Inject constructor(
     private val projectDirectorySkillSource: ProjectDirectorySkillSource,
     private val skillConfigRepository: SkillConfigRepository,
     private val fileAccess: FileAccessProvider,
-    private val pluginSource: PluginDefinitionSource
+    private val pluginSource: PluginDefinitionSource,
+    private val localDefinitions: LocalSkillDefinitionSource
 ) {
     private val version = AtomicLong()
 
@@ -31,38 +40,121 @@ class SkillRepository @Inject constructor(
         version.incrementAndGet()
     }
 
-    fun sourceIdentity(): String = "${fileAccess.agentConfigSourceIdentity()}:${version.get()}:plugins:${pluginSource.revision}"
+    data class DefinitionSnapshot(
+        val sourceIdentity: String,
+        val entries: List<SkillEntry>,
+        val disabledNames: Set<String>
+    ) {
+        val enabled: List<SkillEntry> get() = filterDisabled(entries, disabledNames)
+    }
+
+    fun sourceIdentity(): String = "${localDefinitions.sourceIdentity()}:${version.get()}:plugins:${pluginSource.revision}"
 
     fun checkSourceIdentity(expected: String) {
-        if (sourceIdentity() != expected) throw CancellationException("Skill definition source changed")
+        if (sourceIdentity() != expected) throw SkillDefinitionSourceChanged()
     }
+
+    suspend fun readDefinitionSnapshot(
+        executionFactory: WorkspaceExecutionContextFactory,
+        forceRefresh: Boolean = false
+    ): DefinitionSnapshot {
+        val identity = sourceIdentity()
+        val snapshot = try {
+            val local = localDefinitions.capture()
+            if (local != null) withContext(Dispatchers.IO) {
+                val entries = withPlugins(mergeAll(localDefinitions.skills(local, SkillScope.GLOBAL),
+                    localDefinitions.skills(local, SkillScope.PROJECT)))
+                val disabled = localDefinitions.disabledNames(local)
+                localDefinitions.check(local)
+                DefinitionSnapshot(identity, entries, disabled)
+            } else {
+                val execution = executionFactory.freeze()
+                withContext(Dispatchers.IO + execution) {
+                    legacyRead {
+                        DefinitionSnapshot(identity, legacyEntries(forceRefresh), skillConfigRepository.disabledNames())
+                    }.also { execution.checkCurrent() }
+                }
+            }
+        } catch (failure: CancellationException) {
+            currentCoroutineContext().ensureActive()
+            checkSourceIdentity(identity)
+            throw failure
+        }
+        currentCoroutineContext().ensureActive()
+        checkSourceIdentity(identity)
+        return snapshot
+    }
+
+    private fun <T> blockingRead(block: suspend () -> T): T =
+        runBlocking(WorkspaceExecutionContext.blockingContext()) { withContext(Dispatchers.IO) { block() } }
+
+    private fun <T> legacyRead(block: () -> T): T {
+        val metadata = sourceIdentity()
+        val identity = fileAccess.agentConfigSourceIdentity()
+        return try {
+            block().also {
+                if (fileAccess.agentConfigSourceIdentity() != identity) throw SkillDefinitionSourceChanged()
+            }
+        } catch (failure: CancellationException) {
+            WorkspaceExecutionContext.blockingContext()[Job]?.ensureActive()
+            checkSourceIdentity(metadata)
+            if (fileAccess.agentConfigSourceIdentity() != identity) throw SkillDefinitionSourceChanged()
+            throw failure
+        }
+    }
+
+    private fun withPlugins(host: List<SkillEntry>): List<SkillEntry> {
+        val hostNames = host.map { it.skill.name.lowercase() }.toSet()
+        return (host + pluginSource.skills().filterNot { it.skill.name.lowercase() in hostNames })
+            .sortedBy { it.skill.name.lowercase() }
+    }
+
+    private fun legacyEntries(forceRefresh: Boolean): List<SkillEntry> = withPlugins(mergeAll(
+        globalDirectorySkillSource.listSkills(forceRefresh), projectDirectorySkillSource.listSkills(forceRefresh)))
 
     /** 全部技能（含来源作用域），未过滤禁用；同名技能项目级优先（与 MCP 两级配置一致）。 */
     fun listAllSkills(): List<SkillEntry> = listAllSkills(forceRefresh = false)
 
     fun listAllSkills(forceRefresh: Boolean): List<SkillEntry> {
         val source = sourceIdentity()
-        val host = mergeAll(globalDirectorySkillSource.listSkills(forceRefresh), projectDirectorySkillSource.listSkills(forceRefresh))
-        val hostNames = host.map { it.skill.name.lowercase() }.toSet()
-        return (host + pluginSource.skills().filterNot { it.skill.name.lowercase() in hostNames })
-            .sortedBy { it.skill.name.lowercase() }
-            .also { checkSourceIdentity(source) }
+        return blockingRead {
+            val local = localDefinitions.capture()
+            val entries = if (local != null) {
+                withPlugins(mergeAll(localDefinitions.skills(local, SkillScope.GLOBAL),
+                    localDefinitions.skills(local, SkillScope.PROJECT))).also { localDefinitions.check(local) }
+            } else legacyRead { legacyEntries(forceRefresh) }
+            checkSourceIdentity(source)
+            entries
+        }
     }
 
     private fun skillsIn(scope: SkillScope): List<Skill> {
         val source = sourceIdentity()
-        return when (scope) {
-            SkillScope.GLOBAL -> globalDirectorySkillSource.listSkills(forceRefresh = true)
-            SkillScope.PROJECT -> projectDirectorySkillSource.listSkills(forceRefresh = true)
-            SkillScope.PLUGIN -> throw PluginDefinitionReadOnlyException()
+        return legacyRead {
+            when (scope) {
+                SkillScope.GLOBAL -> globalDirectorySkillSource.listSkills(forceRefresh = true)
+                SkillScope.PROJECT -> projectDirectorySkillSource.listSkills(forceRefresh = true)
+                SkillScope.PLUGIN -> throw PluginDefinitionReadOnlyException()
+            }
         }.also { checkSourceIdentity(source) }
     }
 
     /** 启用的技能列表（注入系统提示词用），禁用技能被过滤。 */
     fun listSkills(): List<Skill> {
         val source = sourceIdentity()
-        return filterDisabled(listAllSkills(), skillConfigRepository.disabledNames()).map { it.skill }
-            .also { checkSourceIdentity(source) }
+        return blockingRead {
+            val local = localDefinitions.capture()
+            val skills = if (local != null) {
+                val entries = withPlugins(mergeAll(localDefinitions.skills(local, SkillScope.GLOBAL),
+                    localDefinitions.skills(local, SkillScope.PROJECT)))
+                filterDisabled(entries, localDefinitions.disabledNames(local)).map { it.skill }
+                    .also { localDefinitions.check(local) }
+            } else legacyRead {
+                filterDisabled(legacyEntries(false), skillConfigRepository.disabledNames()).map { it.skill }
+            }
+            checkSourceIdentity(source)
+            skills
+        }
     }
 
     /** 当前被禁用的技能名集合（小写归一化）。批量判断取一次即可，避免逐个重读配置文件。 */
@@ -71,11 +163,24 @@ class SkillRepository @Inject constructor(
     /** 读取指定 skill 的完整指令正文；不存在 / 解析失败 / 已被禁用时返回 null。 */
     fun loadInstructions(name: String): String? {
         val source = sourceIdentity()
-        if (name.lowercase() in skillConfigRepository.disabledNames()) return null.also { checkSourceIdentity(source) }
-        return (projectDirectorySkillSource.loadInstructions(name)
-            ?: globalDirectorySkillSource.loadInstructions(name)
-            ?: pluginSource.skills().firstOrNull { it.skill.name.equals(name, ignoreCase = true) }?.skill?.instructions)
-            .also { checkSourceIdentity(source) }
+        return blockingRead {
+            val local = localDefinitions.capture()
+            val instructions = if (local != null) {
+                if (name.lowercase() in localDefinitions.disabledNames(local)) null else {
+                    val entries = withPlugins(mergeAll(localDefinitions.skills(local, SkillScope.GLOBAL),
+                        localDefinitions.skills(local, SkillScope.PROJECT)))
+                    entries.firstOrNull { it.skill.name.equals(name, ignoreCase = true) }?.skill?.instructions
+                }.also { localDefinitions.check(local) }
+            } else legacyRead {
+                if (name.lowercase() in skillConfigRepository.disabledNames()) null else {
+                    projectDirectorySkillSource.loadInstructions(name)
+                        ?: globalDirectorySkillSource.loadInstructions(name)
+                        ?: pluginSource.skills().firstOrNull { it.skill.name.equals(name, ignoreCase = true) }?.skill?.instructions
+                }
+            }
+            checkSourceIdentity(source)
+            instructions
+        }
     }
 
     /** 技能是否在任一作用域中被禁用。 */

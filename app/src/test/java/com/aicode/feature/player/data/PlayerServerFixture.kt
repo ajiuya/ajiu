@@ -42,6 +42,7 @@ internal class PlayerServerFixture(root: File, files: FileAccessProvider? = null
         }
         every { context.getString(any()) } returns "Fixture"
         every { workspaceRepository.current } returns current
+        every { workspaceRepository.selection } returns MutableStateFlow(WorkspaceRepository.Selection(current.value))
         every { identityResolver.environmentChanges } returns environmentChanges
         if (files != null) {
             val execution = WorkspaceExecutionContext(ExecutionMode.REMOTE_SSH, files.cacheIdentity(), files, null, null) {
@@ -50,7 +51,7 @@ internal class PlayerServerFixture(root: File, files: FileAccessProvider? = null
             coEvery { identityResolver.capture(workspaceRoot, any(), any()) } answers {
                 ProjectMemoryCapture(identity, "1") { if (!valid.get()) throw CancellationException("Fixture environment changed") }
             }
-            coEvery { executionFactory.freeze(any()) } returns execution
+            coEvery { executionFactory.freezeForPaths(any(), any(), any(), any()) } returns execution
         }
     }
 

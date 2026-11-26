@@ -1,5 +1,6 @@
 package com.aicode.feature.workspace.domain
 
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeAuthorizationRequired
 import com.aicode.feature.settings.data.repository.ExecutionMode
 import com.aicode.feature.settings.data.repository.ExecutionModeHolder
 import java.io.File
@@ -31,16 +32,27 @@ class DelegatingFileAccess @Inject constructor(
         return if (modeHolder.currentMode() == ExecutionMode.REMOTE_SSH) remoteSftpFileAccess else localFileAccess
     }
 
+    private fun baseIdentity(base: FileAccessProvider, localFolder: Boolean = false): String = try {
+        base.cacheIdentity()
+    } catch (required: LocalRuntimeAuthorizationRequired) {
+        if (!localFolder || WorkspaceExecutionContext.current() != null || modeHolder.currentMode() != ExecutionMode.LOCAL_PROOT) {
+            throw required
+        }
+        "local-folder-only:local-chroot"
+    }
+
     private fun pathDelegate(path: String): FileAccessProvider {
         if (!isLocalFolderPath(path)) return delegate()
         val execution = WorkspaceExecutionContext.current()
         val roots = execution?.localFolderSnapshot ?: localFolders.snapshot()
         roots.rootFor(path)
         val base = delegate()
-        val identity = base.cacheIdentity()
+        val identity = baseIdentity(base, localFolder = true)
+        val modeRevision = modeHolder.modeSelectionRevision
         return InternalLocalFolderAccess(roots, execution) {
             execution?.checkCurrent()
-            if (delegate() !== base || base.cacheIdentity() != identity) {
+            if (modeHolder.modeSelectionRevision != modeRevision ||
+                delegate() !== base || baseIdentity(base, localFolder = true) != identity) {
                 throw java.util.concurrent.CancellationException("File execution source changed")
             }
         }
@@ -59,13 +71,15 @@ class DelegatingFileAccess @Inject constructor(
     internal fun capturePathSource(path: String): FilePathSource {
         val execution = WorkspaceExecutionContext.current()
         val base = delegate()
-        val expected = base.cacheIdentity()
+        val expected = baseIdentity(base, isLocalFolderPath(path))
+        val modeRevision = modeHolder.modeSelectionRevision
         val roots = if (isLocalFolderPath(path)) execution?.localFolderSnapshot ?: localFolders.snapshot() else null
         val grant = roots?.rootFor(path)?.grant
         val identity = grant?.let { "$expected:local-folder:${it.id}:${it.epoch}:${roots.revision}" } ?: expected
         fun checkBase() {
             execution?.checkCurrent()
-            if (delegate() !== base || base.cacheIdentity() != expected) {
+            if (modeHolder.modeSelectionRevision != modeRevision ||
+                delegate() !== base || baseIdentity(base, isLocalFolderPath(path)) != expected) {
                 throw java.util.concurrent.CancellationException("File execution source changed")
             }
         }
@@ -87,21 +101,24 @@ class DelegatingFileAccess @Inject constructor(
 
     override fun invalidateAgentConfig(path: String) = pathDelegate(path).invalidateAgentConfig(path)
 
-    override fun openRead(path: String): InputStream = openRead(path, cacheIdentity())
+    override fun openRead(path: String): InputStream = openRead(path, baseIdentity(delegate(), isLocalFolderPath(path)))
 
     override fun openRead(path: String, expectedCacheIdentity: String): InputStream {
         val execution = WorkspaceExecutionContext.current()
         val base = delegate()
         val source = pathDelegate(path)
+        val modeRevision = modeHolder.modeSelectionRevision
         fun checkSource() {
             execution?.checkCurrent()
-            if (delegate() !== base || base.cacheIdentity() != expectedCacheIdentity) {
+            if (modeHolder.modeSelectionRevision != modeRevision ||
+                delegate() !== base || baseIdentity(base, isLocalFolderPath(path)) != expectedCacheIdentity) {
                 throw java.util.concurrent.CancellationException("File execution mode changed")
             }
         }
         checkSource()
         val sourceIdentity = if (source is InternalLocalFolderAccess) source.cacheIdentity() else expectedCacheIdentity
-        return identityCheckedRead(source.openRead(path, sourceIdentity), ::checkSource)
+        val input = identityCheckedRead(source.openRead(path, sourceIdentity), ::checkSource)
+        return execution?.protectRead(input) ?: input
     }
 
     override fun readFile(path: String): String = pathDelegate(path).readFile(path)
@@ -137,10 +154,12 @@ class DelegatingFileAccess @Inject constructor(
         val execution = WorkspaceExecutionContext.current()
         val base = delegate()
         val source = pathDelegate(path)
-        val identity = base.cacheIdentity()
+        val identity = baseIdentity(base, isLocalFolderPath(path))
+        val modeRevision = modeHolder.modeSelectionRevision
         fun checkSource() {
             execution?.checkCurrent()
-            if (delegate() !== base || base.cacheIdentity() != identity) {
+            if (modeHolder.modeSelectionRevision != modeRevision ||
+                delegate() !== base || baseIdentity(base, isLocalFolderPath(path)) != identity) {
                 throw java.util.concurrent.CancellationException("File execution source changed")
             }
         }

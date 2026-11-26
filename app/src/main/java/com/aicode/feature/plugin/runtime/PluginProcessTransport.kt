@@ -1,6 +1,7 @@
 package com.aicode.feature.plugin.runtime
 
 import com.aicode.feature.plugin.domain.PluginJson
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeProcess
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.nio.ByteBuffer
@@ -28,6 +29,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
@@ -38,7 +40,7 @@ import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 
 internal class PluginProcessTransport(
-    private val processFactory: () -> Process,
+    private val processFactory: suspend () -> Process,
     private val checkStart: () -> Unit = {},
     private val hostBudget: PluginRequestBudget = PluginRequestBudget(PLUGIN_MAX_HOST_REQUESTS),
     dispatcher: CoroutineDispatcher = Dispatchers.IO,
@@ -375,6 +377,14 @@ internal class PluginProcessTransport(
     }
 
     private suspend fun disposeProcess(target: Process) {
+        if (target is LocalRuntimeProcess) {
+            runCatching { target.stop() }
+            withTimeoutOrNull(10_000L) { target.awaitCleanup() }
+            runCatching { target.outputStream.close() }
+            runCatching { target.inputStream.close() }
+            runCatching { target.errorStream.close() }
+            return
+        }
         runCatching { target.destroy() }
         runCatching { if (target.isAlive) target.destroyForcibly() }
         runCatching { target.outputStream.close() }

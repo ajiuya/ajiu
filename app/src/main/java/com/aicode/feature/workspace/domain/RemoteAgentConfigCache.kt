@@ -38,6 +38,7 @@ class RemoteAgentConfigCache @Inject constructor(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val transport = SshAgentConfigTransport(connection, ::checkKey)
     private val engine = RemoteAgentConfigCacheEngine(transport, scope)
+    internal val definitionRevision: Long get() = engine.revision
 
     internal fun captureProfile(): RemoteAgentConfigProfile = runBlocking(WorkspaceExecutionContext.blockingContext() + Dispatchers.IO) {
         val revision = settings.activeProfileSelectionRevision

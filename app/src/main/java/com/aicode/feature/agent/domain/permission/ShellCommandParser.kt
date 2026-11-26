@@ -36,6 +36,10 @@ object ShellCommandParser {
 
     data class Blocker(val kind: BlockerKind, val detail: String? = null)
 
+    /** Lexical evidence only: no expansion, filesystem access, or claim of sandboxing. */
+    data class Redirection(val operator: String, val target: String, val literal: Boolean)
+    data class CommandSegment(val tokens: List<String>, val redirections: List<Redirection>)
+
     /**
      * @param segments 顶层每一段的 token 列表（已去引号、按空白分词；重定向及其目标不入 token）。
      * @param analyzable 是否可静态判定；false 时需结合命令的破坏性判断是否触发安全防护。
@@ -47,7 +51,8 @@ object ShellCommandParser {
         val segments: List<List<String>>,
         val analyzable: Boolean,
         val blockers: List<Blocker> = emptyList(),
-        val hasFileOutputRedirect: Boolean = false
+        val hasFileOutputRedirect: Boolean = false,
+        val commandSegments: List<CommandSegment> = emptyList()
     )
 
     private const val NONE = 0
@@ -57,9 +62,14 @@ object ShellCommandParser {
     /** 段首环境赋值形如 `NAME=value`。 */
     private val ENV_ASSIGN = Regex("^[A-Za-z_][A-Za-z0-9_]*=.*$")
 
-    fun analyze(command: String): Analysis {
+    fun analyze(command: String): Analysis = analyzeShell(command)
+
+    private fun analyzeShell(commandText: String): Analysis {
+        val command = hereDocumentView(commandText).shell
         val segments = mutableListOf<List<String>>()
         var current = mutableListOf<String>()
+        var redirects = mutableListOf<Redirection>()
+        val commandSegments = mutableListOf<CommandSegment>()
         val token = StringBuilder()
         var tokenStarted = false
         var tokenQuoted = false
@@ -83,6 +93,7 @@ object ShellCommandParser {
                 val t = token.toString()
                 val operator = redirectOperator
                 if (operator != null) {
+                    redirects.add(Redirection(operator, t, !tokenDynamic))
                     if ('>' in operator) {
                         val descriptorTarget = t.removeSuffix("-")
                         val duplicatesDescriptor = operator == ">&" && !tokenDynamic && quote == NONE &&
@@ -140,6 +151,10 @@ object ShellCommandParser {
         fun flushSegment() {
             flushToken()
             finishRedirect()
+            if (current.isNotEmpty() || redirects.isNotEmpty()) {
+                commandSegments.add(CommandSegment(current.toList(), redirects.toList()))
+                redirects = mutableListOf()
+            }
             if (current.isNotEmpty()) {
                 if (programPrefix(current) in setOf(
                     "{", "}", "if", "then", "elif", "else", "fi", "while", "until",
@@ -220,6 +235,8 @@ object ShellCommandParser {
                         c == '>' || c == '<' -> {
                             val next = command.getOrNull(i + 1)
                             val operator = when {
+                                c == '<' && next == '<' && command.getOrNull(i + 2) == '<' -> "<<<"
+                                c == '<' && next == '<' && command.getOrNull(i + 2) == '-' -> "<<-"
                                 c == '>' && next in listOf('>', '&', '|') -> ">$next"
                                 c == '<' && next in listOf('>', '&', '<') -> "<$next"
                                 else -> c.toString()
@@ -241,7 +258,7 @@ object ShellCommandParser {
         }
         if (quote != NONE) block(BlockerKind.UNTERMINATED_QUOTE) // 未闭合引号：不可信
         flushSegment()
-        val nestedCommands = inlineCommands(command).toMutableList()
+        val nestedCommands = inlineCommands(commandText).toMutableList()
         segments.forEach { segment ->
             expandExecutableSegment(segment) { nested ->
                 nestedCommands.add(nested)
@@ -253,11 +270,11 @@ object ShellCommandParser {
             analysis.blockers.forEach { block(it.kind, it.detail) }
             hasFileOutputRedirect = hasFileOutputRedirect || analysis.hasFileOutputRedirect
         }
-        return Analysis(segments, blockers.isEmpty(), blockers, hasFileOutputRedirect)
+        return Analysis(segments, blockers.isEmpty(), blockers, hasFileOutputRedirect, commandSegments)
     }
 
     /** 跳过段首环境赋值后的有效 token（用于取程序名与匹配）。 */
-    private fun effectiveTokens(tokens: List<String>): List<String> {
+    internal fun effectiveTokens(tokens: List<String>): List<String> {
         var idx = 0
         while (idx < tokens.size && ENV_ASSIGN.matches(tokens[idx])) idx++
         return if (idx == 0) tokens else tokens.subList(idx, tokens.size)
@@ -274,7 +291,7 @@ object ShellCommandParser {
         inlineCommands(command).forEach { addAll(executableSegments(it)) }
     }
 
-    private fun expandExecutableSegment(
+    internal fun expandExecutableSegment(
         tokens: List<String>,
         parseCommand: (String) -> List<List<String>> = ::executableSegments
     ): List<List<String>> = buildList {
@@ -339,8 +356,120 @@ object ShellCommandParser {
         }
     }
 
+    // All consumers (including DENY matching) share the same here-data boundaries.
+    internal fun inlineCommands(command: String): List<String> {
+        val view = hereDocumentView(command)
+        return inlineCommandsInShell(view.shell) + view.expansions
+    }
+
+    private data class HereDocument(val delimiter: String, val quoted: Boolean, val stripTabs: Boolean)
+    private data class HereDataView(val shell: String, val expansions: List<String>)
+
+    /** Mask data, not commands. No execution/expansion; unknown syntax remains best-effort. */
+    private fun hereDocumentView(command: String): HereDataView {
+        if (!command.contains("<<")) return HereDataView(command, emptyList())
+        val shell = command.toCharArray()
+        val expansions = mutableListOf<String>()
+        val pending = ArrayDeque<HereDocument>()
+        var quote = NONE
+        var index = 0
+        while (index < command.length) {
+            val c = command[index]
+            if (quote == SINGLE) {
+                if (c == '\'') quote = NONE
+                index++
+                continue
+            }
+            if (c == '\\') { index += 2; continue }
+            if (c == '\'' && quote == NONE) { quote = SINGLE; index++; continue }
+            if (c == '"') { quote = if (quote == DOUBLE) NONE else DOUBLE; index++; continue }
+            if (c == '`' || (c == '(' && (quote == NONE || command.getOrNull(index - 1) == '$'))) {
+                // Nested shell syntax is handled by the existing recursive command parser.
+                index = inlineCommandEnd(command, index)?.plus(1) ?: command.length
+                continue
+            }
+            if (quote != NONE) { index++; continue }
+            if (c == '#' && (index == 0 || command[index - 1].isWhitespace() || command[index - 1] in ";|&()")) {
+                index = command.indexOf('\n', index).takeIf { it >= 0 } ?: command.length
+                continue
+            }
+            if (command.startsWith("<<<", index)) { index += 3; continue }
+            if (command.startsWith("<<", index)) {
+                var cursor = index + 2
+                val stripTabs = command.getOrNull(cursor) == '-'
+                if (stripTabs) cursor++
+                while (command.getOrNull(cursor) in listOf(' ', '\t')) cursor++
+                val delimiter = StringBuilder()
+                var delimiterQuote = NONE
+                var quoted = false
+                var started = false
+                while (cursor < command.length) {
+                    val word = command[cursor]
+                    if (delimiterQuote == NONE && (word.isWhitespace() || word in ";|&()<>")) break
+                    started = true
+                    when {
+                        word == '\\' && delimiterQuote != SINGLE && cursor + 1 < command.length -> {
+                            quoted = true; delimiter.append(command[cursor + 1]); cursor += 2; continue
+                        }
+                        word == '\'' && delimiterQuote != DOUBLE -> {
+                            quoted = true; delimiterQuote = if (delimiterQuote == SINGLE) NONE else SINGLE
+                        }
+                        word == '"' && delimiterQuote != SINGLE -> {
+                            quoted = true; delimiterQuote = if (delimiterQuote == DOUBLE) NONE else DOUBLE
+                        }
+                        else -> delimiter.append(word)
+                    }
+                    cursor++
+                }
+                if (started && delimiterQuote == NONE) pending.addLast(HereDocument(delimiter.toString(), quoted, stripTabs))
+                index = maxOf(cursor, index + 2)
+                continue
+            }
+            if (c == '\n' && pending.isNotEmpty()) {
+                index++
+                while (pending.isNotEmpty()) {
+                    val here = pending.removeFirst()
+                    val bodyStart = index
+                    var bodyEnd = command.length
+                    while (index < command.length) {
+                        val lineEnd = command.indexOf('\n', index).takeIf { it >= 0 } ?: command.length
+                        val line = command.substring(index, lineEnd)
+                        val delimiterLine = if (here.stripTabs) line.trimStart('\t') else line
+                        val next = if (lineEnd < command.length) lineEnd + 1 else lineEnd
+                        if (delimiterLine == here.delimiter) { bodyEnd = index; index = next; break }
+                        index = next
+                    }
+                    if (!here.quoted) expansions.addAll(hereDataCommands(command.substring(bodyStart, bodyEnd)))
+                    for (position in bodyStart until index) if (shell[position] != '\n') shell[position] = ' '
+                }
+                continue
+            }
+            index++
+        }
+        return HereDataView(String(shell), expansions)
+    }
+
+    /** Quotes in an unquoted here-doc body are data; only backslash escapes suppress expansion. */
+    private fun hereDataCommands(data: String): List<String> = buildList {
+        var index = 0
+        while (index < data.length) {
+            if (data[index] == '\\' && data.getOrNull(index + 1) in listOf('$', '`', '\\', '\n')) {
+                index += 2
+                continue
+            }
+            val start = when {
+                data[index] == '`' -> index
+                data[index] == '$' && data.getOrNull(index + 1) == '(' -> index + 1
+                else -> { index++; continue }
+            }
+            val end = inlineCommandEnd(data, start) ?: break
+            add(data.substring(start + 1, end))
+            index = end + 1
+        }
+    }
+
     // 单引号中的内容是字面数据；命令替换、反引号和分组中的内容才需递归检查。
-    private fun inlineCommands(command: String): List<String> = buildList {
+    private fun inlineCommandsInShell(command: String): List<String> = buildList {
         var quote = NONE
         var index = 0
         while (index < command.length) {

@@ -1,6 +1,8 @@
 package com.aicode.feature.plugin.runtime
 
 import com.aicode.feature.plugin.data.PluginRecord
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwner
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwnerKind
 import com.aicode.feature.plugin.domain.PluginCapture
 import com.aicode.feature.plugin.domain.PluginContent
 import com.aicode.feature.settings.data.repository.ExecutionMode
@@ -43,41 +45,48 @@ class PluginTerminalRunnerTest {
     private var active = true
     private var sequence = 0
     private val data by lazy { temporary.newFolder("data") }
-    private val execution = WorkspaceExecutionContext(ExecutionMode.LOCAL_PROOT, "fixture", mockk(), null, null) {}
+    private val runtimeOwner = RuntimeOwner(RuntimeOwnerKind.PLUGIN, "stable-plugin-source")
+    private val execution = WorkspaceExecutionContext(ExecutionMode.LOCAL_PROOT, "fixture", mockk(), null, null,
+        runtimeOwner = runtimeOwner) {}
     private val capture by lazy { PluginCapture(PluginRecord("fixture.resource", "1.0.0", true, 1,
         archiveSha256 = "archive", manifestSha256 = "manifest", fileHashes = emptyMap(), installRevision = "revision", contentHash = "hash"), mockk(), PluginContent(), temporary.newFolder("install"), {},
         { if (!active) throw CancellationException("Plugin disabled") }) }
 
-    private fun context(source: Any = "source", plugin: PluginCapture = capture) = PluginInvocationContext(plugin, execution,
-        "/workspace", "session", data, changes, sourceIdentity = source) { if (!active) throw CancellationException("Source revoked") }
+    private fun context(source: Any = "source", plugin: PluginCapture = capture,
+        owner: RuntimeOwner = runtimeOwner, capturedExecution: WorkspaceExecutionContext = execution) = PluginInvocationContext(plugin, capturedExecution,
+        "/workspace", "session", data, changes, sourceIdentity = source, runtimeOwner = owner) { if (!active) throw CancellationException("Source revoked") }
 
     private class Provider : TerminalSessionProvider {
-        class Tab(val owner: TerminalResourceOwner, val output: (ByteArray) -> Unit, var running: Boolean = true)
+        class Tab(val owner: TerminalResourceOwner, val output: (ByteArray) -> Unit, var running: Boolean = true,
+            val runtimeOwner: RuntimeOwner? = null, var status: TerminalTabStatus? = null)
         val tabs = ConcurrentHashMap<String, Tab>()
         val entered = CompletableDeferred<Unit>()
         var startGate: CompletableDeferred<Unit>? = null
         var closeGate: CompletableDeferred<Unit>? = null
         val closing = CompletableDeferred<Unit>()
         var index = 0
+        var closeVerified = true
+        var closeCount = 0
         override val tabFinishedEvents = MutableSharedFlow<TabFinishedEvent>()
         override suspend fun startPluginCommand(command: String, title: String?, owner: TerminalResourceOwner, onOutput: (ByteArray) -> Unit): String {
             entered.complete(Unit)
             startGate?.let { withContext(NonCancellable) { it.await() } }
             val id = "actual-${++index}"
-            tabs[id] = Tab(owner, onOutput)
+            tabs[id] = Tab(owner, onOutput, runtimeOwner = WorkspaceExecutionContext.current()?.runtimeOwner)
             onOutput("first bytes\u001b[31m".toByteArray())
             return id
         }
         override fun pluginTabStatus(id: String, owner: TerminalResourceOwner) = tabs[id]?.takeIf { it.owner == owner }
-            ?.let { TerminalTabStatus(it.running, if (it.running) null else 17) }
+            ?.let { it.status ?: TerminalTabStatus(it.running, if (it.running) null else 17) }
         override fun writePluginInput(id: String, owner: TerminalResourceOwner, text: String, appendNewline: Boolean) = tabs[id]?.owner == owner
         override fun interruptPluginTab(id: String, owner: TerminalResourceOwner) = tabs[id]?.owner == owner
         override suspend fun closePluginTab(id: String, owner: TerminalResourceOwner): Boolean {
             if (tabs[id]?.owner != owner) return false
             closing.complete(Unit)
+            closeCount++
             closeGate?.await()
             tabs.remove(id)
-            return true
+            return closeVerified
         }
         override suspend fun startBackgroundCommand(command: String, title: String?, notify: Boolean, sourceSessionId: String?) = error("Unexpected shared terminal creation")
         override fun sendInput(id: String, input: String, appendNewline: Boolean) = error("Unexpected unowned input")
@@ -102,10 +111,14 @@ class PluginTerminalRunnerTest {
         val first = runner.poll(owner, id, 0)
         assertEquals("first bytes\u001b[31m", first.getValue("output").jsonPrimitive.content)
         assertEquals("running", first.getValue("state").jsonPrimitive.content)
+        assertEquals("false", first.getValue("exit_known").jsonPrimitive.content)
+        assertEquals(runtimeOwner, provider.tabs.values.single().runtimeOwner)
+        assertNotEquals(runtimeOwner.scopeId, provider.tabs.values.single().owner.resourceId)
         provider.tabs.values.single().running = false
         val done = runner.poll(owner, id, first.getValue("offset").jsonPrimitive.content.toLong())
         assertEquals("finished", done.getValue("state").jsonPrimitive.content)
         assertEquals("17", done.getValue("exitCode").jsonPrimitive.content)
+        assertEquals("true", done.getValue("exit_known").jsonPrimitive.content)
         assertEquals("", done.getValue("output").jsonPrimitive.content)
         runner.close(owner, id)
         assertTrue(provider.tabs.isEmpty())
@@ -178,6 +191,82 @@ class PluginTerminalRunnerTest {
         runner.close(owner, id)
         assertTrue(provider.tabs.isEmpty())
         notOwned { runner.poll(owner, id, 0) }
+    }
+
+    @Test fun aiOrMismatchedPluginRuntimeOwnerCannotStartOrBorrowAPluginResource() = runBlocking<Unit> {
+        val provider = Provider()
+        val runner = PluginTerminalRunner(provider)
+        val ai = RuntimeOwner(RuntimeOwnerKind.AGENT, "session")
+        val wrong = RuntimeOwner(RuntimeOwnerKind.PLUGIN, "other-stable-source")
+        val aiExecution = WorkspaceExecutionContext(ExecutionMode.LOCAL_PROOT, "fixture", mockk(), null, null,
+            runtimeOwner = ai) {}
+        for (invalid in listOf(context(owner = ai, capturedExecution = aiExecution), context(owner = wrong))) {
+            try { runner.start(invalid, "must-not-run", null); fail("Expected owner mismatch") }
+            catch (failure: PluginHostException) { assertEquals("CONTEXT_CHANGED", failure.code) }
+        }
+        assertTrue(provider.tabs.isEmpty())
+        val id = runner.start(context(), "valid", null).getValue("tabId").jsonPrimitive.content
+        notOwned { runner.poll(context(owner = wrong), id, 0) }
+        notOwned { runner.write(context(owner = wrong), id, "bad", true) }
+        notOwned { runner.stop(context(owner = wrong), id) }
+        notOwned { runner.close(context(owner = wrong), id) }
+        assertEquals(0, runner.list(context(owner = wrong)).size)
+        assertTrue(runner.close(context(), id))
+    }
+
+    @Test fun unknownTaskAndPendingCleanupStayExplicitInPollListAndUnverifiedClose() = runBlocking<Unit> {
+        val provider = Provider().apply { closeVerified = false }
+        val runner = PluginTerminalRunner(provider)
+        val owner = context()
+        val id = runner.start(owner, "task", null).getValue("tabId").jsonPrimitive.content
+        val tab = provider.tabs.values.single()
+        tab.status = TerminalTabStatus(false, -1, exitKnown = false, taskStatus = "UNKNOWN", cleanupStatus = "PENDING")
+        val unknown = runner.poll(owner, id, 0)
+        assertEquals("unknown", unknown.getValue("state").jsonPrimitive.content)
+        assertEquals("false", unknown.getValue("exit_known").jsonPrimitive.content)
+        assertEquals("UNKNOWN", unknown.getValue("task_status").jsonPrimitive.content)
+        assertEquals("PENDING", unknown.getValue("cleanup_status").jsonPrimitive.content)
+        assertFalse(unknown.containsKey("exitCode"))
+        val listed = runner.list(owner).single().jsonObject
+        assertEquals("unknown", listed.getValue("state").jsonPrimitive.content)
+        assertEquals("PENDING", listed.getValue("cleanup_status").jsonPrimitive.content)
+        assertFalse(listed.containsKey("exitCode"))
+        assertFalse(runner.close(owner, id))
+        assertTrue(provider.tabs.isEmpty())
+        assertEquals(1, provider.closeCount)
+    }
+
+    @Test fun stoppedTaskStatusKeepsCleanupIndependentAndRefreshesLateCleanupEvidence() = runBlocking<Unit> {
+        val provider = Provider()
+        val runner = PluginTerminalRunner(provider)
+        val owner = context()
+        val id = runner.start(owner, "task", null).getValue("tabId").jsonPrimitive.content
+        val tab = provider.tabs.values.single()
+        tab.status = TerminalTabStatus(false, null, exitKnown = false, taskStatus = "UNKNOWN", cleanupStatus = "PENDING")
+        assertTrue(runner.stop(owner, id))
+        assertEquals("PENDING", runner.poll(owner, id, 0).getValue("cleanup_status").jsonPrimitive.content)
+        tab.status = TerminalTabStatus(false, null, exitKnown = false, taskStatus = "UNKNOWN", cleanupStatus = "VERIFIED")
+        val stopped = runner.poll(owner, id, 0)
+        assertEquals("cancelled", stopped.getValue("state").jsonPrimitive.content)
+        assertEquals("false", stopped.getValue("exit_known").jsonPrimitive.content)
+        assertEquals("VERIFIED", stopped.getValue("cleanup_status").jsonPrimitive.content)
+        assertFalse(stopped.containsKey("exitCode"))
+        assertEquals("VERIFIED", runner.list(owner).single().jsonObject.getValue("cleanup_status").jsonPrimitive.content)
+        assertTrue(runner.close(owner, id))
+    }
+
+    @Test fun closingOneOfSamePluginResourcesDoesNotCloseTheSibling() = runBlocking<Unit> {
+        val provider = Provider()
+        val runner = PluginTerminalRunner(provider)
+        val owner = context()
+        val first = runner.start(owner, "first", null).getValue("tabId").jsonPrimitive.content
+        val second = runner.start(owner, "second", null).getValue("tabId").jsonPrimitive.content
+        assertTrue(runner.close(owner, first))
+        assertEquals(1, provider.tabs.size)
+        assertEquals("running", runner.poll(owner, second, 0).getValue("state").jsonPrimitive.content)
+        assertTrue(runner.write(owner, second, "still owned", false))
+        assertTrue(runner.close(owner, second))
+        assertEquals(2, provider.closeCount)
     }
 
     @Test fun outputIsBoundedAcrossLargeChunksAndSplitUtf8WithoutScreenSampling() {

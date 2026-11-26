@@ -214,6 +214,17 @@ class AgentRunManager internal constructor(
     private val recoveryCodec = Json { ignoreUnknownKeys = true }
     private val _recoveryBusySessions = MutableStateFlow<Set<String>>(emptySet())
     val recoveryBusySessions: StateFlow<Set<String>> = _recoveryBusySessions.asStateFlow()
+    // One consumed run identity per request; bound process-local history and discard deleted sessions.
+    private val _consumedRecoveryTargets = MutableStateFlow<Map<String, PendingRecoveryTarget>>(emptyMap())
+    internal val consumedRecoveryTargets: StateFlow<Map<String, PendingRecoveryTarget>> = _consumedRecoveryTargets.asStateFlow()
+    private fun consumeRecoveryTarget(target: PendingRecoveryTarget) {
+        val retained = _consumedRecoveryTargets.value.filterValues {
+            it.sessionId != target.sessionId || it.generation == target.generation
+        } - target.requestId
+        _consumedRecoveryTargets.value = (retained + (target.requestId to target.copy(unknownTools = emptySet())))
+            .entries.toList().takeLast(512).associate { it.key to it.value }
+    }
+
     val recovering: StateFlow<Boolean> = _recoveryBusySessions.map { it.isNotEmpty() }
         .stateIn(managerScope, SharingStarted.Eagerly, false)
     private val planRejectedSessions = mutableSetOf<String>()
@@ -301,7 +312,7 @@ class AgentRunManager internal constructor(
                 terminalSessionProvider.tabFinishedEvents.collect { event ->
                     if (!awaitReady(event.sourceSessionId)) return@collect
                     withContext(Dispatchers.IO) {
-                        projectProgressTerminalTracker.finished(event.sourceSessionId, event.tabId, event.exitCode,
+                        projectProgressTerminalTracker.finished(event.sourceSessionId, event.tabId, event.exitCode.takeIf { event.exitKnown },
                             event.sourceMode, event.channelGeneration)
                     }
                     handleBackgroundCommandFinished(event)
@@ -800,11 +811,16 @@ class AgentRunManager internal constructor(
         kind = AgentNotificationKind.BACKGROUND_TASK,
         sourceId = tabId,
         title = title,
-        outcome = if (exitCode == 0) NotificationOutcome.COMPLETED else NotificationOutcome.FAILED,
+        outcome = when {
+            !exitKnown -> NotificationOutcome.UNKNOWN
+            exitCode == 0 -> NotificationOutcome.COMPLETED
+            else -> NotificationOutcome.FAILED
+        },
         command = command,
-        exitCode = exitCode,
+        exitCode = exitCode.takeIf { exitKnown },
         tailOutput = if (historyError == null) tailOutput else {
-            listOf("Task history could not be saved; this command exit status was observed.", tailOutput.orEmpty())
+            val status = if (exitKnown) "this command exit status was observed" else "this command exit status is unknown"
+            listOf("Task history could not be saved; $status.", tailOutput.orEmpty())
                 .joinToString("\n")
         }
     )
@@ -848,6 +864,7 @@ class AgentRunManager internal constructor(
         runRecoveryBatch(scope, targets) { target, _ ->
             val payload = recoveryRepository.payload(target.requestId)
             if (recoveryRepository.abandonPending(scope, target)) {
+                consumeRecoveryTarget(target)
                 payload?.notificationSeqs?.takeIf { it.isNotEmpty() }?.let { agentNotificationCenter.discard(target.sessionId, it) }
             }
         }
@@ -927,6 +944,7 @@ class AgentRunManager internal constructor(
             if (epoch != acceptanceEpoch || !canStartRecovery(sessionId)) return
             val run = recoveryRepository.claimPending(scope, target, environment, unknownToolsVerified) ?: return
             claimed = run
+            consumeRecoveryTarget(target)
             releasedHold = item.holdReason
             val images = messagePersistenceUseCase.loadAttachmentImages(payload.inputAttachments)
             assertScopeCurrent()
@@ -1194,7 +1212,8 @@ class AgentRunManager internal constructor(
         selectedCode: String?,
         acceptedSource: Result<RunSource>,
         acceptedRecoveryRun: RecoveryRun? = null,
-        acceptedCapture: ProjectMemoryCapture? = null
+        acceptedCapture: ProjectMemoryCapture? = null,
+        recoveryRequestId: String? = null
     ): Job {
         val compress = resolved is ResolvedCommand.Action && resolved.name == "compress"
         val epoch = acceptanceEpoch
@@ -1202,53 +1221,81 @@ class AgentRunManager internal constructor(
             val owner = requireNotNull(coroutineContext[Job])
             protectJob(owner)
             var outcome = RecoveryStatus.INTERRUPTED
-            var delegated = false
+            var recoveryRun = acceptedRecoveryRun
+            var delegated: Job? = null
+            var commandCompaction: Job? = null
+            var compactionOutcome: RecoveryStatus? = null
+            fun checkCommandOwner() {
+                if (epoch != acceptanceEpoch || commandOwners[sessionId] !== owner || !owner.isActive ||
+                    sessionId in deletedSessionIds || sessionId in stoppingSessions) {
+                    throw CancellationException("Command owner changed")
+                }
+            }
             try {
                 if (!awaitReady(sessionId)) return@launch
                 stopAllSettled.first { it }
-                if (epoch != acceptanceEpoch || commandOwners[sessionId] !== owner || !owner.isActive || sessionId in deletedSessionIds) return@launch
+                checkCommandOwner()
                 val source = acceptedSource.getOrThrow()
                 checkSource(source)
                 val capture = (acceptedCapture ?: projectMemoryIdentityResolver.capture(workspacePath))
                     ?.let { freezeCapture(it, source) } ?: return@launch
-                val inputId = if (acceptedRecoveryRun == null) UUID.randomUUID().toString() else {
-                    if (!recoveryRepository.isCurrent(acceptedRecoveryRun.id)) return@launch
-                    recoveryRepository.request(acceptedRecoveryRun.requestId)?.inputMessageId ?: return@launch
-                }
                 capture.assertCurrent()
+                val acceptedId = acceptedRecoveryRun?.requestId ?: recoveryRequestId
+                val accepted = acceptedId?.let { recoveryRepository.request(it) ?: return@launch }
+                if (accepted != null) {
+                    val session = sessionUseCase.getSessionById(sessionId) ?: return@launch
+                    if (accepted.sessionId != sessionId || accepted.generation != session.executionGeneration ||
+                        session.workspacePath != workspacePath ||
+                        accepted.environment != recoveryCodec.encodeToString(capture.identity)) {
+                        throw CancellationException("Recovery command environment changed")
+                    }
+                    checkCommandOwner()
+                    capture.assertCurrent()
+                    recoveryRun = recoveryRun ?: recoveryRepository.claim(accepted.id, accepted.environment)
+                    val run = recoveryRun ?: return@launch
+                    if (run.requestId != accepted.id || run.sessionId != sessionId || run.generation != accepted.generation ||
+                        !recoveryRepository.isCurrent(run.id)) return@launch
+                }
+                checkCommandOwner()
+                capture.assertCurrent()
+                val inputId = accepted?.inputMessageId ?: UUID.randomUUID().toString()
                 messagePersistenceUseCase.persist(sessionId, MessageRole.USER, input, id = inputId,
-                    requireSession = compress, recoveryRunId = acceptedRecoveryRun?.id)
+                    requireSession = compress, recoveryRunId = recoveryRun?.id)
                 sessionUseCase.touch(sessionId, messagePersistenceUseCase.nextTimestamp())
                 if (compress && (compressionCommandOwners[sessionId] !== owner || !owner.isActive ||
                         sessionId in deletedSessionIds || sessionId in stoppingSessions)) return@launch
+                checkCommandOwner()
                 capture.assertCurrent()
                 kotlinx.coroutines.coroutineScope {
                     val invocationScope = this
+                    suspend fun delegate(prompt: String) {
+                        checkCommandOwner()
+                        capture.assertCurrent()
+                        check(delegated == null) { "Command already delegated" }
+                        val execution = executeAgentRequestStream(prompt, currentFile = currentFile, selectedCode = selectedCode,
+                            projectRoot = workspacePath, targetSessionId = sessionId, isAutoTrigger = true,
+                            acceptedRecoveryRun = recoveryRun, acceptedCapture = capture)
+                        delegated = execution
+                        execution.join()
+                    }
                     val invocation = object : SlashCommandContext {
                         override fun compactCurrentSession() {
-                            val compaction = startContextCompaction(sessionId, true, workspacePath, currentFile, selectedCode, capture)
-                            if (acceptedRecoveryRun != null && compaction != null) invocationScope.launch { compaction.join() }
+                            val compaction = startContextCompaction(sessionId, true, workspacePath, currentFile, selectedCode, capture,
+                                onFinished = { compactionOutcome = it })
+                            if (recoveryRun != null) {
+                                commandCompaction = compaction
+                                invocationScope.launch { compaction?.join() }
+                            }
                         }
                         override fun showUsage() {
                             invocationScope.launch { showUsageNow(sessionId, source) }
                         }
                         override fun initProject(prompt: String) {
-                            invocationScope.launch {
-                                delegated = true
-                                executeAgentRequestStream(prompt, currentFile = currentFile, selectedCode = selectedCode,
-                                    projectRoot = workspacePath, targetSessionId = sessionId, isAutoTrigger = true,
-                                    acceptedRecoveryRun = acceptedRecoveryRun, acceptedCapture = capture).join()
-                            }
+                            invocationScope.launch { delegate(prompt) }
                         }
                         override fun runSkill(skill: Skill, args: String) {
                             val fixedSkill = skill.copy(requiredTools = skill.requiredTools.toList())
-                            invocationScope.launch {
-                                delegated = true
-                                executeAgentRequestStream(SlashCommandRegistry.buildSkillPrompt(fixedSkill, args),
-                                    currentFile = currentFile, selectedCode = selectedCode,
-                                    projectRoot = workspacePath, targetSessionId = sessionId, isAutoTrigger = true,
-                                    acceptedRecoveryRun = acceptedRecoveryRun, acceptedCapture = capture).join()
-                            }
+                            invocationScope.launch { delegate(SlashCommandRegistry.buildSkillPrompt(fixedSkill, args)) }
                         }
                         override fun setSessionGoal(rawArgs: String) {
                             invocationScope.launch { setSessionGoalNow(sessionId, rawArgs, source) }
@@ -1259,15 +1306,34 @@ class AgentRunManager internal constructor(
                         is ResolvedCommand.SkillCommand -> invocation.runSkill(resolved.skill, resolved.args)
                     }
                 }
-                if (!delegated) outcome = RecoveryStatus.COMPLETED
+                checkCommandOwner()
+                capture.assertCurrent()
+                if (delegated == null) {
+                    outcome = if (compress && recoveryRun != null) compactionOutcome ?: RecoveryStatus.INTERRUPTED
+                        else RecoveryStatus.COMPLETED
+                }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (failure: Exception) {
                 outcome = RecoveryStatus.FAILED
-                setAgentState(sessionId, AgentUIState.Error(failure.toUserMessage(context)))
+                if (commandOwners[sessionId] === owner && sessionId !in deletedSessionIds) {
+                    setAgentState(sessionId, AgentUIState.Error(failure.toUserMessage(context)))
+                }
             } finally {
-                if (acceptedRecoveryRun != null) withContext(NonCancellable + Dispatchers.IO) {
-                    runCatching { recoveryRepository.finish(acceptedRecoveryRun.id, outcome) }
+                withContext(NonCancellable) {
+                    // A delegated workflow owns its outcome; only finish a still-owned row left by an early exit.
+                    delegated?.takeIf { !it.isCompleted }?.cancelAndJoin()
+                    commandCompaction?.takeIf { !it.isCompleted }?.cancelAndJoin()
+                    withContext(Dispatchers.IO) {
+                        val run = recoveryRun
+                        if (run != null) {
+                            runCatching {
+                                if (recoveryRepository.isCurrent(run.id)) recoveryRepository.finish(run.id, outcome)
+                            }
+                        } else if (recoveryRequestId != null) {
+                            runCatching { recoveryRepository.awaitConfirmation(recoveryRequestId) }
+                        }
+                    }
                 }
                 if (commandOwners[sessionId] === owner) {
                     commandOwners.remove(sessionId)
@@ -1313,7 +1379,7 @@ class AgentRunManager internal constructor(
         val resolved = if (subAgentInstructionId == null && request.startsWith('/')) slashCommandRegistry.resolve(request) else null
         if (resolved != null && targetSessionId != null) {
             return runResolvedCommand(resolved, request, targetSessionId, projectRoot, currentFile, selectedCode, source,
-                acceptedRecoveryRun, acceptedCapture)
+                acceptedRecoveryRun, acceptedCapture, recoveryRequestId)
         }
         val epoch = acceptanceEpoch
         val job = managerScope.launch(start = CoroutineStart.LAZY) {
@@ -1327,7 +1393,8 @@ class AgentRunManager internal constructor(
             }
             if (sessionId in deletedSessionIds) return@launch
             if (resolved != null) {
-                runResolvedCommand(resolved, request, sessionId, projectRoot, currentFile, selectedCode, source).join()
+                runResolvedCommand(resolved, request, sessionId, projectRoot, currentFile, selectedCode, source,
+                    acceptedRecoveryRun, acceptedCapture, recoveryRequestId).join()
                 return@launch
             }
             if (targetSessionId == null && sessionJobs[sessionId]?.isCompleted == false) {
@@ -2070,6 +2137,7 @@ class AgentRunManager internal constructor(
         deletedSessionIds.add(sessionId)
         messagePersistenceUseCase.releaseSessionCache(sessionId)
         activeRecoveryRuns.remove(sessionId)
+        _consumedRecoveryTargets.value = _consumedRecoveryTargets.value.filterValues { it.sessionId != sessionId }
         projectMemoryRuntimeBindings.release(sessionId)
         managerScope.launch(Dispatchers.IO) { projectMemoryJournal.clearSession(sessionId) }
         projectProgressTerminalTracker.clearSession(sessionId)
@@ -2459,7 +2527,8 @@ class AgentRunManager internal constructor(
 
     private fun startContextCompaction(
         sid: String, allowCommand: Boolean, expectedWorkspace: String, currentFile: String? = null, selectedCode: String? = null,
-        acceptedCapture: ProjectMemoryCapture? = null
+        acceptedCapture: ProjectMemoryCapture? = null,
+        onFinished: ((RecoveryStatus) -> Unit)? = null
     ): Job? {
         if (sid in deletedSessionIds || sid in stoppingSessions || sid in approvalSessionIds.value ||
             (!allowCommand && (sid in _runningCommandSessions.value || sid in _recoveryBusySessions.value)) ||
@@ -2470,6 +2539,7 @@ class AgentRunManager internal constructor(
             val owner = requireNotNull(coroutineContext[Job])
             protectJob(owner)
             var failed = false
+            var outcome = RecoveryStatus.INTERRUPTED
             suspend fun writable(): Boolean = sessionJobs[sid] === owner && owner.isActive &&
                 sid !in deletedSessionIds && sid !in stoppingSessions && sessionUseCase.getSessionById(sid) != null
             try {
@@ -2509,13 +2579,16 @@ class AgentRunManager internal constructor(
                     messagePersistenceUseCase.persist(sessionId = sid, role = MessageRole.ASSISTANT,
                         content = context.getString(R.string.agent_context_no_compaction), requireSession = true)
                 }
+                outcome = if (failed) RecoveryStatus.FAILED else RecoveryStatus.COMPLETED
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
+                outcome = RecoveryStatus.FAILED
                 FileLogger.w(TAG, "手动压缩未完成: session=$sid")
                 if (writable()) messagePersistenceUseCase.persist(sessionId = sid, role = MessageRole.ASSISTANT,
                     content = context.getString(R.string.agent_compaction_failed, compactionFailureMessage("compaction_failed")), requireSession = true)
             } finally {
+                onFinished?.invoke(outcome)
                 if (sessionJobs[sid] === owner) {
                     setCompacting(sid, false)
                     sessionJobs.remove(sid)

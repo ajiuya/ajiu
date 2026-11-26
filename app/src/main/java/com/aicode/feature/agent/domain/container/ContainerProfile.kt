@@ -30,8 +30,13 @@ data class ContainerProfile(
     /** 该 profile 的执行模式：本地 PRoot 容器 or 远程 SSH。选中时据此切全局 [ExecutionMode]。 */
     val mode: ExecutionMode = ExecutionMode.LOCAL_PROOT,
     /** 添加时间（毫秒时间戳），容器列表按此降序排列；旧数据/内置默认 0 排最后。 */
-    val createdAt: Long = 0
+    val createdAt: Long = 0,
+    val localRuntime: LocalContainerRuntime = LocalContainerRuntime.PROOT,
+    val chrootInstance: ChrootInstance? = null
 ) {
+    val isChroot: Boolean
+        get() = mode == ExecutionMode.LOCAL_PROOT && localRuntime == LocalContainerRuntime.CHROOT
+
     companion object {
         const val BUILTIN_ID = "builtin-alpine"
 
@@ -56,6 +61,20 @@ data class ContainerProfile(
         )
     }
 }
+
+@Serializable
+enum class LocalContainerRuntime {
+    PROOT,
+    CHROOT
+}
+
+@Serializable
+data class ChrootInstance(
+    val id: String,
+    val device: Long,
+    val inode: Long,
+    val installGeneration: Long
+)
 
 @Serializable
 sealed interface RootfsSource {

@@ -3,6 +3,7 @@ package com.aicode.core.watch
 import android.os.FileObserver
 import com.aicode.core.util.FileLogger
 import com.aicode.feature.agent.domain.container.ContainerInstaller
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeAuthorizationRequired
 import com.aicode.feature.settings.data.repository.ContainerSettingsRepository
 import com.aicode.feature.settings.data.repository.ExecutionMode
 import com.aicode.feature.settings.data.repository.ExecutionModeHolder
@@ -10,10 +11,12 @@ import com.aicode.feature.workspace.data.repository.WorkspaceRepository
 import com.aicode.feature.workspace.domain.WorkspacePathMapper
 import com.aicode.feature.workspace.domain.WorkspaceExecutionContext
 import com.aicode.feature.workspace.domain.WorkspaceExecutionContextFactory
+import com.aicode.feature.workspace.domain.model.Workspace
 import java.io.Closeable
 import java.io.File
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
@@ -26,6 +29,7 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.emitAll
@@ -35,6 +39,7 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.flow.receiveAsFlow
+import kotlinx.coroutines.flow.transform
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -82,7 +87,7 @@ class FileChangeHub internal constructor(
         settings: ContainerSettingsRepository
     ) : this(workspaceRepository, containerInstaller, pathMapper, executionModeHolder, Dispatchers.IO, Dispatchers.Main.immediate,
         remoteFileWatchHub = remoteFileWatchHub, executionFactory = executionFactory,
-        profileChanges = settings.activeProfileSelectionRevisions)
+        profileChanges = merge(settings.activeProfileSelectionRevisions, settings.profileConfigurationRevisions))
 
     companion object {
         private const val TAG = "FileChangeHub"
@@ -171,6 +176,22 @@ class FileChangeHub internal constructor(
         )
     )
 
+    private data class WorkspaceWatchSource(
+        val workspace: Workspace?,
+        val workspacePath: String,
+        val modeSelectionRevision: Long,
+        val profile: WorkspacePathMapper.RuntimeProfileState
+    )
+
+    private data class WorkspaceWatchBatch(val source: WorkspaceWatchSource?, val batch: FileChangeBatch)
+
+    private fun isCurrentWorkspaceSource(source: WorkspaceWatchSource): Boolean =
+        source.profile.ready && !source.profile.profile.isChroot &&
+            pathMapper.runtimeProfileState.value == source.profile &&
+            executionModeHolder.currentMode() == ExecutionMode.LOCAL_PROOT &&
+            executionModeHolder.modeSelectionRevision == source.modeSelectionRevision &&
+            workspaceRepository.current.value == source.workspace && workspaceRepository.currentPath() == source.workspacePath
+
     /**
      * 订阅当前工作区（跟随工作区切换自动重建）。[containerSubPath] 是容器路径，默认整个工作区根。
      * 远程模式按冻结 SSH 来源共享快照轮询，不创建宿主观察器。
@@ -182,26 +203,34 @@ class FileChangeHub internal constructor(
         fallbackPoll: Boolean = true,
         batchWindowMs: Int = DEFAULT_BATCH_WINDOW_MS
     ): Flow<FileChangeBatch> = combine(workspaceRepository.current, executionModeHolder.mode,
-        executionModeHolder.modeSelectionRevisions, profileChanges) { _, _, _, _ -> workspaceRepository.currentPath() }
-        .flatMapLatest {
-            if (executionModeHolder.currentMode() == ExecutionMode.REMOTE_SSH) {
-                flow {
-                    val execution = executionFactory?.freeze() ?: throw IllegalStateException("Captured remote watch execution required")
-                    val path = withContext(ioDispatcher + execution) { execution.fileAccess.resolvePath(containerSubPath, true) }
-                    emitAll(watchRemoteDir(execution, path, recursive, filter))
+        executionModeHolder.modeSelectionRevisions, profileChanges, pathMapper.runtimeProfileState) { current, _, revision, _, profile ->
+        WorkspaceWatchSource(current, workspaceRepository.currentPath(), revision, profile)
+    }.flatMapLatest { source ->
+        if (executionModeHolder.currentMode() == ExecutionMode.REMOTE_SSH) {
+            flow {
+                val execution = executionFactory?.freeze() ?: throw IllegalStateException("Captured remote watch execution required")
+                val path = withContext(ioDispatcher + execution) { execution.fileAccess.resolvePath(containerSubPath, true) }
+                emitAll(watchRemoteDir(execution, path, recursive, filter).map { WorkspaceWatchBatch(null, it) })
+            }
+        } else if (!isCurrentWorkspaceSource(source)) {
+            emptyFlow()
+        } else {
+            flow {
+                if (!isCurrentWorkspaceSource(source)) return@flow
+                val hostDir = try {
+                    pathMapper.toHostFile(containerSubPath)
+                } catch (_: LocalRuntimeAuthorizationRequired) {
+                    return@flow
                 }
-            } else {
-                watchHostDir(
-                    hostDir = pathMapper.toHostFile(containerSubPath),
-                    containerRootPath = containerSubPath.trimEnd('/'),
-                    root = ChangeRoot.WORKSPACE,
-                    recursive = recursive,
-                    filter = filter,
-                    fallbackPoll = fallbackPoll,
-                    batchWindowMs = batchWindowMs
-                )
+                if (!isCurrentWorkspaceSource(source)) return@flow
+                emitAll(watchHostDir(hostDir, containerSubPath.trimEnd('/'), ChangeRoot.WORKSPACE,
+                    recursive, filter, fallbackPoll, batchWindowMs) { isCurrentWorkspaceSource(source) }
+                    .map { WorkspaceWatchBatch(source, it) })
             }
         }
+    }.buffer(0).transform { (source, batch) ->
+        if (source == null || isCurrentWorkspaceSource(source)) emit(batch)
+    }
 
     fun watchRemoteDir(execution: WorkspaceExecutionContext, rootPath: String, recursive: Boolean = false,
         filter: WatchFilter = WatchFilter.DEFAULT): Flow<FileChangeBatch> = remoteFileWatchHub.watch(execution, rootPath, recursive, filter)
@@ -239,7 +268,20 @@ class FileChangeHub internal constructor(
         filter: WatchFilter = WatchFilter.DEFAULT,
         fallbackPoll: Boolean = true,
         batchWindowMs: Int = DEFAULT_BATCH_WINDOW_MS
+    ): Flow<FileChangeBatch> = watchHostDir(hostDir, containerRootPath, root, recursive, filter,
+        fallbackPoll, batchWindowMs) { true }
+
+    private fun watchHostDir(
+        hostDir: File,
+        containerRootPath: String?,
+        root: ChangeRoot,
+        recursive: Boolean,
+        filter: WatchFilter,
+        fallbackPoll: Boolean,
+        batchWindowMs: Int,
+        isCurrentScope: () -> Boolean
     ): Flow<FileChangeBatch> = flow {
+        if (!isCurrentScope()) return@flow
         val subscription = Subscription(
             rootDir = hostDir,
             containerRootPath = containerRootPath,
@@ -248,7 +290,8 @@ class FileChangeHub internal constructor(
             filter = filter,
             fallbackPoll = fallbackPoll,
             windowMs = batchWindowMs,
-            parentJob = currentCoroutineContext()[Job]
+            parentJob = currentCoroutineContext()[Job],
+            isCurrentScope = isCurrentScope
         )
         try {
             withContext(ioDispatcher) { subscription.start() }
@@ -267,7 +310,8 @@ class FileChangeHub internal constructor(
         private val filter: WatchFilter,
         private val fallbackPoll: Boolean,
         private val windowMs: Int,
-        parentJob: Job?
+        parentJob: Job?,
+        private val isCurrentScope: () -> Boolean
     ) {
         private val events = PendingFileChanges(MAX_PENDING_EVENTS)
         private val batchesChannel = Channel<FileChangeBatch>(MAX_PENDING_BATCHES)
@@ -284,13 +328,20 @@ class FileChangeHub internal constructor(
         private var attachJob: Job? = null
         private var stopped = false
 
-        fun start() {
+        fun isCurrent(): Boolean = subscriptionJob.isActive && isCurrentScope()
+
+        private fun ensureCurrent() {
             subscriptionJob.ensureActive()
+            if (!isCurrentScope()) throw CancellationException("Workspace watch source changed")
+        }
+
+        fun start() {
+            ensureCurrent()
             rules = IgnoreRules.of(
                 filter,
                 if (filter.followGitignore) readGitignorePatterns(rootDir) else emptyList()
             )
-            subscriptionJob.ensureActive()
+            ensureCurrent()
             scope.launch { mergeLoop() }
             if (rootDir.isDirectory) {
                 attachTree()
@@ -345,7 +396,7 @@ class FileChangeHub internal constructor(
 
         /** 递归注册目录；剪枝只针对父路径段，故先判后注册。[reportNew] 为真时对新挂上的目录补报其存量直接子项。 */
         private fun registerTree(dir: File, reportNew: Boolean) {
-            subscriptionJob.ensureActive()
+            ensureCurrent()
             val parts = relativePartsOf(rootDir, dir)
             if (parts.isNotEmpty() && (rules.isIgnoredDir(parts) || java.nio.file.Files.isSymbolicLink(dir.toPath()))) return
             register(dir, reportNew)
@@ -359,7 +410,7 @@ class FileChangeHub internal constructor(
 
         private fun register(dir: File, reportNew: Boolean) {
             val start = synchronized(lifecycleLock) {
-                if (stopped || !subscriptionJob.isActive) return
+                if (stopped || !isCurrent()) return
                 val path = dir.absolutePath
                 if (myDirs.containsKey(path)) return
                 synchronized(dirLock) {
@@ -423,7 +474,7 @@ class FileChangeHub internal constructor(
 
         fun onEvent(watch: DirWatch, hostPath: String, kind: ChangeKind) {
             synchronized(lifecycleLock) {
-                if (stopped || !subscriptionJob.isActive || myDirs[watch.path] !== watch) return
+                if (stopped || !isCurrent() || myDirs[watch.path] !== watch) return
                 offerEvent(hostPath, kind)
             }
             if (recursive && kind == ChangeKind.CREATED) {
@@ -440,12 +491,12 @@ class FileChangeHub internal constructor(
          */
         private fun startPolling() {
             synchronized(lifecycleLock) {
-                if (stopped || !subscriptionJob.isActive || !fallbackPoll || pollLease != null) return
+                if (stopped || !isCurrent() || !fallbackPoll || pollLease != null) return
                 val key = SnapshotScope(rootDir.absoluteFile.toPath().normalize().toString(), recursive, rules)
                 val leaseRules = rules
                 pollLease = scopeSnapshots.subscribe(key) { last, now ->
                     synchronized(lifecycleLock) {
-                        if (stopped || !subscriptionJob.isActive || rules != leaseRules) return@subscribe
+                        if (stopped || !isCurrent() || rules != leaseRules) return@subscribe
                         if (!last.complete || !now.complete) events.invalidate()
                     }
                     val diff = diffSnapshot(last.entries, now.entries)
@@ -467,7 +518,7 @@ class FileChangeHub internal constructor(
 
         private fun offerEvent(hostPath: String, kind: ChangeKind) {
             synchronized(lifecycleLock) {
-                if (stopped || !subscriptionJob.isActive) return
+                if (stopped || !isCurrent()) return
                 val parents = relativePartsOf(rootDir, File(hostPath)).dropLast(1)
                 if (!rules.isIgnoredDir(parents)) events.offer(hostPath, kind)
             }
@@ -500,7 +551,7 @@ class FileChangeHub internal constructor(
                         registerTree(rootDir, reportNew = true)
                     }
                 }
-                if (merged.isEmpty() && !truncated) continue
+                if (!isCurrent() || (merged.isEmpty() && !truncated)) continue
                 val changes = merged.map { (path, kind) ->
                     FileChange(rootKind, path, containerPathOf(path), kind)
                 }
@@ -521,12 +572,16 @@ class FileChangeHub internal constructor(
             subscribers.add(sub)
             if (reportNew) pendingReady.add(sub)
             if (observer != null && pendingReady.isEmpty()) return null
-            startJob?.let { return it }
+            startJob?.takeUnless { it.isCompleted }?.let { return it }
             val previousStop = pendingStops[path]
             return mainScope.launch(start = CoroutineStart.LAZY) {
+                val currentJob = currentCoroutineContext()[Job]
                 previousStop?.join()
                 val created = synchronized(dirLock) {
-                    if (dirWatches[path] !== this@DirWatch || subscribers.isEmpty()) return@launch
+                    if (dirWatches[path] !== this@DirWatch || subscribers.none { it.isCurrent() }) {
+                        if (startJob === currentJob) startJob = null
+                        return@launch
+                    }
                     if (observer == null) {
                         observerFactory(path, MASK) { current, event, child ->
                             diag("FileObserver.onEvent path=$path event=0x${Integer.toHexString(event)} child=$child")
@@ -544,15 +599,23 @@ class FileChangeHub internal constructor(
                 created?.startWatching()
                 if (created != null) diag("startWatching path=$path")
                 val ready = synchronized(dirLock) {
-                    if (dirWatches[path] !== this@DirWatch || subscribers.isEmpty()) return@launch
-                    startJob = null
+                    if (dirWatches[path] !== this@DirWatch || subscribers.none { it.isCurrent() }) {
+                        if (startJob === currentJob) startJob = null
+                        return@launch
+                    }
+                    if (startJob === currentJob) startJob = null
                     pendingReady.toList().also { pendingReady.clear() }
                 }
                 for (sub in ready) {
                     val active = synchronized(dirLock) { dirWatches[path] === this@DirWatch && sub in subscribers }
                     if (active) sub.onWatchReady(this@DirWatch, dir)
                 }
-            }.also { startJob = it }
+            }.also { job ->
+                startJob = job
+                job.invokeOnCompletion {
+                    synchronized(dirLock) { if (startJob === job) startJob = null }
+                }
+            }
         }
 
         fun unsubscribe(sub: Subscription): Job? {

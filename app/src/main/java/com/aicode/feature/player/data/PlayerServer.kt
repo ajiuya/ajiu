@@ -2,6 +2,7 @@ package com.aicode.feature.player.data
 
 import android.content.Context
 import com.aicode.feature.agent.domain.memory.ProjectMemoryIdentityResolver
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwner
 import com.aicode.feature.player.domain.PlayerRequest
 import com.aicode.feature.player.domain.PlayerRequestCodec
 import com.aicode.feature.workspace.data.repository.WorkspaceRepository
@@ -43,22 +44,37 @@ class PlayerServer @Inject constructor(
     private val sessions = mutableSetOf<PlayerSession>()
     private val states = mutableMapOf<String, PlayerStateStore>()
 
-    suspend fun createSession(request: PlayerRequest): PlayerSession {
+    suspend fun createSession(request: PlayerRequest, runtimeOwner: RuntimeOwner? = null,
+        checkSource: (() -> Unit)? = null): PlayerSession {
         var pending: PlayerSession? = null
         try { return withContext(Dispatchers.IO) {
         val normalized = PlayerRequestCodec.validate(request)
+        currentCoroutineContext().ensureActive()
+        checkSource?.invoke()
+        val media = normalized.items.map { it.url } + listOfNotNull(normalized.src.takeIf { it.isNotEmpty() })
+        val requiresFiles = media.any { !it.startsWith("http://") && !it.startsWith("https://") }
+        val networkOnly = !requiresFiles && (media.isNotEmpty() || normalized.api.isNotEmpty() || normalized.videoId.isNotBlank())
         val owner = SupervisorJob()
         val scope = CoroutineScope(owner + Dispatchers.IO)
         val resources = PlayerResources()
-        val listener = ServerSocket()
+        var listener: ServerSocket? = null
         var library: PlayerLibrary? = null
         var registered: PlayerSession? = null
         try {
-            val binding = try { PlayerWorkspaceBinding.capture(workspaceRepository, identityResolver, executionFactory, owner) }
-                catch (cancelled: kotlinx.coroutines.CancellationException) { currentCoroutineContext().ensureActive(); null }
-                catch (_: IllegalStateException) { null }
-            listener.bind(InetSocketAddress(InetAddress.getByName("127.0.0.1"), 0), 32)
-            val origin = "http://127.0.0.1:${listener.localPort}"
+            val binding = when {
+                networkOnly -> null
+                requiresFiles -> PlayerWorkspaceBinding.capture(workspaceRepository, identityResolver, executionFactory, owner,
+                    normalized.root, runtimeOwner, checkSource) ?: throw IOException("Local player workspace unavailable")
+                else -> try {
+                    PlayerWorkspaceBinding.capture(workspaceRepository, identityResolver, executionFactory, owner,
+                        normalized.root, runtimeOwner, checkSource)
+                } catch (_: IOException) { null }
+            }
+            currentCoroutineContext().ensureActive()
+            checkSource?.invoke()
+            val listening = ServerSocket().also { listener = it }
+            listening.bind(InetSocketAddress(InetAddress.getByName("127.0.0.1"), 0), 32)
+            val origin = "http://127.0.0.1:${listening.localPort}"
             val token = sessionToken()
             val prefix = "/$token/"
             if (binding != null) library = PlayerLibrary(binding, normalized.root, prefix, resources,
@@ -72,29 +88,34 @@ class PlayerServer @Inject constructor(
             lateinit var session: PlayerSession
             session = PlayerSession("$origin$prefix${normalized.mode}.html", origin) {
                 owner.cancel()
-                runCatching { listener.close() }
+                runCatching { listening.close() }
                 resources.close(); library?.close(); mappings.clear(); localMappings.clear()
                 synchronized(sessions) { sessions.remove(session) }
             }
             val data = SessionData(normalized, token, origin, prefix, resources, library, binding, mappings, localMappings, state)
+            currentCoroutineContext().ensureActive()
+            checkSource?.invoke()
             synchronized(sessions) { check(sessions.size < 8) { "Player session limit reached" }; sessions += session }
             registered = session
             pending = session
-            scope.launch(start = CoroutineStart.UNDISPATCHED) {
-                workspaceRepository.current.collect {
-                    if (binding != null) try { binding.checkCurrent() } catch (_: Exception) { session.close() }
+            if (binding != null) {
+                scope.launch(start = CoroutineStart.UNDISPATCHED) {
+                    workspaceRepository.current.collect {
+                        try { binding.checkCurrent() } catch (_: Exception) { session.close() }
+                    }
+                }
+                scope.launch(start = CoroutineStart.UNDISPATCHED) {
+                    identityResolver.environmentChanges.collect {
+                        try { binding.checkCurrent() } catch (_: Exception) { session.close() }
+                    }
                 }
             }
-            scope.launch(start = CoroutineStart.UNDISPATCHED) {
-                identityResolver.environmentChanges.collect {
-                    if (binding != null) try { binding.checkCurrent() } catch (_: Exception) { session.close() }
-                }
-            }
-            Thread({ accept(listener, data, session) }, "player-listener").apply { isDaemon = true }.start()
+            Thread({ accept(listening, data, session) }, "player-listener").apply { isDaemon = true }.start()
             currentCoroutineContext().ensureActive()
+            checkSource?.invoke()
             session
         } catch (failure: Throwable) {
-            registered?.close(); owner.cancel(); resources.close(); library?.close(); runCatching { listener.close() }
+            registered?.close(); owner.cancel(); resources.close(); library?.close(); runCatching { listener?.close() }
             throw failure
         }
         } } catch (failure: Throwable) { pending?.close(); throw failure }

@@ -8,6 +8,7 @@ import com.aicode.feature.agent.domain.container.RemoteSshConnection
 import com.aicode.feature.agent.domain.container.RemoteSshEngine
 import com.aicode.feature.agent.domain.memory.ProjectMemoryCapture
 import com.aicode.feature.agent.domain.memory.ProjectMemoryIdentity
+import com.aicode.feature.settings.data.repository.ContainerProfileSnapshot
 import com.aicode.feature.settings.data.repository.ContainerSettingsRepository
 import com.aicode.feature.settings.data.repository.ExecutionMode
 import com.aicode.feature.settings.data.repository.ExecutionModeHolder
@@ -128,6 +129,10 @@ class WorkspaceRemoteExecutionContextTest {
             every { snapshot() } returns LocalFolderSnapshot.EMPTY
         }
         every { settings.activeProfileSelectionRevision } returns 0L
+        coEvery { settings.captureProfileSnapshot() } returns ContainerProfileSnapshot(
+            "remote-profile", "remote-profile", emptyList(), 0L, 0L, settings
+        )
+        every { settings.checkProfileSnapshot(any()) } returns Unit
         access = DelegatingFileAccess(holder, local, remote, localFolders)
         factory = WorkspaceExecutionContextFactory(access, holder, local, remote, settings, localFolders)
         engine = RemoteSshEngine(connection)

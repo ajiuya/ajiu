@@ -9,6 +9,8 @@ import com.aicode.core.ui.decodeSampledBitmap
 import com.aicode.feature.workspace.domain.FileAccessProvider
 import com.aicode.feature.workspace.domain.DelegatingFileAccess
 import com.aicode.feature.workspace.domain.FilePathSource
+import com.aicode.feature.workspace.domain.WorkspaceExecutionContext
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwner
 import java.io.File
 import java.nio.file.Files
 import kotlinx.coroutines.CancellationException
@@ -23,7 +25,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 internal object ChatImageFiles {
-    private data class Key(val source: String, val path: String, val size: Long, val modified: Long)
+    private data class Key(val source: String, val path: String, val size: Long, val modified: Long,
+        val execution: String?, val owner: RuntimeOwner?)
     private data class DecodeKey(val file: Key, val spec: ImageDecodeSpec)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val files = LeasedFileCache<Key>(32, 256L * 1024 * 1024, 60_000L, scope = scope)
@@ -44,27 +47,34 @@ internal object ChatImageFiles {
     }
 
     suspend fun load(access: FileAccessProvider, path: String, spec: ImageDecodeSpec): ImageBitmap? = withContext(Dispatchers.IO) {
+        val sourceContext = WorkspaceExecutionContext.blockingContext()
         val captured = (access as? DelegatingFileAccess)?.capturePathSource(path)
         val expected = captured?.expectedBaseIdentity ?: access.cacheIdentity()
         val identity = captured?.identity ?: expected
-        val key = Key(identity, path, access.fileSize(path), access.lastModified(path))
+        val execution = WorkspaceExecutionContext.current()
+        val key = Key(identity, path, access.fileSize(path), access.lastModified(path),
+            execution?.fileCacheIdentity, execution?.runtimeOwner)
         checkSource(access, expected, captured)
         val result = images.get(DecodeKey(key, spec)) {
-            files.acquire(key) {
-                checkSource(access, expected, captured)
-                if (identity.startsWith("local:")) {
-                    LeasedFileCache.Resource(access.copyToLocal(path), owned = false).also { checkSource(access, expected, captured) }
-                } else {
-                    download(access, path, expected, captured)
+            withContext(sourceContext + Dispatchers.IO) {
+                files.acquire(key) {
+                    withContext(sourceContext + Dispatchers.IO) {
+                        checkSource(access, expected, captured)
+                        if (identity.startsWith("local:")) {
+                            LeasedFileCache.Resource(access.copyToLocal(path), owned = false).also { checkSource(access, expected, captured) }
+                        } else {
+                            download(access, path, expected, captured)
+                        }
+                    }
+                }.use { lease ->
+                    checkSource(access, expected, captured)
+                    val file = lease.file
+                    val image = if (file.isFile && file.length() > 0L) {
+                        decodeSampledBitmap(file.absolutePath, spec.maxEdge, spec.maxPixels)
+                    } else null
+                    checkSource(access, expected, captured)
+                    image
                 }
-            }.use { lease ->
-                checkSource(access, expected, captured)
-                val file = lease.file
-                val image = if (file.isFile && file.length() > 0L) {
-                    decodeSampledBitmap(file.absolutePath, spec.maxEdge, spec.maxPixels)
-                } else null
-                checkSource(access, expected, captured)
-                image
             }
         }
         currentCoroutineContext().ensureActive()
@@ -100,6 +110,6 @@ internal object ChatImageFiles {
 
     private fun checkSource(access: FileAccessProvider, expected: String, captured: FilePathSource?, authorize: Boolean = true) {
         if (authorize) captured?.checkAuthorization() else captured?.checkCurrent()
-        if (access.cacheIdentity() != expected) throw CancellationException("Image source changed")
+        if (captured == null && access.cacheIdentity() != expected) throw CancellationException("Image source changed")
     }
 }

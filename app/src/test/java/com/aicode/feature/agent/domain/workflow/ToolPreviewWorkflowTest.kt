@@ -100,7 +100,7 @@ class ToolPreviewWorkflowTest {
         coEvery { compactor.compactIfNeeded(any(), any(), any(), any(), any(), any(), any(), any(), any()) } answers {
             CompactionResult(firstArg<List<AgentMessage>>(), false)
         }
-        coEvery { policy.evaluate(any(), any(), any()) } returns ToolPermissionPolicyEngine.EvalResult(ToolPermissionPolicyEngine.Verdict.ALLOW)
+        coEvery { policy.evaluate(any(), any(), any(), any()) } returns ToolPermissionPolicyEngine.EvalResult(ToolPermissionPolicyEngine.Verdict.ALLOW)
         every { outputStore.process(any(), any(), any()) } answers { thirdArg<ToolResult>() }
         val hooks = mockk<com.aicode.feature.plugin.runtime.PluginHookDispatcher>(relaxed = true)
         coEvery { hooks.beforeTool(any(), any(), any()) } answers { com.aicode.feature.plugin.runtime.PluginBeforeTool(thirdArg()) }
@@ -123,7 +123,7 @@ class ToolPreviewWorkflowTest {
             recoveryRepository = mockk(relaxed = true),
             pluginHooks = hooks,
             workspaceExecutionContextFactory = mockk {
-                coEvery { freeze(any()) } returns WorkspaceExecutionContext(
+                coEvery { freeze(any(), any()) } returns WorkspaceExecutionContext(
                     ExecutionMode.LOCAL_PROOT, "preview-test", files, null, null
                 ) {}
             }

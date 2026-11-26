@@ -2,6 +2,7 @@ package com.aicode.feature.workspace.domain
 
 import com.aicode.core.util.FileLogger
 import com.aicode.core.util.boundedLines
+import com.aicode.feature.settings.data.repository.ContainerProfileSnapshot
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
@@ -17,6 +18,7 @@ import kotlin.io.NoSuchFileException
 import java.nio.file.Path
 import java.nio.file.SimpleFileVisitor
 import java.nio.file.StandardCopyOption
+import java.security.MessageDigest
 import java.nio.file.attribute.BasicFileAttributes
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -30,13 +32,32 @@ class LocalFileAccess @Inject constructor(
     private val pathMapper: WorkspacePathMapper
 ) : FileAccessProvider {
 
-    internal fun captureExecutionMapping(): WorkspacePathMapper.ExecutionMapping = pathMapper.captureExecutionMapping()
+    internal fun captureExecutionMapping(snapshot: ContainerProfileSnapshot? = null): WorkspacePathMapper.ExecutionMapping =
+        pathMapper.captureExecutionMapping(snapshot)
+
+    internal fun checkExecutionMapping(mapping: WorkspacePathMapper.ExecutionMapping) = pathMapper.checkExecutionMapping(mapping)
+
+    internal fun captureWorkspaceSource(): WorkspacePathMapper.WorkspaceSource = pathMapper.captureWorkspaceSource()
+
+    internal fun checkWorkspaceSource(source: WorkspacePathMapper.WorkspaceSource) = pathMapper.checkWorkspaceSource(source)
+
+    internal fun cacheIdentity(mapping: WorkspacePathMapper.ExecutionMapping): String {
+        val profile = MessageDigest.getInstance("SHA-256").digest(mapping.profile.toString().toByteArray())
+            .joinToString("") { "%02x".format(it) }
+        return listOf(
+            mapping.selectionRevision.toString(), mapping.configurationRevision.toString(), profile,
+            mapping.workspaceRoot.path, mapping.rootfsRoot.path, mapping.aicodeRoot.path, mapping.home
+        ).joinToString(separator = "", prefix = "local:proot:") { "${it.length}:$it" }
+    }
 
     internal fun transferFile(path: String, followFinal: Boolean = true): File = resolve(path, followFinal)
 
     private fun resolve(path: String, followFinalLink: Boolean = true): File {
         val execution = WorkspaceExecutionContext.current()
         execution?.requireMode(com.aicode.feature.settings.data.repository.ExecutionMode.LOCAL_PROOT)
+        if (execution?.localRuntimeCapture != null || execution?.localMapping?.profile?.isChroot == true) {
+            throw IOException("CHROOT files require their captured runtime backend")
+        }
         return pathMapper.resolveFile(path, followFinalLink).also { execution?.checkCurrent() }
     }
 
@@ -70,10 +91,12 @@ class LocalFileAccess @Inject constructor(
     override fun cacheIdentity(): String {
         WorkspaceExecutionContext.current()?.let {
             it.requireMode(com.aicode.feature.settings.data.repository.ExecutionMode.LOCAL_PROOT)
+            if (it.localRuntimeCapture != null || it.localMapping?.profile?.isChroot == true) {
+                throw IOException("CHROOT files require their captured runtime backend")
+            }
             return it.fileCacheIdentity
         }
-        return listOf("~/workspace", "/", "~/").map { resolve(it).canonicalPath }
-            .joinToString(separator = "", prefix = "local:") { "${it.length}:$it" }
+        return cacheIdentity(captureExecutionMapping())
     }
 
     override fun openRead(path: String): InputStream {

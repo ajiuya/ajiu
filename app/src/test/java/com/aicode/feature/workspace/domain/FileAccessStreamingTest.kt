@@ -1,5 +1,6 @@
 package com.aicode.feature.workspace.domain
 
+import com.aicode.feature.agent.domain.container.ContainerProfile
 import com.aicode.feature.settings.data.repository.ExecutionMode
 import com.aicode.feature.settings.data.repository.ExecutionModeHolder
 import io.mockk.every
@@ -81,19 +82,27 @@ class FileAccessStreamingTest {
         val mapper = mockk<WorkspacePathMapper>()
         var root = temporary.newFolder("workspace")
         var rootfs = temporary.newFolder("rootfs")
-        var home = File(rootfs, "root")
+        val config = temporary.newFolder("aicode")
+        var home = "/root"
+        every { mapper.captureExecutionMapping(any()) } answers {
+            WorkspacePathMapper.ExecutionMapping(
+                ContainerProfile.BUILTIN_ALPINE, root.canonicalFile, rootfs.canonicalFile, config.canonicalFile, home
+            )
+        }
         every { mapper.resolveFile(any(), any()) } answers {
             when (val path = firstArg<String>()) {
                 "~/workspace" -> root
                 "/" -> rootfs
-                "~/" -> home
+                "~/" -> File(rootfs, home.removePrefix("/"))
                 else -> File(root, path.removePrefix("~/workspace/"))
             }
         }
         val file = File(root, "image.bin").apply { writeBytes(byteArrayOf(7, 8, 9)) }
         val access = LocalFileAccess(mapper)
         val original = access.cacheIdentity()
-        assertArrayEquals(file.readBytes(), access.openRead("image.bin", original).use { it.readBytes() })
+        val input = access.openRead("image.bin", original)
+        file.writeBytes(byteArrayOf(9, 8, 7))
+        assertArrayEquals(byteArrayOf(9, 8, 7), input.use { it.readBytes() })
         val alias = File(temporary.root, "alias")
         Files.createSymbolicLink(alias.toPath(), root.toPath())
         root = alias
@@ -101,7 +110,7 @@ class FileAccessStreamingTest {
         rootfs = temporary.newFolder("profile-two")
         assertNotEquals(original, access.cacheIdentity())
         val profileIdentity = access.cacheIdentity()
-        home = File(rootfs, "home/other")
+        home = "/home/other"
         assertNotEquals(profileIdentity, access.cacheIdentity())
         root = temporary.newFolder("workspace-two")
         assertThrows(CancellationException::class.java) { access.openRead("image.bin", original) }

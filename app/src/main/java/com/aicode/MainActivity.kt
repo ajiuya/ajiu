@@ -620,7 +620,7 @@ fun AppNavigation(
     val drawerImageViewerState = rememberImageViewerState()
     val drawerDecodeSpec = rememberViewerDecodeSpec()
     val drawerImageLoad = remember(agentViewModel.fileAccess, drawerDecodeSpec) {
-        chatImageLoader(agentViewModel.fileAccess, drawerDecodeSpec.maxEdge, drawerDecodeSpec.maxPixels)
+        chatImageLoader(agentViewModel.fileAccess, drawerDecodeSpec.maxEdge, drawerDecodeSpec.maxPixels, agentViewModel::captureUserFile)
     }
     val openTreeEntry: (String) -> Unit = { path ->
         val name = path.trimEnd('/').substringAfterLast('/')

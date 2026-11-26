@@ -51,6 +51,9 @@ class LocalFileAccessTest {
         every { installer.aicodeDir } returns File(tmp.root, "global")
         every { installer.rootfsDirFor(any()) } returns File(tmp.root, "rootfs")
         every { settings.activeProfileIdFlow } returns emptyFlow()
+        every { settings.customProfilesFlow } returns emptyFlow()
+        every { settings.profileConfigurationRevision } returns 0L
+        every { settings.activeProfileSelectionRevision } returns 0L
         every { home.home() } returns "/root"
         every { home.expandHome(any()) } answers {
             firstArg<String>().replaceFirst("~/", "/root/")

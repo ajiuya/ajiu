@@ -7,6 +7,8 @@ import com.aicode.feature.agent.domain.container.LinuxContainerEngine
 import com.aicode.feature.agent.domain.container.ProotInvocation
 import com.aicode.feature.agent.domain.container.RemoteConnectionIdentity
 import com.aicode.feature.agent.domain.container.RemoteSshConnection
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwner
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwnerKind
 import com.aicode.feature.settings.data.repository.ExecutionMode
 import com.aicode.feature.settings.data.repository.ExecutionModeHolder
 import com.aicode.feature.workspace.data.repository.WorkspaceRepository
@@ -46,12 +48,14 @@ import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
 import kotlinx.coroutines.yield
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withContext
 import net.schmizz.sshj.connection.channel.direct.Session
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Rule
@@ -110,7 +114,7 @@ class TabFinishedEventTest {
         val mapping = WorkspacePathMapper.ExecutionMapping(ContainerProfile.BUILTIN_ALPINE,
             temporary.newFolder("workspace"), rootfs, temporary.newFolder("aicode"), "/root")
         execution = WorkspaceExecutionContext(ExecutionMode.LOCAL_PROOT, "fixture", mockk(), mapping, null) {}
-        local = TerminalSessionManager(context, engine, workspace, history)
+        local = TerminalSessionManager(context, engine, workspace, history, mockk(), mockk())
         remote = RemoteTerminalSessionManager(connection, holder, workspace, context)
     }
 
@@ -152,6 +156,7 @@ class TabFinishedEventTest {
             val id = local.startBackgroundCommand("build", "Build", true, "session-1")
             val tab = local.tab(id)!!
             assertEquals("LOCAL_PROOT", tab.sourceMode)
+            assertSame(execution, tab.capturedExecution)
             assertNull(tab.channelGeneration)
             holder.setMode(ExecutionMode.REMOTE_SSH)
             finish(local, tab, 17)
@@ -163,6 +168,24 @@ class TabFinishedEventTest {
         } finally {
             collector.cancelAndJoin()
         }
+    }
+
+    @Test
+    fun remoteAiCreationRetainsTheExactExecutionAndRejectsAnotherOwnersCapture() = runBlocking {
+        holder.setMode(ExecutionMode.REMOTE_SSH)
+        val owner = RuntimeOwner(RuntimeOwnerKind.AGENT, "source-session")
+        val captured = WorkspaceExecutionContext(ExecutionMode.REMOTE_SSH, "captured-remote", mockk(), null, null,
+            runtimeOwner = owner, checkSource = {})
+        val id = withContext(captured) { remote.startOwnedBackgroundCommand("remote", null, false, owner) }
+        val tab = requireNotNull(remote.tab(id))
+        assertSame(captured, tab.capturedExecution)
+        assertEquals(owner, tab.runtimeOwner)
+        assertTrue(withContext(captured) {
+            runCatching {
+                remote.startOwnedBackgroundCommand("must-not-start", null, false, RuntimeOwner(RuntimeOwnerKind.AGENT, "foreign-session"))
+            }.exceptionOrNull() is IllegalArgumentException
+        })
+        assertEquals(listOf(id), remote.tabs.value.map { it.id })
     }
 
     @Test
@@ -284,7 +307,7 @@ class TabFinishedEventTest {
     @Test
     fun cancellationDuringHistoryCreateMarksSavedRecordUnknownWithoutExecutingOrNotifying() = runBlocking {
         val repository = TerminalTaskHistoryRepository(historyFiles, Dispatchers.IO)
-        local = TerminalSessionManager(context, engine, workspace, repository)
+        local = TerminalSessionManager(context, engine, workspace, repository, mockk(), mockk())
         val persisted = CompletableDeferred<TerminalTaskRecord>()
         val releaseWrite = CountDownLatch(1)
         historyFiles.afterWrite = { record ->

@@ -5,6 +5,10 @@ import com.aicode.core.util.FileLogger
 import com.aicode.core.util.LINE_TRUNCATED_NOTE
 import com.aicode.R
 import com.aicode.feature.settings.data.repository.ExecutionMode
+import com.aicode.feature.settings.data.repository.ContainerProfileSnapshot
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeAuthorizationRequired
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeCapture
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeCommands
 import com.aicode.feature.workspace.domain.WorkspaceExecutionContext
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CancellationException
@@ -25,6 +29,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -79,7 +84,8 @@ class LinuxContainerEngine @Inject constructor(
     private val containerOsDetector: ContainerOsDetector,
     private val containerSettingsRepository: com.aicode.feature.settings.data.repository.ContainerSettingsRepository,
     private val pathHomeResolver: com.aicode.feature.workspace.domain.PathHomeResolver,
-    private val mobileBuildConfigurator: MobileBuildConfigurator
+    private val mobileBuildConfigurator: MobileBuildConfigurator,
+    private val localRuntime: LocalRuntimeCommands
 ) : CommandEngine {
     /** 容器初始化的实时进度，供所有入口（终端页/AI/后台终端/MCP）共享同一份状态。 */
     private val _initProgress = MutableStateFlow<ContainerInitState>(ContainerInitState.Idle)
@@ -97,39 +103,52 @@ class LinuxContainerEngine @Inject constructor(
     /** 当前在途的初始化 job（受 [initMutex] 保护），完成后置 null。 */
     private var initJob: Job? = null
 
-    /**
-     * 当前选中的 profile（缓存自 [containerSettingsRepository.activeProfileIdFlow]，避免同步读 DataStore）。
-     * 启动首帧为内置 Alpine（等同改动前）；profile 切换后由 flow collector 更新。fallback 到内置保证安全。
-     */
     @Volatile
     private var currentProfile: ContainerProfile = ContainerProfile.BUILTIN_ALPINE
+    @Volatile
+    private var currentProfileSnapshot: ContainerProfileSnapshot? = null
 
     init {
         CoroutineScope(Dispatchers.IO).launch {
-            containerSettingsRepository.activeProfileIdFlow.collect { id ->
-                currentProfile = resolveProfile(id)
+            containerSettingsRepository.activeProfileFlow.collect {
+                val snapshot = containerSettingsRepository.captureProfileSnapshot()
+                val selected = snapshot.profiles.firstOrNull { it.id == snapshot.selectedProfileId }
+                    ?: ContainerProfile.BUILTIN_ALPINE.takeIf { snapshot.selectedProfileId == it.id }
+                if (selected != null) currentProfile = selected
+                currentProfileSnapshot = snapshot.takeIf { selected != null }
             }
         }
     }
 
-    /**
-     * 按 id 解析 profile：从持久化列表找，找不到回退列表第一个，再兜底内置 Alpine（保证引擎始终可用）。
-     * 列表里持久化的 Alpine 覆盖项优先于 [ContainerProfile.BUILTIN_ALPINE] 常量（用户编辑过的配置生效）。
-     */
-    private suspend fun resolveProfile(id: String): ContainerProfile {
-        val profiles = containerSettingsRepository.customProfilesFlow.first()
-        return profiles.firstOrNull { it.id == id }
-            ?: profiles.firstOrNull()
-            ?: ContainerProfile.BUILTIN_ALPINE
+    private fun runtimeCapture(profile: ContainerProfile): LocalRuntimeCapture {
+        val execution = WorkspaceExecutionContext.current() ?: throw LocalRuntimeAuthorizationRequired()
+        execution.requireMode(ExecutionMode.LOCAL_PROOT)
+        val capture = execution.localRuntimeCapture ?: throw LocalRuntimeAuthorizationRequired()
+        if (!profile.isChroot || capture.profileId != profile.id || capture.instance != profile.chrootInstance ||
+            capture.owner != execution.runtimeOwner) throw CancellationException("CHROOT execution capture changed")
+        execution.checkCurrent()
+        capture.checkCurrent()
+        return capture
     }
 
     private fun executionProfile(): ContainerProfile {
-        val execution = WorkspaceExecutionContext.current() ?: return currentProfile
+        val execution = WorkspaceExecutionContext.current()
+        if (execution == null) {
+            val snapshot = currentProfileSnapshot ?: throw IllegalStateException("Local execution profile is not ready")
+            containerSettingsRepository.checkProfileSnapshot(snapshot)
+            if (currentProfile.id != snapshot.selectedProfileId) throw CancellationException("Local command profile changed")
+            return currentProfile
+        }
         execution.requireMode(ExecutionMode.LOCAL_PROOT)
-        val captured = execution.localMapping?.profile ?: throw CancellationException("Local execution profile missing")
-        if (currentProfile != captured) throw CancellationException("Local command profile changed")
+        val captured = execution.localRuntimeCapture?.profile ?: execution.localMapping?.profile
+            ?: throw CancellationException("Local execution profile missing")
+        if (!captured.isChroot && currentProfile != captured) throw CancellationException("Local command profile changed")
         return captured
     }
+
+    private fun metadataProfile(): ContainerProfile? = if (WorkspaceExecutionContext.current() != null) {
+        executionProfile()
+    } else runCatching { executionProfile() }.getOrNull()
 
     /**
      * 当前正在途的凭据请求计数（自定义 credential helper 阻塞等 app 弹窗回填的对数）。
@@ -197,6 +216,11 @@ class LinuxContainerEngine @Inject constructor(
         projectPath: String?,
         timeoutMs: Long
     ): Flow<CommandEvent> = flow {
+        val profile = executionProfile()
+        if (profile.isChroot) {
+            emitAll(localRuntime.execStream(runtimeCapture(profile), command, projectPath, timeoutMs))
+            return@flow
+        }
         // 未就绪（rootfs 未解压或基础包未配置）时不自动初始化，直接提示用户去终端页完成初始化。
         notReadyHint()?.let {
             emit(CommandEvent.Line(it))
@@ -293,6 +317,8 @@ class LinuxContainerEngine @Inject constructor(
         projectPath: String?,
         timeoutMs: Long
     ): String = withContext(Dispatchers.IO) {
+        val profile = executionProfile()
+        if (profile.isChroot) return@withContext localRuntime.exec(runtimeCapture(profile), command, projectPath, timeoutMs).output
         // 未就绪时不自动初始化，直接返回引导文案，由用户去终端页完成初始化。
         notReadyHint()?.let { return@withContext it }
         execCaptured(command, projectPath, timeoutMs).output
@@ -307,6 +333,8 @@ class LinuxContainerEngine @Inject constructor(
         projectPath: String?,
         timeoutMs: Long
     ): CommandResult = withContext(Dispatchers.IO) {
+        val profile = executionProfile()
+        if (profile.isChroot) return@withContext localRuntime.exec(runtimeCapture(profile), command, projectPath, timeoutMs)
         // 未就绪时不自动初始化，直接返回引导文案，由用户去终端页完成初始化。
         notReadyHint()?.let { return@withContext CommandResult(it, null) }
         val r = execCaptured(command, projectPath, timeoutMs)
@@ -327,7 +355,9 @@ class LinuxContainerEngine @Inject constructor(
         projectPath: String?,
         timeoutMs: Long
     ): CommandResult? {
-        if (!containerInstaller.isInstalledFor(executionProfile())) return null
+        val profile = executionProfile()
+        if (profile.isChroot) return localRuntime.exec(runtimeCapture(profile), command, projectPath, timeoutMs)
+        if (!containerInstaller.isInstalledFor(profile)) return null
         val result = execCaptured(command, projectPath, timeoutMs)
         return CommandResult(result.output, result.exitCode, result.truncated)
     }
@@ -337,6 +367,8 @@ class LinuxContainerEngine @Inject constructor(
         projectPath: String?,
         timeoutMs: Long
     ): CommandResult = withContext(Dispatchers.IO) {
+        val profile = executionProfile()
+        if (profile.isChroot) return@withContext localRuntime.exec(runtimeCapture(profile), command, projectPath, timeoutMs, unbounded = true)
         notReadyHint()?.let { return@withContext CommandResult(it, null) }
         val r = execCaptured(command, projectPath, timeoutMs, unbounded = true)
         CommandResult(r.output, r.exitCode, r.truncated)
@@ -463,6 +495,7 @@ class LinuxContainerEngine @Inject constructor(
      */
     private fun startContainerProcess(command: String, projectPath: String?): Process {
         val profile = executionProfile()
+        check(!profile.isChroot) { "CHROOT tasks require an authorized runtime capture" }
         val useProot = containerInstaller.isInstalledFor(profile)
 
         val processBuilder = if (useProot) {
@@ -480,16 +513,20 @@ class LinuxContainerEngine @Inject constructor(
     }
 
     /** 容器是否已安装就绪（按当前 profile）。 */
-    override fun isContainerInstalled(): Boolean = containerInstaller.isInstalledFor(executionProfile())
+    override fun isContainerInstalled(): Boolean {
+        val profile = metadataProfile() ?: return false
+        return if (profile.isChroot) runCatching { runtimeCapture(profile) }.isSuccess else containerInstaller.isInstalledFor(profile)
+    }
 
     /**
      * 基础包是否已配置完成（按当前 profile 的标记）。首次进入终端时由初始化菜单
      * （assets/aicode/provision.sh）引导安装，完成后脚本写标记；未完成时不影响进入 shell。
      */
-    override fun isProvisioned(): Boolean = isProvisionedFor(executionProfile())
+    override fun isProvisioned(): Boolean = metadataProfile()?.let(::isProvisionedFor) ?: false
 
     /** 按指定 profile 判断基础包配置是否完成（[defaultShell] 据此选 bash/sh）。 */
     fun isProvisionedFor(profile: ContainerProfile): Boolean {
+        if (profile.isChroot) return false
         val marker = provisionMarker(profile)
         return marker.exists() && marker.readText().trim() == PROVISION_VERSION
     }
@@ -498,10 +535,14 @@ class LinuxContainerEngine @Inject constructor(
      * 容器未就绪（rootfs 未解压）时返回引导文案，就绪返回 null。
      * 命令执行入口据此不自动初始化、直接失败并引导用户去终端页完成初始化。
      */
-    override fun notReadyHint(): String? = notReadyHintFor(executionProfile())
+    override fun notReadyHint(): String? {
+        val profile = metadataProfile() ?: return context.getString(R.string.container_not_ready_hint)
+        return notReadyHintFor(profile)
+    }
 
     /** 按指定 profile 判断容器是否就绪（MCP 按运行时容器启动前检查用）。 */
     fun notReadyHintFor(profile: ContainerProfile): String? {
+        if (profile.isChroot) return if (runCatching { runtimeCapture(profile) }.isSuccess) null else LocalRuntimeAuthorizationRequired().message
         if (containerInstaller.isInstalledFor(profile)) return null
         return context.getString(R.string.container_not_ready_hint)
     }
@@ -510,10 +551,11 @@ class LinuxContainerEngine @Inject constructor(
      * 容器默认命令 shell：优先用 profile 指定的 [ContainerProfile.shellPath]；未指定时
      * 按 provision 状态选 `/bin/bash`（脚本已安装 bash）或 `/bin/sh`。
      */
-    override fun defaultShell(): String = defaultShellFor(executionProfile())
+    override fun defaultShell(): String = metadataProfile()?.let(::defaultShellFor) ?: "/bin/sh"
 
     private fun defaultShellFor(profile: ContainerProfile): String {
         profile.shellPath?.takeIf { it.isNotBlank() }?.let { return it }
+        if (profile.isChroot) return "/bin/sh"
         return if (isProvisionedFor(profile)) "/bin/bash" else "/bin/sh"
     }
 
@@ -530,6 +572,11 @@ class LinuxContainerEngine @Inject constructor(
      */
     override suspend fun ensureInstalled() {
         val profile = executionProfile()
+        if (profile.isChroot) {
+            runtimeCapture(profile).checkCurrent()
+            _initProgress.value = ContainerInitState.Ready
+            return
+        }
         val startedAt = System.currentTimeMillis()
         FileLogger.i(
             TAG,
@@ -591,6 +638,10 @@ class LinuxContainerEngine @Inject constructor(
     fun logContainerDiagnostics(reason: String) {
         runCatching {
             val profile = currentProfile
+            if (profile.isChroot) {
+                FileLogger.i(TAG, "CHROOT diagnostics: profile=${profile.id} instance=${profile.chrootInstance?.id}")
+                return@runCatching
+            }
             val rootfs = containerInstaller.rootfsDirFor(profile)
             val marker = provisionMarker(profile)
             val provision = java.io.File(containerInstaller.aicodeDir, "provision.sh")
@@ -662,6 +713,7 @@ class LinuxContainerEngine @Inject constructor(
      * 与 [runCommandStream] 不同，这里不读取/消费输出流，由调用方决定如何处理（通常丢弃）。
      */
     fun startProotProcess(command: String, projectPath: String?): Process {
+        check(!executionProfile().isChroot) { "CHROOT tasks require the runtime process API" }
         val pb = buildProcessBuilder(buildProotInvocation(command, projectPath))
         pb.redirectErrorStream(true)
         pb.redirectInput(STDIN_FROM_DEV_NULL)
@@ -686,6 +738,10 @@ class LinuxContainerEngine @Inject constructor(
         extraEnv: Map<String, String> = emptyMap(),
         profile: ContainerProfile = executionProfile()
     ): Process {
+        if (profile.isChroot) {
+            val capture = runtimeCapture(profile)
+            return runBlocking(Dispatchers.IO) { localRuntime.startStdio(capture, program, programArgs, projectPath, extraEnv) }
+        }
         val invocation = buildStdioInvocation(program, programArgs, projectPath, extraEnv, profile)
         val pb = buildProcessBuilder(invocation)
         // 刻意不 redirectErrorStream：stdout 留给 JSON-RPC，stderr 由调用方单独消费。
@@ -735,6 +791,7 @@ class LinuxContainerEngine @Inject constructor(
      * 但**不含**最终的客户机命令（由各调用方自行追加 `/bin/sh -c …` 或 `exec` 形式）。
      */
     private fun buildBaseProotArgv(projectPath: String?, profile: ContainerProfile): MutableList<String> {
+        check(!profile.isChroot) { "CHROOT cannot use PRoot invocation or provisioning" }
         val execution = WorkspaceExecutionContext.current()
         execution?.requireMode(ExecutionMode.LOCAL_PROOT)
         runCatching { mobileBuildConfigurator.prepare(profile) }

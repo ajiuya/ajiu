@@ -1,4 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">阿九工作台（调试）</string>
+    <string name="chroot_verification_visible_message">正在验证chroot，请保持此页面可见，结束后自动关闭</string>
 </resources>

@@ -62,6 +62,7 @@ public final class TerminalSession extends TerminalOutput {
 
     /** The exit status of the shell process. Only valid if ${@link #mShellPid} is -1. */
     int mShellExitStatus;
+    private SessionBackend.ExitOutcome mShellExitOutcome = SessionBackend.ExitOutcome.unknown();
 
     /** Set by the application for user identification of session, not by terminal. */
     public String mSessionName;
@@ -190,8 +191,8 @@ public final class TerminalSession extends TerminalOutput {
             new Thread("TermSessionWaiter[pid=" + mShellPid + "]") {
                 @Override
                 public void run() {
-                    int processExitCode = mBackend.waitForExit();
-                    mMainThreadHandler.sendMessage(mMainThreadHandler.obtainMessage(MSG_PROCESS_EXITED, processExitCode));
+                    SessionBackend.ExitOutcome outcome = mBackend.waitForExitOutcome();
+                    mMainThreadHandler.sendMessage(mMainThreadHandler.obtainMessage(MSG_PROCESS_EXITED, outcome));
                 }
             }.start();
         } else {
@@ -202,8 +203,8 @@ public final class TerminalSession extends TerminalOutput {
             new Thread("TermSessionWaiter[remote]") {
                 @Override
                 public void run() {
-                    int processExitCode = mBackend.waitForExit();
-                    mMainThreadHandler.sendMessage(mMainThreadHandler.obtainMessage(MSG_PROCESS_EXITED, processExitCode));
+                    SessionBackend.ExitOutcome outcome = mBackend.waitForExitOutcome();
+                    mMainThreadHandler.sendMessage(mMainThreadHandler.obtainMessage(MSG_PROCESS_EXITED, outcome));
                 }
             }.start();
         }
@@ -326,10 +327,11 @@ public final class TerminalSession extends TerminalOutput {
     }
 
     /** Cleanup resources when the process/stream exits. */
-    void cleanupResources(int exitStatus) {
+    void cleanupResources(SessionBackend.ExitOutcome outcome) {
         synchronized (this) {
             mShellPid = -1;
-            mShellExitStatus = exitStatus;
+            mShellExitOutcome = outcome;
+            mShellExitStatus = outcome.getStatus();
         }
 
         // Stop the reader and writer threads, and close the I/O streams
@@ -350,6 +352,22 @@ public final class TerminalSession extends TerminalOutput {
     /** Only valid if not {@link #isRunning()}. */
     public synchronized int getExitStatus() {
         return mShellExitStatus;
+    }
+
+    public synchronized SessionBackend.ExitOutcome getExitOutcome() {
+        return mShellExitOutcome;
+    }
+
+    static String exitDescription(SessionBackend.ExitOutcome outcome) {
+        String description = "\r\n[Process completed";
+        if (!outcome.isKnown()) {
+            description += " (exit status unknown)";
+        } else if (outcome.getStatus() > 0) {
+            description += " (code " + outcome.getStatus() + ")";
+        } else if (outcome.getStatus() < 0) {
+            description += " (signal " + (-outcome.getStatus()) + ")";
+        }
+        return description + " - press Enter]";
     }
 
     @Override
@@ -436,21 +454,12 @@ public final class TerminalSession extends TerminalOutput {
                 }
                 mInputMessagePending.set(false);
                 removeMessages(MSG_NEW_INPUT);
-                int exitCode = (Integer) msg.obj;
-                mClient.logInfo(LOG_TAG, "PTY 子进程退出: pid=" + mShellPid + " exit=" + exitCode);
-                cleanupResources(exitCode);
+                SessionBackend.ExitOutcome outcome = (SessionBackend.ExitOutcome) msg.obj;
+                mClient.logInfo(LOG_TAG, "PTY 子进程退出: pid=" + mShellPid + " exit=" +
+                    (outcome.isKnown() ? outcome.getStatus() : "unknown"));
+                cleanupResources(outcome);
 
-                String exitDescription = "\r\n[Process completed";
-                if (exitCode > 0) {
-                    // Non-zero process exit.
-                    exitDescription += " (code " + exitCode + ")";
-                } else if (exitCode < 0) {
-                    // Negated signal.
-                    exitDescription += " (signal " + (-exitCode) + ")";
-                }
-                exitDescription += " - press Enter]";
-
-                byte[] bytesToWrite = exitDescription.getBytes(StandardCharsets.UTF_8);
+                byte[] bytesToWrite = exitDescription(outcome).getBytes(StandardCharsets.UTF_8);
                 mEmulator.append(bytesToWrite, bytesToWrite.length);
                 notifyScreenUpdate();
 

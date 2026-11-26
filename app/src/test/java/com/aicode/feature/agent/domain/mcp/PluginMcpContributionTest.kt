@@ -50,9 +50,15 @@ class PluginMcpContributionTest {
         coEvery { anyConstructed<McpClient>().connect() } coAnswers { connects++; 1 }
         every { anyConstructed<McpClient>().tools } returns listOf(descriptor)
         every { anyConstructed<McpClient>().close() } answers { closes++; Unit }
-        coEvery { config.getEffectiveServers() } returns listOf(McpServerConfig("user", url = "https://example.invalid/user"))
+        val selected = com.aicode.feature.workspace.data.repository.WorkspaceRepository.Selection(null)
+        val userConfig = McpServerConfig("user", url = "https://example.invalid/user")
+        coEvery { config.getEffectiveServers() } returns listOf(userConfig)
+        coEvery { config.getEffectiveEntries() } returns listOf(McpServerEntry(userConfig, McpScope.GLOBAL, 1L, "test-global", workspaceSelectionId = selected.id))
+        every { config.checkEntryCurrent(any()) } returns Unit
         every { oauth.cancel(any()) } returns Unit
-        manager = McpManager(config, tools, mockk(), mockk(), mockk(), mockk(), oauth, plugins)
+        val workspaces = mockk<com.aicode.feature.workspace.data.repository.WorkspaceRepository>()
+        every { workspaces.selection } returns MutableStateFlow(selected)
+        manager = McpManager(config, tools, mockk(), mockk(), workspaces, mockk(), oauth, plugins, mockk())
     }
 
     @After fun cleanup() { unmockkConstructor(McpClient::class) }

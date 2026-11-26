@@ -1,5 +1,6 @@
 package com.aicode.feature.terminal.domain
 
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwner
 import com.aicode.feature.settings.data.repository.ExecutionMode
 import com.aicode.feature.settings.data.repository.ExecutionModeHolder
 import com.aicode.feature.workspace.domain.WorkspaceExecutionContext
@@ -82,4 +83,28 @@ class DelegatingTerminalSessionProvider @Inject constructor(
     override fun listTabs(): List<TabInfo> = delegate().listTabs()
 
     override fun closeTab(id: String): Boolean = delegate().closeTab(id)
+
+    override suspend fun startOwnedBackgroundCommand(command: String, title: String?, notify: Boolean, owner: RuntimeOwner): String =
+        delegate().startOwnedBackgroundCommand(command, title, notify, owner)
+
+    override fun listOwnedTabs(owner: RuntimeOwner): List<TabInfo> = delegate().listOwnedTabs(owner)
+
+    override fun getOwnedTabOutput(id: String, owner: RuntimeOwner): String? = delegate().getOwnedTabOutput(id, owner)
+
+    override fun sendOwnedInput(id: String, owner: RuntimeOwner, input: String, appendNewline: Boolean): Boolean =
+        delegate().sendOwnedInput(id, owner, input, appendNewline)
+
+    override fun writeOwnedText(id: String, owner: RuntimeOwner, text: String): Boolean =
+        delegate().writeOwnedText(id, owner, text)
+
+    override fun writeOwnedBytes(id: String, owner: RuntimeOwner, vararg bytes: Int): Boolean =
+        delegate().writeOwnedBytes(id, owner, *bytes)
+
+    override fun resizeOwnedTab(id: String, owner: RuntimeOwner, columns: Int, rows: Int): Boolean =
+        delegate().resizeOwnedTab(id, owner, columns, rows)
+
+    override fun signalOwnedTab(id: String, owner: RuntimeOwner, signal: Int): Boolean =
+        delegate().signalOwnedTab(id, owner, signal)
+
+    override suspend fun closeOwnedTab(id: String, owner: RuntimeOwner): TerminalCloseResult? = delegate().closeOwnedTab(id, owner)
 }

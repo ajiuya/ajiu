@@ -13,6 +13,7 @@ import com.aicode.core.ui.decodeSampledBitmap
 import com.aicode.core.util.FileLogger
 import com.aicode.feature.agent.presentation.AgentAttachment
 import com.aicode.feature.workspace.domain.FileAccessProvider
+import com.aicode.feature.workspace.domain.WorkspaceExecutionContext
 import java.io.File
 import java.util.Base64
 import kotlinx.coroutines.Dispatchers
@@ -29,12 +30,20 @@ private const val TAG = "ChatImageLoader"
 internal fun chatImageLoader(
     fileAccess: FileAccessProvider,
     maxEdge: Int,
-    maxPixels: Long
+    maxPixels: Long,
+    captureFile: (suspend (String) -> WorkspaceExecutionContext)? = null
 ): suspend (ImageSource) -> ImageBitmap? = { source ->
     withContext(Dispatchers.IO) {
         try {
             when (source) {
-                is ImageSource.ContainerPath -> ChatImageFiles.load(fileAccess, source.path, ImageDecodeSpec(maxEdge, maxPixels))
+                is ImageSource.ContainerPath -> {
+                    val execution = captureFile?.invoke(source.path)
+                    if (execution == null) ChatImageFiles.load(fileAccess, source.path, ImageDecodeSpec(maxEdge, maxPixels))
+                    else withContext(execution) {
+                        execution.checkCurrent()
+                        ChatImageFiles.load(fileAccess, source.path, ImageDecodeSpec(maxEdge, maxPixels)).also { execution.checkCurrent() }
+                    }
+                }
                 else -> ChatLocalImageCache.load(source, ImageDecodeSpec(maxEdge, maxPixels))
             }
         } catch (e: CancellationException) {

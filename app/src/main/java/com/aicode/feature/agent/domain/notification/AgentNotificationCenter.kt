@@ -23,7 +23,7 @@ enum class AgentNotificationKind { BACKGROUND_TASK, SUBAGENT, AGENT_MESSAGE, USE
 enum class AgentMessageAction { MESSAGE, ADD_INSTRUCTION, CORRECTION }
 
 @Serializable
-enum class NotificationOutcome { COMPLETED, FAILED, STOPPED }
+enum class NotificationOutcome { COMPLETED, FAILED, STOPPED, UNKNOWN }
 
 data class AgentNotificationTimelineEntry(
     val seq: Long,

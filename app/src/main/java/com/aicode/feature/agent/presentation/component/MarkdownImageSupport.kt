@@ -26,6 +26,7 @@ import androidx.compose.runtime.setValue
 import kotlinx.coroutines.CancellationException
 import com.aicode.core.util.FileLogger
 import com.aicode.feature.workspace.domain.FileAccessProvider
+import com.aicode.feature.workspace.domain.WorkspaceExecutionContext
 import com.mikepenz.markdown.model.ImageData
 import com.mikepenz.markdown.model.ImageTransformer
 import kotlinx.coroutines.Dispatchers
@@ -53,7 +54,8 @@ private object NoOpImageTransformer : ImageTransformer {
  * 看原图，那边会按屏幕尺寸重新解码一份更清晰的。
  */
 internal class MarkdownImageTransformer(
-    private val fileAccess: FileAccessProvider
+    private val fileAccess: FileAccessProvider,
+    private val captureFile: suspend (String) -> WorkspaceExecutionContext,
 ) : ImageTransformer {
 
     @Composable
@@ -78,9 +80,17 @@ internal class MarkdownImageTransformer(
         return ImageData(painter = p, modifier = modifier, contentScale = ContentScale.Fit)
     }
 
-    private suspend fun decode(url: String): Painter? {
+    internal suspend fun decode(url: String): Painter? {
+        if (!isLocalPath(url)) return null
         return try {
-            ChatImageFiles.load(fileAccess, url, ImageDecodeSpec(MARKDOWN_MAX_EDGE, Long.MAX_VALUE))?.let { BitmapPainter(it) }
+            withContext(Dispatchers.IO) {
+                val execution = captureFile(url)
+                withContext(execution) {
+                    execution.checkCurrent()
+                    ChatImageFiles.load(fileAccess, url, ImageDecodeSpec(MARKDOWN_MAX_EDGE, Long.MAX_VALUE))
+                        ?.let { BitmapPainter(it) }.also { execution.checkCurrent() }
+                }
+            }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {

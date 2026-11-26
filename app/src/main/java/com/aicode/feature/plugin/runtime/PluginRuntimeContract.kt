@@ -1,6 +1,8 @@
 package com.aicode.feature.plugin.runtime
 
 import com.aicode.feature.agent.domain.container.ContainerProfile
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeCapture
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwner
 import com.aicode.feature.settings.data.repository.ExecutionMode
 import java.io.File
 import java.util.concurrent.atomic.AtomicInteger
@@ -13,19 +15,32 @@ class PluginRuntimeContext private constructor(
     val invocationId: String,
     internal val authorityIdentity: Any,
     internal val allowIdleCallbacks: Boolean,
+    internal val sourceIdentity: Any?,
+    internal val runtimeOwner: RuntimeOwner?,
+    internal val localRuntimeCapture: LocalRuntimeCapture?,
+    internal val runtimeProfile: ContainerProfile?,
     val checkCurrent: () -> Unit
 ) {
     constructor(workspacePath: String, sessionId: String?, invocationId: String, checkCurrent: () -> Unit) :
-        this(workspacePath, sessionId, invocationId, Any(), false, checkCurrent)
+        this(workspacePath, sessionId, invocationId, Any(), false, null, null, null, null, checkCurrent)
+
+    internal fun withExecutionSource(source: Any, owner: RuntimeOwner, capture: LocalRuntimeCapture?, profile: ContainerProfile?): PluginRuntimeContext {
+        require(capture == null || capture.owner == owner)
+        return PluginRuntimeContext(workspacePath, sessionId, invocationId, authorityIdentity, allowIdleCallbacks,
+            source, owner, capture, profile, checkCurrent)
+    }
 
     internal fun withBackgroundAuthority(identity: Any): PluginRuntimeContext =
-        PluginRuntimeContext(workspacePath, sessionId, invocationId, identity, allowIdleCallbacks, checkCurrent)
+        PluginRuntimeContext(workspacePath, sessionId, invocationId, identity, allowIdleCallbacks,
+            sourceIdentity, runtimeOwner, localRuntimeCapture, runtimeProfile, checkCurrent)
 
     internal fun withIdleCallbacks(): PluginRuntimeContext =
-        PluginRuntimeContext(workspacePath, sessionId, invocationId, authorityIdentity, true, checkCurrent)
+        PluginRuntimeContext(workspacePath, sessionId, invocationId, authorityIdentity, true,
+            sourceIdentity, runtimeOwner, localRuntimeCapture, runtimeProfile, checkCurrent)
 
     internal fun guarded(checkCurrent: () -> Unit): PluginRuntimeContext =
-        PluginRuntimeContext(workspacePath, sessionId, invocationId, authorityIdentity, allowIdleCallbacks, checkCurrent)
+        PluginRuntimeContext(workspacePath, sessionId, invocationId, authorityIdentity, allowIdleCallbacks,
+            sourceIdentity, runtimeOwner, localRuntimeCapture, runtimeProfile, checkCurrent)
 }
 
 internal const val PLUGIN_MAX_PROCESSES = 4
@@ -55,7 +70,10 @@ internal data class PluginLocalLaunch(
     val profile: ContainerProfile,
     val workingDirectory: String,
     val command: List<String>,
-    val environment: Map<String, String>
+    val environment: Map<String, String>,
+    val runtimeOwner: RuntimeOwner? = null,
+    val localRuntimeCapture: LocalRuntimeCapture? = null,
+    val checkSource: () -> Unit = {}
 ) {
     init {
         require(profile.mode == ExecutionMode.LOCAL_PROOT)
@@ -78,5 +96,5 @@ internal interface PluginOwnedProcess {
 internal interface PluginRuntimeProcessFactory {
     suspend fun captureProfile(): ContainerProfile
     fun containerPath(file: File): String
-    fun start(launch: PluginLocalLaunch): Process
+    suspend fun start(launch: PluginLocalLaunch): Process
 }

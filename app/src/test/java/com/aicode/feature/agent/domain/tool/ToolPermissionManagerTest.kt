@@ -183,6 +183,77 @@ class ToolPermissionManagerTest {
     }
 
     @Test
+    fun hostWriteSessionRegression_alwaysChoiceWaitsForWorkflowValidationBeforeSavingWideGrant() = runTest {
+        val grant = "host-write-session-v1:root-source-epoch"
+        val request = request("host-write-id", "session", grant).copy(toolName = "Root")
+        val pending = async { manager.awaitApproval(request) }
+        runCurrent()
+        assertEquals(grant, manager.pendingRequest.value!!.sessionGrant)
+
+        manager.resolve(request.id, PermissionChoice.ALWAYS_SESSION)
+
+        assertEquals(PermissionChoice.ALWAYS_SESSION, pending.await())
+        assertNull(manager.pendingRequest.value)
+        coVerify(exactly = 0) { grants.allow(any(), any()) }
+
+        manager.confirmHostWriteSessionGrant("session", grant)
+        coVerify(exactly = 1) { grants.allow("session", grant) }
+        coVerify(exactly = 1) { grants.allow(any(), any()) }
+    }
+
+    @Test
+    fun hostWriteSessionRegression_onceAndRejectNeverSaveWideGrant() = runTest {
+        for (choice in listOf(PermissionChoice.ONCE, PermissionChoice.REJECT)) {
+            val request = request("host-${choice.name}", "session", "host-write-session-v1:scope")
+            val pending = async { manager.awaitApproval(request) }
+            runCurrent()
+            manager.resolve(request.id, choice)
+            assertEquals(choice, pending.await())
+            assertNull(manager.pendingRequest.value)
+            assertTrue(manager.awaitingSessionIds.value.isEmpty())
+        }
+        coVerify(exactly = 0) { grants.allow(any(), any()) }
+    }
+
+    @Test
+    fun hostWriteSessionRegression_completedAlwaysThenRevocationCannotTriggerLateManagerSave() = runTest {
+        val request = request("queued-choice", "session", "host-write-session-v1:old-epoch").copy(toolName = "Root")
+        val pending = async { manager.awaitApproval(request) }
+        runCurrent()
+        manager.resolve(request.id, PermissionChoice.ALWAYS_SESSION)
+        // The completed choice cannot be replaced, but it must not itself persist an old scope.
+        manager.rejectForTool("Root")
+        assertEquals(PermissionChoice.ALWAYS_SESSION, pending.await())
+        manager.resolve(request.id, PermissionChoice.ALWAYS_SESSION)
+        assertNull(manager.pendingRequest.value)
+        assertTrue(manager.awaitingSessionIds.value.isEmpty())
+        coVerify(exactly = 0) { grants.allow(any(), any()) }
+    }
+
+    @Test
+    fun hostWriteSessionRegression_blankScopeOrSessionCannotBeSavedByEitherManagerPath() = runTest {
+        for ((index, grant) in listOf("", "  ", "host-write-session-v1:", "host-write-session-v1:  ").withIndex()) {
+            val request = request("blank-scope-$index", "session", grant)
+            val pending = async { manager.awaitApproval(request) }
+            runCurrent()
+            manager.resolve(request.id, PermissionChoice.ALWAYS_SESSION)
+            assertEquals(PermissionChoice.ALWAYS_SESSION, pending.await())
+            manager.confirmHostWriteSessionGrant("session", grant)
+        }
+        for ((index, session) in listOf("", "  ").withIndex()) {
+            val request = request("blank-session-$index", session, "host-write-session-v1:scope")
+            val pending = async { manager.awaitApproval(request) }
+            runCurrent()
+            assertTrue(manager.awaitingSessionIds.value.isEmpty())
+            manager.resolve(request.id, PermissionChoice.ALWAYS_SESSION)
+            assertEquals(PermissionChoice.ALWAYS_SESSION, pending.await())
+            manager.confirmHostWriteSessionGrant(session, request.sessionGrant!!)
+        }
+        manager.confirmHostWriteSessionGrant("session", "root:sudo id")
+        coVerify(exactly = 0) { grants.allow(any(), any()) }
+    }
+
+    @Test
     fun disablingRootRejectsOnlyPendingHostRootRequests() = runTest {
         val rootRequest = request("root-id", "s1").copy(toolName = "Root")
         val otherRequest = request("bash-id", "s2")

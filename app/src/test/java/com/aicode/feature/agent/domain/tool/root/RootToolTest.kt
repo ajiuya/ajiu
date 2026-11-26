@@ -50,9 +50,9 @@ class RootToolTest {
     )
 
     @Test
-    fun schemaExposesOnlyCommandTimeoutAndElevateAndAlwaysAsks() {
+    fun schemaExposesOnlyCommandTimeoutAndElevateAndDefaultsToAllow() {
         assertEquals("Root", tool.name)
-        assertEquals(ToolPermissionPolicy.ASK, tool.permissionPolicy)
+        assertEquals(ToolPermissionPolicy.AUTO_APPROVE, tool.permissionPolicy)
         assertEquals(setOf(ToolCapability.EXECUTE_COMMANDS), tool.capabilities)
         assertEquals(setOf("command", "timeout", "elevate"), tool.parameters.keys)
         assertEquals(ParameterType.STRING, tool.parameters.getValue("command").type)

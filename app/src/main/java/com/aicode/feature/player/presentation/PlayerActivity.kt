@@ -37,6 +37,7 @@ import com.aicode.feature.player.data.PlayerSession
 import com.aicode.feature.player.domain.PlayerMediaTypes
 import com.aicode.feature.player.domain.PlayerRequest
 import com.aicode.feature.player.domain.PlayerRequestCodec
+import com.aicode.feature.workspace.domain.UiFileExecutionSource
 import dagger.hilt.android.AndroidEntryPoint
 import java.io.ByteArrayInputStream
 import javax.inject.Inject
@@ -54,6 +55,7 @@ class PlayerActivity : ComponentActivity() {
     private var generation = 0
     private var navigation = 0
     private var request: PlayerRequest? = null
+    private var fileSource: UiFileExecutionSource? = null
     private var session: PlayerSession? = null
     @Volatile private var policy: PlayerSessionPolicy? = null
     @Volatile private var grantedContent = emptySet<String>()
@@ -153,6 +155,10 @@ class PlayerActivity : ComponentActivity() {
     private fun decodeRequest(intent: Intent) {
         val raw = intent.getStringExtra(EXTRA_REQUEST)
         val decoded = raw?.takeIf { it.length <= MAX_REQUEST && it.toByteArray().size <= MAX_REQUEST }?.let(PlayerRequestCodec::decode)
+        fileSource?.close()
+        fileSource = decoded?.let { payload ->
+            UiFileExecutionSource("player", payload.root, requireNotNull(scope.coroutineContext[Job]))
+        }
         request = decoded
         if (decoded == null) { releaseSession(); showError(R.string.player_error_request) } else createSession()
     }
@@ -200,6 +206,7 @@ class PlayerActivity : ComponentActivity() {
     }
     private fun createSession() {
         val payload = request ?: return
+        val source = fileSource ?: return
         releaseSession(); failed = false; pageReady = false
         loading.visibility = View.VISIBLE; loading.bringToFront(); errorPanel.visibility = View.GONE
         val expected = generation
@@ -207,7 +214,7 @@ class PlayerActivity : ComponentActivity() {
             var created: PlayerSession? = null
             var adopted = false
             try {
-                created = server.createSession(payload)
+                created = server.createSession(payload, source.runtimeOwner, source::checkCurrent)
                 val guard = PlayerSessionPolicy(created.url, created.origin)
                 withContext(Dispatchers.Main.immediate) {
                     if (generation != expected || isFinishing || isDestroyed) return@withContext
@@ -446,7 +453,7 @@ class PlayerActivity : ComponentActivity() {
         PlayerMediaTypes.supports(name)
     }.getOrDefault(false)
     private fun cancelChooser() { documentValidation?.cancel(); documentValidation = null; chooserCallback?.onReceiveValue(null); chooserCallback = null }
-    private fun closePlayer() { releaseSession(); finish() }
+    private fun closePlayer() { fileSource?.close(); releaseSession(); finish() }
     private fun releaseSession() {
         generation++; creation?.cancel(); creation = null; handler.removeCallbacksAndMessages(null); cancelChooser()
         coordinator?.close(); coordinator = null; pipSignature = null; pipParamsCache = null; hideCustomView()
@@ -473,7 +480,7 @@ class PlayerActivity : ComponentActivity() {
         cleanup.postDelayed({ finishCleanup() }, 250)
         runCatching { view.evaluateJavascript("try{window.AjiuPlayer&&window.AjiuPlayer.pause()}catch(e){};try{window.AjiuPlayer&&window.AjiuPlayer.destroy()}catch(e){}") { finishCleanup() } }.onFailure { finishCleanup() }
     }
-    override fun onDestroy() { releaseSession(); scope.cancel(); unregisterReceiver(pipReceiver); super.onDestroy() }
+    override fun onDestroy() { fileSource?.close(); releaseSession(); scope.cancel(); unregisterReceiver(pipReceiver); super.onDestroy() }
     private fun showToast(resource: Int) = Toast.makeText(this, resource, Toast.LENGTH_SHORT).show()
     private fun dp(value: Int) = (resources.displayMetrics.density * value).toInt()
     companion object {

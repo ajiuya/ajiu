@@ -2,17 +2,42 @@ package com.aicode.feature.agent.domain.skill
 
 import com.aicode.feature.agent.domain.plugin.PluginDefinitionSource
 import com.aicode.testutil.TestFileAccessProvider
+import com.aicode.feature.settings.data.repository.ExecutionMode
+import com.aicode.feature.workspace.domain.WorkspaceExecutionContext
+import com.aicode.feature.workspace.domain.WorkspaceExecutionContextFactory
+import com.aicode.feature.workspace.domain.WorkspacePathMapper
+import com.aicode.feature.workspace.domain.LocalFileAccess
+import com.aicode.feature.workspace.domain.LocalFolderGrantRepository
+import com.aicode.feature.workspace.domain.LocalFolderSnapshot
+import com.aicode.feature.workspace.domain.PathHomeResolver
+import com.aicode.feature.workspace.domain.RemoteSftpFileAccess
+import com.aicode.feature.agent.domain.container.LocalContainerRuntime
+import io.mockk.Called
+import io.mockk.coEvery
+import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.spyk
 import io.mockk.verify
 import java.io.File
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertThrows
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.TemporaryFolder
 
 class SkillRepositoryTest {
+    @get:Rule val temporary = TemporaryFolder()
 
     private val provider = TestFileAccessProvider()
     private val globalSource = spyk(GlobalDirectorySkillSource(provider)).apply {
@@ -28,13 +53,127 @@ class SkillRepositoryTest {
         every { revision } returns 0
         every { skills() } returns emptyList()
     }
-    private val repository = SkillRepository(globalSource, projectSource, config, provider, pluginSource)
+    private val localDefinitions = mockk<LocalSkillDefinitionSource>().apply {
+        every { sourceIdentity() } returns "legacy-fixture"
+        coEvery { capture() } returns null
+    }
+    private val repository = SkillRepository(globalSource, projectSource, config, provider, pluginSource, localDefinitions)
 
     private fun skill(name: String) = Skill(
         name = name,
         description = "desc of $name",
         instructions = "body of $name"
     )
+
+    @Test
+    fun chrootSynchronousReads_useTheSameFixedDefinitionsAndDisabledUnion() {
+        val f = LocalSkillDefinitionFixture(temporary.newFolder())
+        f.instruction(SkillScope.GLOBAL, "global", "shared", "global body")
+        f.instruction(SkillScope.PROJECT, "project", "SHARED", "project body")
+        f.instruction(SkillScope.GLOBAL, "keep", "keep", "enabled body")
+        f.disabled(SkillScope.PROJECT, "shared")
+        val plugin = SkillEntry(skill("plugin"), SkillScope.PLUGIN)
+        every { f.plugins.skills() } returns listOf(plugin)
+        assertEquals(listOf("keep", "plugin", "SHARED"), f.repository.listAllSkills().map { it.skill.name })
+        assertEquals(listOf("keep", "plugin"), f.repository.listSkills().map { it.name })
+        assertNull(f.repository.loadInstructions("SHARED"))
+        assertEquals("enabled body", f.repository.loadInstructions("KEEP"))
+        assertEquals(plugin.skill.instructions, f.repository.loadInstructions("plugin"))
+        f.repository.setSkillDisabled("shared", false, SkillScope.PROJECT)
+        assertEquals("project body", f.repository.loadInstructions("shared"))
+        verify { f.backend wasNot Called }
+    }
+
+    @Test
+    fun nonChrootSnapshot_freezesTheExistingBackendAndPreservesScopeAndDisableSemantics() = runBlocking {
+        val factory = mockk<WorkspaceExecutionContextFactory>()
+        val execution = WorkspaceExecutionContext(ExecutionMode.LOCAL_PROOT, provider.cacheIdentity(), provider, null, null) { }
+        coEvery { factory.freeze(any(), any(), any()) } returns execution
+        every { globalSource.listSkills(any()) } returns listOf(skill("global"), skill("shared"))
+        every { projectSource.listSkills(any()) } returns listOf(skill("shared").copy(instructions = "project"))
+        every { config.disabledNames() } returns setOf("shared")
+        val snapshot = repository.readDefinitionSnapshot(factory, forceRefresh = true)
+        assertEquals(listOf("global", "shared"), snapshot.entries.map { it.skill.name })
+        assertEquals(listOf("global"), snapshot.enabled.map { it.skill.name })
+        assertEquals("project", snapshot.entries.single { it.scope == SkillScope.PROJECT }.skill.instructions)
+        repository.checkSourceIdentity(snapshot.sourceIdentity)
+        coVerify(exactly = 1) { factory.freeze(any(), any(), any()) }
+        verify(exactly = 1) { globalSource.listSkills(true) }
+        verify(exactly = 1) { projectSource.listSkills(true) }
+    }
+
+    @Test
+    fun chrootSynchronousRead_doesNotStartIoFromACancelledCaller() = runBlocking {
+        val f = LocalSkillDefinitionFixture(temporary.newFolder())
+        val cancelled = Job().apply { cancel() }
+        val execution = WorkspaceExecutionContext(ExecutionMode.LOCAL_PROOT, "captured", f.backend, null, null,
+            cancellationJob = cancelled) { cancelled.ensureActive() }
+        val failure = try {
+            withContext(execution + cancelled) { f.repository.listAllSkills() }
+            null
+        } catch (failure: Throwable) { failure }
+        assertTrue(failure is CancellationException)
+        assertEquals(0, f.contextReads)
+        verify { f.backend wasNot Called }
+    }
+
+    @Test
+    fun inheritedActiveExecutionAfterSourceSwitch_rejectsAsyncAndSyncChrootReads_withoutRestrictingUiReads() = runBlocking {
+        for (change in listOf("workspaceAndProfile", "sameWorkspaceProfile")) {
+            val f = LocalSkillDefinitionFixture(temporary.newFolder())
+            val proot = f.profile.copy(localRuntime = LocalContainerRuntime.PROOT)
+            f.profiles.value = listOf(proot)
+            f.configurationRevision.value++
+            every { f.installer.rootfsDirFor(any()) } returns File(f.files, "rootfs")
+            val home = mockk<PathHomeResolver>()
+            every { home.home() } returns "/root"
+            every { home.expandHome(any()) } answers { firstArg<String>().replaceFirst("~/", "/root/") }
+            val mapper = WorkspacePathMapper(f.workspace, f.installer, f.settings, home)
+            withTimeout(5_000) { mapper.runtimeProfileState.first { it.ready && it.profile == proot } }
+            val local = LocalFileAccess(mapper)
+            val folders = mockk<LocalFolderGrantRepository>()
+            coEvery { folders.awaitReady() } returns Unit
+            every { folders.snapshot() } returns LocalFolderSnapshot.EMPTY
+            val remote = mockk<RemoteSftpFileAccess>()
+            val factory = WorkspaceExecutionContextFactory(local, f.mode, local, remote, f.settings, folders)
+            val owner = requireNotNull(currentCoroutineContext()[Job])
+            val capturedA = factory.freeze()
+            capturedA.checkCurrent()
+            assertTrue(owner.isActive)
+            if (change == "workspaceAndProfile") f.select(f.second)
+            f.profiles.value = listOf(f.profile)
+            f.configurationRevision.value++
+            withTimeout(5_000) { mapper.runtimeProfileState.first { it.ready && it.profile == f.profile } }
+            f.instruction(SkillScope.PROJECT, "selected-b", "selected-b", "new source B")
+            f.disabled(SkillScope.PROJECT, "blocked")
+            assertThrows(CancellationException::class.java) { capturedA.checkCurrent() }
+            assertTrue("The old execution owner was cancelled instead of its source becoming stale", owner.isActive)
+            val failures = linkedMapOf<String, Throwable?>()
+            for (api in listOf("snapshot", "listAll", "listSkills", "loadInstructions", "config")) {
+                failures[api] = try {
+                    withContext(capturedA) {
+                        when (api) {
+                            "snapshot" -> f.repository.readDefinitionSnapshot(factory)
+                            "listAll" -> f.repository.listAllSkills()
+                            "listSkills" -> f.repository.listSkills()
+                            "loadInstructions" -> f.repository.loadInstructions("selected-b")
+                            else -> f.config.disabledNames()
+                        }
+                    }
+                    null
+                } catch (failure: Throwable) { failure }
+            }
+            val fromUi = f.repository.readDefinitionSnapshot(factory)
+            assertEquals("new source B", fromUi.enabled.single().skill.instructions)
+            assertEquals("new source B", f.repository.loadInstructions("selected-b"))
+            assertEquals(setOf("blocked"), f.config.disabledNames())
+            assertTrue(owner.isActive)
+            for ((api, failure) in failures) {
+                assertTrue("$change/$api read source B through obsolete active execution A; failure=$failure", failure is CancellationException)
+            }
+            verify { f.backend wasNot Called }
+        }
+    }
 
     @Test
     fun loadInstructions_projectOverridesSameNameWithDifferentBody() {

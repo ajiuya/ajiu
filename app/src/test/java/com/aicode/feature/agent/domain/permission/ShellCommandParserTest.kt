@@ -10,6 +10,63 @@ import org.junit.Test
 class ShellCommandParserTest {
 
     @Test
+    fun commandSegments_keepInputOutputAndReadWriteRedirectEvidence() {
+        val analysis = ShellCommandParser.analyze("cat < '/system/build.prop'; id 2>>/sys/probe; exec 3<>/system/probe")
+        assertEquals(listOf(listOf("cat"), listOf("id"), listOf("exec")), analysis.segments)
+        assertEquals(
+            listOf(
+                ShellCommandParser.Redirection("<", "/system/build.prop", true),
+                ShellCommandParser.Redirection(">>", "/sys/probe", true),
+                ShellCommandParser.Redirection("<>", "/system/probe", true)
+            ),
+            analysis.commandSegments.flatMap { it.redirections }
+        )
+    }
+
+    @Test
+    fun redirectEvidence_doesNotConfuseQuotedDataWithDynamicTargets() {
+        val literal = ShellCommandParser.analyze("printf '%s' '> /system/probe'")
+        assertTrue(literal.commandSegments.single().redirections.isEmpty())
+        val dynamic = ShellCommandParser.analyze("id >\"\$TARGET\"")
+        assertEquals(ShellCommandParser.Redirection(">", "\$TARGET", false), dynamic.commandSegments.single().redirections.single())
+        val nullOutput = ShellCommandParser.analyze("id >/dev/'null' 2>&1")
+        assertFalse(nullOutput.hasFileOutputRedirect)
+        assertEquals(listOf("/dev/null", "1"), nullOutput.commandSegments.single().redirections.map { it.target })
+    }
+
+    @Test
+    fun redirectionOnlyCommandsRemainVisibleWithoutInventingAnExecutable() {
+        val analysis = ShellCommandParser.analyze(">/sys/probe")
+        assertTrue(analysis.segments.isEmpty())
+        assertTrue(analysis.commandSegments.single().tokens.isEmpty())
+        assertEquals(ShellCommandParser.Redirection(">", "/sys/probe", true), analysis.commandSegments.single().redirections.single())
+    }
+
+    @Test
+    fun hereData_isNotAnExecutableSegmentButRealExpansionsAndFollowingWrappersRemainVisible() {
+        for (command in listOf(
+            "cat <<'EOF'\ngit push origin main\nEOF",
+            "cat <<EOF\ngit push origin main\nEOF",
+            "cat <<'EOF'\n\$(git push origin main)\nEOF",
+            "cat <<< 'git push origin main'"
+        )) assertFalse(command, ShellCommandParser.executableSegments(command).any { ShellCommandParser.matches("git push", it) })
+
+        for (command in listOf(
+            "cat <<EOF\n\$(git push origin main)\nEOF",
+            "cat <<EOF\n`git push origin main`\nEOF",
+            "cat <<'EOF'\nliteral data\nEOF\nsh -c 'git push origin main'"
+        )) assertTrue(command, ShellCommandParser.executableSegments(command).any { ShellCommandParser.matches("git push", it) })
+    }
+
+    @Test
+    fun hereStringAndTabStrippingHereDocumentOperatorsRemainWholeTokens() {
+        assertEquals("<<<", ShellCommandParser.analyze("cat <<< '/system/probe'").commandSegments.single().redirections.single().operator)
+        val here = ShellCommandParser.analyze("cat <<-'EOF'\n\tcat /system/probe\n\tEOF")
+        assertEquals("<<-", here.commandSegments.single().redirections.single().operator)
+        assertEquals(listOf(listOf("cat")), here.segments)
+    }
+
+    @Test
     fun singleSegment_isAnalyzable_andPrefixIsProgram() {
         val a = ShellCommandParser.analyze("git status -s")
         assertTrue(a.analyzable)

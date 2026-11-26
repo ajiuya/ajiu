@@ -2,25 +2,36 @@ package com.aicode.feature.agent.domain.command
 
 import android.content.Context
 import com.aicode.R
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeAuthorizationRequired
 import com.aicode.feature.agent.domain.skill.Skill
+import com.aicode.feature.agent.domain.skill.SkillDefinitionSourceChanged
+import com.aicode.feature.agent.domain.skill.SkillEntry
 import com.aicode.feature.agent.domain.skill.SkillRepository
+import com.aicode.feature.agent.domain.skill.SkillScope
 import com.aicode.feature.workspace.domain.WorkspaceExecutionContext
 import com.aicode.feature.workspace.domain.WorkspaceExecutionContextFactory
 import com.aicode.feature.settings.data.repository.ExecutionMode
+import io.mockk.Called
 import io.mockk.coEvery
+import io.mockk.coVerify
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
 import io.mockk.every
 import io.mockk.mockk
+import io.mockk.verify
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.withContext
+import java.io.IOException
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -31,6 +42,9 @@ class SlashCommandRegistryTest {
 
     private val context = mockk<Context>()
     private val skillRepository = mockk<SkillRepository>()
+    private val definitionExecution = WorkspaceExecutionContext(
+        ExecutionMode.LOCAL_PROOT, "fixture", mockk(), null, null
+    ) {}
 
     private fun action(cmdName: String, descRes: Int, takesArgs: Boolean = false) =
         object : ActionCommandHandler {
@@ -48,24 +62,70 @@ class SlashCommandRegistryTest {
     private val init = action("init", R.string.slash_command_init_desc)
 
     private fun registry(vararg handlers: ActionCommandHandler): SlashCommandRegistry {
-        val factory = mockk<WorkspaceExecutionContextFactory>()
-        coEvery { factory.freeze(any()) } returns WorkspaceExecutionContext(
-            ExecutionMode.LOCAL_PROOT, "fixture", mockk(), null, null
-        ) {}
-        return SlashCommandRegistry(handlers.toSet(), skillRepository, context, factory)
-    }
-
-    private fun prepare(registry: SlashCommandRegistry, skills: List<Skill>) {
         every { context.getString(R.string.slash_command_usage_desc) } returns "用量"
         every { context.getString(R.string.slash_command_compress_desc) } returns "压缩上下文"
         every { context.getString(R.string.slash_command_init_desc) } returns "初始化项目"
+        val factory = mockk<WorkspaceExecutionContextFactory>()
+        return SlashCommandRegistry(handlers.toSet(), skillRepository, context, factory)
+    }
+
+    private fun snapshot(source: String, skills: List<Skill>, disabled: Set<String> = emptySet()) =
+        SkillRepository.DefinitionSnapshot(source, skills.map { SkillEntry(it, SkillScope.GLOBAL) }, disabled)
+
+    private fun prepare(registry: SlashCommandRegistry, skills: List<Skill>) {
         every { skillRepository.sourceIdentity() } returns "fixture"
         every { skillRepository.checkSourceIdentity(any()) } returns Unit
-        every { skillRepository.listSkills() } returns skills
+        coEvery { skillRepository.readDefinitionSnapshot(any(), any()) } returns snapshot("fixture", skills)
         runBlocking { registry.refresh() }
     }
 
+    @Test
+    fun pendingChrootFactoryWithoutOwnerStillRequiresAuthorization() = runBlocking {
+        val fixture = PendingChrootSkillMenuFixture()
+        fixture.assertPendingWithoutExecutionOwner()
+
+        val failure = runCatching { fixture.factory.freeze() }.exceptionOrNull()
+
+        fixture.assertNoRuntimeOrFileAccessCalls()
+        assertEquals(LocalRuntimeAuthorizationRequired::class.java, failure?.javaClass)
+        assertNull(WorkspaceExecutionContext.current())
+    }
+
+    @Test
+    fun pendingChrootRefreshPublishesBuiltinAndHostSkillWithoutRuntimeAuthorization() = runBlocking {
+        val fixture = PendingChrootSkillMenuFixture()
+        fixture.assertPendingWithoutExecutionOwner()
+
+        val result = runCatching { fixture.registry.refresh() }
+
+        fixture.assertNoRuntimeOrFileAccessCalls()
+        result.exceptionOrNull()?.let { failure ->
+            throw AssertionError("Refreshing the skill menu must succeed without a CHROOT execution owner", failure)
+        }
+        assertEquals(SlashCommandRegistry.RefreshState.Ready, fixture.registry.refreshState.value)
+        assertEquals(listOf("usage", "host-skill"), fixture.registry.commands.value.map { it.name })
+        assertEquals(listOf(SlashCommandKind.ACTION, SlashCommandKind.SKILL), fixture.registry.commands.value.map { it.kind })
+        assertTrue(fixture.registry.resolve("/usage") is SlashCommandRegistry.ResolvedCommand.Action)
+        val skill = fixture.registry.resolve("/host-skill args") as SlashCommandRegistry.ResolvedCommand.SkillCommand
+        assertEquals("Fixture instructions for host-skill", skill.skill.instructions)
+        assertEquals("args", skill.args)
+        assertNull(fixture.registry.resolve("/disabled-fixture"))
+        assertNull(WorkspaceExecutionContext.current())
+        fixture.assertNoRuntimeOrFileAccessCalls()
+    }
+
     // ---- 菜单合并 ----
+
+    @Test
+    fun commands_publishBuiltinsBeforeTheFirstRefreshWithoutReadingSkills() {
+        val registry = registry(usage, compress, init)
+
+        assertEquals(listOf("compress", "init", "usage"), registry.commands.value.map { it.name })
+        assertTrue(registry.commands.value.all { it.kind == SlashCommandKind.ACTION })
+        assertTrue(registry.resolve("/usage") is SlashCommandRegistry.ResolvedCommand.Action)
+        assertEquals(SlashCommandRegistry.RefreshState.Idle, registry.refreshState.value)
+        verify { skillRepository wasNot Called }
+    }
 
     @Test
     fun commands_builtinsFirstThenSkills() {
@@ -176,12 +236,17 @@ class SlashCommandRegistryTest {
         every { skillRepository.checkSourceIdentity(any()) } answers {
             if (firstArg<String>() != source) throw kotlinx.coroutines.CancellationException("changed")
         }
-        every { skillRepository.listSkills() } answers {
-            if (source == "server-a") {
-                entered.countDown()
-                check(release.await(10, TimeUnit.SECONDS))
-                listOf(skill("old", "server a", "old server body"))
-            } else listOf(skill("new", "server b", "new server body"))
+        coEvery { skillRepository.readDefinitionSnapshot(any(), any()) } coAnswers {
+            withContext(Dispatchers.IO + definitionExecution) {
+                assertSame(definitionExecution, WorkspaceExecutionContext.current())
+                val capturedSource = source
+                val skills = if (capturedSource == "server-a") {
+                    entered.countDown()
+                    check(release.await(10, TimeUnit.SECONDS))
+                    listOf(skill("old", "server a", "old server body"))
+                } else listOf(skill("new", "server b", "new server body"))
+                snapshot(capturedSource, skills)
+            }
         }
         val old = async(Dispatchers.Default) { registry.refresh() }
         try {
@@ -201,9 +266,11 @@ class SlashCommandRegistryTest {
     fun cancelledRefreshNeverPublishesAnEmptySkillList() = runBlocking {
         val registry = registry(usage)
         prepare(registry, listOf(skill("kept", "same source")))
-        every { skillRepository.listSkills() } throws kotlinx.coroutines.CancellationException("cancelled")
-        assertTrue(runCatching { registry.refresh() }.exceptionOrNull() is kotlinx.coroutines.CancellationException)
+        val cancelled = kotlinx.coroutines.CancellationException("cancelled")
+        coEvery { skillRepository.readDefinitionSnapshot(any(), any()) } throws cancelled
+        assertSame(cancelled, runCatching { registry.refresh() }.exceptionOrNull())
         assertTrue(registry.resolve("/kept") is SlashCommandRegistry.ResolvedCommand.SkillCommand)
+        assertEquals(SlashCommandRegistry.RefreshState.Ready, registry.refreshState.value)
     }
 
     @Test
@@ -212,10 +279,13 @@ class SlashCommandRegistryTest {
         prepare(registry, emptyList())
         val entered = CompletableDeferred<Unit>()
         val closed = CompletableDeferred<Unit>()
-        every { skillRepository.listSkills() } answers {
-            runBlocking(WorkspaceExecutionContext.blockingContext()) {
-                entered.complete(Unit)
-                try { awaitCancellation() } finally { closed.complete(Unit) }
+        coEvery { skillRepository.readDefinitionSnapshot(any(), any()) } coAnswers {
+            withContext(Dispatchers.IO + definitionExecution) {
+                assertSame(definitionExecution, WorkspaceExecutionContext.current())
+                runBlocking(WorkspaceExecutionContext.blockingContext()) {
+                    entered.complete(Unit)
+                    try { awaitCancellation() } finally { closed.complete(Unit) }
+                }
             }
         }
         val refresh = async(Dispatchers.Default) { registry.refresh() }
@@ -223,6 +293,76 @@ class SlashCommandRegistryTest {
         refresh.cancelAndJoin()
         closed.await()
         assertEquals(listOf("usage"), registry.commands.value.map { it.name })
+    }
+
+    @Test
+    fun ioFailureClearsUnreliableSkillsKeepsBuiltinsAndCanRetry() = runBlocking {
+        val registry = registry(usage)
+        prepare(registry, listOf(skill("stale", "old definition")))
+        coEvery { skillRepository.readDefinitionSnapshot(any(), any()) } coAnswers {
+            assertEquals(SlashCommandRegistry.RefreshState.Loading, registry.refreshState.value)
+            throw IOException("Fixture definition read failed")
+        }
+
+        registry.refresh()
+
+        assertEquals(SlashCommandRegistry.RefreshState.Failed, registry.refreshState.value)
+        assertEquals(listOf("usage"), registry.commands.value.map { it.name })
+        assertNull(registry.resolve("/stale"))
+        assertTrue(registry.resolve("/usage") is SlashCommandRegistry.ResolvedCommand.Action)
+
+        coEvery { skillRepository.readDefinitionSnapshot(any(), any()) } returns
+            snapshot("fixture", listOf(skill("recovered", "fresh definition")))
+        registry.refresh()
+
+        assertEquals(SlashCommandRegistry.RefreshState.Ready, registry.refreshState.value)
+        assertEquals(listOf("usage", "recovered"), registry.commands.value.map { it.name })
+        assertTrue(registry.resolve("/recovered") is SlashCommandRegistry.ResolvedCommand.SkillCommand)
+    }
+
+    @Test
+    fun sourceMetadataFailuresDropSkillsWithoutRereadingOrBreakingBuiltinResolution() {
+        val registry = registry(usage)
+        prepare(registry, listOf(skill("cached", "previous source")))
+        every { skillRepository.sourceIdentity() } throws IOException("Fixture metadata unavailable")
+
+        assertTrue(registry.resolve("/usage") is SlashCommandRegistry.ResolvedCommand.Action)
+        assertEquals(listOf("usage"), registry.commands.value.map { it.name })
+        assertEquals(SlashCommandRegistry.RefreshState.Unavailable, registry.refreshState.value)
+        assertNull(registry.resolve("/cached"))
+
+        prepare(registry, listOf(skill("cached", "new source")))
+        every { skillRepository.checkSourceIdentity(any()) } throws SkillDefinitionSourceChanged()
+
+        assertTrue(registry.resolve("/usage") is SlashCommandRegistry.ResolvedCommand.Action)
+        assertNull(registry.resolve("/cached"))
+        assertEquals(listOf("usage"), registry.commands.value.map { it.name })
+        assertEquals(SlashCommandRegistry.RefreshState.Unavailable, registry.refreshState.value)
+        coVerify(exactly = 2) { skillRepository.readDefinitionSnapshot(any(), any()) }
+    }
+
+    @Test
+    fun activeSourceChangeDiscardsSkillsWithoutCancellingTheCaller() = runBlocking {
+        val registry = registry(usage)
+        prepare(registry, listOf(skill("stale", "previous source")))
+        coEvery { skillRepository.readDefinitionSnapshot(any(), any()) } throws SkillDefinitionSourceChanged()
+
+        registry.refresh()
+
+        assertTrue(currentCoroutineContext().isActive)
+        assertEquals(SlashCommandRegistry.RefreshState.Unavailable, registry.refreshState.value)
+        assertEquals(listOf("usage"), registry.commands.value.map { it.name })
+        assertNull(registry.resolve("/stale"))
+    }
+
+    @Test
+    fun downstreamErrorsAreNotConvertedIntoRecoverableMenuFailures() = runBlocking {
+        val registry = registry(usage)
+        prepare(registry, emptyList())
+        val error = AssertionError("Fixture downstream error")
+        coEvery { skillRepository.readDefinitionSnapshot(any(), any()) } throws error
+
+        assertSame(error, runCatching { registry.refresh() }.exceptionOrNull())
     }
 
     // ---- 技能提示词 ----

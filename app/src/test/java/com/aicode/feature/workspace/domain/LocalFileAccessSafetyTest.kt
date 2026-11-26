@@ -5,6 +5,7 @@ import com.aicode.feature.settings.data.repository.ContainerSettingsRepository
 import com.aicode.feature.workspace.data.repository.WorkspaceRepository
 import io.mockk.every
 import io.mockk.mockk
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.emptyFlow
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -38,9 +39,13 @@ class LocalFileAccessSafetyTest {
         val settings = mockk<ContainerSettingsRepository>()
         val home = mockk<PathHomeResolver>()
         every { workspace.currentPath() } returns root.absolutePath
+        every { workspace.selection } returns MutableStateFlow(WorkspaceRepository.Selection(null))
         every { installer.aicodeDir } returns global
         every { installer.rootfsDirFor(any()) } returns rootfs
         every { settings.activeProfileIdFlow } returns emptyFlow()
+        every { settings.customProfilesFlow } returns emptyFlow()
+        every { settings.profileConfigurationRevision } returns 0L
+        every { settings.activeProfileSelectionRevision } returns 0L
         every { home.home() } returns "/root"
         every { home.expandHome(any()) } answers {
             val path = firstArg<String>()
@@ -105,6 +110,8 @@ class LocalFileAccessSafetyTest {
             }
         }
         val mapped = mockk<WorkspacePathMapper>()
+        val mapping = mapper.captureExecutionMapping()
+        every { mapped.captureExecutionMapping(any()) } returns mapping
         every { mapped.resolveFile(any(), any()) } answers {
             if (firstArg<String>() == "growing") growing else mapper.resolveFile(firstArg(), secondArg())
         }
@@ -123,6 +130,10 @@ class LocalFileAccessSafetyTest {
             override fun length(): Long = super.length().also { currentRoot = next }
         }
         val mapped = mockk<WorkspacePathMapper>()
+        val mapping = mapper.captureExecutionMapping()
+        every { mapped.captureExecutionMapping(any()) } answers {
+            mapping.copy(workspaceRoot = currentRoot.canonicalFile, workspaceSourcePath = currentRoot.absolutePath)
+        }
         every { mapped.resolveFile(any(), any()) } answers {
             when (firstArg<String>()) {
                 "~/workspace" -> currentRoot

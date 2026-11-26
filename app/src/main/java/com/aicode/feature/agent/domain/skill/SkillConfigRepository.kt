@@ -7,17 +7,28 @@ import com.aicode.feature.agent.domain.plugin.PluginDefinitionReadOnlyException
 import com.aicode.feature.agent.domain.container.ContainerInstaller
 import com.aicode.feature.workspace.domain.FileAccessProvider
 import com.aicode.feature.workspace.domain.ProjectAicodeRoot
+import com.aicode.feature.workspace.domain.WorkspaceExecutionContext
 import java.io.File
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.emitAll
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.mapNotNull
 import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.flow.shareIn
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -37,12 +48,14 @@ import kotlinx.serialization.json.putJsonArray
  * 生效禁用集合 = 全局 + 项目并集。每次读取都从磁盘加载，外部手工编辑即时生效；
  * 名单中不存在的技能名在过滤时天然被忽略，无需清理。
  */
+@OptIn(ExperimentalCoroutinesApi::class)
 @Singleton
 class SkillConfigRepository @Inject constructor(
     private val containerInstaller: ContainerInstaller,
     private val projectAicodeRoot: ProjectAicodeRoot,
     private val fileChangeHub: FileChangeHub,
-    private val fileAccess: FileAccessProvider
+    private val fileAccess: FileAccessProvider,
+    private val localDefinitions: LocalSkillDefinitionSource
 ) {
     /** 本地全局配置文件，仅用于宿主文件变更监听。 */
     private fun globalFile(): File = File(containerInstaller.aicodeDir, CONFIG_FILE)
@@ -51,22 +64,31 @@ class SkillConfigRepository @Inject constructor(
     private fun projectFile(): File = File(projectAicodeRoot.current(), CONFIG_FILE)
 
     /** 当前生效的禁用技能名集合（全局 + 项目并集，归一化为小写）。 */
-    fun disabledNames(): Set<String> {
-        val global = readGlobalDisabled()
-        val project = readDisabled(projectFile())
-        return (global + project).map { it.lowercase() }.toSet()
+    fun disabledNames(): Set<String> = runBlocking(WorkspaceExecutionContext.blockingContext()) {
+        withContext(Dispatchers.IO) {
+            val local = localDefinitions.capture()
+            if (local != null) localDefinitions.disabledNames(local) else {
+                val global = readGlobalDisabled()
+                val project = readDisabled(projectFile())
+                (global + project).map { it.lowercase() }.toSet()
+            }
+        }
     }
 
     /** 在指定作用域的配置中启用/禁用某个技能。 */
     fun setDisabled(name: String, disabled: Boolean, scope: SkillScope) {
         if (scope == SkillScope.PLUGIN) throw PluginDefinitionReadOnlyException()
-        val names = (if (scope == SkillScope.GLOBAL) readGlobalDisabled() else readDisabled(projectFile()))
-            .toMutableSet()
-        if (disabled) names.add(name) else names.remove(name)
-        if (scope == SkillScope.GLOBAL) {
-            fileAccess.writeFile(GLOBAL_CONFIG_PATH, serializeDisabled(names))
-        } else {
-            writeDisabled(projectFile(), names)
+        runBlocking(WorkspaceExecutionContext.blockingContext()) {
+            withContext(Dispatchers.IO) {
+                val local = localDefinitions.capture()
+                if (local != null) localDefinitions.setDisabled(local, name, disabled, scope) else {
+                    val names = (if (scope == SkillScope.GLOBAL) readGlobalDisabled() else readDisabled(projectFile()))
+                        .toMutableSet()
+                    if (disabled) names.add(name) else names.remove(name)
+                    if (scope == SkillScope.GLOBAL) fileAccess.writeFile(GLOBAL_CONFIG_PATH, serializeDisabled(names))
+                    else writeDisabled(projectFile(), names)
+                }
+            }
         }
     }
 
@@ -74,6 +96,7 @@ class SkillConfigRepository @Inject constructor(
         if (fileAccess.isFile(GLOBAL_CONFIG_PATH)) parseDisabled(fileAccess.readFile(GLOBAL_CONFIG_PATH))
         else emptySet()
     }.getOrElse {
+        if (it is CancellationException) throw it
         FileLogger.w(TAG, "读取 $CONFIG_FILE 失败: ${it.message}")
         emptySet()
     }
@@ -86,7 +109,7 @@ class SkillConfigRepository @Inject constructor(
      * 技能目录或配置文件被外部修改时广播一次。订阅驱动：只在有订阅者（设置页）期间才由
      * [FileChangeHub] 监听技能目录与两个 skills.json，无人订阅时零开销。
      */
-    val changes: SharedFlow<Unit> = merge(
+    private fun legacyChanges() = merge(
         fileChangeHub.watchAicode(SKILLS_DIR, recursive = true),
         fileChangeHub.watchAicode(),
         fileChangeHub.watchWorkspace("${FileChangeHub.CONTAINER_ROOT}/$AICODE_DIR/$SKILLS_DIR", recursive = true),
@@ -95,6 +118,21 @@ class SkillConfigRepository @Inject constructor(
         if (!batch.changes.any(::isSkillChange)) return@mapNotNull null
         FileLogger.i(TAG, "检测到技能目录或配置变化，已通知刷新")
         Unit
+    }
+
+    val changes: SharedFlow<Unit> = localDefinitions.sourceSignals().flatMapLatest {
+        flow {
+            emit(Unit)
+            val local = localDefinitions.capture()
+            if (local != null) emitAll(localDefinitions.changes(local, fileChangeHub))
+            else emitAll(legacyChanges())
+        }.catch { failure ->
+            when (failure) {
+                is SkillDefinitionSourceChanged -> currentCoroutineContext().ensureActive()
+                is CancellationException -> throw failure
+                else -> FileLogger.w(TAG, "Skill definition watch unavailable")
+            }
+        }
     }.shareIn(watchScope, SharingStarted.WhileSubscribed(), replay = 0)
 
     /** 技能相关变更：两个 skills.json，或全局/项目技能目录自身及其下的任何文件。 */

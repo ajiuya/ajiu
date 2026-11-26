@@ -50,7 +50,10 @@ class PluginHookDispatcherTest {
             coEvery { gateway.captureBackgroundContext(any(), any()) } answers { invocation(firstArg()) }
         }
         fun invocation(capture: PluginCapture) = contexts.getOrPut("${capture.id}:${capture.activationEpoch}") {
-            PluginInvocationContext(capture, null, "/workspace", "session", plugins.dataDirectory(capture.id), flowOf(Unit)) {}
+            PluginInvocationContext(capture, null, "/workspace", "session", plugins.dataDirectory(capture.id), flowOf(Unit),
+                sourceIdentity = "${capture.id}:${capture.installRevision}:${capture.contentHash}:${capture.activationEpoch}",
+                runtimeOwner = com.aicode.feature.agent.domain.container.runtime.RuntimeOwner(
+                    com.aicode.feature.agent.domain.container.runtime.RuntimeOwnerKind.PLUGIN, "hook-test:${capture.activationEpoch}")) {}
         }
         suspend fun install(events: List<Pair<String, String>>): PluginCapture {
             val hooks = events.mapIndexed { index, (event, mode) -> """{"id":"h$index","event":"$event","mode":"$mode","handler":"h$index"}""" }.joinToString(",")

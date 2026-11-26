@@ -1,6 +1,7 @@
 package com.aicode.feature.agent.presentation.filebrowse
 
 import com.aicode.core.util.GitIgnoreMatcher
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwner
 import android.net.Uri
 import com.aicode.feature.agent.presentation.BrowseClipboard
 import com.aicode.feature.agent.presentation.BrowseOperationNotice
@@ -47,7 +48,9 @@ internal data class FileBrowseScope(
     val localMapping: WorkspacePathMapper.ExecutionMapping?,
     val localFolders: List<LocalFolderGrant> = emptyList(),
     val localFolderRevision: Long = 0,
-    val selectionRevision: Long = 0
+    val selectionRevision: Long = 0,
+    val runtimeOwner: RuntimeOwner? = null,
+    val grantedFolderScope: Boolean = false
 )
 
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -508,9 +511,14 @@ internal class FileBrowseController(
 
     private suspend fun <T> frozen(captured: FileBrowseScope, token: Long, block: suspend (WorkspaceExecutionContext) -> T): T {
         if (!mailbox.isCurrent(token)) throw CancellationException("File browse scope changed")
-        val execution = withContext(ioDispatcher) { executionFactory.freeze() }
+        val execution = withContext(ioDispatcher) {
+            if (captured.grantedFolderScope) executionFactory.freezeForPaths(
+                captured.localFolders.filter { it.available }.map { it.rootPath }, runtimeOwner = captured.runtimeOwner
+            ) else executionFactory.freeze(runtimeOwner = captured.runtimeOwner)
+        }
         val mapping = execution.localMapping?.let { it.copy(profile = it.profile.copy(name = "")) }
         if (!mailbox.isCurrent(token) || execution.mode != captured.mode || execution.fileCacheIdentity != captured.fileIdentity ||
+            (captured.runtimeOwner != null && execution.runtimeOwner != captured.runtimeOwner) ||
             mapping != captured.localMapping || (mapping != null && mapping.profile.id != captured.profileId) ||
             execution.localFolderSnapshot.revision != captured.localFolderRevision ||
             currentSelectionRevision() != captured.selectionRevision
@@ -640,8 +648,9 @@ internal class FileBrowseController(
     private fun reconcileWatches() {
         val visible = visibleDirectories()
         val wanted = if (active) {
-            visible.filterTo(linkedSetOf()) { scope?.mode == ExecutionMode.LOCAL_PROOT || isLocalFolder(it) }
-                .also { if (scope?.mode == ExecutionMode.LOCAL_PROOT) it += WORKSPACE_ROOT }
+            visible.filterTo(linkedSetOf()) {
+                isLocalFolder(it) || scope?.mode == ExecutionMode.LOCAL_PROOT && scope?.grantedFolderScope != true
+            }.also { if (scope?.mode == ExecutionMode.LOCAL_PROOT && scope?.grantedFolderScope != true) it += WORKSPACE_ROOT }
         } else emptySet()
         (watches.keys - wanted).forEach { path ->
             mailbox.unwatch(path)

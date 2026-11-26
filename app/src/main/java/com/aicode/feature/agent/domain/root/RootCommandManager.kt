@@ -1,6 +1,5 @@
 package com.aicode.feature.agent.domain.root
 
-import com.aicode.feature.settings.data.repository.RootAccessSettingsRepository
 import kotlinx.coroutines.CancellableContinuation
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
@@ -8,7 +7,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.currentCoroutineContext
@@ -16,9 +14,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import java.io.InputStream
 import java.nio.ByteBuffer
@@ -31,17 +26,17 @@ import kotlin.coroutines.resume
 
 @Singleton
 class RootCommandManager internal constructor(
-    private val repository: RootAccessSettingsRepository,
+    private val authority: RootAuthorityCoordinator,
     private val rootProcessFactory: RootProcessFactory,
     private val scope: CoroutineScope,
     private val processDispatcher: CoroutineDispatcher
 ) {
     @Inject
     constructor(
-        repository: RootAccessSettingsRepository,
+        authority: RootAuthorityCoordinator,
         rootProcessFactory: RootProcessFactory
     ) : this(
-        repository,
+        authority,
         rootProcessFactory,
         CoroutineScope(SupervisorJob() + Dispatchers.IO),
         Dispatchers.IO
@@ -73,49 +68,18 @@ class RootCommandManager internal constructor(
         @Volatile var result: RootCommandResult? = null
     }
 
-    private val gate = Any()
-    private val settingsMutex = Mutex()
     private val permits = mutableMapOf<String, Permit>()
     private val active = mutableSetOf<ManagedCommand>()
-    private var observedState: RootAccessState? = null
-    private var blocked = false
 
     init {
-        scope.launch(start = CoroutineStart.UNDISPATCHED) {
-            repository.state.collect {
-                synchronized(gate) { observeLocked(repository.state.value) }
-            }
-        }
+        authority.registerRevocation(onRevoke = ::revokeAllLocked)
     }
 
-    val accessState get() = repository.state
+    val accessState get() = authority.accessState
 
-    suspend fun accessSnapshot(): RootAccessState {
-        repository.snapshot()
-        return synchronized(gate) {
-            val current = repository.state.value
-            observeLocked(current)
-            if (blocked) current.copy(enabled = false) else current
-        }
-    }
+    suspend fun accessSnapshot(): RootAccessState = authority.accessSnapshot()
 
-    suspend fun setEnabled(enabled: Boolean) {
-        settingsMutex.withLock {
-            synchronized(gate) {
-                blocked = true
-                revokeAllLocked()
-            }
-            // 撤销后即使调用方取消，也必须把关闭状态持久化，写入失败时保持阻断。
-            withContext(NonCancellable) {
-                repository.setEnabled(enabled)
-                repository.snapshot()
-                synchronized(gate) {
-                    observeLocked(repository.state.value)
-                    blocked = false
-                }
-            }
-        }
-    }
+    suspend fun setEnabled(enabled: Boolean) = authority.setEnabled(enabled)
 
     suspend fun authorize(
         sessionId: String,
@@ -124,23 +88,15 @@ class RootCommandManager internal constructor(
         expectedAuthorityId: String
     ): String? {
         if (sessionId.isBlank() || command.isBlank() || !accessSnapshot().enabled) return null
-        return synchronized(gate) {
-            val current = repository.state.value
-            observeLocked(current)
-            if (blocked || !current.enabled || current.generation != expectedGeneration ||
-                current.authorityId.isBlank() || current.authorityId != expectedAuthorityId
-            ) {
-                null
-            } else {
-                UUID.randomUUID().toString().also {
-                    permits[it] = Permit(sessionId, command, current.generation, current.authorityId)
-                }
+        return authority.withCurrent(expectedAuthorityId, expectedGeneration) {
+            UUID.randomUUID().toString().also {
+                permits[it] = Permit(sessionId, command, expectedGeneration, expectedAuthorityId)
             }
         }
     }
 
     fun revokePermit(permitId: String) {
-        synchronized(gate) { permits.remove(permitId) }
+        authority.withLock { permits.remove(permitId) }
     }
 
     suspend fun execute(
@@ -150,19 +106,21 @@ class RootCommandManager internal constructor(
         permitId: String?
     ): RootCommandResult {
         accessSnapshot()
-        val execution = synchronized(gate) {
-            val current = repository.state.value
-            observeLocked(current)
+        var rejection = EXIT_APPROVAL_REQUIRED
+        val execution = authority.withLock { current ->
             val permit = permitId?.let { permits.remove(it) }
-            if (blocked || !current.enabled) return RootCommandResult("", EXIT_DISABLED)
-            if (permit == null || permit.sessionId != sessionId || permit.command != command ||
+            if (!current.enabled) {
+                rejection = EXIT_DISABLED
+                null
+            } else if (permit == null || permit.sessionId != sessionId || permit.command != command ||
                 permit.generation != current.generation || current.authorityId.isBlank() ||
                 permit.authorityId != current.authorityId
             ) {
-                return RootCommandResult("", EXIT_APPROVAL_REQUIRED)
+                null
+            } else {
+                ManagedCommand(permit).also { active.add(it) }
             }
-            ManagedCommand(permit).also { active.add(it) }
-        }
+        } ?: return RootCommandResult("", rejection)
         return try {
             withTimeout(timeoutMs.coerceIn(1L, MAX_TIMEOUT_MS)) {
                 suspendCancellableCoroutine { continuation ->
@@ -172,7 +130,7 @@ class RootCommandManager internal constructor(
                             RootCommandResult("", if (cause is TimeoutCancellationException) EXIT_TIMEOUT else EXIT_INTERRUPTED)
                         )
                     }
-                    synchronized(gate) {
+                    authority.withLock {
                         val result = execution.result
                         if (result != null) {
                             continuation.resume(result)
@@ -202,21 +160,19 @@ class RootCommandManager internal constructor(
 
     private suspend fun runCommand(execution: ManagedCommand) {
         try {
-            val process = synchronized(gate) {
-                observeLocked(repository.state.value)
-                if (execution.result != null) return
-                val current = repository.state.value
-                if (blocked || !current.enabled || current.generation != execution.permit.generation ||
-                    current.authorityId.isBlank() || current.authorityId != execution.permit.authorityId
-                ) {
-                    finish(execution, RootCommandResult("", EXIT_DISABLED))
-                    return
+            val process = authority.withCurrent(execution.permit.authorityId, execution.permit.generation) {
+                if (execution.result != null) {
+                    null
+                } else {
+                    rootProcessFactory.create(execution.permit.command).also {
+                        execution.process = it
+                        authority.withLock {}
+                    }
                 }
-                // 创建与登记共用关闭闸锁；关闭返回后，排队的旧许可不可能再启动。
-                rootProcessFactory.create(execution.permit.command).also {
-                    execution.process = it
-                    observeLocked(repository.state.value)
-                }
+            }
+            if (process == null) {
+                finish(execution, RootCommandResult("", EXIT_DISABLED))
+                return
             }
             if (execution.result != null) return
             val output = CommandOutput()
@@ -240,21 +196,14 @@ class RootCommandManager internal constructor(
         }
     }
 
-    private fun observeLocked(next: RootAccessState) {
-        if (observedState != next) {
-            observedState = next
-            revokeAllLocked()
-        }
-    }
-
     private fun revokeAllLocked() {
         permits.clear()
         active.toList().forEach { finish(it, RootCommandResult("", EXIT_INTERRUPTED)) }
     }
 
     private fun finish(execution: ManagedCommand, result: RootCommandResult) {
-        synchronized(gate) {
-            if (execution.result != null) return
+        authority.withLock {
+            if (execution.result != null) return@withLock
             execution.result = result
             active.remove(execution)
             execution.process?.let { runCatching { rootProcessFactory.destroy(it) } }

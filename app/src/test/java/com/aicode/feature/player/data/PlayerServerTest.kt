@@ -1,14 +1,37 @@
 package com.aicode.feature.player.data
 
+import com.aicode.feature.agent.domain.container.ChrootInstance
+import com.aicode.feature.agent.domain.container.ContainerProfile
+import com.aicode.feature.agent.domain.container.LocalContainerRuntime
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeAuthorizationRequired
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeCommands
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwner
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwnerKind
+import com.aicode.feature.agent.domain.memory.ProjectMemoryCapture
+import com.aicode.feature.agent.domain.memory.ProjectMemoryIdentity
 import com.aicode.feature.player.domain.PlayerItem
 import com.aicode.feature.player.domain.PlayerRequest
 import com.aicode.feature.workspace.domain.FileEntry
+import com.aicode.feature.workspace.domain.FileAccessProvider
+import com.aicode.feature.workspace.domain.LocalFileAccess
+import com.aicode.feature.workspace.domain.LocalFolderGrantRepository
+import com.aicode.feature.workspace.domain.LocalFolderSnapshot
+import com.aicode.feature.workspace.domain.RemoteSftpFileAccess
+import com.aicode.feature.workspace.domain.WorkspaceExecutionContextFactory
+import com.aicode.feature.workspace.domain.WorkspacePathMapper
+import com.aicode.feature.workspace.domain.model.WorkspaceType
+import com.aicode.feature.settings.data.repository.ContainerProfileSnapshot
+import com.aicode.feature.settings.data.repository.ContainerSettingsRepository
+import com.aicode.feature.settings.data.repository.ExecutionModeHolder
+import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.mockkConstructor
+import io.mockk.spyk
 import io.mockk.unmockkConstructor
 import io.mockk.verify
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -20,6 +43,7 @@ import org.junit.Assert.*
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
+import java.io.File
 import java.io.IOException
 import java.io.InputStream
 import java.net.Socket
@@ -58,6 +82,118 @@ class PlayerServerTest {
         coVerify(exactly = 0) { fixture.executionFactory.freeze(any()) }
     }
 
+    @Test fun httpMediaAndNetworkCatalogRequestsNeverCaptureAnUnauthorizedActiveChroot(): Unit = runBlocking {
+        val f = DeniedChrootWorkspace()
+        val catalog = buildJsonObject { put("eps", JsonArray(emptyList())) }
+        every { f.base.backend.apiSeries(any(), any(), any(), any()) } returns catalog
+        every { f.base.backend.detail("fixture", "42", any()) } returns catalog
+        val assets = mockk<android.content.res.AssetManager>()
+        every { f.base.context.assets } returns assets
+        every { assets.open(any()) } answers { "network player asset".byteInputStream() }
+        val requests = listOf(
+            PlayerRequest(mode = "embed", src = "HTTPS://cdn.example/a.mp4"),
+            PlayerRequest(mode = "series", items = listOf(PlayerItem("One", "https://cdn.example/one.mp4"),
+                PlayerItem("Two", "http://cdn.example/two.mp4"))),
+            PlayerRequest(mode = "series", api = "https://catalog.example/api", query = "title"),
+            PlayerRequest(mode = "series", videoSources = listOf("fixture"), videoId = "42"),
+        )
+        val server = f.server()
+        for (request in requests) {
+            server.createSession(request, f.owner).use { session ->
+                val prefix = playerSessionPrefix(session)
+                assertTrue(playerHttp(session, URI(session.url).path).startsWith("HTTP/1.1 200"))
+                val config = playerHttp(session, prefix + "config.js")
+                assertTrue(config.startsWith("HTTP/1.1 200"))
+                assertTrue(config.contains("window.__AJIU_STATE_NAMESPACE__=\"${stateNamespaceHash("network")}\""))
+                assertTrue(playerHttp(session, prefix + "api/catalog").startsWith("HTTP/1.1 200"))
+                assertTrue(playerHttp(session, prefix + "api/library").startsWith("HTTP/1.1 503"))
+                assertTrue(playerHttp(session, prefix + "local?path=" + encodeQuery("~/workspace/a.mp4")).startsWith("HTTP/1.1 503"))
+                assertTrue(playerHttp(session, prefix + "files/tilde/workspace/a.mp4").startsWith("HTTP/1.1 503"))
+            }
+        }
+        coVerify(exactly = 0) { f.factory.freezeForPaths(any(), any(), any(), any()) }
+        coVerify(exactly = 0) { f.runtime.capture(any(), any(), any(), any(), any(), any()) }
+        coVerify(exactly = 0) { f.base.identityResolver.capture(any(), any(), any()) }
+        verify(exactly = 0) { f.runtime.fileAccess(any()) }
+        verify(exactly = 0) { f.local.captureWorkspaceSource() }
+    }
+
+    @Test fun explicitLocalAndMixedMediaCannotCreateANetworkSessionAfterChrootAuthorizationFailure(): Unit = runBlocking {
+        val f = DeniedChrootWorkspace()
+        val server = f.server()
+        val requests = listOf(
+            PlayerRequest(mode = "embed", src = "~/workspace/a.mp4"),
+            PlayerRequest(mode = "series", items = listOf(PlayerItem("Local", "~/workspace/a.mp4"))),
+            PlayerRequest(mode = "series", src = "https://cdn.example/a.mp4",
+                items = listOf(PlayerItem("Local", "~/workspace/a.mp4"))),
+            PlayerRequest(mode = "series", src = "~/workspace/a.mp4",
+                items = listOf(PlayerItem("Network", "https://cdn.example/a.mp4"))),
+            PlayerRequest(mode = "series", api = "https://catalog.example/api", query = "title",
+                items = listOf(PlayerItem("Local", "~/workspace/a.mp4"))),
+        )
+        for (request in requests) {
+            assertPropagated(f.failure, runCatching { server.createSession(request, f.owner) }.exceptionOrNull())
+            assertTrue(activeSessions(server).isEmpty())
+        }
+        coVerify(exactly = requests.size) { f.runtime.capture(any(), any(), any(), f.owner, any(), any()) }
+        verify(exactly = 0) { f.runtime.fileAccess(any()) }
+        verify(exactly = 0) { f.base.context.getSharedPreferences(any(), any()) }
+        assertTrue(temporary.root.listFiles().isNullOrEmpty())
+    }
+
+    @Test fun emptyIndexKeepsNetworkUiWhenOnlyItsOptionalFileCapabilityThrowsIOException(): Unit = runBlocking {
+        val f = DeniedChrootWorkspace()
+        val server = f.server()
+        for (failure in listOf(LocalRuntimeAuthorizationRequired(), IOException("Workspace unavailable"))) {
+            f.failure = failure
+            server.createSession(PlayerRequest(), f.owner).use { session ->
+                val prefix = playerSessionPrefix(session)
+                assertTrue(playerHttp(session, prefix + "config.js").startsWith("HTTP/1.1 200"))
+                assertTrue(playerHttp(session, prefix + "api/library").startsWith("HTTP/1.1 503"))
+            }
+            assertTrue(activeSessions(server).isEmpty())
+        }
+        coVerify(exactly = 2) { f.runtime.capture(any(), any(), any(), f.owner, any(), any()) }
+        verify(exactly = 0) { f.runtime.fileAccess(any()) }
+    }
+
+    @Test fun optionalIndexDoesNotSwallowCancellationSecurityOrAssertionFailures(): Unit = runBlocking {
+        val f = DeniedChrootWorkspace()
+        val server = f.server()
+        for (failure in listOf(CancellationException("Source changed"), SecurityException("Denied"), AssertionError("Invariant"))) {
+            f.failure = failure
+            assertPropagated(failure, runCatching { server.createSession(PlayerRequest(), f.owner) }.exceptionOrNull())
+            assertTrue(activeSessions(server).isEmpty())
+        }
+        verify(exactly = 0) { f.base.context.getSharedPreferences(any(), any()) }
+        verify(exactly = 0) { f.runtime.fileAccess(any()) }
+    }
+
+    @Test fun networkOnlyCreationStillChecksItsUiSourceAndClosesARejectedSession(): Unit = runBlocking {
+        val f = DeniedChrootWorkspace()
+        val server = f.server()
+        for (rejectAt in listOf(1, 2, 4)) {
+            var checks = 0
+            var closed = false
+            val failure = CancellationException("UI source closed")
+            val result = runCatching {
+                server.createSession(PlayerRequest(mode = "embed", src = "https://cdn.example/a.mp4"), f.owner) {
+                    checks++
+                    if (checks == rejectAt) {
+                        activeSessions(server).singleOrNull()?.onClosed { closed = true }
+                        throw failure
+                    }
+                }
+            }
+            assertPropagated(failure, result.exceptionOrNull())
+            assertEquals(rejectAt, checks)
+            assertTrue(activeSessions(server).isEmpty())
+            if (rejectAt == 4) assertTrue(closed)
+        }
+        coVerify(exactly = 0) { f.factory.freezeForPaths(any(), any(), any(), any()) }
+        coVerify(exactly = 0) { f.runtime.capture(any(), any(), any(), any(), any(), any()) }
+    }
+
     @Test fun requestItemsAreReturnedByCatalogWithoutQueryingConfiguredSites(): Unit = runBlocking {
         val fixture = PlayerServerFixture(temporary.root)
         val item = PlayerItem("Song", "https://cdn.example/song.mp3", "audio")
@@ -81,6 +217,7 @@ class PlayerServerTest {
         val fixture = PlayerServerFixture(temporary.root, access)
         fixture.server().createSession(PlayerRequest()).use { session ->
             val prefix = playerSessionPrefix(session)
+            assertTrue(playerHttp(session, prefix + "config.js").contains("window.__AJIU_STATE_NAMESPACE__=\"${fixture.namespace}\""))
             val route = prefix + "local?path=" + encodeQuery("~/workspace/a.mp4")
             val head = playerHttp(session, route, "HEAD")
             assertTrue(head.startsWith("HTTP/1.1 200"))
@@ -280,6 +417,59 @@ class PlayerServerTest {
             unclaimed?.close()
             owner.cancel()
         }
+    }
+
+    private fun assertPropagated(expected: Throwable, actual: Throwable?) {
+        assertNotNull(actual)
+        assertEquals(expected.javaClass, actual!!.javaClass)
+        assertEquals(expected.message, actual.message)
+        assertTrue("The thrown exception must remain in the recovered cause chain",
+            generateSequence(actual) { it.cause }.take(16).any { it === expected })
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    private fun activeSessions(server: PlayerServer): Set<PlayerSession> {
+        val sessions = PlayerServer::class.java.getDeclaredField("sessions").apply { isAccessible = true }.get(server) as MutableSet<PlayerSession>
+        return synchronized(sessions) { sessions.toSet() }
+    }
+
+    private inner class DeniedChrootWorkspace {
+        private val access = mockk<FileAccessProvider> {
+            every { cacheIdentity() } returns "active-chroot-fixture"
+        }
+        val base = PlayerServerFixture(temporary.root, access)
+        val local = mockk<LocalFileAccess>()
+        private val remote = mockk<RemoteSftpFileAccess>()
+        private val settings = mockk<ContainerSettingsRepository>()
+        private val grants = mockk<LocalFolderGrantRepository>()
+        val runtime = mockk<LocalRuntimeCommands>()
+        val owner = RuntimeOwner(RuntimeOwnerKind.FILE, "player-server-ui-fixture")
+        var failure: Throwable = LocalRuntimeAuthorizationRequired()
+        val profile = ContainerProfile.BUILTIN_ALPINE.copy(
+            id = "chroot-player", isBuiltin = false, localRuntime = LocalContainerRuntime.CHROOT,
+            chrootInstance = ChrootInstance("0123456789abcdef01234567", 1, 2, 3)
+        )
+        private val snapshot = ContainerProfileSnapshot(profile.id, profile.id, listOf(profile), 0, 3, Any())
+        val factory = spyk(WorkspaceExecutionContextFactory(access, ExecutionModeHolder(), local, remote, settings, grants, runtime))
+
+        init {
+            base.current.value = requireNotNull(base.current.value).copy(type = WorkspaceType.INTERNAL)
+            coEvery { base.identityResolver.capture("/work/project", any(), any()) } returns ProjectMemoryCapture(
+                ProjectMemoryIdentity("local_proot", projectRoot = "/work/project", profileId = profile.id)
+            ) {}
+            coEvery { grants.awaitReady() } returns Unit
+            every { grants.snapshot() } returns LocalFolderSnapshot.EMPTY
+            coEvery { settings.captureProfileSnapshot() } returns snapshot
+            every { settings.checkProfileSnapshot(snapshot) } returns Unit
+            every { local.captureWorkspaceSource() } returns WorkspacePathMapper.WorkspaceSource(File("/work/project"), "/work/project")
+            every { local.checkWorkspaceSource(any()) } returns Unit
+            coEvery { runtime.capture(any(), any(), any(), any(), any(), any()) } coAnswers {
+                arg<() -> Unit>(5).invoke()
+                throw failure
+            }
+        }
+
+        fun server() = PlayerServer(base.context, base.workspaceRepository, base.identityResolver, factory, base.backend, PlayerCopyBudget())
     }
 
     @Test fun closeRevokesListenerAndIncompleteClientConnections(): Unit = runBlocking {

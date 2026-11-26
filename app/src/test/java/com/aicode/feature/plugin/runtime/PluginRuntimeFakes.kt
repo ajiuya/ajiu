@@ -89,7 +89,7 @@ internal class PluginFakeProcessFactory : PluginRuntimeProcessFactory {
     var beforeStart: (() -> Unit)? = null
     override suspend fun captureProfile(): ContainerProfile = ContainerProfile.BUILTIN_ALPINE
     override fun containerPath(file: File): String = file.absolutePath
-    override fun start(launch: PluginLocalLaunch): Process {
+    override suspend fun start(launch: PluginLocalLaunch): Process {
         beforeStart?.invoke()
         return PluginFakeProcess().also { launches.add(launch); processes.add(it); check(started.trySend(it).isSuccess) }
     }

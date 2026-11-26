@@ -49,6 +49,7 @@ class FilePreviewViewModelTest {
     @Before
     fun setUp() {
         Dispatchers.setMain(dispatcher)
+        every { factory.close() } just Runs
         viewModel = FilePreviewViewModel(factory)
         store.put("file-preview", viewModel)
     }
@@ -77,7 +78,7 @@ class FilePreviewViewModelTest {
         val oldSource = source(oldValid)
         val newSource = source(newValid)
         val gate = gatedOpen(oldRequest) { oldSource }
-        coEvery { factory.open(newRequest) } returns newSource
+        coEvery { factory.open(newRequest, any()) } returns newSource
         val observed = observeLoads()
         runCurrent()
 
@@ -109,8 +110,8 @@ class FilePreviewViewModelTest {
         runCurrent()
         assertEquals(expected, viewModel.load.value)
         assertEquals(listOf(PreviewLoad.Loading, expected), observed)
-        coVerify(exactly = 1) { factory.open(oldRequest) }
-        coVerify(exactly = 1) { factory.open(newRequest) }
+        coVerify(exactly = 1) { factory.open(oldRequest, any()) }
+        coVerify(exactly = 1) { factory.open(newRequest, any()) }
     }
 
     @Test
@@ -118,7 +119,7 @@ class FilePreviewViewModelTest {
         val request = PreviewRequest("report.md", "Report", "text/markdown", "/cache/report.copy")
         val valid = MutableStateFlow(true)
         val source = source(valid)
-        coEvery { factory.open(request) } returns source
+        coEvery { factory.open(request, any()) } returns source
         val observed = observeLoads()
         runCurrent()
 
@@ -146,7 +147,7 @@ class FilePreviewViewModelTest {
         runCurrent()
         assertEquals(listOf(PreviewLoad.Loading, ready, failed, PreviewLoad.Loading), observed)
         verify(exactly = 1) { source.close() }
-        coVerify(exactly = 1) { factory.open(request) }
+        coVerify(exactly = 1) { factory.open(request, any()) }
     }
 
     @Test
@@ -181,7 +182,7 @@ class FilePreviewViewModelTest {
         assertSame(PreviewLoad.Loading, viewModel.load.value)
         assertEquals(listOf(PreviewLoad.Loading), observed)
         verify(exactly = 1) { source.close() }
-        coVerify(exactly = 1) { factory.open(request) }
+        coVerify(exactly = 1) { factory.open(request, any()) }
     }
 
     @Test
@@ -190,7 +191,7 @@ class FilePreviewViewModelTest {
         val failedRequest = PreviewRequest("missing.html", "Missing", "text/html", "/cache/missing.copy")
         val oldValid = MutableStateFlow(true)
         val oldSource = source(oldValid)
-        coEvery { factory.open(oldRequest) } returns oldSource
+        coEvery { factory.open(oldRequest, any()) } returns oldSource
         val gate = gatedOpen(failedRequest) { throw IOException("Preview unavailable") }
         val observed = observeLoads()
         runCurrent()
@@ -219,14 +220,40 @@ class FilePreviewViewModelTest {
         assertEquals(failed, viewModel.load.value)
         assertEquals(listOf(PreviewLoad.Loading, ready, PreviewLoad.Loading, failed), observed)
         verify(exactly = 1) { oldSource.close() }
-        coVerify(exactly = 1) { factory.open(oldRequest) }
-        coVerify(exactly = 1) { factory.open(failedRequest) }
+        coVerify(exactly = 1) { factory.open(oldRequest, any()) }
+        coVerify(exactly = 1) { factory.open(failedRequest, any()) }
 
         oldValid.value = true
         oldValid.value = false
         runCurrent()
         assertEquals(failed, viewModel.load.value)
         assertEquals(listOf(PreviewLoad.Loading, ready, PreviewLoad.Loading, failed), observed)
+    }
+
+    @Test
+    fun cachedReplacementClosesThePreviousAuthorizationSourceBeforeOpening() = runTest(dispatcher) {
+        val guest = PreviewRequest("guest.md")
+        val cached = PreviewRequest("cached.md", cachedPath = "/cache/cached.md")
+        val events = mutableListOf<String>()
+        coEvery { factory.open(guest, any()) } throws IOException("Authorization required")
+        every { factory.close() } answers { events += "close" }
+        coEvery { factory.open(cached, any()) } answers {
+            events += "open"
+            source(MutableStateFlow(true))
+        }
+        val first = open(guest)
+        runCurrent()
+        awaitIo { first.join() }
+        runCurrent()
+        assertTrue(viewModel.load.value is PreviewLoad.Failed)
+        assertTrue(events.isEmpty())
+        val second = open(cached)
+        assertEquals(listOf("close"), events)
+        runCurrent()
+        awaitIo { second.join() }
+        runCurrent()
+        assertEquals(listOf("close", "open"), events)
+        assertTrue(viewModel.load.value is PreviewLoad.Ready)
     }
 
     private fun source(valid: MutableStateFlow<Boolean>): PreviewSource = mockk<PreviewSource>().also { source ->
@@ -246,7 +273,7 @@ class FilePreviewViewModelTest {
 
     private fun gatedOpen(request: PreviewRequest, result: () -> PreviewSource): OpenGate = OpenGate().also { gate ->
         gates += gate
-        coEvery { factory.open(request) } coAnswers {
+        coEvery { factory.open(request, any()) } coAnswers {
             withContext(NonCancellable) {
                 gate.entered.complete(Unit)
                 gate.release.await()

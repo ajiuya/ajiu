@@ -47,7 +47,9 @@ class RouteCapture internal constructor(
         val root = if (local) snapshot.rootFor(path) else null
         val backend = if (local) host else default
         val namespace = when {
-            local || execution.mode == ExecutionMode.LOCAL_PROOT -> "host"
+            local -> "host"
+            execution.localRuntimeCapture != null -> "chroot:${execution.localRuntimeCapture.digest}"
+            execution.mode == ExecutionMode.LOCAL_PROOT -> "host"
             else -> "remote:" + (execution.remoteSource?.identity?.generation?.toString() ?: execution.fileCacheIdentity)
         }
         val identity = root?.let { "local-folder:${it.grant.id}:${it.grant.epoch}:${snapshot.revision}" }
@@ -102,7 +104,10 @@ class RouteCapture internal constructor(
             )
         }
         return execution.useCaptured {
-            listOfNotNull(execution.remoteSource?.workspaceRoot, "/").flatMap { root ->
+            val runtime = execution.localRuntimeCapture
+            val roots = if (runtime != null) listOf("/", "/root/workspace", "/root/.aicode")
+                else listOfNotNull(execution.remoteSource?.workspaceRoot, "/")
+            roots.flatMap { root ->
                 listOf(execution.fileAccess.resolvePath(root, false), execution.fileAccess.resolvePath(root, true))
             }
         }
@@ -174,7 +179,7 @@ private class CapturedFileAccess(
         var opened: java.io.InputStream? = null
         return try {
             val input = use { backend.openRead(path, expectedCacheIdentity).also { opened = it } }
-            identityCheckedRead(input) { use {} }
+            execution.protectRead(identityCheckedRead(input) { use {} })
         } catch (failure: Throwable) {
             runCatching { opened?.close() }.exceptionOrNull()?.let(failure::addSuppressed)
             throw failure

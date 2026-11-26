@@ -58,7 +58,9 @@ internal class PluginConversationFixture(root: File) {
         data.mkdirs()
         return PluginInvocationContext(capture, execution, workspace, session, data,
             merge(changes, manager.snapshot.map { Unit }),
-            sourceIdentity = identity, background = background) {
+            sourceIdentity = identity, background = background,
+            runtimeOwner = com.aicode.feature.agent.domain.container.runtime.RuntimeOwner(
+                com.aicode.feature.agent.domain.container.runtime.RuntimeOwnerKind.PLUGIN, "conversation-test:${capture.id}:${session ?: "background"}")) {
             if (!current) throw kotlinx.coroutines.CancellationException("Fixture source changed")
         }
     }

@@ -1,6 +1,9 @@
 package com.aicode.feature.plugin.runtime
 
 import com.aicode.feature.agent.domain.container.CommandEngine
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwner
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwnerKind
+import com.aicode.feature.plugin.data.PluginFiles
 import com.aicode.feature.agent.domain.container.RemoteSshConnection
 import com.aicode.feature.agent.domain.container.RemoteConnectionIdentity
 import com.aicode.feature.agent.domain.model.AgentContext
@@ -63,11 +66,15 @@ class PluginHostGateway @Inject constructor(
 ) {
     private val environmentChanges = combine(workspaces.selection, modes.modeSelectionRevisions,
         settings.activeProfileSelectionRevisions, connection.identityState, localFolders.snapshots) { _, _, _, _, _ -> Unit }
-    private val changes: Flow<Unit> = merge(environmentChanges, plugins.snapshot.map { Unit }, capabilities.grants.map { Unit })
-    private data class SourceIdentity(val workspace: Any, val mode: ExecutionMode, val modeRevision: Long,
-        val profileRevision: Long, val rootsRevision: Long, val remote: RemoteConnectionIdentity?, val files: String?)
+    private val changes: Flow<Unit> = merge(environmentChanges, settings.profileConfigurationRevisions.map { Unit },
+        plugins.snapshot.map { Unit }, capabilities.grants.map { Unit })
+    private data class SourceIdentity(val pluginId: String, val installRevision: String, val contentHash: String,
+        val activationEpoch: Long, val workspace: Any, val sessionId: String?, val mode: ExecutionMode, val modeRevision: Long,
+        val profileRevision: Long, val configurationRevision: Long, val rootsRevision: Long, val remote: RemoteConnectionIdentity?)
     private data class BackgroundIdentity(val id: String, val revision: String, val hash: String, val epoch: Long)
     private val backgroundAuthorities = linkedMapOf<BackgroundIdentity, Any>()
+    private var workspaceSourceSelection: Any? = null
+    private var workspaceSourceEpoch = 0L
 
     suspend fun captureContext(
         capture: PluginCapture, sessionId: String? = null, workspacePath: String? = null,
@@ -79,6 +86,7 @@ class PluginHostGateway @Inject constructor(
         val mode = modes.currentMode()
         val modeRevision = modes.modeSelectionRevision
         val profileRevision = settings.activeProfileSelectionRevision
+        val configurationRevision = settings.profileConfigurationRevision
         val remote = if (mode == ExecutionMode.REMOTE_SSH) connection.identityState.value else null
         val selection = workspaces.selection.value
         val selected = selection.workspace?.takeIf { it.available }?.path.orEmpty()
@@ -86,28 +94,46 @@ class PluginHostGateway @Inject constructor(
         if (fixed != selected || agentContext != null && (fixed.isBlank() || sessionId.isNullOrBlank())) {
             throw PluginHostException("CONTEXT_CHANGED", "The requested workspace is not selected")
         }
-        val execution = if (fixed.isEmpty()) null else executionFactory.freeze(agentContext?.projectMemoryCapture)
-        if (execution != null) {
-            val matches = when (mode) {
-                ExecutionMode.LOCAL_PROOT -> execution.localMapping?.workspaceRoot == java.io.File(fixed).canonicalFile
-                ExecutionMode.REMOTE_SSH -> execution.remoteSource?.let { it.workspaceRoot.trimEnd('/') == fixed.trimEnd('/') && it.identity == remote } == true
+        val workspaceEpoch = synchronized(backgroundAuthorities) {
+            if (workspaceSourceSelection !== selection) {
+                workspaceSourceSelection = selection
+                workspaceSourceEpoch++
             }
-            if (execution.mode != mode || !matches) throw PluginHostException("CONTEXT_CHANGED", "Workspace binding does not match the selected root")
+            workspaceSourceEpoch
         }
-        val definition = agentContext?.agentDefinition
-        val stableTarget = listOf(mode.name, fixed,
-            execution?.localMapping?.let { com.aicode.feature.plugin.data.PluginFiles.sha256(it.profile.toString().toByteArray(Charsets.UTF_8)) }.orEmpty(),
-            if (remote == null) "" else connection.config?.let { "${it.host}:${it.port}:${it.username}:${remote.home}" }.orEmpty()).joinToString("|")
-        PluginInvocationContext(capture, execution, fixed, sessionId, plugins.dataDirectory(capture.id), changes,
-            { name -> definition?.allowsTool(name) != false },
-            SourceIdentity(selection, mode, modeRevision, profileRevision, grants.revision, remote, execution?.fileCacheIdentity), persistentIdentity = stableTarget) {
+        val source = SourceIdentity(capture.id, capture.installRevision, capture.contentHash, capture.activationEpoch,
+            selection, sessionId, mode, modeRevision, profileRevision, configurationRevision, grants.revision, remote)
+        val owner = RuntimeOwner(RuntimeOwnerKind.PLUGIN, PluginFiles.sha256(listOf(capture.id, capture.installRevision,
+            capture.contentHash, capture.activationEpoch, fixed, sessionId, mode.name, modeRevision, profileRevision,
+            configurationRevision, grants.revision, remote, workspaceEpoch).joinToString("\u0000").toByteArray(Charsets.UTF_8)))
+        val checkSource = {
+            capture.checkActive()
             if (modes.currentMode() != mode || modes.modeSelectionRevision != modeRevision ||
-                settings.activeProfileSelectionRevision != profileRevision || workspaces.selection.value !== selection ||
-                mode == ExecutionMode.REMOTE_SSH && connection.identityState.value != remote) {
+                settings.activeProfileSelectionRevision != profileRevision || settings.profileConfigurationRevision != configurationRevision ||
+                workspaces.selection.value !== selection || mode == ExecutionMode.REMOTE_SSH && connection.identityState.value != remote) {
                 throw CancellationException("Plugin execution source changed")
             }
             grants.checkCurrent()
-        }.also { it.checkIntegrity() }
+        }
+        val execution = if (fixed.isEmpty()) null else executionFactory.freeze(agentContext?.projectMemoryCapture,
+            runtimeOwner = owner, checkSource = checkSource)
+        if (execution != null) {
+            val matches = when (mode) {
+                ExecutionMode.LOCAL_PROOT -> execution.localRuntimeCapture?.workspacePath?.let {
+                    java.io.File(it).canonicalFile == java.io.File(fixed).canonicalFile
+                } ?: (execution.localMapping?.workspaceRoot == java.io.File(fixed).canonicalFile)
+                ExecutionMode.REMOTE_SSH -> execution.remoteSource?.let { it.workspaceRoot.trimEnd('/') == fixed.trimEnd('/') && it.identity == remote } == true
+            }
+            if (execution.mode != mode || execution.runtimeOwner != owner || !matches) throw PluginHostException("CONTEXT_CHANGED", "Workspace binding does not match the selected root")
+        }
+        val definition = agentContext?.agentDefinition
+        val stableTarget = listOf(mode.name, fixed,
+            (execution?.profileSnapshot?.activeProfile ?: execution?.localMapping?.profile)?.let {
+                PluginFiles.sha256(it.toString().toByteArray(Charsets.UTF_8)) }.orEmpty(),
+            if (remote == null) "" else connection.config?.let { "${it.host}:${it.port}:${it.username}:${remote.home}" }.orEmpty()).joinToString("|")
+        PluginInvocationContext(capture, execution, fixed, sessionId, plugins.dataDirectory(capture.id), changes,
+            { name -> definition?.allowsTool(name) != false },
+            source, persistentIdentity = stableTarget, runtimeOwner = owner, sourceCheck = checkSource).also { it.checkIntegrity() }
     }
 
     suspend fun captureBackgroundContext(capture: PluginCapture, capability: PluginCapability? = null): PluginInvocationContext = withContext(Dispatchers.IO) {
@@ -127,9 +153,11 @@ class PluginHostGateway @Inject constructor(
         PluginInvocationContext(capture, null, "", null, plugins.dataDirectory(capture.id),
             merge(plugins.snapshot.map { Unit }, capabilities.grants.map { Unit }),
             { name -> name !in setOf("Bash", "terminal", "Root", "Shizuku", "readFile", "writeFile", "editFile", "list", "search") },
-            "background:${capture.id}:${capture.installRevision}:${capture.activationEpoch}", background = true,
+            identity, background = true,
             persistentIdentity = "plugin-background:${capture.id}:${capture.installRevision}",
-            allowIdleCallbacks = auto, backgroundAuthority = authority) {
+            allowIdleCallbacks = auto, backgroundAuthority = authority,
+            runtimeOwner = RuntimeOwner(RuntimeOwnerKind.PLUGIN, PluginFiles.sha256(
+                listOf("background", capture.id, capture.installRevision, capture.contentHash, capture.activationEpoch).joinToString("\u0000").toByteArray(Charsets.UTF_8)))) {
             if (capability != null && !capabilities.checkGranted(capture, capability) ||
                 auto && !capabilities.checkGranted(capture, PluginCapability.AUTOSTART)) throw CancellationException("Background capability revoked")
         }

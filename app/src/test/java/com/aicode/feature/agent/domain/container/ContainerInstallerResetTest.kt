@@ -121,6 +121,35 @@ class ContainerInstallerResetTest {
         assertTrue("自定义容器的 PROOT_TMP_DIR 不能随内置容器重置而消失", customTmp.isDirectory)
     }
 
+    @Test
+    fun chrootProfileCannotUseProotInstallResetDeleteOrPaths() = runTest {
+        val profile = localProfile("chroot-1").copy(localRuntime = LocalContainerRuntime.CHROOT)
+        val stray = fakeRootfs(File(filesDir, "rootfs_chroot-1"), ".installed_custom")
+        val builtin = fakeRootfs(File(filesDir, "rootfs"), ".installed")
+        osDetector.cacheOs(profile.id, "alpine")
+        val progress = mutableListOf<Int>()
+
+        suspend fun rejected(block: suspend () -> Unit) {
+            try {
+                block()
+                throw AssertionError("CHROOT entered the PRoot lifecycle")
+            } catch (_: IllegalArgumentException) {
+                assertTrue(stray.isDirectory)
+                assertTrue(builtin.isDirectory)
+                assertEquals("alpine", osDetector.cachedOs(profile.id))
+            }
+        }
+
+        assertFalse(installer.isInstalledFor(profile))
+        rejected { installer.rootfsDirFor(profile) }
+        rejected { installer.prootTmpDirFor(profile) }
+        rejected { installer.installRootfsIfNeed(profile) }
+        rejected { installer.resetRootfs(profile) { progress += it } }
+        rejected { installer.deleteCustomRootfs(profile) { progress += it } }
+        rejected { installer.resetRootfs(profile.copy(isBuiltin = true)) }
+        assertTrue(progress.isEmpty())
+    }
+
     private fun localProfile(id: String) = ContainerProfile(
         id = id,
         name = id,

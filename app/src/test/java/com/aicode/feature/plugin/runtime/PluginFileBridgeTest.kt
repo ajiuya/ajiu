@@ -118,9 +118,10 @@ class PluginFileBridgeTest {
     }
 
     private fun invocation(execution: WorkspaceExecutionContext?, root: String = execution?.remoteSource?.workspaceRoot
-        ?: execution?.localMapping?.workspaceRoot?.path.orEmpty()): PluginInvocationContext {
+        ?: execution?.localRuntimeCapture?.workspacePath ?: execution?.localMapping?.workspaceRoot?.path.orEmpty()): PluginInvocationContext {
         val revision = selection
-        return PluginInvocationContext(capture, execution, root, "file-test", data, emptyFlow()) {
+        return PluginInvocationContext(capture, execution, root, "file-test", data, emptyFlow(),
+            sourceIdentity = execution?.fileCacheIdentity ?: "private-data", runtimeOwner = execution?.runtimeOwner) {
             if (selection != revision) throw CancellationException("Selected workspace changed")
         }
     }
@@ -477,6 +478,103 @@ class PluginFileBridgeTest {
         assertEquals("false", call("fs.stat", path(data.resolve("private").path)).value("exists"))
         failWith("PATH_FORBIDDEN") { call("fs.delete", path("/"), authorize = noPrompt) }
         assertEquals("container system", rootfs.resolve("etc/fixture").readText())
+    }
+
+    @Test fun chrootStatListReadAndStagedWritesUseGuestPathsAndKeepPrivateDataOnHost() = runBlocking<Unit> {
+        val fixture = PluginChrootFileFixture(temporary.newFolder("guest"), workspace, snapshot())
+        val ctx = invocation(fixture.execution)
+        fixture.workspace.resolve("file").writeText("guest content")
+        workspace.resolve("file").writeText("different host content")
+        fixture.guest.resolve("root/note").writeText("guest home")
+        var prompts = 0
+        val authorize: FilePermissionCheck = { _, _, _, _ -> prompts++; assertSame(fixture.execution, WorkspaceExecutionContext.current()) }
+        assertEquals("true", call("fs.stat", path("file"), ctx, authorize).value("exists"))
+        assertEquals(listOf("file"), call("fs.list", path("~/workspace"), ctx, authorize).names())
+        for (name in listOf("file", "~/workspace/file", "/root/workspace/file")) {
+            assertEquals("guest content", call("fs.read", path(name), ctx, authorize).value("content"))
+        }
+        assertEquals("guest home", call("fs.read", path("~/note"), ctx, authorize).value("content"))
+        call("fs.write", text("new/child", "new guest bytes"), ctx, authorize)
+        assertEquals("new guest bytes", fixture.workspace.resolve("new/child").readText())
+        assertFalse(workspace.resolve("new").exists())
+        assertTrue(fixture.writes.any { "/.aicode-transfer-" in it && it.endsWith("/payload/child") })
+        assertEquals(7, prompts)
+        assertFalse(fixture.workspace.listFiles()!!.any { it.name.startsWith(".aicode-transfer-") })
+        assertEquals(fixture.sessions, fixture.closedSessions)
+        val sessions = fixture.sessions
+        data.resolve("private").writeText("private host data")
+        assertEquals("private host data", call("fs.read", path("data://private"), ctx, noPrompt).value("content"))
+        assertEquals(sessions, fixture.sessions)
+        assertEquals("different host content", workspace.resolve("file").readText())
+    }
+
+    @Test fun chrootNativeDenialReadOnlyGrantAndPluginManagementBoundariesRemainEnforced() = runBlocking<Unit> {
+        val fixture = PluginChrootFileFixture(temporary.newFolder("guest"), workspace, snapshot())
+        val ctx = invocation(fixture.execution)
+        fixture.workspace.resolve("file").writeText("keep")
+        failWith("USER_REJECTED") { call("fs.write", text("file", "bad"), ctx) { _, _, _, _ ->
+            throw PluginHostException("USER_REJECTED", "Native approval denied")
+        } }
+        assertEquals("keep", fixture.workspace.resolve("file").readText())
+        assertEquals(0, fixture.stages)
+        val denied = PluginChrootFileFixture(temporary.newFolder("denied-guest"), workspace, snapshot(available = false))
+        failWith("FILE_READ_ONLY") { call("fs.write", text("$virtual/device", "bad"), invocation(denied.execution), noPrompt) }
+        assertTrue(granted.list()!!.isEmpty())
+        val control = fixture.guest.resolve("root/.aicode/plugins/installed/other").apply { parentFile.mkdirs(); writeText("protected") }
+        for (name in listOf("/root/.aicode/plugins/installed/other", "~/.aicode/plugins/installed/other")) {
+            failWith("PATH_FORBIDDEN") { call("fs.read", path(name), ctx, noPrompt) }
+            failWith("PATH_FORBIDDEN") { call("fs.write", text(name, "bad"), ctx, noPrompt) }
+        }
+        assertEquals("protected", control.readText())
+        failWith("PATH_FORBIDDEN") { call("fs.delete", path("/root"), ctx, noPrompt) }
+        failWith("PATH_CONFLICT") { call("fs.copy", pair("file", "/root/workspace/file"), ctx, noPrompt) }
+    }
+
+    @Test fun chrootSourceChangesAndUnknownCleanupNeverRetryOnTheHostOrAnotherRoot() = runBlocking<Unit> {
+        val fixture = PluginChrootFileFixture(temporary.newFolder("guest"), workspace, snapshot())
+        val ctx = invocation(fixture.execution)
+        fixture.workspace.resolve("existing").writeText("guest keep")
+        workspace.resolve("existing").writeText("host keep")
+        fixture.onPayload = { fixture.sourceCurrent = false }
+        cancelled { call("fs.write", text("existing", "bad"), ctx) }
+        assertEquals("guest keep", fixture.workspace.resolve("existing").readText())
+        assertEquals("host keep", workspace.resolve("existing").readText())
+        val count = fixture.sessions
+        cancelled { call("fs.stat", path("existing"), ctx, noPrompt) }
+        assertEquals(count, fixture.sessions)
+        val other = PluginChrootFileFixture(temporary.newFolder("other-guest"), workspace, snapshot())
+        withContext(fixture.execution) {
+            cancelled { call("fs.write", text("existing", "bad"), invocation(other.execution), noPrompt) }
+        }
+        assertEquals(0, other.sessions)
+        val unknown = PluginChrootFileFixture(temporary.newFolder("unknown-guest"), workspace, snapshot())
+        unknown.workspace.resolve("existing").writeText("before")
+        unknown.failCleanupAfterPayload = true
+        failWith("FILE_IO") { call("fs.write", text("existing", "after"), invocation(unknown.execution)) }
+        assertTrue(unknown.payloadWritten)
+        assertEquals(unknown.sessions, unknown.closedSessions)
+        assertEquals("host keep", workspace.resolve("existing").readText())
+        assertEquals(unknown.sessions, requireNotNull(unknown.sessionsAtUnknownCleanup))
+        assertEquals("after", unknown.workspace.resolve("existing").readText())
+    }
+
+    @Test fun chrootTransfersKeepExistingTreeLimitsAndRejectLinksBeforePublication() = runBlocking<Unit> {
+        val fixture = PluginChrootFileFixture(temporary.newFolder("guest"), workspace, snapshot())
+        val ctx = invocation(fixture.execution)
+        fixture.workspace.resolve("tree/sub").mkdirs()
+        fixture.workspace.resolve("tree/sub/file").writeText("guest")
+        call("fs.copy", pair("tree", "copy"), ctx)
+        call("fs.rename", pair("copy", "moved"), ctx)
+        assertEquals("guest", fixture.workspace.resolve("moved/sub/file").readText())
+        call("fs.delete", path("moved"), ctx)
+        assertFalse(fixture.workspace.resolve("moved").exists())
+        Files.createSymbolicLink(fixture.workspace.resolve("tree/link").toPath(), File("sub/file").toPath())
+        val stages = fixture.stages
+        failWith("FILE_IO") { call("fs.copy", pair("tree", "linked-copy"), ctx) }
+        assertEquals(stages, fixture.stages)
+        assertFalse(fixture.workspace.resolve("linked-copy").exists())
+        assertEquals("guest", fixture.workspace.resolve("tree/sub/file").readText())
+        failWith("PARAM_INVALID") { call("fs.delete", buildJsonObject { put("path", "tree"); put("recursive", true) }, ctx, noPrompt) }
     }
 
     @Test fun remoteRelativeAliasAndAbsoluteFormsReadTheFrozenServerRootNotHome() = runBlocking<Unit> {

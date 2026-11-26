@@ -22,7 +22,7 @@ internal class PluginDependencyTestFixture(root: File) {
     private val factory = object : PluginRuntimeProcessFactory {
         override suspend fun captureProfile() = localProfile
         override fun containerPath(file: File) = file.path
-        override fun start(launch: PluginLocalLaunch): Process {
+        override suspend fun start(launch: PluginLocalLaunch): Process {
             launches += launch
             return onStart(launch)
         }

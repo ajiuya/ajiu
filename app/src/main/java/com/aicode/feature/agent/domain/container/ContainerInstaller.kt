@@ -388,9 +388,14 @@ class ContainerInstaller @Inject constructor(
      * 远程 SSH profile 无本地 rootfs，返回一个占位目录（不会被使用/创建）。
      * 目录隔离——内置与自定义互不共享、互不删除，切回内置时其 rootfs 原封不动。
      */
-    fun rootfsDirFor(profile: ContainerProfile): File =
-        if (profile.isBuiltin) rootfsDir
-        else File(context.filesDir, "rootfs_${profile.id}")
+    fun rootfsDirFor(profile: ContainerProfile): File {
+        requireProotProfile(profile)
+        return if (profile.isBuiltin) rootfsDir else File(context.filesDir, "rootfs_${profile.id}")
+    }
+
+    private fun requireProotProfile(profile: ContainerProfile) {
+        require(!profile.isChroot) { "CHROOT instances must use the identity-bound runtime lifecycle" }
+    }
 
     /** 自定义镜像的已安装标记（独立于内置 .installed，避免混淆）。 */
     private fun customInstalledMarker(profile: ContainerProfile): File =
@@ -399,6 +404,7 @@ class ContainerInstaller @Inject constructor(
     /** 按 [profile] 判断是否已安装就绪：内置走现有版本校验，自定义本地看目录与标记，远程 SSH 恒就绪。 */
     fun isInstalledFor(profile: ContainerProfile): Boolean =
         when {
+            profile.isChroot -> false
             profile.isBuiltin -> isInstalled()
             profile.rootfsSource is RootfsSource.RemoteSsh -> true
             else -> rootfsDirFor(profile).isDirectory && customInstalledMarker(profile).exists()
@@ -414,6 +420,7 @@ class ContainerInstaller @Inject constructor(
         profile: ContainerProfile,
         onProgress: (ContainerInitState) -> Unit = {}
     ) = withContext(Dispatchers.IO) {
+        requireProotProfile(profile)
         if (isInstalledFor(profile)) return@withContext
 
         // rootfs 将被重新解压，容器系统可能变化，清掉旧的识别缓存让下次运行重新检测。
@@ -516,6 +523,7 @@ class ContainerInstaller @Inject constructor(
         profile: ContainerProfile,
         onProgress: (Int) -> Unit = {}
     ) = withContext(Dispatchers.IO) {
+        requireProotProfile(profile)
         // profile 被删除或换镜像，缓存随之作废（重新运行时重新检测）。
         containerOsDetector.clear(profile.id)
         if (profile.isBuiltin) return@withContext
@@ -533,6 +541,7 @@ class ContainerInstaller @Inject constructor(
 
     /** 按 [profile] 统一重置 rootfs：内置走 [resetBuiltinRootfs]，自定义本地删其 rootfs 目录，远程 SSH 无本地数据不操作。 */
     suspend fun resetRootfs(profile: ContainerProfile, onProgress: (Int) -> Unit = {}) {
+        requireProotProfile(profile)
         if (profile.isBuiltin) {
             resetBuiltinRootfs(onProgress)
             return

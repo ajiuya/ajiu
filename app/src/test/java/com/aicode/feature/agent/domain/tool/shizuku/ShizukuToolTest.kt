@@ -8,6 +8,7 @@ import com.aicode.feature.agent.domain.shizuku.ShizukuCommandResult
 import com.aicode.feature.agent.domain.shizuku.ShizukuManager
 import com.aicode.feature.agent.domain.shizuku.ShizukuShellService
 import com.aicode.feature.agent.domain.shizuku.ShizukuState
+import com.aicode.feature.agent.domain.tool.ToolPermissionPolicy
 import com.aicode.feature.agent.domain.tool.ToolResult
 import io.mockk.Runs
 import io.mockk.coEvery
@@ -364,6 +365,7 @@ class ShizukuToolTest {
 
     @Test
     fun approvalContextIsNotExposedInParameterOrModelSchemas() {
+        assertEquals(ToolPermissionPolicy.AUTO_APPROVE, tool.permissionPolicy)
         assertEquals(setOf("command", "timeout", "elevate"), tool.parameters.keys)
         for (schema in listOf(tool.toJsonSchema(), tool.toModelJsonSchema())) {
             val properties = schema["properties"] as Map<*, *>

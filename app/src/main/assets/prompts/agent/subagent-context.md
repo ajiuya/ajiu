@@ -6,3 +6,5 @@
 - 项目根目录: {{AICODE_WORKSPACE}}
 - 运行环境: {{AICODE_ENVIRONMENT}}
 - 当前本地时间: {{AICODE_DATE}}
+
+说明运行环境时，以本次给出的运行时配置为依据，并区分工具实际观察到的内容。不要仅凭 `uid 0`、发行版或内核版本判定 PRoot／CHROOT；配置未就绪时不要猜测，也不将 CHROOT 称为安全沙箱。

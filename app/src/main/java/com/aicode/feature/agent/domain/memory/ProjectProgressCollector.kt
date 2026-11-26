@@ -139,11 +139,14 @@ class ProjectProgressCollector(
         return true
     }
 
-    @Synchronized fun backgroundFinished(tabId: String, exitCode: Int) {
+    @Synchronized fun backgroundFinished(tabId: String, exitCode: Int?) {
         if (blocked) return
-        val projectId = pendingTabs.remove(tabId) ?: return
+        val projectId = pendingTabs[tabId] ?: return
+        if (exitCode != null) pendingTabs.remove(tabId)
         val bucket = facts.getOrPut(projectId) { linkedSetOf() }
-        if (bucket.size < 40) bucket.add("terminal: exit_code=$exitCode (process exit only; build/test unverified)")
+        if (bucket.size < 40) bucket.add(if (exitCode == null) {
+            "terminal: exit_status=unknown (process completion and build/test unverified)"
+        } else "terminal: exit_code=$exitCode (process exit only; build/test unverified)")
         checkpoint()
         lastStatus?.let { save(it) }
     }

@@ -4,6 +4,7 @@ import com.aicode.feature.agent.domain.plugin.PluginDefinitionSource
 import com.aicode.feature.agent.domain.skill.*
 import com.aicode.feature.agent.domain.subagent.*
 import com.aicode.testutil.TestFileAccessProvider
+import io.mockk.coEvery
 import io.mockk.every
 import io.mockk.mockk
 import java.io.File
@@ -54,7 +55,10 @@ class RemoteAgentConfigRepositorySourceTest {
     private fun skillRepository(disabled: Set<String> = emptySet()): SkillRepository {
         val config = mockk<SkillConfigRepository>()
         every { config.disabledNames() } returns disabled
-        return SkillRepository(GlobalDirectorySkillSource(provider), ProjectDirectorySkillSource(provider), config, provider, pluginSource)
+        val local = mockk<LocalSkillDefinitionSource>()
+        every { local.sourceIdentity() } returns "remote-metadata"
+        coEvery { local.capture() } returns null
+        return SkillRepository(GlobalDirectorySkillSource(provider), ProjectDirectorySkillSource(provider), config, provider, pluginSource, local)
     }
     private fun agentRepository(disabled: Set<String> = emptySet()): AgentDefinitionRepository {
         val config = mockk<AgentDefinitionConfigRepository>()

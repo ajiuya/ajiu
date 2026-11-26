@@ -1761,9 +1761,9 @@ fun AIChatPanel(
 
     val localFolderRevision by viewModel.localFolderRevision.collectAsStateWithLifecycle()
     val fileSelectionRevision by viewModel.fileProfileSelectionRevisions.collectAsStateWithLifecycle()
-    val markdownImageTransformer = remember(viewModel.fileAccess, projectRoot, executionMode, connectionState,
+    val markdownImageTransformer = remember(viewModel, viewModel.fileAccess, projectRoot, executionMode, connectionState,
         localFolderRevision, fileSelectionRevision) {
-        MarkdownImageTransformer(viewModel.fileAccess)
+        MarkdownImageTransformer(viewModel.fileAccess, viewModel::captureUserFile)
     }
     val imageViewerState = rememberImageViewerState()
     val filePreviewState = rememberFilePreviewState(currentSessionId)
@@ -1778,7 +1778,7 @@ fun AIChatPanel(
     val viewerDecodeSpec = rememberViewerDecodeSpec()
     val chatImageLoad = remember(viewModel.fileAccess, viewerDecodeSpec, projectRoot, executionMode, connectionState,
         localFolderRevision, fileSelectionRevision) {
-        chatImageLoader(viewModel.fileAccess, viewerDecodeSpec.maxEdge, viewerDecodeSpec.maxPixels)
+        chatImageLoader(viewModel.fileAccess, viewerDecodeSpec.maxEdge, viewerDecodeSpec.maxPixels, viewModel::captureUserFile)
     }
 
     val attachmentOpener = remember(viewModel.fileAccess, context, filePreviewState) {

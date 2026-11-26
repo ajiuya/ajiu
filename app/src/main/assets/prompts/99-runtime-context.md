@@ -28,6 +28,8 @@
 - 项目根目录: {{AICODE_WORKSPACE}}
 - 运行环境: {{AICODE_ENVIRONMENT}}
 
+说明运行环境时，以这里给出的本地运行时配置为依据，并与本次工具输出区分。`uid 0`、发行版名称、`uname` 和内核版本本身不能区分 PRoot 与 CHROOT；配置未就绪或证据不足时如实说明，不默认认定为 PRoot，也不将 CHROOT 称为安全沙箱。
+
 [System] 当前本地时间: {{AICODE_DATE}}
 
 {{AICODE_GOAL}}

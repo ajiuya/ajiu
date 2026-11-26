@@ -1,6 +1,7 @@
 package com.aicode.feature.plugin.runtime
 
 import com.aicode.feature.terminal.domain.TerminalResourceOwner
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwnerKind
 import com.aicode.feature.terminal.domain.TerminalSessionProvider
 import com.aicode.feature.terminal.domain.TerminalTabStatus
 import java.nio.ByteBuffer
@@ -25,6 +26,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonObjectBuilder
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 
@@ -87,6 +89,8 @@ class PluginTerminalRunner @Inject constructor(private val provider: TerminalSes
         var stopped = false
         var stoppedStatus: TerminalTabStatus? = null
         var entered = false
+        var closeVerified = false
+        var backendClosed = false
     }
     private val lock = Any()
     private val runs = linkedMapOf<String, Run>()
@@ -95,6 +99,9 @@ class PluginTerminalRunner @Inject constructor(private val provider: TerminalSes
     suspend fun start(context: PluginInvocationContext, command: String, title: String?): JsonObject {
         context.checkIntegrity()
         val execution = context.execution ?: throw PluginHostException("CONTEXT_REQUIRED", "A ready captured workspace is required")
+        if (execution.runtimeOwner?.kind != RuntimeOwnerKind.PLUGIN || execution.runtimeOwner != context.runtimeOwner) {
+            throw PluginHostException("CONTEXT_CHANGED", "A matching plugin execution owner is required")
+        }
         val run = Run(context, PluginResourceOwner.of(context), title, command)
         synchronized(lock) {
             if (runs.size >= 8 || runs.values.count { it.owner.pluginId == run.owner.pluginId } >= 4) {
@@ -127,9 +134,17 @@ class PluginTerminalRunner @Inject constructor(private val provider: TerminalSes
                 } finally {
                     withContext(NonCancellable) {
                         observer?.cancelAndJoin()
-                        run.tabId?.let { id -> withContext(Dispatchers.Main.immediate) { provider.closePluginTab(id, run.terminalOwner) } }
-                        run.output.finish()
-                        synchronized(lock) { runs.remove(run.id, run) }
+                        try {
+                            if (!run.backendClosed) {
+                                run.closeVerified = run.tabId?.let { id ->
+                                    withContext(Dispatchers.Main.immediate) { provider.closePluginTab(id, run.terminalOwner) }
+                                } == true
+                                run.backendClosed = true
+                            }
+                        } finally {
+                            run.output.finish()
+                            synchronized(lock) { runs.remove(run.id, run) }
+                        }
                     }
                 }
             }.also { job ->
@@ -152,14 +167,14 @@ class PluginTerminalRunner @Inject constructor(private val provider: TerminalSes
 
     suspend fun poll(context: PluginInvocationContext, id: String, offset: Long): JsonObject {
         val run = owned(context, id)
-        val status = run.stoppedStatus ?: withContext(Dispatchers.Main.immediate) { provider.pluginTabStatus(requireNotNull(run.tabId), run.terminalOwner) }
+        val status = status(run)
         if (status == null) throw PluginHostException("TAB_CLOSED", "The terminal was closed")
         if (!status.running) run.output.finish()
         val (output, next, truncated) = run.output.poll(offset)
         context.checkCurrent()
         return buildJsonObject {
-            put("output", output); put("offset", next); put("state", if (run.stopped) "cancelled" else if (status.running) "running" else "finished")
-            status.exitCode?.let { put("exitCode", it) }; put("truncated", truncated)
+            put("output", output); put("offset", next); put("truncated", truncated)
+            putStatus(status, run.stopped)
         }
     }
 
@@ -187,8 +202,13 @@ class PluginTerminalRunner @Inject constructor(private val provider: TerminalSes
             status
         }
         if (completed != null) run.stoppedStatus = completed else {
-            withContext(Dispatchers.Main.immediate) { provider.closePluginTab(requireNotNull(run.tabId), run.terminalOwner) }
-            run.stoppedStatus = TerminalTabStatus(false, null)
+            val verified = withContext(Dispatchers.Main.immediate) { provider.closePluginTab(requireNotNull(run.tabId), run.terminalOwner) }
+            val chroot = run.context.execution?.localRuntimeCapture != null
+            run.stoppedStatus = TerminalTabStatus(false, null, exitKnown = false,
+                taskStatus = if (chroot) "UNKNOWN" else null,
+                cleanupStatus = if (chroot) { if (verified) "VERIFIED" else "UNKNOWN" } else null)
+            run.closeVerified = verified
+            run.backendClosed = true
         }
         run.output.finish()
         context.checkCurrent()
@@ -199,25 +219,47 @@ class PluginTerminalRunner @Inject constructor(private val provider: TerminalSes
         val run = owned(context, id)
         retire(run)
         run.job?.join()
-        return true
+        return run.closeVerified
     }
 
     suspend fun list(context: PluginInvocationContext): JsonArray {
         context.checkIntegrity()
         val owner = PluginResourceOwner.of(context)
-        val mine = synchronized(lock) { runs.values.filter { it.owner == owner && !it.closing && it.tabId != null } }
+        val mine = synchronized(lock) { runs.values.filter {
+            it.owner == owner && it.context.runtimeOwner == context.runtimeOwner && !it.closing && it.tabId != null
+        } }
         return JsonArray(mine.map { run ->
-            val status = run.stoppedStatus ?: withContext(Dispatchers.Main.immediate) { provider.pluginTabStatus(requireNotNull(run.tabId), run.terminalOwner) }
+            val status = status(run) ?: TerminalTabStatus(false, null, exitKnown = false,
+                taskStatus = if (run.context.execution?.localRuntimeCapture != null) "UNKNOWN" else null)
             buildJsonObject {
                 put("tabId", run.id); put("title", run.title ?: run.id); put("command", run.command)
-                put("state", if (run.stopped) "cancelled" else if (status?.running == true) "running" else "finished")
+                putStatus(status, run.stopped)
             }
         }).also { context.checkCurrent() }
     }
 
+    private suspend fun status(run: Run): TerminalTabStatus? =
+        withContext(Dispatchers.Main.immediate) { provider.pluginTabStatus(requireNotNull(run.tabId), run.terminalOwner) }
+            ?: run.stoppedStatus
+
+    private fun JsonObjectBuilder.putStatus(status: TerminalTabStatus, stopped: Boolean) {
+        put("state", when {
+            stopped -> "cancelled"
+            status.taskStatus == "UNKNOWN" -> "unknown"
+            status.running -> "running"
+            else -> "finished"
+        })
+        put("exit_known", status.exitKnown)
+        if (status.exitKnown) status.exitCode?.let { put("exitCode", it) }
+        status.taskStatus?.let { put("task_status", it) }
+        status.cleanupStatus?.let { put("cleanup_status", it) }
+    }
+
     private fun owned(context: PluginInvocationContext, id: String): Run {
         context.checkIntegrity()
-        return synchronized(lock) { runs[id]?.takeIf { it.owner == PluginResourceOwner.of(context) && !it.closing } }
+        return synchronized(lock) { runs[id]?.takeIf {
+            it.owner == PluginResourceOwner.of(context) && it.context.runtimeOwner == context.runtimeOwner && !it.closing
+        } }
             ?: throw PluginHostException("TAB_NOT_FOUND", "No terminal belongs to this plugin and source")
     }
 

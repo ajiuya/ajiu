@@ -1,5 +1,8 @@
 package com.aicode.feature.terminal.domain
 
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeCleanup
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwner
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwnerKind
 import kotlinx.coroutines.flow.SharedFlow
 
 /**
@@ -55,11 +58,50 @@ interface TerminalSessionProvider {
 
     /** 关闭并销毁标签。返回是否成功。 */
     fun closeTab(id: String): Boolean
+
+    suspend fun startOwnedBackgroundCommand(
+        command: String,
+        title: String?,
+        notify: Boolean,
+        owner: RuntimeOwner
+    ): String {
+        require(owner.kind == RuntimeOwnerKind.AGENT)
+        return startBackgroundCommand(command, title, notify, owner.scopeId)
+    }
+
+    fun listOwnedTabs(owner: RuntimeOwner): List<TabInfo> = listTabs().filter { it.runtimeOwner == owner }
+
+    fun getOwnedTabOutput(id: String, owner: RuntimeOwner): String? =
+        if (listOwnedTabs(owner).any { it.id == id }) getTabOutput(id) else null
+
+    fun sendOwnedInput(id: String, owner: RuntimeOwner, input: String, appendNewline: Boolean = true): Boolean =
+        listOwnedTabs(owner).any { it.id == id } && sendInput(id, input, appendNewline)
+
+    fun writeOwnedText(id: String, owner: RuntimeOwner, text: String): Boolean =
+        listOwnedTabs(owner).any { it.id == id } && writeToTab(id, text)
+
+    fun writeOwnedBytes(id: String, owner: RuntimeOwner, vararg bytes: Int): Boolean =
+        listOwnedTabs(owner).any { it.id == id } && writeBytesToTab(id, *bytes)
+
+    fun resizeOwnedTab(id: String, owner: RuntimeOwner, columns: Int, rows: Int): Boolean = false
+
+    fun signalOwnedTab(id: String, owner: RuntimeOwner, signal: Int): Boolean = false
+
+    suspend fun closeOwnedTab(id: String, owner: RuntimeOwner): TerminalCloseResult? =
+        if (listOwnedTabs(owner).any { it.id == id } && closeTab(id)) TerminalCloseResult() else null
 }
 
 data class TerminalResourceOwner(val pluginId: String, val resourceId: String)
 
-data class TerminalTabStatus(val running: Boolean, val exitCode: Int?)
+data class TerminalTabStatus(
+    val running: Boolean,
+    val exitCode: Int?,
+    val exitKnown: Boolean = exitCode != null,
+    val taskStatus: String? = null,
+    val cleanupStatus: String? = null
+)
+
+data class TerminalCloseResult(val cleanup: LocalRuntimeCleanup? = null)
 
 internal fun TerminalTab.isOwnedBy(owner: TerminalResourceOwner): Boolean =
     ownerPluginId == owner.pluginId && ownerResourceId == owner.resourceId

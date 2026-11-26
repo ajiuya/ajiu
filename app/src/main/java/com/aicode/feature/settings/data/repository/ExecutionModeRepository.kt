@@ -18,14 +18,14 @@ private val Context.executionModeDataStore by preferencesDataStore(
 
 /** 执行环境模式。 */
 enum class ExecutionMode {
-    /** 本地 PRoot 容器（原有行为）。 */
+    /** 本地容器通道；名称为持久化兼容保留，实际 PRoot/CHROOT 由 ContainerProfile.localRuntime 决定。 */
     LOCAL_PROOT,
     /** 远程 SSH 服务器。 */
     REMOTE_SSH
 }
 
 /**
- * 持久化当前执行模式（本地 PRoot / 远程 SSH）。
+ * 持久化当前执行通道（本地容器 / 远程 SSH）；本地运行时类型由容器配置提供。
  *
  * 远程连接参数不再在此持久化，改由
  * [com.aicode.feature.agent.domain.container.ActiveRemoteConnectionResolver] 按当前激活容器 profile 实时解析。
@@ -40,7 +40,7 @@ class ExecutionModeRepository @Inject constructor(
         val MODE_KEY = stringPreferencesKey("execution_mode")
     }
 
-    /** 当前执行模式；无值时默认本地 PRoot。 */
+    /** 当前执行通道；无值时默认本地，具体运行时取所选容器配置（默认 PRoot）。 */
     val executionModeFlow: Flow<ExecutionMode> = context.executionModeDataStore.data.map { prefs ->
         prefs[MODE_KEY]?.let {
             runCatching { ExecutionMode.valueOf(it) }.getOrNull()

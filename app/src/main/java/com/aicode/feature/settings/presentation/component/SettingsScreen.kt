@@ -88,6 +88,8 @@ import com.aicode.feature.settings.data.repository.BackgroundSettingsRepository
 import com.aicode.feature.settings.domain.model.AIProviderConfig
 import com.aicode.feature.settings.domain.model.ModelMetadata
 import com.aicode.feature.settings.presentation.SettingsViewModel
+import com.aicode.feature.settings.presentation.ContainerProfileAddition
+import com.aicode.feature.settings.presentation.ChrootSettingsViewModel
 import com.aicode.feature.settings.presentation.ShizukuViewModel
 import com.aicode.feature.settings.presentation.SkillImportState
 import com.aicode.feature.settings.presentation.SkillUiEntry
@@ -274,6 +276,8 @@ fun SettingsScreen(
     val imageGenProviderId by viewModel.imageGenProviderId.collectAsStateWithLifecycle()
     val imageGenModel by viewModel.imageGenModel.collectAsStateWithLifecycle()
     val modelMetadata by viewModel.modelMetadata.collectAsStateWithLifecycle()
+    val chrootViewModel = androidx.hilt.navigation.compose.hiltViewModel<ChrootSettingsViewModel>()
+    val chrootUiState by chrootViewModel.uiState.collectAsStateWithLifecycle()
     val containerProfiles by viewModel.profiles.collectAsStateWithLifecycle()
     val activeProfileId by viewModel.activeProfileId.collectAsStateWithLifecycle()
     val defaultContainerId by viewModel.defaultContainerId.collectAsStateWithLifecycle()
@@ -1171,32 +1175,44 @@ fun SettingsScreen(
                         }
                     )
                 }
-                SettingsSection.Container -> ContainerSection(
-                    profiles = containerProfiles,
-                    activeProfileId = activeProfileId,
-                    defaultContainerId = defaultContainerId,
-                    osMap = containerOsMap,
-                    showAddSheetExternal = showContainerAddSheet,
-                    onDismissAddSheet = { showContainerAddSheet = false },
-                    onSelect = { viewModel.setActiveContainerProfile(it) },
-                    onSetDefaultContainer = { viewModel.setDefaultContainerId(it) },
-                    onSaveCustom = { viewModel.saveCustomContainerProfile(it) },
-                    onEditCustom = { viewModel.editCustomContainerProfile(it) },
-                    onDeleteProfile = { viewModel.deleteContainerProfile(it) },
-                    onSwitchConfirmed = onStopAllAndCloseTerminal,
-                    onResetProfile = { profile ->
-                        // 重置与切换容器同等破坏性：rootfs 整体删掉，AI 会话与终端标签必须全部停掉，
-                        // 否则它们会继续读写正在被删的目录。
-                        onStopAllAndCloseTerminal()
-                        viewModel.resetContainer(profile)
-                    },
-                    resetState = containerReset,
-                    onRestoreBuiltin = { viewModel.restoreBuiltinAlpine() },
-                    remoteConnections = remoteConnections,
-                    onReorder = { fromIndex, toIndex ->
-                        viewModel.reorderContainerProfiles(fromIndex, toIndex)
-                    }
-                )
+                SettingsSection.Container -> {
+                    ContainerSection(
+                        profiles = containerProfiles,
+                        activeProfileId = activeProfileId,
+                        defaultContainerId = defaultContainerId,
+                        osMap = containerOsMap,
+                        showAddSheetExternal = showContainerAddSheet,
+                        onDismissAddSheet = { showContainerAddSheet = false },
+                        onSelect = { viewModel.setActiveContainerProfile(it) },
+                        onSaveCustom = { profile, setDefault, rootAtConsent ->
+                            chrootViewModel.addProfileFromUser(ContainerProfileAddition(profile, setDefault), rootAtConsent)
+                        },
+                        onEditCustom = { profile, setDefault -> viewModel.editCustomContainerProfile(profile, setDefault) },
+                        onDeleteProfile = { viewModel.deleteContainerProfile(it) },
+                        onSwitchConfirmed = onStopAllAndCloseTerminal,
+                        onResetProfile = { profile ->
+                            // 重置与切换容器同等破坏性：rootfs 整体删掉，AI 会话与终端标签必须全部停掉，
+                            // 否则它们会继续读写正在被删的目录。
+                            onStopAllAndCloseTerminal()
+                            viewModel.resetContainer(profile)
+                        },
+                        resetState = containerReset,
+                        onRestoreBuiltin = { viewModel.restoreBuiltinAlpine() },
+                        remoteConnections = remoteConnections,
+                        downloadedImages = downloadedImages.values.toList(),
+                        chrootUiState = chrootUiState,
+                        onChrootInstanceAction = chrootViewModel::requestInstanceAction,
+                        onChrootAuthorization = chrootViewModel::requestAuthorization,
+                        onChrootConfirm = chrootViewModel::confirm,
+                        onChrootCancel = chrootViewModel::cancelConfirmation,
+                        onChrootClearError = chrootViewModel::clearError,
+                        onCancelAddition = chrootViewModel::cancelAddition,
+                        onClearAdditionResult = chrootViewModel::clearAdditionResult,
+                        onReorder = { fromIndex, toIndex ->
+                            viewModel.reorderContainerProfiles(fromIndex, toIndex)
+                        }
+                    )
+                }
                 SettingsSection.ContainerDownloads -> ContainerImageDownloadSection(
                     catalog = imageCatalog,
                     imageVersions = imageVersions,
@@ -1207,9 +1223,17 @@ fun SettingsScreen(
                     selection = selectionFor(SettingsSection.ContainerDownloads),
                     onDownload = { entry -> viewModel.startContainerImageDownload(entry, selectedImageSource) },
                     onCancel = { viewModel.cancelContainerImageDownload() },
-                    onImport = { entryId, fileUri -> viewModel.importDownloadedImage(entryId, fileUri) },
+                    onImport = { entryId, fileUri, runtime ->
+                        val rootAtConsent = chrootUiState.rootState
+                        val addition = viewModel.importDownloadedImage(entryId, fileUri, runtime)
+                        if (addition != null) chrootViewModel.addProfileFromUser(addition, rootAtConsent)
+                        else chrootViewModel.rejectChangedAddition()
+                    },
                     onDelete = { entryId -> viewModel.deleteDownloadedImage(entryId) },
-                    onBatchDelete = { ids -> viewModel.deleteDownloadedImages(ids) }
+                    onBatchDelete = { ids -> viewModel.deleteDownloadedImages(ids) },
+                    chrootUiState = chrootUiState,
+                    onCancelAddition = chrootViewModel::cancelAddition,
+                    onClearAdditionResult = chrootViewModel::clearAdditionResult
                 )
                 SettingsSection.Proxy -> ProxySection(
                     config = proxyConfig,

@@ -7,6 +7,8 @@ import com.aicode.feature.plugin.runtime.PluginFakeProcess
 import com.aicode.feature.plugin.runtime.PluginFakeProcessFactory
 import com.aicode.feature.plugin.runtime.PluginRuntimeContext
 import com.aicode.feature.plugin.runtime.PluginRuntimeManager
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwner
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwnerKind
 import java.io.File
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -33,7 +35,8 @@ class PluginBackupRuntimeTest {
         return PluginCoreFixtures.activate(manager, id)
     }
     private suspend fun invoke(runtime: PluginRuntimeManager, capture: PluginCapture) = runtime.invoke(capture,
-        requireNotNull(capture.content.runtime), "fixture", JsonObject(emptyMap()), PluginRuntimeContext("/fixture", "session", "invocation", {}),
+        requireNotNull(capture.content.runtime), "fixture", JsonObject(emptyMap()), PluginRuntimeContext("/fixture", "session", "invocation", {})
+            .withExecutionSource("backup-fixture:${capture.id}", RuntimeOwner(RuntimeOwnerKind.PLUGIN, "backup-fixture:${capture.id}"), null, null),
         { _, _ -> JsonPrimitive("fixture") })
     private fun answer(process: PluginFakeProcess, request: JsonObject) = process.send(buildJsonObject {
         put("jsonrpc", "2.0"); put("id", requireNotNull(request["id"])); put("result", "fixture")

@@ -18,9 +18,10 @@ import com.aicode.feature.agent.domain.container.ContainerImageEntry
 import com.aicode.feature.agent.domain.container.ContainerInstaller
 import com.aicode.feature.agent.domain.container.ContainerOsDetector
 import com.aicode.feature.agent.domain.container.ContainerProfile
+import com.aicode.feature.agent.domain.container.LocalContainerRuntime
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeUserActions
 import com.aicode.feature.agent.domain.container.RemoteSshConnection
 import com.aicode.feature.agent.domain.container.RootfsSource
-import com.aicode.feature.agent.domain.container.displayLabel
 import com.aicode.feature.agent.domain.mcp.McpConfigRepository
 import com.aicode.feature.agent.domain.mcp.McpManager
 import com.aicode.feature.agent.domain.mcp.McpScope
@@ -65,7 +66,6 @@ import dagger.hilt.android.qualifiers.ApplicationContext
 import com.aicode.feature.settings.data.repository.AppThemeMode
 import com.aicode.feature.settings.data.repository.ContainerSettingsRepository
 import com.aicode.feature.settings.data.repository.DownloadedImageRecord
-import com.aicode.feature.settings.data.repository.effectiveVersion
 import com.aicode.feature.settings.data.repository.ExecutionMode
 import com.aicode.feature.settings.data.repository.CompactionModelSettingsRepository
 import com.aicode.feature.settings.data.repository.DefaultModelSettingsRepository
@@ -122,6 +122,7 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -394,6 +395,7 @@ class SettingsViewModel @Inject constructor(
     private val containerImageDownloader: ContainerImageDownloader,
     private val containerImageVersionProbe: ContainerImageVersionProbe,
     private val containerInstaller: ContainerInstaller,
+    private val localRuntimeUserActions: LocalRuntimeUserActions,
     private val containerOsDetector: ContainerOsDetector,
     private val executionModeRepository: ExecutionModeRepository,
     private val executionModeHolder: ExecutionModeHolder,
@@ -1533,46 +1535,44 @@ class SettingsViewModel @Inject constructor(
     fun refreshSkills() {
         val owner = ++skillRefreshOwner
         viewModelScope.launch {
-            val result = try {
-                val execution = definitionExecutionContextFactory.freeze()
-                withContext(Dispatchers.IO + execution) {
-                    val source = skillRepository.sourceIdentity()
-                    if (owner == skillRefreshOwner && skillsListSource != source) {
-                        _skills.value = emptyList()
-                        skillsListSource = source
-                    }
-                    val disabled = skillRepository.disabledNames()
-                    val entries = skillRepository.listAllSkills(forceRefresh = true).map { entry ->
-                        SkillUiEntry(
-                            name = entry.skill.name,
-                            description = entry.skill.description,
-                            scope = entry.scope,
-                            disabled = entry.skill.name.lowercase() in disabled,
-                            instructions = entry.skill.instructions,
-                            requiredTools = entry.skill.requiredTools
-                        )
-                    }
-                    skillRepository.checkSourceIdentity(source)
-                    source to entries
+            try {
+                val source = skillRepository.sourceIdentity()
+                if (owner == skillRefreshOwner && skillsListSource != source) {
+                    _skills.value = emptyList()
+                    skillsListSource = null
                 }
-            } catch (e: Exception) {
+                val snapshot = skillRepository.readDefinitionSnapshot(definitionExecutionContextFactory, forceRefresh = true)
+                val entries = snapshot.entries.map { entry ->
+                    SkillUiEntry(
+                        name = entry.skill.name,
+                        description = entry.skill.description,
+                        scope = entry.scope,
+                        disabled = entry.skill.name.lowercase() in snapshot.disabledNames,
+                        instructions = entry.skill.instructions,
+                        requiredTools = entry.skill.requiredTools
+                    )
+                }
+                kotlinx.coroutines.currentCoroutineContext().ensureActive()
                 if (owner == skillRefreshOwner) {
-                    try {
-                        if (skillRepository.sourceIdentity() != skillsListSource) { _skills.value = emptyList(); skillsListSource = null }
-                    } catch (changed: Exception) {
-                        _skills.value = emptyList()
-                        skillsListSource = null
-                        if (changed is kotlinx.coroutines.CancellationException) throw changed
-                    }
+                    skillRepository.checkSourceIdentity(snapshot.sourceIdentity)
+                    skillsListSource = snapshot.sourceIdentity
+                    _skills.value = entries
                 }
-                if (e is kotlinx.coroutines.CancellationException) throw e
-                FileLogger.w("SettingsViewModel", "刷新技能失败", e)
-                return@launch
-            }
-            if (owner == skillRefreshOwner) {
-                skillRepository.checkSourceIdentity(result.first)
-                skillsListSource = result.first
-                _skills.value = result.second
+            } catch (_: com.aicode.feature.agent.domain.skill.SkillDefinitionSourceChanged) {
+                kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                if (owner == skillRefreshOwner) {
+                    _skills.value = emptyList()
+                    skillsListSource = null
+                }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                if (owner == skillRefreshOwner) {
+                    _skills.value = emptyList()
+                    skillsListSource = null
+                }
+                FileLogger.w("SettingsViewModel", "刷新技能失败", failure)
             }
         }
     }
@@ -2429,8 +2429,11 @@ class SettingsViewModel @Inject constructor(
 
     /** 重置容器：内置恢复出厂（清覆盖配置 + 删 rootfs），自定义本地镜像删 rootfs 下次重新解压。远程 SSH 无本地数据，UI 不提供入口。 */
     fun resetContainer(profile: ContainerProfile) {
-        if (_containerReset.value != null) return
+        if (_containerReset.value != null || profile.isChroot) return
         viewModelScope.launch {
+            val snapshot = containerSettingsRepository.captureProfileSnapshot()
+            val current = snapshot.profiles.firstOrNull { it.id == profile.id } ?: return@launch
+            if (current.isChroot || current != profile) return@launch
             if (profile.isBuiltin) {
                 containerSettingsRepository.upsertCustomProfile(ContainerProfile.BUILTIN_ALPINE)
             }
@@ -2442,6 +2445,7 @@ class SettingsViewModel @Inject constructor(
 
     /** 删 profile 附带的 rootfs 清理，带进度；内置与远程 SSH 没本地 rootfs 可删，不弹进度框。 */
     private suspend fun cleanRootfsWithProgress(profile: ContainerProfile) {
+        require(!profile.isChroot) { "CHROOT cleanup must use the runtime lifecycle" }
         if (profile.isBuiltin || profile.rootfsSource is RootfsSource.RemoteSsh) {
             containerInstaller.deleteCustomRootfs(profile)
             return
@@ -2474,13 +2478,6 @@ class SettingsViewModel @Inject constructor(
         }
     }
 
-    /** 保存（新增/覆盖）自定义容器 profile。 */
-    fun saveCustomContainerProfile(profile: ContainerProfile) {
-        viewModelScope.launch {
-            containerSettingsRepository.upsertCustomProfile(profile)
-        }
-    }
-
     /**
      * 容器列表长按拖拽排序：同步更新内存顺序（列表已重排 UI 才重绘，避免松手瞬间回跳），
      * 再异步持久化新顺序（存储顺序即显示顺序）。
@@ -2499,21 +2496,38 @@ class SettingsViewModel @Inject constructor(
     }
 
     /** 编辑自定义 profile：覆盖配置；若镜像来源变了则删旧 rootfs 触发重新解压。 */
-    fun editCustomContainerProfile(profile: ContainerProfile) {
+    fun editCustomContainerProfile(profile: ContainerProfile, setAsDefault: Boolean) {
         viewModelScope.launch {
-            val old = _customProfiles.value.firstOrNull { it.id == profile.id }
-            val oldUri = (old?.rootfsSource as? RootfsSource.LocalFile)?.uri
-            val newUri = (profile.rootfsSource as? RootfsSource.LocalFile)?.uri
-            if (old != null && oldUri != newUri) {
-                cleanRootfsWithProgress(profile)
+            val snapshot = containerSettingsRepository.captureProfileSnapshot()
+            val old = snapshot.profiles.firstOrNull { it.id == profile.id } ?: return@launch
+            if (old.mode != profile.mode || old.localRuntime != profile.localRuntime) return@launch
+            if (old.isChroot) {
+                val state = localRuntimeUserActions.state(old)
+                if (!state.journalHealthy || state.recoveryRequired || state.busy ||
+                    old.rootfsSource != profile.rootfsSource || old.chrootInstance != profile.chrootInstance) return@launch
             }
+            val oldUri = (old.rootfsSource as? RootfsSource.LocalFile)?.uri
+            val newUri = (profile.rootfsSource as? RootfsSource.LocalFile)?.uri
+            if (oldUri != newUri) cleanRootfsWithProgress(profile)
+            containerSettingsRepository.checkProfileSnapshot(snapshot)
             containerSettingsRepository.upsertCustomProfile(profile)
+            // Await the edit before changing the default; never race the configuration snapshot.
+            if (profile.mode == ExecutionMode.LOCAL_PROOT) {
+                if (setAsDefault) containerSettingsRepository.setDefaultContainerId(profile.id)
+                else if (snapshot.defaultContainerId == profile.id) {
+                    containerSettingsRepository.setDefaultContainerId(ContainerProfile.BUILTIN_ID)
+                }
+            }
         }
     }
 
     /** 删除容器 profile（内置 Alpine 也可删，删光后由空态恢复），连带清理本地 rootfs。 */
     fun deleteContainerProfile(profile: ContainerProfile) {
+        if (profile.isChroot) return
         viewModelScope.launch {
+            val snapshot = containerSettingsRepository.captureProfileSnapshot()
+            val current = snapshot.profiles.firstOrNull { it.id == profile.id } ?: return@launch
+            if (current.isChroot || current != profile) return@launch
             containerSettingsRepository.deleteCustomProfile(profile.id)
             cleanRootfsWithProgress(profile)
             if (_activeProfileId.value == profile.id) {
@@ -2597,37 +2611,18 @@ class SettingsViewModel @Inject constructor(
     }
 
     /**
-     * 把已下载的镜像作为自定义 profile 导入容器列表（可重复导入，每次新建 profile），后续流程与手动导入一致。
+     * Prepare only in response to the explicit Import click. The shared addition coordinator awaits
+     * saving and (for CHROOT) creation; observing a download or recomposition cannot import it.
      */
-    fun importDownloadedImage(entryId: String, fileUri: String) {
-        val entry = _imageCatalog.value.firstOrNull { it.id == entryId } ?: return
-        val record = _downloadedImages.value[entryId]
-        viewModelScope.launch {
-            val profile = ContainerProfile(
-                id = "custom-${System.currentTimeMillis()}",
-                // 用**磁盘上这份文件的实际版本**命名：记录字段优先，升级前的旧记录退回文件名解析，
-                // 都拿不到才用目录当前版本。否则会出现「名字写着 3.21.8、实际解压的是 3.21.7」。
-                name = entry.displayLabel(
-                    record?.effectiveVersion()?.takeIf { it.isNotBlank() } ?: _imageVersions.value[entry.id]
-                ),
-                rootfsSource = RootfsSource.LocalFile(fileUri),
-                shellPath = null,
-                extraArgs = ContainerProfile.DEFAULT_PROOT_ARGS,
-                isBuiltin = false
-            )
-            containerSettingsRepository.upsertCustomProfile(profile)
-            // 保留已下载记录（含下载时的版本号，供「有新版」判定），仅标记已导入；UI 状态不消失。
-            // 旧记录在这里顺带把文件名解析出的版本回写进去，下次就不必再解析。
-            containerSettingsRepository.upsertDownloadedImage(
-                DownloadedImageRecord(
-                    entryId = entryId,
-                    fileUri = fileUri,
-                    version = record?.effectiveVersion().orEmpty(),
-                    installed = true
-                )
-            )
-            _containerImageDownload.value = ContainerImageDownloadUiState.Idle
-        }
+    internal fun importDownloadedImage(
+        entryId: String,
+        fileUri: String,
+        runtime: LocalContainerRuntime
+    ): ContainerProfileAddition? {
+        val entry = _imageCatalog.value.firstOrNull { it.id == entryId } ?: return null
+        val record = _downloadedImages.value[entryId] ?: return null
+        if (record.fileUri != fileUri || fileUri.isBlank()) return null
+        return downloadedContainerProfileAddition(entry, record, fileUri, runtime, _imageVersions.value[entry.id])
     }
 
     /** 删除已下载的镜像：清记录 + 删下载文件（仅限 rootfs_images 目录，防误删）；若正在下载该条目先取消。 */

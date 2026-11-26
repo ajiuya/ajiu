@@ -2,6 +2,9 @@ package com.aicode.feature.agent.domain.tool.container
 
 import com.aicode.core.util.FileLogger
 import com.aicode.feature.agent.domain.tool.AgentTool
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeAuthorizationRequired
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwner
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwnerKind
 import com.aicode.feature.agent.domain.tool.ParameterType
 import com.aicode.feature.agent.domain.tool.PendingToolPermission
 import com.aicode.feature.agent.domain.tool.StreamingAgentTool
@@ -11,6 +14,7 @@ import com.aicode.feature.agent.domain.tool.ToolPermissionPolicy
 import com.aicode.feature.agent.domain.tool.ToolResult
 import com.aicode.feature.agent.domain.tool.ToolStreamEvent
 import com.aicode.feature.terminal.domain.TerminalSessionProvider
+import com.aicode.feature.terminal.domain.TabInfo
 import com.aicode.feature.terminal.domain.TerminalTaskRecord
 import com.aicode.feature.terminal.domain.TerminalTaskScopeResolver
 import com.aicode.feature.terminal.data.repository.TerminalTaskHistoryRepository
@@ -198,6 +202,16 @@ class TerminalSessionTool @Inject constructor(
     private fun actionOf(args: Map<String, JsonElement>): String =
         args["action"]?.asPlainString()?.trim()?.lowercase() ?: ""
 
+    private fun callerOwner(sessionId: String?): RuntimeOwner? =
+        sessionId?.let { runCatching { RuntimeOwner(RuntimeOwnerKind.AGENT, it) }.getOrNull() }
+
+    private fun ownerRequired() = ToolResult.Error("Terminal session owner is required", "TERMINAL_OWNER_REQUIRED")
+
+    private fun authorizationRequired() = ToolResult.Error(
+        "CHROOT authorization is required for this session. Use the native instance authorization entry, then retry.",
+        "LOCAL_RUNTIME_AUTHORIZATION_REQUIRED"
+    )
+
     override fun buildPermissionRequest(
         callId: String,
         args: Map<String, JsonElement>,
@@ -282,12 +296,16 @@ class TerminalSessionTool @Inject constructor(
         if (args.containsKey("history_id") && actionOf(args) != "read") {
             return ToolResult.Error("history_id 只供读取，不能恢复或操作进程", "TERMINAL_HISTORY_READ_ONLY")
         }
-        return when (actionOf(args)) {
-            "start" -> start(args, sourceSessionId)
-            "send" -> send(args)
-            "key" -> sendKey(args)
-            "read" -> read(args, sourceSessionId)
-            "close" -> close(args)
+        val action = actionOf(args)
+        val owner = callerOwner(sourceSessionId)
+        if (action in setOf("start", "send", "key", "close") && owner == null) return ownerRequired()
+        if (action == "read" && !args.containsKey("history_id") && owner == null) return ownerRequired()
+        return when (action) {
+            "start" -> start(args, requireNotNull(owner))
+            "send" -> send(args, requireNotNull(owner))
+            "key" -> sendKey(args, requireNotNull(owner))
+            "read" -> read(args, sourceSessionId, owner)
+            "close" -> close(args, requireNotNull(owner))
             else -> ToolResult.Error("缺少或非法的 action 参数（应为 start/send/key/read/close）")
         }
     }
@@ -304,16 +322,21 @@ class TerminalSessionTool @Inject constructor(
             emit(ToolStreamEvent.Completed(ToolResult.Error("history_id 只供读取，不能恢复或操作进程", "TERMINAL_HISTORY_READ_ONLY")))
             return@flow
         }
+        val owner = callerOwner(context.sessionId)
+        if (actionOf(args) in setOf("start", "send") && owner == null) {
+            emit(ToolStreamEvent.Completed(ownerRequired()))
+            return@flow
+        }
         when (actionOf(args)) {
-            "start" -> streamStart(args, context)
-            "send" -> streamSend(args)
+            "start" -> streamStart(args, requireNotNull(owner))
+            "send" -> streamSend(args, requireNotNull(owner))
             else -> emit(ToolStreamEvent.Completed(execute(args, context.sessionId)))
         }
     }
 
     private suspend fun kotlinx.coroutines.flow.FlowCollector<ToolStreamEvent>.streamStart(
         args: Map<String, JsonElement>,
-        context: com.aicode.feature.agent.domain.model.AgentContext
+        owner: RuntimeOwner
     ) {
         val command = args["command"]?.asPlainString()
         if (command == null) {
@@ -323,9 +346,12 @@ class TerminalSessionTool @Inject constructor(
         val title = args["title"]?.asPlainString()
         val notify = args["notify"]?.asPlainString()?.toBooleanStrictOrNull() ?: false
         val tabId = try {
-            withContext(Dispatchers.Main) { sessionManager.startBackgroundCommand(command, title, notify, context.sessionId) }
+            withContext(Dispatchers.Main) { sessionManager.startOwnedBackgroundCommand(command, title, notify, owner) }
         } catch (e: CancellationException) {
             throw e
+        } catch (e: LocalRuntimeAuthorizationRequired) {
+            emit(ToolStreamEvent.Completed(authorizationRequired()))
+            return
         } catch (e: Exception) {
             FileLogger.e(TAG, "启动后台命令失败: $command", e)
             emit(ToolStreamEvent.Completed(ToolResult.Error("启动后台命令失败：${e.message}")))
@@ -333,12 +359,12 @@ class TerminalSessionTool @Inject constructor(
         }
 
         FileLogger.i(TAG, "后台命令已启动 tab=$tabId(流式捕获): $command")
-        captureOutputFor(tabId, initialOutput = "")
-        val result = withContext(Dispatchers.Main) { capturedResult(tabId, actionLabel = "start") }
+        captureOutputFor(tabId, owner, initialOutput = "")
+        val result = withContext(Dispatchers.Main) { capturedResult(tabId, owner, actionLabel = "start") }
         emit(ToolStreamEvent.Completed(result))
     }
 
-    private suspend fun kotlinx.coroutines.flow.FlowCollector<ToolStreamEvent>.streamSend(args: Map<String, JsonElement>) {
+    private suspend fun kotlinx.coroutines.flow.FlowCollector<ToolStreamEvent>.streamSend(args: Map<String, JsonElement>, owner: RuntimeOwner) {
         val tabId = args["tab_id"]?.asPlainString()
         if (tabId.isNullOrBlank()) {
             emit(ToolStreamEvent.Completed(ToolResult.Error("send 操作缺少必需参数：tab_id")))
@@ -351,26 +377,27 @@ class TerminalSessionTool @Inject constructor(
         }
         val submit = args["submit"]?.asPlainString()?.toBooleanStrictOrNull() ?: true
 
-        val before = withContext(Dispatchers.Main) { sessionManager.getTabOutput(tabId) }
+        val before = withContext(Dispatchers.Main) { sessionManager.getOwnedTabOutput(tabId, owner) }
         if (before == null) {
             emit(ToolStreamEvent.Completed(ToolResult.Error("未找到终端标签：$tabId")))
             return
         }
 
-        val ok = withContext(Dispatchers.Main) { sessionManager.sendInput(tabId, input, appendNewline = submit) }
+        val ok = withContext(Dispatchers.Main) { sessionManager.sendOwnedInput(tabId, owner, input, appendNewline = submit) }
         if (!ok) {
             emit(ToolStreamEvent.Completed(ToolResult.Error("未找到终端标签：$tabId")))
             return
         }
         FileLogger.i(TAG, "向 $tabId 发送输入(流式捕获): $input")
 
-        captureOutputFor(tabId, initialOutput = before)
-        val result = withContext(Dispatchers.Main) { capturedResult(tabId, actionLabel = "send") }
+        captureOutputFor(tabId, owner, initialOutput = before)
+        val result = withContext(Dispatchers.Main) { capturedResult(tabId, owner, actionLabel = "send") }
         emit(ToolStreamEvent.Completed(result))
     }
 
     private suspend fun kotlinx.coroutines.flow.FlowCollector<ToolStreamEvent>.captureOutputFor(
         tabId: String,
+        owner: RuntimeOwner,
         initialOutput: String
     ) {
         var elapsed = 0L
@@ -379,7 +406,7 @@ class TerminalSessionTool @Inject constructor(
             delay(START_POLL_INTERVAL_MS)
             elapsed += START_POLL_INTERVAL_MS
 
-            val output = withContext(Dispatchers.Main) { sessionManager.getTabOutput(tabId) }
+            val output = withContext(Dispatchers.Main) { sessionManager.getOwnedTabOutput(tabId, owner) }
                 ?: break
             val delta = outputDelta(lastOutput, output)
             if (delta.isNotEmpty()) {
@@ -399,13 +426,13 @@ class TerminalSessionTool @Inject constructor(
      *
      * TerminalSessionManager 内部需主线程，故整段切到 Main。
      */
-    private suspend fun start(args: Map<String, JsonElement>, sourceSessionId: String?): ToolResult = withContext(Dispatchers.Main) {
+    private suspend fun start(args: Map<String, JsonElement>, owner: RuntimeOwner): ToolResult = withContext(Dispatchers.Main) {
         val command = args["command"]?.asPlainString()
             ?: return@withContext ToolResult.Error("start 操作缺少必需参数：command")
         val title = args["title"]?.asPlainString()
         val notify = args["notify"]?.asPlainString()?.toBooleanStrictOrNull() ?: false
         try {
-            val tabId = sessionManager.startBackgroundCommand(command, title, notify, sourceSessionId)
+            val tabId = sessionManager.startOwnedBackgroundCommand(command, title, notify, owner)
             FileLogger.i(TAG, "后台命令已启动 tab=$tabId: $command")
 
             // 轮询捕获初始输出：命令退出则提前结束，否则最多等满 START_CAPTURE_MS。
@@ -413,13 +440,15 @@ class TerminalSessionTool @Inject constructor(
             while (elapsed < START_CAPTURE_MS) {
                 delay(START_POLL_INTERVAL_MS)
                 elapsed += START_POLL_INTERVAL_MS
-                val running = sessionManager.listTabs().firstOrNull { it.id == tabId }?.running ?: false
+                val running = sessionManager.listOwnedTabs(owner).firstOrNull { it.id == tabId }?.running ?: false
                 if (!running) break
             }
 
-            capturedResult(tabId, actionLabel = "start")
+            capturedResult(tabId, owner, actionLabel = "start")
         } catch (e: CancellationException) {
             throw e
+        } catch (e: LocalRuntimeAuthorizationRequired) {
+            authorizationRequired()
         } catch (e: Exception) {
             FileLogger.e(TAG, "启动后台命令失败: $command", e)
             ToolResult.Error("启动后台命令失败：${e.message}")
@@ -432,13 +461,13 @@ class TerminalSessionTool @Inject constructor(
      * 与 start 保持一致：返回 tab_id / running / output，避免 AI 发送命令后必须再手动 read 一次
      * 才能看到即时结果。交互 shell 没有可靠的“命令结束”信号，因此这里固定等待 [START_CAPTURE_MS]。
      */
-    private suspend fun send(args: Map<String, JsonElement>): ToolResult = withContext(Dispatchers.Main) {
+    private suspend fun send(args: Map<String, JsonElement>, owner: RuntimeOwner): ToolResult = withContext(Dispatchers.Main) {
         val tabId = args["tab_id"]?.asPlainString()
             ?: return@withContext ToolResult.Error("send 操作缺少必需参数：tab_id")
         val input = args["input"]?.asPlainString()
             ?: return@withContext ToolResult.Error("send 操作缺少必需参数：input")
         val submit = args["submit"]?.asPlainString()?.toBooleanStrictOrNull() ?: true
-        val ok = sessionManager.sendInput(tabId, input, appendNewline = submit)
+        val ok = sessionManager.sendOwnedInput(tabId, owner, input, appendNewline = submit)
         if (ok) {
             FileLogger.i(TAG, "向 $tabId 发送输入: $input")
             var elapsed = 0L
@@ -446,9 +475,9 @@ class TerminalSessionTool @Inject constructor(
                 delay(START_POLL_INTERVAL_MS)
                 elapsed += START_POLL_INTERVAL_MS
             }
-            capturedResult(tabId, actionLabel = "send")
+            capturedResult(tabId, owner, actionLabel = "send")
         } else {
-            val exists = sessionManager.listTabs().any { it.id == tabId }
+            val exists = sessionManager.listOwnedTabs(owner).any { it.id == tabId }
             if (exists) {
                 ToolResult.Error("终端 $tabId 已结束，无法发送命令，如需执行新命令请用 start 新建终端", "TERMINAL_NOT_ACTIVE")
             } else {
@@ -458,33 +487,33 @@ class TerminalSessionTool @Inject constructor(
     }
 
     /** 向指定终端发送预定义快捷键/控制字符。TerminalSessionManager 需主线程。 */
-    private suspend fun sendKey(args: Map<String, JsonElement>): ToolResult = withContext(Dispatchers.Main) {
+    private suspend fun sendKey(args: Map<String, JsonElement>, owner: RuntimeOwner): ToolResult = withContext(Dispatchers.Main) {
         val tabId = args["tab_id"]?.asPlainString()
             ?: return@withContext ToolResult.Error("key 操作缺少必需参数：tab_id")
         val key = args["key"]?.asPlainString()
             ?: return@withContext ToolResult.Error("key 操作缺少必需参数：key")
         val normalized = normalizeKey(key)
         val ok = when (normalized) {
-            "ctrl+c" -> sessionManager.writeBytesToTab(tabId, 0x03)
-            "ctrl+d" -> sessionManager.writeBytesToTab(tabId, 0x04)
-            "ctrl+z" -> sessionManager.writeBytesToTab(tabId, 0x1A)
-            "ctrl+l" -> sessionManager.writeBytesToTab(tabId, 0x0C)
-            "ctrl+u" -> sessionManager.writeBytesToTab(tabId, 0x15)
-            "ctrl+w" -> sessionManager.writeBytesToTab(tabId, 0x17)
-            "esc", "escape" -> sessionManager.writeBytesToTab(tabId, 0x1B)
-            "tab" -> sessionManager.writeBytesToTab(tabId, 0x09)
-            "enter", "return" -> sessionManager.writeBytesToTab(tabId, 0x0D)
-            "up" -> sessionManager.writeToTab(tabId, "\u001B[A")
-            "down" -> sessionManager.writeToTab(tabId, "\u001B[B")
-            "right" -> sessionManager.writeToTab(tabId, "\u001B[C")
-            "left" -> sessionManager.writeToTab(tabId, "\u001B[D")
+            "ctrl+c" -> sessionManager.writeOwnedBytes(tabId, owner, 0x03)
+            "ctrl+d" -> sessionManager.writeOwnedBytes(tabId, owner, 0x04)
+            "ctrl+z" -> sessionManager.writeOwnedBytes(tabId, owner, 0x1A)
+            "ctrl+l" -> sessionManager.writeOwnedBytes(tabId, owner, 0x0C)
+            "ctrl+u" -> sessionManager.writeOwnedBytes(tabId, owner, 0x15)
+            "ctrl+w" -> sessionManager.writeOwnedBytes(tabId, owner, 0x17)
+            "esc", "escape" -> sessionManager.writeOwnedBytes(tabId, owner, 0x1B)
+            "tab" -> sessionManager.writeOwnedBytes(tabId, owner, 0x09)
+            "enter", "return" -> sessionManager.writeOwnedBytes(tabId, owner, 0x0D)
+            "up" -> sessionManager.writeOwnedText(tabId, owner, "\u001B[A")
+            "down" -> sessionManager.writeOwnedText(tabId, owner, "\u001B[B")
+            "right" -> sessionManager.writeOwnedText(tabId, owner, "\u001B[C")
+            "left" -> sessionManager.writeOwnedText(tabId, owner, "\u001B[D")
             else -> return@withContext ToolResult.Error("不支持的快捷键：$key，支持：${SUPPORTED_KEYS.joinToString(", ")}")
         }
         if (ok) {
             FileLogger.i(TAG, "向 $tabId 发送快捷键: $normalized")
             ToolResult.Success(JsonPrimitive("已向终端标签 $tabId 发送快捷键 $normalized，可用 terminal(action=\"read\", tab_id=\"$tabId\") 查看结果。"))
         } else {
-            val exists = sessionManager.listTabs().any { it.id == tabId }
+            val exists = sessionManager.listOwnedTabs(owner).any { it.id == tabId }
             if (exists) {
                 ToolResult.Error("终端 $tabId 已结束，无法发送快捷键", "TERMINAL_NOT_ACTIVE")
             } else {
@@ -494,7 +523,7 @@ class TerminalSessionTool @Inject constructor(
     }
 
     /** 读取终端输出；省略 tab_id 则列出所有标签。TerminalSessionManager 需主线程。 */
-    private suspend fun read(args: Map<String, JsonElement>, sourceSessionId: String?): ToolResult = withContext(Dispatchers.Main) {
+    private suspend fun read(args: Map<String, JsonElement>, sourceSessionId: String?, caller: RuntimeOwner?): ToolResult = withContext(Dispatchers.Main) {
         val tabId = args["tab_id"]?.asPlainString()?.takeIf { it.isNotBlank() }
         val historyId = args["history_id"]?.asPlainString()?.takeIf { it.isNotBlank() }
         if (args.containsKey("history_id") && historyId == null) {
@@ -530,14 +559,16 @@ class TerminalSessionTool @Inject constructor(
                 return@withContext ToolResult.Error("任务历史读取失败，不能据此判断执行结果", "TERMINAL_HISTORY_READ_FAILED")
             }
         }
+        val owner = caller ?: return@withContext ownerRequired()
         if (tabId == null) {
-            val list = sessionManager.listTabs()
+            val list = sessionManager.listOwnedTabs(owner)
             val activeText = if (list.isEmpty()) "当前没有终端标签。" else list.joinToString("\n") {
                 val state = if (it.running) "运行中" else "已结束"
                 val kind = if (it.isBackground) "后台" else "交互"
                 "${it.id}  [$kind/$state]  ${it.title}" + (it.command?.let { c -> "  ($c)" } ?: "") +
                     (it.historyId?.let { id -> "  history_id=$id" } ?: "") +
-                    (it.historyError?.let { "  [历史保存失败]" } ?: "")
+                    (it.historyError?.let { "  [历史保存失败]" } ?: "") +
+                    (it.taskStatus?.let { status -> "  task_status=$status cleanup_status=${it.cleanupStatus}" } ?: "")
             }
             val historyText = try {
                 val scope = if (sourceSessionId.isNullOrBlank()) null else historyScopeResolver.capture()
@@ -558,9 +589,11 @@ class TerminalSessionTool @Inject constructor(
             }
             return@withContext ToolResult.Success(JsonPrimitive(activeText + historyText))
         }
-        val output = sessionManager.getTabOutput(tabId)
+        val output = sessionManager.getOwnedTabOutput(tabId, owner)
             ?: return@withContext ToolResult.Error("未找到终端标签：$tabId")
-        ToolResult.Success(JsonPrimitive(filteredOutput(output, filter, regex)))
+        val filtered = filteredOutput(output, filter, regex)
+        val tab = sessionManager.listOwnedTabs(owner).firstOrNull { it.id == tabId }
+        ToolResult.Success(if (tab?.taskStatus != null) liveResult(tab, filtered) else JsonPrimitive(filtered))
     }
 
     private fun filteredOutput(output: String, filter: String?, regex: Regex?): String {
@@ -588,22 +621,30 @@ class TerminalSessionTool @Inject constructor(
      * 关闭终端标签，支持 `tab_ids` 数组一次关闭多个（与 `tab_id` 合并去重）。
      * 单个标签的返回文案保持不变；批量时逐个关闭并汇报未找到的 id。TerminalSessionManager 需主线程。
      */
-    private suspend fun close(args: Map<String, JsonElement>): ToolResult = withContext(Dispatchers.Main) {
+    private suspend fun close(args: Map<String, JsonElement>, owner: RuntimeOwner): ToolResult = withContext(Dispatchers.Main) {
         val ids = (parseTabIds(args["tab_ids"]) + parseTabIds(args["tab_id"])).distinct()
         if (ids.isEmpty()) {
             return@withContext ToolResult.Error("close 操作缺少必需参数：tab_ids 或 tab_id", "MISSING_TAB_ID")
         }
         val closed = mutableListOf<String>()
         val missing = mutableListOf<String>()
+        val cleanup = mutableMapOf<String, JsonElement>()
         ids.forEach { id ->
-            if (sessionManager.closeTab(id)) {
+            val result = sessionManager.closeOwnedTab(id, owner)
+            if (result != null) {
                 closed += id
+                result.cleanup?.let { cleanup[id] = JsonPrimitive(it.name) }
                 FileLogger.i(TAG, "关闭终端标签: $id")
             } else {
                 missing += id
             }
         }
         when {
+            cleanup.isNotEmpty() -> ToolResult.Success(JsonObject(mapOf(
+                "closed_tabs" to JsonArray(closed.map(::JsonPrimitive)),
+                "missing_tabs" to JsonArray(missing.map(::JsonPrimitive)),
+                "cleanup_status" to JsonObject(cleanup)
+            )))
             closed.isEmpty() -> ToolResult.Error(
                 "未找到终端标签：${missing.joinToString("、")}",
                 "TERMINAL_NOT_FOUND"
@@ -623,26 +664,30 @@ class TerminalSessionTool @Inject constructor(
     private fun normalizeKey(key: String): String =
         key.trim().lowercase().replace(" ", "").replace("_", "+").replace("-", "+")
 
-    private fun capturedResult(tabId: String, actionLabel: String): ToolResult {
-        val tab = sessionManager.listTabs().firstOrNull { it.id == tabId }
+    private fun capturedResult(tabId: String, owner: RuntimeOwner, actionLabel: String): ToolResult {
+        val tab = sessionManager.listOwnedTabs(owner).firstOrNull { it.id == tabId }
             ?: return ToolResult.Error("未找到终端标签：$tabId")
-        val rawOutput = sessionManager.getTabOutput(tabId) ?: ""
+        val rawOutput = sessionManager.getOwnedTabOutput(tabId, owner) ?: ""
         FileLogger.v(
             TAG,
             "$actionLabel 捕获 tab=$tabId running=${tab.running} 输出 ${rawOutput.length} 字符"
         )
-        return ToolResult.Success(
-            JsonObject(
-                buildMap {
-                    put("tab_id", JsonPrimitive(tabId))
-                    put("running", JsonPrimitive(tab.running))
-                    put("output", JsonPrimitive(rawOutput))
-                    tab.historyId?.let { put("history_id", JsonPrimitive(it)) }
-                    tab.historyError?.let { put("history_error", JsonPrimitive(it)) }
-                }
-            )
-        )
+        return ToolResult.Success(liveResult(tab, rawOutput))
     }
+
+    private fun liveResult(tab: TabInfo, output: String): JsonObject = JsonObject(buildMap {
+        put("tab_id", JsonPrimitive(tab.id))
+        put("running", JsonPrimitive(tab.running))
+        put("output", JsonPrimitive(output))
+        tab.historyId?.let { put("history_id", JsonPrimitive(it)) }
+        tab.historyError?.let { put("history_error", JsonPrimitive(it)) }
+        tab.taskStatus?.let {
+            put("task_status", JsonPrimitive(it))
+            put("exit_known", JsonPrimitive(tab.exitKnown))
+            tab.exitCode?.let { code -> put("exit_code", JsonPrimitive(code)) }
+        }
+        tab.cleanupStatus?.let { put("cleanup_status", JsonPrimitive(it)) }
+    })
 
     private fun outputDelta(previous: String, current: String): String {
         if (current.isEmpty() || current == previous) return ""

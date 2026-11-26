@@ -44,12 +44,15 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runCurrent
@@ -276,9 +279,9 @@ class RecoveryViewModelTest {
         loadingAttachments.await()
         runCurrent()
         assertTrue(vm.recovering.value)
-        val preparing = vm.recoveryBubble.first { it.scope == bubble.scope && it.busy }
-        assertEquals(bubble.items, preparing.items)
-        assertEquals(bubble.continueTargets, preparing.continueTargets)
+        val preparing = vm.recoveryBubble.first { it.scope == bubble.scope && it.items.isEmpty() }
+        assertTrue(preparing.continueTargets.isEmpty())
+        assertFalse(preparing.busy)
         vm.abandonRecovery(preparing)
         vm.continueRecovery(bubble)
         runCurrent()
@@ -381,8 +384,10 @@ class RecoveryViewModelTest {
         loadingAttachments.await()
         val claimed = requireNotNull(ledger.requests.getValue(interrupted.request.id).activeRunId)
         assertNotEquals(interrupted.run.id, claimed)
-        val preparing = vm.recoveryBubble.first { it.scope == bubble.scope && it.busy }
-        assertEquals(bubble.items, preparing.items)
+        val preparing = vm.recoveryBubble.first {
+            it.scope == bubble.scope && it.busy && it.items.map { item -> item.target.requestId } == listOf(later.id)
+        }
+        assertEquals(listOf(later.id), preparing.continueTargets.map { it.requestId })
         assertTrue(backendCalls.isEmpty())
         val pendingOnly = snapshot(later.id)
         assertTrue(pendingOnly.busy)
@@ -712,60 +717,141 @@ class RecoveryViewModelTest {
 
     @Test
     fun oneConfirmationContinuesParentAndChildWithoutStartingTheirLaterRequests() = runTest(dispatcher, timeout = 15.seconds) {
-        val childFirst = seedPending("z-child-first", CHILD)
-        val parentFirst = seedPending("z-parent-first")
-        val childLater = seedPending("a-child-later", CHILD)
-        val parentLater = seedPending("a-parent-later")
-        val bubble = snapshot(parentFirst.id, parentLater.id, childFirst.id, childLater.id)
-        assertTrue(bubble.items.all { it.environmentMatches })
+        val digestEntered = CompletableDeferred<Unit>()
+        val releaseDigest = CompletableDeferred<Unit>()
+        try {
+            val childFirst = seedPending("z-child-first", CHILD)
+            val parentFirst = seedPending("z-parent-first")
+            val childLater = seedPending("a-child-later", CHILD)
+            val parentLater = seedPending("a-parent-later")
+            val childLaterRow = ledger.requests.getValue(childLater.id)
+            val originalRequests = setOf(parentFirst.id, parentLater.id, childFirst.id, childLater.id)
+            val confirmedRequests = setOf(parentFirst.id, parentLater.id, childFirst.id)
+            fun assertChildLaterUntouched() {
+                assertEquals(childLaterRow, ledger.requests.getValue(childLater.id))
+                assertEquals("AWAITING_CONFIRMATION", ledger.requests.getValue(childLater.id).status)
+                assertTrue(ledger.runs.values.none { it.requestId == childLater.id })
+                assertNull(ledger.messages[childLater.inputMessageId])
+            }
+            coEvery { fixture.messages.getMessagesBySessionOnce(CHILD) } coAnswers {
+                withContext(Dispatchers.Main) {
+                    // Initial history must load normally; only the completion digest waits for the test.
+                    if (ledger.requests.getValue(childFirst.id).status == "COMPLETED") {
+                        digestEntered.complete(Unit)
+                        releaseDigest.await()
+                    }
+                    ledger.messages.values.filter { it.sessionId == CHILD }.sortedBy { it.timestamp }
+                }
+            }
+            val bubble = snapshot(parentFirst.id, parentLater.id, childFirst.id, childLater.id)
+            assertTrue(bubble.items.all { it.environmentMatches })
 
-        vm.continueRecovery(bubble)
-        val started = List(2) { backendRuns.receive() }.associateBy { it.context.sessionId }
-        val parentRun = started.getValue(PARENT)
-        val childRun = started.getValue(CHILD)
-        assertRecoveryRun(parentFirst, parentRun)
-        assertRecoveryRun(childFirst, childRun)
-        assertTrue(parentRun.owner.isActive)
-        assertTrue(childRun.owner.isActive)
-        vm.recovering.first { !it }
-        assertEquals("AWAITING_CONFIRMATION", ledger.requests.getValue(parentLater.id).status)
-        assertEquals("AWAITING_CONFIRMATION", ledger.requests.getValue(childLater.id).status)
-        assertEquals(setOf(parentFirst.id, childFirst.id), ledger.runs.values.map { it.requestId }.toSet())
-        assertEquals(2, backendCalls.size)
-        val hidden = snapshot()
-        assertTrue(hidden.items.isEmpty())
-        assertTrue(hidden.batch.isEmpty())
-        assertTrue(hidden.continueTargets.isEmpty())
-        assertEquals(setOf(PARENT, CHILD), hidden.runningSessions)
-        assertFalse(hidden.busy)
+            vm.continueRecovery(bubble)
+            val started = List(2) { backendRuns.receive() }.associateBy { it.context.sessionId }
+            val parentRun = started.getValue(PARENT)
+            val childRun = started.getValue(CHILD)
+            val childRunId = requireNotNull(childRun.context.recoveryRunId)
+            assertRecoveryRun(parentFirst, parentRun)
+            assertRecoveryRun(childFirst, childRun)
+            assertTrue(parentRun.owner.isActive)
+            assertTrue(childRun.owner.isActive)
+            vm.recovering.first { !it }
+            assertEquals("AWAITING_CONFIRMATION", ledger.requests.getValue(parentLater.id).status)
+            assertChildLaterUntouched()
+            assertEquals(setOf(parentFirst.id, childFirst.id), ledger.runs.values.map { it.requestId }.toSet())
+            assertEquals(2, backendCalls.size)
+            val hidden = snapshot()
+            assertTrue(hidden.items.isEmpty())
+            assertTrue(hidden.batch.isEmpty())
+            assertTrue(hidden.continueTargets.isEmpty())
+            assertEquals(setOf(PARENT, CHILD), hidden.runningSessions)
+            assertFalse(hidden.busy)
 
-        complete(parentRun)
-        val next = snapshot(parentLater.id)
-        assertEquals(1, next.items.size)
-        assertEquals(listOf(parentLater.id), next.batch.map { it.target.requestId })
-        assertEquals(next.batch.map { it.target }, next.continueTargets)
-        assertEquals(setOf(CHILD), next.runningSessions)
-        assertEquals("AWAITING_CONFIRMATION", ledger.requests.getValue(childLater.id).status)
-        assertEquals(2, backendCalls.size)
-        vm.continueRecovery(next)
-        val secondParentRun = backendRuns.receive()
-        assertRecoveryRun(parentLater, secondParentRun)
-        complete(secondParentRun)
-        assertEquals("COMPLETED", ledger.requests.getValue(parentFirst.id).status)
-        assertEquals("COMPLETED", ledger.requests.getValue(parentLater.id).status)
-        assertEquals("RUNNING", ledger.requests.getValue(childFirst.id).status)
-        assertEquals("AWAITING_CONFIRMATION", ledger.requests.getValue(childLater.id).status)
-        assertEquals(3, backendCalls.size)
+            complete(parentRun)
+            val next = snapshot(parentLater.id)
+            assertEquals(1, next.items.size)
+            assertEquals(listOf(parentLater.id), next.batch.map { it.target.requestId })
+            assertEquals(next.batch.map { it.target }, next.continueTargets)
+            assertEquals(setOf(CHILD), next.runningSessions)
+            assertChildLaterUntouched()
+            assertEquals(2, backendCalls.size)
+            vm.continueRecovery(next)
+            val secondParentRun = backendRuns.receive()
+            assertRecoveryRun(parentLater, secondParentRun)
+            complete(secondParentRun)
+            assertEquals("COMPLETED", ledger.requests.getValue(parentFirst.id).status)
+            assertEquals("COMPLETED", ledger.requests.getValue(parentLater.id).status)
+            assertEquals("RUNNING", ledger.requests.getValue(childFirst.id).status)
+            assertChildLaterUntouched()
+            assertEquals(3, backendCalls.size)
 
-        complete(childRun)
-        val remaining = snapshot(childLater.id)
-        assertEquals(listOf(childLater.id), remaining.batch.map { it.target.requestId })
-        assertEquals(remaining.batch.map { it.target }, remaining.continueTargets)
-        assertTrue(remaining.runningSessions.isEmpty())
-        assertFalse(remaining.busy)
-        assertEquals("AWAITING_CONFIRMATION", ledger.requests.getValue(childLater.id).status)
-        assertEquals(setOf(parentFirst.id, parentLater.id, childFirst.id), ledger.runs.values.map { it.requestId }.toSet())
-        assertEquals(3, backendCalls.size)
+            complete(childRun)
+            digestEntered.await()
+            val remaining = snapshot(childLater.id)
+            assertEquals(listOf(childLater.id), remaining.batch.map { it.target.requestId })
+            assertEquals(remaining.batch.map { it.target }, remaining.continueTargets)
+            assertTrue(remaining.runningSessions.isEmpty())
+            assertFalse(remaining.busy)
+            assertEquals("COMPLETED", ledger.requests.getValue(childFirst.id).status)
+            assertChildLaterUntouched()
+            assertEquals(originalRequests, ledger.requests.keys.toSet())
+            assertEquals(confirmedRequests, ledger.runs.values.map { it.requestId }.toSet())
+            assertEquals(3, ledger.runs.size)
+            assertEquals(3, backendCalls.size)
+
+            releaseDigest.complete(Unit)
+            val notice = backendRuns.receive()
+            val noticeRun = ledger.runs.getValue(requireNotNull(notice.context.recoveryRunId))
+            val noticeRequest = requireNotNull(repository.request(noticeRun.requestId))
+            val payload = requireNotNull(repository.payload(noticeRequest.id))
+            assertEquals(PARENT, notice.context.sessionId)
+            assertEquals(PARENT, noticeRun.sessionId)
+            assertEquals(PARENT, noticeRequest.sessionId)
+            assertFalse(noticeRequest.id in originalRequests)
+            assertEquals(com.aicode.feature.agent.domain.recovery.RecoveryOrigin.NOTIFICATION, payload.origin)
+            assertEquals(1, payload.notificationSeqs.size)
+            val seq = payload.notificationSeqs.single()
+            val notification = fixture.notifications.peek(PARENT).single()
+            assertEquals(seq, notification.seq)
+            assertEquals(com.aicode.feature.agent.domain.notification.AgentNotificationKind.SUBAGENT, notification.kind)
+            assertEquals(com.aicode.feature.agent.domain.notification.NotificationOutcome.COMPLETED, notification.outcome)
+            assertEquals(CHILD, notification.sourceId)
+            assertEquals("terminal-$childRunId", notification.eventId)
+            assertEquals(payload.modelRequest, notice.request)
+            assertEquals(noticeRequest.inputMessageId, notice.context.inputMessageId)
+            assertEquals(payload.modelRequest, ledger.messages.getValue(noticeRequest.inputMessageId).content)
+            assertEquals(noticeRequest.id, repository.notificationRequest(PARENT, seq)?.id)
+            assertTrue(seq in ledger.deliveredNotificationSeqs)
+            assertEquals(RecoveryStatus.RUNNING, noticeRequest.status)
+            assertEquals(originalRequests + noticeRequest.id, ledger.requests.keys.toSet())
+            assertEquals(confirmedRequests + noticeRequest.id, ledger.runs.values.map { it.requestId }.toSet())
+            assertEquals(4, ledger.runs.size)
+            assertEquals(4, backendCalls.size)
+            assertChildLaterUntouched()
+
+            complete(notice)
+            val afterNotice = snapshot(childLater.id)
+            assertEquals(remaining.items, afterNotice.items)
+            assertEquals(remaining.continueTargets, afterNotice.continueTargets)
+            assertEquals("COMPLETED", ledger.requests.getValue(noticeRequest.id).status)
+            assertEquals(noticeRequest.id, repository.notificationRequest(PARENT, seq)?.id)
+            assertTrue(seq in ledger.deliveredNotificationSeqs)
+            assertEquals(originalRequests + noticeRequest.id, ledger.requests.keys.toSet())
+            assertEquals(confirmedRequests + noticeRequest.id, ledger.runs.values.map { it.requestId }.toSet())
+            assertEquals(4, ledger.runs.size)
+            assertTrue(ledger.runs.values.all { it.status == "COMPLETED" })
+            assertEquals(4, backendCalls.size)
+            assertTrue(backendRuns.tryReceive().isFailure)
+            assertTrue(fixture.jobs.isEmpty())
+            assertChildLaterUntouched()
+            verify(exactly = 4) { fixture.workflow.executeEvents(any(), any(), any()) }
+        } finally {
+            releaseDigest.complete(Unit)
+            withContext(NonCancellable) {
+                fixture.closeUi()
+                fixture.closeProcessOwner().join()
+            }
+        }
     }
 
     @Test
@@ -861,6 +947,577 @@ class RecoveryViewModelTest {
         assertTrue(restored.runningSessions.isEmpty())
         assertFalse(restored.busy)
         assertEquals("AWAITING_CONFIRMATION", ledger.requests.getValue(parent.id).status)
+    }
+
+    @Test
+    fun recoveryBubbleRegression_queuedUsageCompletesItsRequestBeforeLaterSend() = runTest(dispatcher, timeout = 15.seconds) {
+        val usageEntered = CompletableDeferred<Unit>()
+        val releaseUsage = CompletableDeferred<Unit>()
+        every { fixture.dependencies.llmCallRecordDao.getSummary(any()) } returns flow {
+            usageEntered.complete(Unit)
+            releaseUsage.await()
+            emit(CallSummary(0, 0, 0, 0, 0, 0, null, null))
+        }
+        val handler = fixture.installCommand("/usage")
+        every { handler.execute(any(), any()) } answers { firstArg<SlashCommandContext>().showUsage() }
+        coEvery { fixture.messages.insert(any()) } answers {
+            val message = firstArg<AgentMessageEntity>()
+            ledger.messages[message.id] = message
+            Unit
+        }
+
+        try {
+            vm.enqueueAgentRequest("Run before queued usage", projectRoot = WORKSPACE, targetSessionId = PARENT)
+            val first = backendRuns.receive()
+            vm.enqueueAgentRequest("/usage", projectRoot = WORKSPACE, targetSessionId = PARENT)
+            runCurrent()
+            val commandId = requireNotNull(vm.queuedRequests.value.single().recoveryRequestId)
+            val accepted = ledger.requests.getValue(commandId)
+            assertEquals("QUEUED", accepted.status)
+
+            complete(first)
+            usageEntered.await()
+            assertTrue(PARENT in fixture.manager.runningCommandSessions.value)
+            releaseUsage.complete(Unit)
+            fixture.manager.runningCommandSessions.first { PARENT !in it }
+            runCurrent()
+
+            assertEquals("A completed queued command must settle its own recovery request",
+                "COMPLETED", ledger.requests.getValue(commandId).status)
+            assertEquals(listOf(accepted.inputMessageId), ledger.messages.values.filter {
+                it.sessionId == PARENT && it.role == MessageRole.USER.name && it.content == "/usage"
+            }.map { it.id })
+            val commandRun = ledger.runs.values.single { it.requestId == commandId }
+            assertEquals("COMPLETED", commandRun.status)
+            assertEquals(commandRun.id, ledger.requests.getValue(commandId).activeRunId)
+            verify(exactly = 1) { handler.execute(any(), "") }
+            assertEquals(1, backendCalls.size)
+
+            vm.enqueueAgentRequest("Ordinary request after usage", projectRoot = WORKSPACE, targetSessionId = PARENT)
+            val later = backendRuns.receive()
+            assertEquals("Ordinary request after usage", later.request)
+            val laterRun = ledger.runs.getValue(requireNotNull(later.context.recoveryRunId))
+            assertNotEquals(commandId, laterRun.requestId)
+            assertEquals("RUNNING", ledger.requests.getValue(laterRun.requestId).status)
+            assertFalse(ledger.requests.values.any { it.status == "AWAITING_CONFIRMATION" })
+            complete(later)
+            assertEquals(3, ledger.requests.size)
+            assertTrue(ledger.requests.values.all { it.status == "COMPLETED" })
+            assertEquals(2, backendCalls.size)
+            assertTrue(snapshot().items.isEmpty())
+            verify(exactly = 2) { fixture.workflow.executeEvents(any(), any(), any()) }
+        } finally {
+            releaseUsage.complete(Unit)
+            withContext(NonCancellable) {
+                fixture.closeUi()
+                fixture.closeProcessOwner().join()
+            }
+        }
+    }
+
+    @Test
+    fun recoveryBubbleRegression_completedClaimCannotReappearFromOldSnapshot() = runTest(dispatcher, timeout = 15.seconds) {
+        val observed = mutableListOf<RecoveryBubbleUi>()
+        val collector = backgroundScope.launch { vm.recoveryBubble.collect { observed += it } }
+        try {
+            val request = seedPending("stale-completed")
+            val later = seedPending("independent-pending")
+            val initial = snapshot(request.id, later.id)
+            val consumedTarget = initial.items.first().target
+            val laterRow = ledger.requests.getValue(later.id)
+
+            vm.continueRecovery(initial)
+            val run = backendRuns.receive()
+            val runId = requireNotNull(run.context.recoveryRunId)
+            assertNotEquals(consumedTarget.activeRunId, runId)
+            vm.recoveryBubble.first {
+                it.scope == initial.scope && it.items.isEmpty() && PARENT in it.runningSessions && !it.busy
+            }
+            runCurrent()
+            val beforeCompletion = observed.size
+
+            // Keep the original scopeRows emission in flight: do not call snapshot(), which refreshes it.
+            complete(run)
+            assertEquals("COMPLETED", ledger.requests.getValue(request.id).status)
+            assertEquals("COMPLETED", ledger.runs.getValue(runId).status)
+            val settled = vm.recoveryBubble.first {
+                it.scope == initial.scope && !it.busy && PARENT !in it.runningSessions &&
+                    it.items.any { item -> item.target.requestId == later.id }
+            }
+            runCurrent()
+            assertEquals("The consumed target must stay absent while an unrelated pending request remains visible",
+                listOf(later.id), settled.items.map { it.target.requestId })
+            assertFalse("No completed target may reappear before the delayed database emission arrives",
+                observed.drop(beforeCompletion).any { bubble -> bubble.items.any { it.target == consumedTarget } })
+            assertEquals(laterRow, ledger.requests.getValue(later.id))
+            assertEquals(1, backendCalls.size)
+            assertTrue(fixture.jobs.isEmpty())
+
+            ledger.refreshPendingScopeRows()
+            val refreshed = vm.recoveryBubble.first {
+                it.scope == initial.scope && it.items.map { item -> item.target.requestId } == listOf(later.id)
+            }
+            assertEquals(settled.items, refreshed.items)
+            assertEquals(listOf(later.id), refreshed.continueTargets.map { it.requestId })
+        } finally {
+            withContext(NonCancellable) {
+                collector.cancelAndJoin()
+                fixture.closeUi()
+                fixture.closeProcessOwner().join()
+            }
+        }
+    }
+
+    @Test
+    fun recoveryBubbleRegression_newFailureRemainsVisibleAfterClaimedTargetChanges() = runTest(dispatcher, timeout = 15.seconds) {
+        val collector = backgroundScope.launch { vm.recoveryBubble.collect {} }
+        try {
+            val request = seedPending("retry-fails-again")
+            val later = seedPending("pending-after-retry")
+            val initial = snapshot(request.id, later.id)
+            val oldTarget = initial.items.first().target
+            val laterRow = ledger.requests.getValue(later.id)
+
+            vm.continueRecovery(initial)
+            val run = backendRuns.receive()
+            val runId = requireNotNull(run.context.recoveryRunId)
+            assertNotEquals(oldTarget.activeRunId, runId)
+            vm.recoveryBubble.first {
+                it.scope == initial.scope && it.items.isEmpty() && PARENT in it.runningSessions && !it.busy
+            }
+            run.send(AgentEvent.Failed("Synthetic local persistence failure"))
+            run.events.close()
+            run.owner.join()
+            runCurrent()
+            assertEquals("FAILED", ledger.requests.getValue(request.id).status)
+            assertEquals("FAILED", ledger.runs.getValue(runId).status)
+
+            ledger.refreshPendingScopeRows()
+            val failed = vm.recoveryBubble.first {
+                it.scope == initial.scope && !it.busy &&
+                    it.items.firstOrNull()?.target?.activeRunId == runId
+            }
+            assertEquals(listOf(request.id, later.id), failed.items.map { it.target.requestId })
+            assertNotEquals(oldTarget, failed.items.first().target)
+            assertEquals(runId, failed.continueTargets.single().activeRunId)
+            assertEquals(laterRow, ledger.requests.getValue(later.id))
+            assertTrue(failed.runningSessions.isEmpty())
+            assertTrue(vm.agentStates.value[PARENT] is AgentUIState.Error)
+            assertTrue(fixture.jobs.isEmpty())
+            assertEquals(1, backendCalls.size)
+            verify(exactly = 1) { fixture.workflow.executeEvents(any(), any(), any()) }
+        } finally {
+            withContext(NonCancellable) {
+                collector.cancelAndJoin()
+                fixture.closeUi()
+                fixture.closeProcessOwner().join()
+            }
+        }
+    }
+
+    @Test
+    fun recoveryBubbleRegression_queuedUsageFailureStaysRecoverable() = runTest(dispatcher, timeout = 15.seconds) {
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        every { fixture.dependencies.llmCallRecordDao.getSummary(any()) } returns flow {
+            entered.complete(Unit)
+            release.await()
+            throw IllegalStateException("Synthetic usage query failure")
+        }
+        val handler = fixture.installCommand("/usage")
+        every { handler.execute(any(), any()) } answers { firstArg<SlashCommandContext>().showUsage() }
+        try {
+            vm.enqueueAgentRequest("Before failing command", projectRoot = WORKSPACE, targetSessionId = PARENT)
+            val first = backendRuns.receive()
+            vm.enqueueAgentRequest("/usage", projectRoot = WORKSPACE, targetSessionId = PARENT)
+            runCurrent()
+            val commandId = requireNotNull(vm.queuedRequests.value.single().recoveryRequestId)
+            complete(first)
+            entered.await()
+            val runId = requireNotNull(ledger.requests.getValue(commandId).activeRunId)
+            assertEquals("RUNNING", ledger.requests.getValue(commandId).status)
+            release.complete(Unit)
+            fixture.manager.runningCommandSessions.first { PARENT !in it }
+            runCurrent()
+
+            assertEquals("FAILED", ledger.requests.getValue(commandId).status)
+            assertEquals("FAILED", ledger.runs.getValue(runId).status)
+            assertEquals(1, ledger.writes.count { it == "request:$commandId:FAILED" })
+            val bubble = snapshot(commandId)
+            assertEquals(runId, bubble.continueTargets.single().activeRunId)
+            assertTrue(vm.agentStates.value[PARENT] is AgentUIState.Error)
+            assertEquals(1, backendCalls.size)
+            verify(exactly = 1) { handler.execute(any(), "") }
+        } finally {
+            release.complete(Unit)
+            withContext(NonCancellable) {
+                fixture.closeUi()
+                fixture.closeProcessOwner().join()
+            }
+        }
+    }
+
+    @Test
+    fun recoveryBubbleRegression_stoppedQueuedUsageStaysInterrupted() = runTest(dispatcher, timeout = 15.seconds) {
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val queryCancelled = CompletableDeferred<Unit>()
+        every { fixture.dependencies.llmCallRecordDao.getSummary(any()) } returns flow {
+            entered.complete(Unit)
+            try {
+                release.await()
+                emit(CallSummary(0, 0, 0, 0, 0, 0, null, null))
+            } finally {
+                queryCancelled.complete(Unit)
+            }
+        }
+        val handler = fixture.installCommand("/usage")
+        every { handler.execute(any(), any()) } answers { firstArg<SlashCommandContext>().showUsage() }
+        try {
+            vm.enqueueAgentRequest("Before stopped command", projectRoot = WORKSPACE, targetSessionId = PARENT)
+            val first = backendRuns.receive()
+            vm.enqueueAgentRequest("/usage", projectRoot = WORKSPACE, targetSessionId = PARENT)
+            runCurrent()
+            val commandId = requireNotNull(vm.queuedRequests.value.single().recoveryRequestId)
+            complete(first)
+            entered.await()
+            val runId = requireNotNull(ledger.requests.getValue(commandId).activeRunId)
+
+            vm.stopAgentSession(PARENT)
+            queryCancelled.await()
+            fixture.manager.runningCommandSessions.first { PARENT !in it }
+            runCurrent()
+            assertEquals("INTERRUPTED", ledger.requests.getValue(commandId).status)
+            assertEquals("INTERRUPTED", ledger.runs.getValue(runId).status)
+            assertEquals(1, ledger.writes.count { it == "request:$commandId:INTERRUPTED" })
+            assertEquals(runId, snapshot(commandId).continueTargets.single().activeRunId)
+            assertEquals(1, backendCalls.size)
+            assertTrue(fixture.jobs.isEmpty())
+        } finally {
+            release.complete(Unit)
+            withContext(NonCancellable) {
+                fixture.closeUi()
+                fixture.closeProcessOwner().join()
+            }
+        }
+    }
+
+    @Test
+    fun recoveryBubbleRegression_queuedInitReusesRunAndPreservesDelegateFailure() = runTest(dispatcher, timeout = 15.seconds) {
+        val handler = fixture.installCommand("/init")
+        every { handler.execute(any(), any()) } answers {
+            firstArg<SlashCommandContext>().initProject("Synthetic delegated initialization")
+        }
+        try {
+            vm.enqueueAgentRequest("Before delegated command", projectRoot = WORKSPACE, targetSessionId = PARENT)
+            val first = backendRuns.receive()
+            vm.enqueueAgentRequest("/init", projectRoot = WORKSPACE, targetSessionId = PARENT)
+            runCurrent()
+            val commandId = requireNotNull(vm.queuedRequests.value.single().recoveryRequestId)
+            val accepted = ledger.requests.getValue(commandId)
+            complete(first)
+            val delegated = backendRuns.receive()
+            val runId = requireNotNull(delegated.context.recoveryRunId)
+            assertEquals("Synthetic delegated initialization", delegated.request)
+            assertEquals(commandId, ledger.runs.getValue(runId).requestId)
+            assertEquals(accepted.inputMessageId, delegated.context.inputMessageId)
+            assertEquals("/init", ledger.messages.getValue(accepted.inputMessageId).content)
+            assertEquals(2, ledger.requests.size)
+            assertEquals(1, ledger.runs.values.count { it.requestId == commandId })
+
+            delegated.send(AgentEvent.Failed("Synthetic delegated failure"))
+            delegated.events.close()
+            delegated.owner.join()
+            fixture.manager.runningCommandSessions.first { PARENT !in it }
+            runCurrent()
+            assertEquals("FAILED", ledger.requests.getValue(commandId).status)
+            assertEquals("FAILED", ledger.runs.getValue(runId).status)
+            assertEquals(1, ledger.writes.count { it == "request:$commandId:FAILED" })
+            assertFalse(ledger.writes.contains("request:$commandId:INTERRUPTED"))
+            assertFalse(ledger.writes.contains("request:$commandId:COMPLETED"))
+            assertEquals(runId, snapshot(commandId).continueTargets.single().activeRunId)
+            assertEquals(2, backendCalls.size)
+            verify(exactly = 1) { handler.execute(any(), "") }
+        } finally {
+            withContext(NonCancellable) {
+                fixture.closeUi()
+                fixture.closeProcessOwner().join()
+            }
+        }
+    }
+
+    @Test
+    fun recoveryBubbleRegression_stoppedQueuedInitCancelsItsDelegatedRun() = runTest(dispatcher, timeout = 15.seconds) {
+        val handler = fixture.installCommand("/init")
+        every { handler.execute(any(), any()) } answers {
+            firstArg<SlashCommandContext>().initProject("Synthetic cancellable initialization")
+        }
+        try {
+            vm.enqueueAgentRequest("Before cancelled delegation", projectRoot = WORKSPACE, targetSessionId = PARENT)
+            val first = backendRuns.receive()
+            vm.enqueueAgentRequest("/init", projectRoot = WORKSPACE, targetSessionId = PARENT)
+            runCurrent()
+            val commandId = requireNotNull(vm.queuedRequests.value.single().recoveryRequestId)
+            complete(first)
+            val delegated = backendRuns.receive()
+            val runId = requireNotNull(delegated.context.recoveryRunId)
+            assertEquals(commandId, ledger.runs.getValue(runId).requestId)
+
+            vm.stopAgentSession(PARENT)
+            delegated.owner.join()
+            fixture.manager.runningCommandSessions.first { PARENT !in it }
+            runCurrent()
+            assertTrue(delegated.owner.isCancelled)
+            assertEquals("INTERRUPTED", ledger.requests.getValue(commandId).status)
+            assertEquals("INTERRUPTED", ledger.runs.getValue(runId).status)
+            assertEquals(1, ledger.writes.count { it == "request:$commandId:INTERRUPTED" })
+            assertEquals(1, ledger.runs.values.count { it.requestId == commandId })
+            assertEquals(2, ledger.requests.size)
+            assertEquals(runId, snapshot(commandId).continueTargets.single().activeRunId)
+            assertTrue(fixture.jobs.isEmpty())
+            assertEquals(2, backendCalls.size)
+        } finally {
+            withContext(NonCancellable) {
+                fixture.closeUi()
+                fixture.closeProcessOwner().join()
+            }
+        }
+    }
+
+    @Test
+    fun recoveryBubbleRegression_abandonedTargetCannotReappearFromOldSnapshot() = runTest(dispatcher, timeout = 15.seconds) {
+        val collector = backgroundScope.launch { vm.recoveryBubble.collect {} }
+        try {
+            val request = seedPending("abandon-stale-target")
+            val later = seedPending("keep-after-abandon")
+            val initial = snapshot(request.id, later.id)
+            val laterRow = ledger.requests.getValue(later.id)
+            vm.abandonRecovery(initial)
+            val current = vm.recoveryBubble.first {
+                it.scope == initial.scope && !it.busy &&
+                    ledger.requests.getValue(request.id).status == "ABANDONED"
+            }
+            assertEquals(listOf(later.id), current.items.map { it.target.requestId })
+            assertEquals(laterRow, ledger.requests.getValue(later.id))
+            assertTrue(ledger.runs.isEmpty())
+            assertTrue(backendCalls.isEmpty())
+            ledger.refreshPendingScopeRows()
+            assertEquals(current.items, snapshot(later.id).items)
+        } finally {
+            withContext(NonCancellable) {
+                collector.cancelAndJoin()
+                fixture.closeUi()
+                fixture.closeProcessOwner().join()
+            }
+        }
+    }
+
+    @Test
+    fun recoveryBubbleRegression_queuedUsageSourceChangeCannotCompleteItsRun() = runTest(dispatcher, timeout = 15.seconds) {
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        every { fixture.dependencies.llmCallRecordDao.getSummary(any()) } returns flow {
+            entered.complete(Unit)
+            release.await()
+            emit(CallSummary(0, 0, 0, 0, 0, 0, null, null))
+        }
+        val handler = fixture.installCommand("/usage")
+        every { handler.execute(any(), any()) } answers { firstArg<SlashCommandContext>().showUsage() }
+        try {
+            vm.enqueueAgentRequest("Before source change", projectRoot = WORKSPACE, targetSessionId = PARENT)
+            val first = backendRuns.receive()
+            vm.enqueueAgentRequest("/usage", projectRoot = WORKSPACE, targetSessionId = PARENT)
+            runCurrent()
+            val commandId = requireNotNull(vm.queuedRequests.value.single().recoveryRequestId)
+            complete(first)
+            entered.await()
+            val runId = requireNotNull(ledger.requests.getValue(commandId).activeRunId)
+
+            fixture.executionModeHolder.setMode(com.aicode.feature.settings.data.repository.ExecutionMode.REMOTE_SSH)
+            fixture.executionModeHolder.setMode(com.aicode.feature.settings.data.repository.ExecutionMode.LOCAL_PROOT)
+            release.complete(Unit)
+            fixture.manager.runningCommandSessions.first { PARENT !in it }
+            runCurrent()
+            assertEquals("INTERRUPTED", ledger.requests.getValue(commandId).status)
+            assertEquals("INTERRUPTED", ledger.runs.getValue(runId).status)
+            assertEquals(1, ledger.writes.count { it == "request:$commandId:INTERRUPTED" })
+            assertEquals(runId, snapshot(commandId).continueTargets.single().activeRunId)
+            assertEquals(1, backendCalls.size)
+        } finally {
+            release.complete(Unit)
+            withContext(NonCancellable) {
+                fixture.closeUi()
+                fixture.closeProcessOwner().join()
+            }
+        }
+    }
+
+    @Test
+    fun recoveryBubbleRegression_changedQueuedEnvironmentRequiresConfirmationWithoutExecution() = runTest(dispatcher, timeout = 15.seconds) {
+        val handler = fixture.installCommand("/usage")
+        every { handler.execute(any(), any()) } answers { firstArg<SlashCommandContext>().showUsage() }
+        try {
+            vm.enqueueAgentRequest("Before changed environment", projectRoot = WORKSPACE, targetSessionId = PARENT)
+            val first = backendRuns.receive()
+            vm.enqueueAgentRequest("/usage", projectRoot = WORKSPACE, targetSessionId = PARENT)
+            runCurrent()
+            val commandId = requireNotNull(vm.queuedRequests.value.single().recoveryRequestId)
+            val accepted = ledger.requests.getValue(commandId)
+            coEvery { fixture.projectIdentityResolver.capture(any(), any(), any()) } returns
+                ProjectMemoryCapture(fixture.projectIdentity.copy(profileId = "changed-command-profile")) {}
+            complete(first)
+            fixture.manager.runningCommandSessions.first { PARENT !in it }
+            runCurrent()
+
+            assertEquals("AWAITING_CONFIRMATION", ledger.requests.getValue(commandId).status)
+            assertNull(ledger.requests.getValue(commandId).activeRunId)
+            assertTrue(ledger.runs.values.none { it.requestId == commandId })
+            assertNull(ledger.messages[accepted.inputMessageId])
+            val pending = snapshot(commandId)
+            assertFalse(pending.items.single().environmentMatches)
+            assertTrue(pending.continueTargets.isEmpty())
+            assertEquals(1, backendCalls.size)
+            verify(exactly = 0) { handler.execute(any(), any()) }
+        } finally {
+            withContext(NonCancellable) {
+                fixture.closeUi()
+                fixture.closeProcessOwner().join()
+            }
+        }
+    }
+
+    @Test
+    fun recoveryBubbleRegression_queuedCompactionFailureCannotBeRecordedAsCompleted() = runTest(dispatcher, timeout = 15.seconds) {
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val handler = fixture.installCommand("/compress")
+        every { handler.name } returns "compress"
+        every { handler.execute(any(), any()) } answers { firstArg<SlashCommandContext>().compactCurrentSession() }
+        coEvery { fixture.workflow.compactSession(any(), any(), any(), any()) } coAnswers {
+            val emit = arg<suspend (AgentEvent) -> Unit>(3)
+            emit(AgentEvent.CompactionStarted(18_000, "queued-compaction"))
+            entered.complete(Unit)
+            release.await()
+            emit(AgentEvent.CompactionFailed("compaction_no_final", "queued-compaction"))
+            false
+        }
+        try {
+            vm.enqueueAgentRequest("Before failed compaction", projectRoot = WORKSPACE, targetSessionId = PARENT)
+            val first = backendRuns.receive()
+            vm.enqueueAgentRequest("/compress", projectRoot = WORKSPACE, targetSessionId = PARENT)
+            runCurrent()
+            val commandId = requireNotNull(vm.queuedRequests.value.single().recoveryRequestId)
+            complete(first)
+            entered.await()
+            val runId = requireNotNull(ledger.requests.getValue(commandId).activeRunId)
+            assertEquals("RUNNING", ledger.requests.getValue(commandId).status)
+            release.complete(Unit)
+            fixture.manager.runningCommandSessions.first { PARENT !in it }
+            runCurrent()
+
+            assertEquals("FAILED", ledger.requests.getValue(commandId).status)
+            assertEquals("FAILED", ledger.runs.getValue(runId).status)
+            assertEquals(1, ledger.writes.count { it == "request:$commandId:FAILED" })
+            assertEquals(runId, snapshot(commandId).continueTargets.single().activeRunId)
+            assertTrue(fixture.jobs.isEmpty())
+            assertEquals(1, backendCalls.size)
+            coVerify(exactly = 1) { fixture.workflow.compactSession(any(), any(), any(), any()) }
+        } finally {
+            release.complete(Unit)
+            withContext(NonCancellable) {
+                fixture.closeUi()
+                fixture.closeProcessOwner().join()
+            }
+        }
+    }
+
+    @Test
+    fun recoveryBubbleRegression_queuedCompactionSuccessSettlesOwnedRun() = runTest(dispatcher, timeout = 15.seconds) {
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val handler = fixture.installCommand("/compress")
+        every { handler.name } returns "compress"
+        every { handler.execute(any(), any()) } answers { firstArg<SlashCommandContext>().compactCurrentSession() }
+        coEvery { fixture.workflow.compactSession(any(), any(), any(), any()) } coAnswers {
+            entered.complete(Unit)
+            release.await()
+            true
+        }
+        try {
+            vm.enqueueAgentRequest("Before successful compaction", projectRoot = WORKSPACE, targetSessionId = PARENT)
+            val first = backendRuns.receive()
+            vm.enqueueAgentRequest("/compress", projectRoot = WORKSPACE, targetSessionId = PARENT)
+            runCurrent()
+            val commandId = requireNotNull(vm.queuedRequests.value.single().recoveryRequestId)
+            val accepted = ledger.requests.getValue(commandId)
+            complete(first)
+            entered.await()
+            val runId = requireNotNull(ledger.requests.getValue(commandId).activeRunId)
+            assertEquals("RUNNING", ledger.requests.getValue(commandId).status)
+            release.complete(Unit)
+            fixture.manager.runningCommandSessions.first { PARENT !in it }
+            runCurrent()
+
+            assertEquals("COMPLETED", ledger.requests.getValue(commandId).status)
+            assertEquals("COMPLETED", ledger.runs.getValue(runId).status)
+            assertEquals(1, ledger.writes.count { it == "request:$commandId:COMPLETED" })
+            assertEquals("/compress", ledger.messages.getValue(accepted.inputMessageId).content)
+            assertTrue(snapshot().items.isEmpty())
+            assertTrue(fixture.jobs.isEmpty())
+            assertEquals(1, backendCalls.size)
+        } finally {
+            release.complete(Unit)
+            withContext(NonCancellable) {
+                fixture.closeUi()
+                fixture.closeProcessOwner().join()
+            }
+        }
+    }
+
+    @Test
+    fun recoveryBubbleRegression_stoppedQueuedCompactionStaysInterrupted() = runTest(dispatcher, timeout = 15.seconds) {
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val cancelled = CompletableDeferred<Unit>()
+        val handler = fixture.installCommand("/compress")
+        every { handler.name } returns "compress"
+        every { handler.execute(any(), any()) } answers { firstArg<SlashCommandContext>().compactCurrentSession() }
+        coEvery { fixture.workflow.compactSession(any(), any(), any(), any()) } coAnswers {
+            entered.complete(Unit)
+            try {
+                release.await()
+                true
+            } finally {
+                cancelled.complete(Unit)
+            }
+        }
+        try {
+            vm.enqueueAgentRequest("Before stopped compaction", projectRoot = WORKSPACE, targetSessionId = PARENT)
+            val first = backendRuns.receive()
+            vm.enqueueAgentRequest("/compress", projectRoot = WORKSPACE, targetSessionId = PARENT)
+            runCurrent()
+            val commandId = requireNotNull(vm.queuedRequests.value.single().recoveryRequestId)
+            complete(first)
+            entered.await()
+            val runId = requireNotNull(ledger.requests.getValue(commandId).activeRunId)
+
+            vm.stopAgentSession(PARENT)
+            cancelled.await()
+            fixture.manager.runningCommandSessions.first { PARENT !in it }
+            runCurrent()
+            assertEquals("INTERRUPTED", ledger.requests.getValue(commandId).status)
+            assertEquals("INTERRUPTED", ledger.runs.getValue(runId).status)
+            assertEquals(1, ledger.writes.count { it == "request:$commandId:INTERRUPTED" })
+            assertEquals(runId, snapshot(commandId).continueTargets.single().activeRunId)
+            assertTrue(fixture.jobs.isEmpty())
+            assertEquals(1, backendCalls.size)
+        } finally {
+            release.complete(Unit)
+            withContext(NonCancellable) {
+                fixture.closeUi()
+                fixture.closeProcessOwner().join()
+            }
+        }
     }
 
     @Test

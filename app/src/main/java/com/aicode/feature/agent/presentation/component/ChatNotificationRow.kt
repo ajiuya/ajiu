@@ -222,14 +222,18 @@ internal fun notificationTimelineItem(notification: PendingNotification, timesta
         notification.kind in setOf(AgentNotificationKind.AGENT_MESSAGE, AgentNotificationKind.USER_MESSAGE) -> "message"
         notification.outcome == NotificationOutcome.COMPLETED -> "completed"
         notification.outcome == NotificationOutcome.FAILED -> "failed"
+        notification.outcome == NotificationOutcome.UNKNOWN -> "unknown"
         else -> "stopped"
     }
     val summary = when (notification.kind) {
-        AgentNotificationKind.BACKGROUND_TASK -> "后台任务「${notification.title}」已结束"
+        AgentNotificationKind.BACKGROUND_TASK -> if (notification.outcome == NotificationOutcome.UNKNOWN) {
+            "后台任务「${notification.title}」退出结果未知，需核验"
+        } else "后台任务「${notification.title}」已结束"
         AgentNotificationKind.SUBAGENT -> when (notification.outcome) {
             NotificationOutcome.COMPLETED -> "子代理「${notification.title}」已执行完成"
             NotificationOutcome.FAILED -> "子代理「${notification.title}」已执行失败"
             NotificationOutcome.STOPPED -> "子代理「${notification.title}」已停止"
+            NotificationOutcome.UNKNOWN -> "子代理「${notification.title}」结果未知，需核验"
         }
         AgentNotificationKind.AGENT_MESSAGE -> when (notification.action) {
             AgentMessageAction.ADD_INSTRUCTION -> "给${notification.targetTitle ?: notification.title}代理添加指令"
@@ -305,6 +309,7 @@ private fun notificationSignature(notice: SubAgentNotificationMetadata): String 
         "completed" -> NotificationOutcome.COMPLETED.name
         "failed" -> NotificationOutcome.FAILED.name
         "stopped" -> NotificationOutcome.STOPPED.name
+        "unknown" -> NotificationOutcome.UNKNOWN.name
         else -> "COMPLETED"
     },
     notice.taskTitle.ifBlank { notice.title },
@@ -340,6 +345,7 @@ internal fun notificationRowModel(
                     "completed" -> NotificationOutcome.COMPLETED
                     "failed" -> NotificationOutcome.FAILED
                     "stopped" -> NotificationOutcome.STOPPED
+                    "unknown" -> NotificationOutcome.UNKNOWN
                     else -> null
                 },
             )
@@ -366,6 +372,7 @@ internal fun notificationRowModel(
                 "completed" -> NotificationOutcome.COMPLETED
                 "failed" -> NotificationOutcome.FAILED
                 "stopped" -> NotificationOutcome.STOPPED
+                "unknown" -> NotificationOutcome.UNKNOWN
                 else -> null
             },
         )
@@ -435,6 +442,7 @@ internal fun ChatNotificationRow(
             NotificationOutcome.COMPLETED -> R.string.chat_notification_agent_completed
             NotificationOutcome.FAILED -> R.string.chat_notification_agent_failed
             NotificationOutcome.STOPPED -> R.string.chat_notification_agent_stopped
+            NotificationOutcome.UNKNOWN -> R.string.chat_notification_background_task_status_unknown
         })
     }
     val detail = listOfNotNull(outcome, model.detail.takeIf { it.isNotBlank() }).joinToString(" · ")
@@ -443,7 +451,7 @@ internal fun ChatNotificationRow(
             NotificationOutcome.COMPLETED -> R.string.chat_notification_background_task_completed
             NotificationOutcome.FAILED -> R.string.chat_notification_background_task_failed
             NotificationOutcome.STOPPED -> R.string.chat_notification_background_task_stopped
-            null -> R.string.chat_notification_background_task_status_unknown
+            NotificationOutcome.UNKNOWN, null -> R.string.chat_notification_background_task_status_unknown
         })
         val exitCode = model.backgroundTaskExitCode?.takeIf { it.isNotBlank() && !it.equals("unknown", ignoreCase = true) }
             ?: stringResource(R.string.chat_notification_background_task_exit_unknown)

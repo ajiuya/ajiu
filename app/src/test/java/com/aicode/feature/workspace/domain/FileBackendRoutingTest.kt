@@ -1,9 +1,16 @@
 package com.aicode.feature.workspace.domain
 
 import com.aicode.feature.agent.domain.container.ContainerProfile
+import com.aicode.feature.agent.domain.container.ChrootInstance
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeAuthorizationRequired
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeCapture
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwner
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwnerKind
+import com.aicode.feature.settings.data.repository.ContainerProfileSnapshot
 import com.aicode.feature.settings.data.repository.ContainerSettingsRepository
 import com.aicode.feature.settings.data.repository.ExecutionMode
 import com.aicode.feature.settings.data.repository.ExecutionModeHolder
+import io.mockk.coEvery
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.verify
@@ -15,6 +22,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertThrows
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Rule
@@ -213,6 +221,48 @@ class FileBackendRoutingTest {
     }
 
     @Test
+    fun chrootRoutesUseGuestNamespaceWhileAuthorizedFoldersStayOnHostWithoutWorkerQueries() = runBlocking {
+        val worker = mockk<FileAccessProvider>()
+        val owner = RuntimeOwner(RuntimeOwnerKind.FILE, "browser")
+        val runtime = LocalRuntimeCapture(owner, "chroot", 1, ChrootInstance("instance", 1, 2, 3),
+            directory.absolutePath, "/root", "generation", Any()) {}
+        val frozen = WorkspaceExecutionContext(ExecutionMode.LOCAL_PROOT, "chroot-generation", worker, null, null,
+            snapshot, owner, runtime) {}
+        val capture = FileBackendRouting().capture(frozen, listOf(virtualRoot, "~/workspace/file"))
+        val guest = capture.endpoint("~/workspace/file")
+        val host = capture.endpoint(virtualRoot)
+        assertEquals("chroot:generation", guest.physicalNamespace)
+        assertEquals("host", host.physicalNamespace)
+        assertEquals("chroot-generation", guest.identity)
+        withContext(frozen) {
+            assertTrue(host.provider.isDirectory(virtualRoot))
+            assertSame(worker, guest.transferBackend)
+        }
+        verify(exactly = 0) { worker.cacheIdentity() }
+        verify(exactly = 0) { worker.isDirectory(any()) }
+        verify(exactly = 0) { local.isDirectory(any()) }
+        verify(exactly = 0) { remote.isDirectory(any()) }
+    }
+
+    @Test
+    fun missingChrootCaptureDoesNotInterceptAnIndependentlyAuthorizedHostFolder() {
+        holder.setMode(ExecutionMode.LOCAL_PROOT)
+        every { local.cacheIdentity() } throws LocalRuntimeAuthorizationRequired()
+        File(directory, "file").writeText("host")
+        assertEquals("host", access.readFile("$virtualRoot/file"))
+        val source = access.capturePathSource("$virtualRoot/file")
+        source.checkCurrent()
+        source.checkAuthorization()
+        assertEquals('h'.code, access.openRead("$virtualRoot/file").use { it.read() })
+        assertThrows(LocalRuntimeAuthorizationRequired::class.java) { access.cacheIdentity() }
+        every { local.readFile("/etc/hosts") } throws LocalRuntimeAuthorizationRequired()
+        assertThrows(LocalRuntimeAuthorizationRequired::class.java) { access.readFile("/etc/hosts") }
+        verify(exactly = 0) { remote.readFile(any()) }
+        rootsCurrent = false
+        assertThrows(CancellationException::class.java) { source.checkCurrent() }
+    }
+
+    @Test
     fun pathSourceCacheKeyIncludesGrantEpochAndRevisionWithoutChangingRemoteExpectedBase() {
         val captured = access.capturePathSource("$virtualRoot/file")
         assertEquals("remote-base", captured.expectedBaseIdentity)
@@ -248,7 +298,17 @@ class FileBackendRoutingTest {
         var selectionRevision = 1L
         every { settings.activeProfileSelectionRevision } answers { selectionRevision }
         every { settings.activeProfileIdFlow } returns flowOf(ContainerProfile.BUILTIN_ID)
-        every { local.captureExecutionMapping() } returns mapping
+        coEvery { settings.captureProfileSnapshot() } answers {
+            ContainerProfileSnapshot(ContainerProfile.BUILTIN_ID, ContainerProfile.BUILTIN_ID,
+                listOf(ContainerProfile.BUILTIN_ALPINE), selectionRevision, 0L, settings)
+        }
+        every { settings.checkProfileSnapshot(any()) } answers {
+            if (firstArg<ContainerProfileSnapshot>().selectionRevision != selectionRevision) {
+                throw CancellationException("Profile selection changed")
+            }
+        }
+        every { local.captureExecutionMapping(any()) } returns mapping
+        every { local.checkExecutionMapping(mapping) } returns Unit
         every { local.cacheIdentity() } returns "local"
         val emptyRoots = mockk<LocalFolderGrantRepository>(relaxed = true) {
             every { snapshot() } returns LocalFolderSnapshot.EMPTY

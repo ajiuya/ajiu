@@ -60,6 +60,7 @@ import com.aicode.feature.settings.data.repository.ModelReasoningEffortRepositor
 import com.aicode.feature.settings.data.repository.StartupSessionMode
 import com.aicode.feature.workspace.domain.FileAccessProvider
 import com.aicode.feature.workspace.domain.WorkspaceExecutionContextFactory
+import com.aicode.feature.workspace.domain.WorkspaceExecutionContext
 import com.aicode.feature.workspace.domain.WorkspacePathMapper
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -103,6 +104,9 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.io.OutputStream
 import java.util.UUID
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeUserActions
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwner
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwnerKind
 import javax.inject.Inject
 
 data class ChatNotificationTimelineEvent(
@@ -157,7 +161,8 @@ class AIAgentViewModel @Inject constructor(
     private val recoveryRepository: RecoveryRepository,
     private val projectMemoryIdentityResolver: ProjectMemoryIdentityResolver,
     @param:ApplicationContext private val context: Context,
-    private val agentRunManager: AgentRunManager
+    private val agentRunManager: AgentRunManager,
+    private val localRuntimeUserActions: LocalRuntimeUserActions? = null
 ) : ViewModel(), SlashCommandContext {
 
     private val recoveryCodec = Json { ignoreUnknownKeys = true }
@@ -376,14 +381,24 @@ class AIAgentViewModel @Inject constructor(
             })
         }
     }
+    private val recoveryPreparation = combine(
+        agentRunManager.recoveryBusySessions, agentRunManager.consumedRecoveryTargets
+    ) { preparing, _ -> preparing }
     internal val recoveryBubble: StateFlow<RecoveryBubbleUi> = combine(
-        scopedRecovery, agentRunManager.recoveryBusySessions, agentRunManager.agentStates,
+        scopedRecovery, recoveryPreparation, agentRunManager.agentStates,
         agentRunManager.compactingSessions, agentRunManager.runningCommandSessions
     ) { snapshot, preparing, states, compacting, commands ->
         val runningSessions = snapshot.items.map { it.target.sessionId }.filterTo(mutableSetOf()) { sid ->
             sid in compacting || sid in commands || states[sid] == AgentUIState.Loading || states[sid] == AgentUIState.Streaming
         }
-        val items = snapshot.items.filterNot { it.target.sessionId in runningSessions }
+        // Read the committed invalidations here: another combine input may arrive before their flow emission.
+        val consumed = agentRunManager.consumedRecoveryTargets.value
+        val items = snapshot.items.filterNot { item ->
+            val target = item.target
+            target.sessionId in runningSessions || consumed[target.requestId]?.let {
+                it.sessionId == target.sessionId && it.generation == target.generation && it.activeRunId == target.activeRunId
+            } == true
+        }
         snapshot.copy(
             items = items,
             busy = items.distinctBy { it.target.sessionId }.any { it.target.sessionId in preparing },
@@ -395,6 +410,7 @@ class AIAgentViewModel @Inject constructor(
         if (path.isBlank() || _currentWorkspace.value == path) return
         selectionLoadedWorkspace.value = null
         updateSelectedSession(null)
+        browseWorkspaceRevision.incrementAndGet()
         _currentWorkspace.value = path
         browseController.setScope(null)
         // 搜索限定当前工作区，切区后旧结果无意义，一并清空。
@@ -534,6 +550,29 @@ class AIAgentViewModel @Inject constructor(
         expansionPrefs.edit().putStringSet(workspace, HashSet(paths)).apply()
     }
     private val browseScopeRetry = MutableStateFlow(0L)
+    private val browseOwnerIdentity = UUID.randomUUID().toString()
+    private val browseOwnerActive = java.util.concurrent.atomic.AtomicBoolean(true)
+    private val browseWorkspaceRevision = java.util.concurrent.atomic.AtomicLong()
+    private fun fileRuntimeOwner() = RuntimeOwner(RuntimeOwnerKind.FILE, browseOwnerIdentity)
+
+    private suspend fun freezeFileExecution(paths: List<String>? = null): WorkspaceExecutionContext {
+        val workspace = _currentWorkspace.value
+        val revision = browseWorkspaceRevision.get()
+        val check = {
+            if (!browseOwnerActive.get() || _currentWorkspace.value != workspace || browseWorkspaceRevision.get() != revision) {
+                throw CancellationException("File browser execution source changed")
+            }
+        }
+        return if (paths == null) workspaceExecutionContextFactory.freeze(runtimeOwner = fileRuntimeOwner(), checkSource = check)
+        else workspaceExecutionContextFactory.freezeForPaths(paths, runtimeOwner = fileRuntimeOwner(), checkSource = check)
+    }
+
+    internal suspend fun captureUserFile(path: String): WorkspaceExecutionContext = freezeFileExecution(listOf(path))
+
+    override fun onCleared() {
+        browseOwnerActive.set(false)
+        super.onCleared()
+    }
     private val _browseNotices = MutableSharedFlow<BrowseOperationNotice>(extraBufferCapacity = 16)
     val browseNotices = _browseNotices.asSharedFlow()
     private val browseController = FileBrowseController(
@@ -546,7 +585,7 @@ class AIAgentViewModel @Inject constructor(
         watch = { path -> fileChangeHub.watchWorkspace(path).asDirtySignal() },
         watchLocalFolder = { path ->
             flow {
-                val execution = workspaceExecutionContextFactory.freeze()
+                val execution = freezeFileExecution(listOf(path))
                 val host = withContext(execution) {
                     val route = fileBackendRouting.capture(execution, listOf(path))
                     val backend = route.endpoint(path).provider as com.aicode.feature.workspace.domain.InternalLocalFolderAccess
@@ -991,7 +1030,8 @@ class AIAgentViewModel @Inject constructor(
         }
     )
 
-    private data class BrowseSource(val workspace: String, val profile: String, val mode: ExecutionMode, val selectionRevision: Long)
+    private data class BrowseSource(val workspace: String, val profile: String, val mode: ExecutionMode, val selectionRevision: Long,
+        val configurationRevision: Long)
 
     private companion object {
         const val TAG = "AIAgentViewModel"
@@ -1005,30 +1045,57 @@ class AIAgentViewModel @Inject constructor(
                 _currentWorkspace,
                 containerSettingsRepository.activeProfileIdFlow.distinctUntilChanged(),
                 executionModeHolder.mode,
-                containerSettingsRepository.activeProfileSelectionRevisions
-            ) { workspace, profile, mode, selectedRevision ->
-                BrowseSource(workspace, profile, mode, selectedRevision)
+                containerSettingsRepository.activeProfileSelectionRevisions,
+                containerSettingsRepository.profileConfigurationRevisions
+            ) { workspace, profile, mode, selectedRevision, configurationRevision ->
+                BrowseSource(workspace, profile, mode, selectedRevision, configurationRevision)
             }
             combine(selection, localFolderGrants.snapshots) { source, _ -> source }
                 .flatMapLatest { source ->
                     browseController.setScope(null)
+                    val actions = localRuntimeUserActions
+                    val profile = if (actions != null && source.mode == ExecutionMode.LOCAL_PROOT) {
+                        try { containerSettingsRepository.captureProfileSnapshot().activeProfile }
+                        catch (cancelled: CancellationException) { throw cancelled }
+                        catch (_: Exception) { null }
+                    } else null
+                    val runtimeChanges = if (actions != null && profile?.isChroot == true) {
+                        actions.changes.map {
+                            actions.state(profile).let { state ->
+                                listOf(state.instance, state.rootEnabled, state.journalHealthy, state.recoveryRequired, state.authorizedOwners)
+                            }
+                        }.distinctUntilChanged().drop(1).map { Unit }
+                    } else kotlinx.coroutines.flow.emptyFlow()
                     merge(
                         projectMemoryIdentityResolver.environmentChanges,
-                        browseScopeRetry.drop(1).map { Unit }
+                        browseScopeRetry.drop(1).map { Unit },
+                        runtimeChanges
                     ).onStart { emit(Unit) }.map { source }
                 }
-                .collectLatest { (workspace, profile, mode, selectionRevision) ->
+                .collectLatest { (workspace, profile, mode, selectionRevision, configurationRevision) ->
                     if (workspace.isBlank()) return@collectLatest
                     try {
-                        val execution = withContext(Dispatchers.IO) { workspaceExecutionContextFactory.freeze() }
+                        var grantedFolderScope = false
+                        val execution = withContext(Dispatchers.IO) {
+                            try { freezeFileExecution() }
+                            catch (required: com.aicode.feature.agent.domain.container.runtime.LocalRuntimeAuthorizationRequired) {
+                                val paths = localFolderGrants.snapshot().roots.filter { it.available }.map { it.rootPath }
+                                if (paths.isEmpty()) throw required
+                                grantedFolderScope = true
+                                freezeFileExecution(paths)
+                            }
+                        }
                         if (execution.mode != mode || (execution.localMapping != null && execution.localMapping.profile.id != profile) ||
-                            selectionRevision != containerSettingsRepository.activeProfileSelectionRevision) {
+                            selectionRevision != containerSettingsRepository.activeProfileSelectionRevision ||
+                            configurationRevision != containerSettingsRepository.profileConfigurationRevision ||
+                            (execution.localRuntimeCapture != null && execution.localRuntimeCapture.profileId != profile)) {
                             throw CancellationException("File browse environment changed")
                         }
                         execution.checkCurrent()
                         val mapping = execution.localMapping?.let { it.copy(profile = it.profile.copy(name = "")) }
                         browseController.updateScope(FileBrowseScope(workspace, profile, mode, execution.fileCacheIdentity, mapping,
-                            execution.localFolderSnapshot.roots, execution.localFolderSnapshot.revision, selectionRevision))
+                            execution.localFolderSnapshot.roots, execution.localFolderSnapshot.revision, selectionRevision,
+                            runtimeOwner = execution.runtimeOwner, grantedFolderScope = grantedFolderScope))
                     } catch (cancelled: CancellationException) {
                         currentCoroutineContext().ensureActive()
                         browseController.setUnavailable(cancelled.message)
@@ -1039,9 +1106,14 @@ class AIAgentViewModel @Inject constructor(
                 }
         }
 
-        // 启动与工作区切换时重新扫描技能（项目级技能随工作区变化），刷新 `/` 命令菜单。
         viewModelScope.launch {
-            _currentWorkspace.collect { slashCommandRegistry.refresh() }
+            combine(
+                _currentWorkspace,
+                executionModeHolder.mode,
+                executionModeHolder.modeSelectionRevisions,
+                containerSettingsRepository.activeProfileSelectionRevisions,
+                containerSettingsRepository.profileConfigurationRevisions
+            ) { _, _, _, _, _ -> Unit }.collectLatest { slashCommandRegistry.refresh() }
         }
 
         viewModelScope.launch {

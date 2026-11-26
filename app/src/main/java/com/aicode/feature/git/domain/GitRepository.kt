@@ -2,6 +2,17 @@ package com.aicode.feature.git.domain
 
 import com.aicode.core.util.FileLogger
 import com.aicode.feature.agent.domain.container.CommandEngine
+import com.aicode.feature.agent.domain.container.CommandResult
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeAuthorizationRequired
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwner
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwnerKind
+import com.aicode.feature.settings.data.repository.ContainerSettingsRepository
+import com.aicode.feature.workspace.domain.WorkspaceExecutionContext
+import com.aicode.feature.workspace.domain.WorkspaceExecutionContextFactory
+import com.aicode.feature.plugin.data.PluginFiles
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import com.aicode.feature.git.domain.model.GitBranch
 import com.aicode.feature.git.domain.model.GitCommit
 import com.aicode.feature.git.domain.model.GitFileChange
@@ -21,6 +32,48 @@ import javax.inject.Singleton
 
 private const val TAG = "GitRepository"
 
+class GitOperationExpiredException : IllegalStateException("Git operation source changed; refresh the selected repository and retry")
+class GitWorkspaceRequiredException : IllegalStateException("Select an available workspace before running Git")
+
+class FrozenGitOperation internal constructor(
+    val workspacePath: String,
+    val repoRoot: String,
+    val mode: ExecutionMode,
+    val configurationRevision: Long,
+    val owner: RuntimeOwner,
+    private val factory: WorkspaceExecutionContextFactory,
+    private val sourceCheck: () -> Unit
+) {
+    private val mutex = Mutex()
+    @Volatile private var captured: WorkspaceExecutionContext? = null
+    val runtimeProfile get() = captured?.profileSnapshot?.activeProfile ?: captured?.localMapping?.profile
+
+    fun checkCurrent() {
+        try {
+            sourceCheck()
+            captured?.checkCurrent()
+        } catch (_: CancellationException) {
+            throw GitOperationExpiredException()
+        }
+    }
+
+    internal suspend fun execution(): WorkspaceExecutionContext = mutex.withLock {
+        checkCurrent()
+        captured ?: factory.freeze(runtimeOwner = owner, checkSource = sourceCheck).also {
+            if (it.mode != mode || it.runtimeOwner != owner) throw GitOperationExpiredException()
+            checkCurrent()
+            captured = it
+        }
+    }
+}
+
+private inline fun <T> gitAttempt(block: () -> T): Result<T> = try {
+    Result.success(block())
+} catch (failure: Exception) {
+    if (failure is CancellationException || failure is GitOperationExpiredException || failure is LocalRuntimeAuthorizationRequired) throw failure
+    Result.failure(failure)
+}
+
 /**
  * 在容器内执行 git 命令并解析输出。
  *
@@ -37,7 +90,9 @@ private const val TAG = "GitRepository"
 class GitRepository @Inject constructor(
     private val engine: CommandEngine,
     private val workspaceRepository: WorkspaceRepository,
-    private val executionModeHolder: ExecutionModeHolder
+    private val executionModeHolder: ExecutionModeHolder,
+    private val executionFactory: WorkspaceExecutionContextFactory,
+    private val containerSettings: ContainerSettingsRepository
 ) {
     /** 当前选中的 git 仓库路径；null 表示未指定（用工作区根）。 */
     @Volatile
@@ -59,15 +114,65 @@ class GitRepository @Inject constructor(
      * 每条参数经 [shellQuote] 单引号转义，含空格/特殊字符的值（提交消息、含空格路径等）安全传递。
      */
     private suspend fun git(
+        operation: FrozenGitOperation,
         vararg args: String
-    ): String = gitRaw(args)
+    ): String = gitRaw(operation, args)
 
     /** 当前 git 命令的执行目录：选中了子目录仓库用其路径，否则工作区根。 */
-    private fun repoCwd(): String = currentRepoPath ?: workspaceRepository.currentPath()
+    @Volatile private var repoSelectionRevision = 0L
+    private var repoWorkspaceSelection: WorkspaceRepository.Selection? = null
+    private var ownerWorkspaceSelection: WorkspaceRepository.Selection? = null
+    private var ownerWorkspaceEpoch = 0L
 
-    /** 设置当前选中的 git 仓库路径（null 回到工作区根）。 */
-    fun setRepoPath(path: String?) {
+    @Synchronized
+    fun captureOperation(): FrozenGitOperation {
+        val selection = workspaceRepository.selection.value
+        val workspace = selection.workspace?.takeIf { it.available }?.path
+            ?: throw GitWorkspaceRequiredException()
+        if (ownerWorkspaceSelection !== selection) {
+            ownerWorkspaceSelection = selection
+            ownerWorkspaceEpoch++
+        }
+        val root = currentRepoPath?.takeIf { repoWorkspaceSelection === selection } ?: workspace
+        val revision = repoSelectionRevision
+        val mode = executionModeHolder.currentMode()
+        val modeRevision = executionModeHolder.modeSelectionRevision
+        val profileRevision = containerSettings.activeProfileSelectionRevision
+        val configRevision = containerSettings.profileConfigurationRevision
+        val fingerprint = listOf(workspace, root, mode.name, modeRevision, profileRevision, configRevision,
+            ownerWorkspaceEpoch, revision).joinToString("\u0000")
+        val owner = RuntimeOwner(RuntimeOwnerKind.GIT, PluginFiles.sha256(fingerprint.toByteArray(Charsets.UTF_8)))
+        return FrozenGitOperation(workspace, root, mode, configRevision, owner, executionFactory) {
+            if (workspaceRepository.selection.value !== selection || repoSelectionRevision != revision ||
+                executionModeHolder.currentMode() != mode || executionModeHolder.modeSelectionRevision != modeRevision ||
+                containerSettings.activeProfileSelectionRevision != profileRevision ||
+                containerSettings.profileConfigurationRevision != configRevision) throw GitOperationExpiredException()
+        }.also { it.checkCurrent() }
+    }
+
+    @Synchronized
+    fun setRepoPath(path: String?, operation: FrozenGitOperation? = null) {
+        operation?.checkCurrent()
+        val selection = workspaceRepository.selection.value
+        val oldRoot = currentRepoPath?.takeIf { repoWorkspaceSelection === selection } ?: selection.workspace?.path
+        val newRoot = path ?: selection.workspace?.path
+        if (oldRoot != newRoot) repoSelectionRevision++
         currentRepoPath = path
+        repoWorkspaceSelection = selection
+    }
+
+    private suspend fun execute(
+        operation: FrozenGitOperation,
+        command: String,
+        cwd: String = operation.repoRoot,
+        timeoutMs: Long = CommandEngine.DEFAULT_TIMEOUT_MS
+    ): CommandResult {
+        operation.checkCurrent()
+        val execution = operation.execution()
+        return withContext(execution) {
+            operation.checkCurrent()
+            engine.runCommandSyncUnbounded(command, cwd, timeoutMs).also { operation.checkCurrent() }
+        }
     }
 
     /**
@@ -75,23 +180,24 @@ class GitRepository @Inject constructor(
      * 本地模式用 File 列子目录；远程模式只检查工作区根，避免扫到手机上的同名目录。
      * 返回按「根优先、子目录按名称排序」的路径列表。
      */
-    suspend fun discoverRepos(): List<String> {
-        val root = workspaceRepository.currentPath()
+    suspend fun discoverRepos(operation: FrozenGitOperation = captureOperation()): List<String> {
+        operation.checkCurrent()
+        val root = operation.workspacePath
         val candidates = mutableListOf(root)
-        if (executionModeHolder.currentMode() != ExecutionMode.REMOTE_SSH) {
-            runCatching {
+        if (operation.mode != ExecutionMode.REMOTE_SSH) {
+            gitAttempt {
                 java.io.File(root).listFiles { f -> f.isDirectory }
                     ?.sortedBy { it.name }
                     ?.forEach { candidates.add(it.absolutePath) }
             }
         }
-        return candidates.filter { isGitRepo(it) }
+        return candidates.filter { isGitRepo(it, operation) }.also { operation.checkCurrent() }
     }
 
     /** 指定路径是否处于 git 工作树内（用于仓库发现与手动指定校验）。 */
-    suspend fun isGitRepo(path: String): Boolean {
-        return runCatching {
-            engine.runCommandSyncUnbounded("git rev-parse --is-inside-work-tree", path).output.trim() == "true"
+    suspend fun isGitRepo(path: String, operation: FrozenGitOperation = captureOperation()): Boolean {
+        return gitAttempt {
+            execute(operation, "git rev-parse --is-inside-work-tree", path).output.trim() == "true"
         }.getOrElse { false }
     }
 
@@ -99,10 +205,12 @@ class GitRepository @Inject constructor(
      * 列出工作区根的一层直接子目录（供仓库选择弹窗展示扫描范围）。
      * 本地模式用 File 列；远程模式返回空，避免扫到手机上的同名目录。
      */
-    fun listSubdirectories(): List<String> {
-        if (executionModeHolder.currentMode() == ExecutionMode.REMOTE_SSH) return emptyList()
-        val root = workspaceRepository.currentPath()
-        return runCatching {
+    fun listSubdirectories(operation: FrozenGitOperation = captureOperation()): List<String> {
+        operation.checkCurrent()
+        if (operation.mode == ExecutionMode.REMOTE_SSH) return emptyList()
+        operation.checkCurrent()
+        val root = operation.workspacePath
+        return gitAttempt {
             java.io.File(root).listFiles { f -> f.isDirectory }
                 ?.sortedBy { it.name }
                 ?.map { it.absolutePath }
@@ -111,7 +219,7 @@ class GitRepository @Inject constructor(
     }
 
     /** 当前工作区根路径（git 命令的默认执行目录）。 */
-    fun workspaceRoot(): String = workspaceRepository.currentPath()
+    fun workspaceRoot(operation: FrozenGitOperation = captureOperation()): String = operation.workspacePath.also { operation.checkCurrent() }
 
     /**
      * 执行一条 `git` **写**子命令，据退出码判成败：非零（真实失败）抛 [GitCommandFailureException]
@@ -120,24 +228,26 @@ class GitRepository @Inject constructor(
      * 同样按失败抛，避免静默成功。
      */
     private suspend fun gitChecked(
+        operation: FrozenGitOperation,
         vararg args: String
-    ): String = gitCheckedWithTimeout(CommandEngine.DEFAULT_TIMEOUT_MS, *args)
+    ): String = gitCheckedWithTimeout(operation, CommandEngine.DEFAULT_TIMEOUT_MS, *args)
 
     private suspend fun gitCheckedWithTimeout(
+        operation: FrozenGitOperation,
         timeoutMs: Long,
         vararg args: String
     ): String {
         // 用不限幅执行：diff 内容/文件内容可能远超 AI 工具链路的 4 万字符限幅，
         // 截断占位符会混入 diff 数据流被 UI 渲染成伪 diff 行。
-        val result = engine.runCommandSyncUnbounded(buildGitCommand(args), repoCwd(), timeoutMs)
+        val result = execute(operation, buildGitCommand(args), timeoutMs = timeoutMs)
         if (result.outputTruncated) throw GitOutputTooLargeException()
         if (result.exitCode == 0) return result.output
         throw GitCommandFailureException(result.output.ifBlank { "git 退出码 ${result.exitCode}" })
     }
 
     /** 拼命令并跑（不判退出码），[git] 与 [gitChecked] 复用。 */
-    private suspend fun gitRaw(args: Array<out String>): String {
-        val result = engine.runCommandSyncUnbounded(buildGitCommand(args), repoCwd())
+    private suspend fun gitRaw(operation: FrozenGitOperation, args: Array<out String>): String {
+        val result = execute(operation, buildGitCommand(args))
         if (result.outputTruncated) throw GitOutputTooLargeException()
         return result.output
     }
@@ -149,13 +259,17 @@ class GitRepository @Inject constructor(
     }
 
     /** 当前工作区是否处于一个 git 工作树内。SSH 未连接等异常时返回 false 而非抛出，避免 UI 崩溃。 */
-    suspend fun isRepo(): Boolean {
-        return runCatching { git("rev-parse", "--is-inside-work-tree").trim() == "true" }
+    suspend fun isRepo(operation: FrozenGitOperation = captureOperation()): Boolean {
+        return gitAttempt { git(operation, "rev-parse", "--is-inside-work-tree").trim() == "true" }
             .getOrElse { false }
     }
 
     /** 容器是否就绪可执行 git 命令；未就绪时返回引导文案（供 Git 页在刷新前提示用户去终端页初始化）。 */
-    fun notReadyHint(): String? = engine.notReadyHint()
+    suspend fun notReadyHint(operation: FrozenGitOperation = captureOperation()): String? =
+        withContext(operation.execution()) {
+            operation.checkCurrent()
+            engine.notReadyHint().also { operation.checkCurrent() }
+        }
 
     /**
      * 在当前工作区初始化 git 仓库。
@@ -163,25 +277,25 @@ class GitRepository @Inject constructor(
      * 默认分支优先使用现代标准的 `main`（Git 2.28+ 支持 `git init -b main`），
      * 若环境 Git 版本较低不支持 `-b` 参数，降级为先 `git init` 再将未初始化的 HEAD 指向 `refs/heads/main`。
      */
-    suspend fun initRepo(): String {
-        return runCatching { gitChecked("init", "-b", "main") }
+    suspend fun initRepo(operation: FrozenGitOperation = captureOperation()): String {
+        return gitAttempt { gitChecked(operation, "init", "-b", "main") }
             .getOrElse {
-                val out = gitChecked("init")
-                runCatching { git("symbolic-ref", "HEAD", "refs/heads/main") }
+                val out = gitChecked(operation, "init")
+                gitAttempt { git(operation, "symbolic-ref", "HEAD", "refs/heads/main") }
                 out
             }
     }
 
     /** 克隆远程仓库到当前工作区根目录（`git clone <url> .`）。据退出码判成败，失败抛 [GitCommandFailureException]。 */
-    suspend fun cloneRepo(url: String): String =
-        gitCheckedWithTimeout(600_000L, "clone", url.trim(), ".")
+    suspend fun cloneRepo(url: String, operation: FrozenGitOperation = captureOperation()): String =
+        gitCheckedWithTimeout(operation, 600_000L, "clone", url.trim(), ".")
 
     /** 是否已配置至少一个远程仓库（`git remote` 输出非空）。拉取/推送前据此门控。 */
-    suspend fun hasRemote(): Boolean = git("remote").trim().isNotEmpty()
+    suspend fun hasRemote(operation: FrozenGitOperation = captureOperation()): Boolean = git(operation, "remote").trim().isNotEmpty()
 
     /** `git status` 聚合视图。 */
-    suspend fun status(): GitStatus {
-        val raw = git("status", "--porcelain=v1", "-b")
+    suspend fun status(operation: FrozenGitOperation = captureOperation()): GitStatus {
+        val raw = git(operation, "status", "--porcelain=v1", "-b")
         val lines = raw.split('\n').map { it.removeSuffix("\r") }
 
         var branch = "(unknown)"
@@ -241,20 +355,20 @@ class GitRepository @Inject constructor(
                 unstaged.add(GitFileChange(path, y.toString(), staged = false))
             }
         }
-        val isMerging = hasMergeHead() || conflicted.isNotEmpty()
+        val isMerging = hasMergeHead(operation) || conflicted.isNotEmpty()
         return GitStatus(branch, ahead, behind, staged, unstaged, untracked, conflicted, isMerging, upstream, isDetached)
     }
 
     /** 本地 + 远程分支列表，当前分支高亮。 */
-    suspend fun branches(): List<GitBranch> = loadAllRefs().branches
+    suspend fun branches(operation: FrozenGitOperation = captureOperation()): List<GitBranch> = loadAllRefs(operation).branches
 
     /**
      * 仅拉本地分支的 refs-by-commit 映射（`for-each-ref refs/heads`，大仓库亚秒级），
      * 供首屏轻量快照的 graph 标注当前分支位置。远程分支与标签标注延迟到 BRANCHES tab 全量加载。
      */
-    suspend fun localRefsOnly(): Map<String, List<GitGraphRef>> = withContext(Dispatchers.Default) {
-        val raw = runCatching {
-            git("for-each-ref", "--format=%(refname:short)\u001f%(objectname)\u001f%(HEAD)\u001f%(refname)", "refs/heads")
+    suspend fun localRefsOnly(operation: FrozenGitOperation = captureOperation()): Map<String, List<GitGraphRef>> = withContext(Dispatchers.Default) {
+        val raw = gitAttempt {
+            git(operation, "for-each-ref", "--format=%(refname:short)\u001f%(objectname)\u001f%(HEAD)\u001f%(refname)", "refs/heads")
         }.getOrDefault("")
         if (raw.isBlank() || raw.startsWith("fatal:")) return@withContext emptyMap()
         val result = mutableMapOf<String, MutableList<GitGraphRef>>()
@@ -271,8 +385,8 @@ class GitRepository @Inject constructor(
     }
 
     /** 最近 [limit] 条提交。 */
-    suspend fun log(limit: Int = 50): List<GitCommit> {
-        val raw = git("log", "--pretty=format:%H%x1f%h%x1f%an%x1f%ar%x1f%s", "-n", limit.toString())
+    suspend fun log(limit: Int = 50, operation: FrozenGitOperation = captureOperation()): List<GitCommit> {
+        val raw = git(operation, "log", "--pretty=format:%H%x1f%h%x1f%an%x1f%ar%x1f%s", "-n", limit.toString())
         if (raw.isBlank() || raw.startsWith("fatal:")) return emptyList()
         return raw.split('\n').mapNotNull { line ->
             val parts = line.removeSuffix("\r").split('\u001f')
@@ -297,9 +411,10 @@ class GitRepository @Inject constructor(
      */
     suspend fun graph(
         limit: Int = GRAPH_PAGE_SIZE,
-        refs: Map<String, List<GitGraphRef>> = emptyMap()
+        refs: Map<String, List<GitGraphRef>> = emptyMap(),
+        operation: FrozenGitOperation = captureOperation()
     ): GitGraph =
-        graphAppend(emptyList(), refs, limit)
+        graphAppend(emptyList(), refs, limit, operation)
 
     /**
      * 分页加载下一批提交并整体重算泳道布局。
@@ -315,10 +430,11 @@ class GitRepository @Inject constructor(
     suspend fun graphAppend(
         existingCommits: List<GraphCommit>,
         refs: Map<String, List<GitGraphRef>> = emptyMap(),
-        limit: Int = GRAPH_PAGE_SIZE
+        limit: Int = GRAPH_PAGE_SIZE,
+        operation: FrozenGitOperation = captureOperation()
     ): GitGraph = withContext(Dispatchers.Default) {
         val skip = existingCommits.size
-        val logRaw = runCatching { git("log", "--pretty=format:%H%x1f%h%x1f%an%x1f%ar%x1f%s%x1f%P%x1f%b", "--skip", skip.toString(), "-n", limit.toString()) }
+        val logRaw = gitAttempt { git(operation, "log", "--pretty=format:%H%x1f%h%x1f%an%x1f%ar%x1f%s%x1f%P%x1f%b", "--skip", skip.toString(), "-n", limit.toString()) }
             .getOrDefault("")
         if (logRaw.isBlank() || logRaw.startsWith("fatal:")) {
             return@withContext if (existingCommits.isEmpty()) GitGraph.EMPTY
@@ -349,10 +465,10 @@ class GitRepository @Inject constructor(
         val refsByCommit: Map<String, List<GitGraphRef>>
     )
 
-    suspend fun loadAllRefs(): AllRefs = withContext(Dispatchers.Default) {
-        val raw = runCatching {
+    suspend fun loadAllRefs(operation: FrozenGitOperation = captureOperation()): AllRefs = withContext(Dispatchers.Default) {
+        val raw = gitAttempt {
             git(
-                "for-each-ref",
+                operation, "for-each-ref",
                 "--format=%(refname:short)\u001f%(objectname)\u001f%(HEAD)\u001f%(refname)\u001f%(upstream:short)\u001f%(upstream:track)",
                 "refs/heads", "refs/remotes", "refs/tags"
             )
@@ -395,8 +511,8 @@ class GitRepository @Inject constructor(
      * 退化为「删除旧 + 新增新」，状态码取首字符即可复用 [com.aicode.feature.git.domain.model.GitFileChange]。
      * 返回空列表表示该提交无文件改动（如空提交）。
      */
-    suspend fun commitFiles(hash: String): List<GitFileChange> {
-        val raw = git("diff-tree", "--no-commit-id", "-r", "--root", "--name-status", "--no-renames", hash)
+    suspend fun commitFiles(hash: String, operation: FrozenGitOperation = captureOperation()): List<GitFileChange> {
+        val raw = git(operation, "diff-tree", "--no-commit-id", "-r", "--root", "--name-status", "--no-renames", hash)
         return withContext(Dispatchers.Default) {
             raw.lineSequence().mapNotNull { line ->
                 val l = line.removeSuffix("\r").trim()
@@ -411,22 +527,22 @@ class GitRepository @Inject constructor(
         }
     }
 
-    suspend fun stage(path: String) = gitChecked("add", "--", path)
-    suspend fun unstage(path: String) = gitChecked("reset", "HEAD", "--", path)
-    suspend fun stageAll() = gitChecked("add", "-A")
-    suspend fun unstageAll() = gitChecked("reset")
-    suspend fun commit(message: String, amend: Boolean = false) =
-        if (amend) gitChecked("commit", "--amend", "-m", message)
-        else gitChecked("commit", "-m", message)
+    suspend fun stage(path: String, operation: FrozenGitOperation = captureOperation()) = gitChecked(operation, "add", "--", path)
+    suspend fun unstage(path: String, operation: FrozenGitOperation = captureOperation()) = gitChecked(operation, "reset", "HEAD", "--", path)
+    suspend fun stageAll(operation: FrozenGitOperation = captureOperation()) = gitChecked(operation, "add", "-A")
+    suspend fun unstageAll(operation: FrozenGitOperation = captureOperation()) = gitChecked(operation, "reset")
+    suspend fun commit(message: String, amend: Boolean = false, operation: FrozenGitOperation = captureOperation()) =
+        if (amend) gitChecked(operation, "commit", "--amend", "-m", message)
+        else gitChecked(operation, "commit", "-m", message)
 
     /**
      * 获取用于 AI 生成提交信息的差异文本。
      * 优先获取暂存区差异（`git diff --cached`）；如果暂存区为空，则获取工作区差异（`git diff`）。
      */
-    suspend fun diffForCommitMessage(): String {
-        val staged = gitRaw(arrayOf("diff", "--cached", "--no-color", "--no-ext-diff"))
+    suspend fun diffForCommitMessage(operation: FrozenGitOperation = captureOperation()): String {
+        val staged = gitRaw(operation, arrayOf("diff", "--cached", "--no-color", "--no-ext-diff"))
         if (staged.isNotBlank() && !staged.startsWith("fatal:")) return staged
-        val worktree = gitRaw(arrayOf("diff", "--no-color", "--no-ext-diff"))
+        val worktree = gitRaw(operation, arrayOf("diff", "--no-color", "--no-ext-diff"))
         return if (!worktree.startsWith("fatal:")) worktree else ""
     }
 
@@ -435,7 +551,7 @@ class GitRepository @Inject constructor(
      * 被删除的文件由此重新出现。用 `checkout` 而非 `restore`——后者需 git 2.23+，
      * 远程 SSH 模式下服务器 git 可能更老。
      */
-    suspend fun revertWorktree(path: String): String = gitChecked("checkout", "--", path)
+    suspend fun revertWorktree(path: String, operation: FrozenGitOperation = captureOperation()): String = gitChecked(operation, "checkout", "--", path)
 
     /**
      * 回退单个文件的全部改动（已暂存 + 未暂存），还原到上次提交：先 `reset` 让索引回到 HEAD，
@@ -443,44 +559,44 @@ class GitRepository @Inject constructor(
      * 此时跳过 checkout——否则 git 会以 `pathspec did not match` 失败。
      * 仓库尚无任何提交时无 HEAD 可比，只能 `rm --cached` 退回未跟踪。
      */
-    suspend fun revertToHead(path: String): String {
-        if (!hasHead()) return gitChecked("rm", "-q", "--cached", "--", path)
-        gitChecked("reset", "-q", "HEAD", "--", path)
-        return if (existsInHead(path)) gitChecked("checkout", "--", path) else ""
+    suspend fun revertToHead(path: String, operation: FrozenGitOperation = captureOperation()): String {
+        if (!hasHead(operation)) return gitChecked(operation, "rm", "-q", "--cached", "--", path)
+        gitChecked(operation, "reset", "-q", "HEAD", "--", path)
+        return if (existsInHead(path, operation)) gitChecked(operation, "checkout", "--", path) else ""
     }
 
     /**
      * 回退全部未暂存改动。pathspec `:/` 指仓库根，工作区是仓库子目录时也能覆盖全仓库改动
      * （`--  .` 只作用于当前目录）。已暂存的内容不受影响。
      */
-    suspend fun revertAllWorktree(): String = gitChecked("checkout", "--", ":/")
+    suspend fun revertAllWorktree(operation: FrozenGitOperation = captureOperation()): String = gitChecked(operation, "checkout", "--", ":/")
 
     /**
      * 删除未跟踪的文件或目录（`git clean -f -d`）。`-d` 覆盖 status 折叠成一行的新目录；
      * 不带 `-x`，被 .gitignore 忽略的文件保持不动。这些文件从未进入版本库，删除后 git 无法恢复。
      */
-    suspend fun deleteUntracked(path: String): String = gitChecked("clean", "-f", "-d", "--", path)
+    suspend fun deleteUntracked(path: String, operation: FrozenGitOperation = captureOperation()): String = gitChecked(operation, "clean", "-f", "-d", "--", path)
 
     /**
      * 某个未跟踪目录下的未跟踪文件清单。`git status` 默认把新目录折叠成 `dir/` 一行，
      * 里面的文件不单独列出；UI 展开该目录时按需调用此方法，避免 `-uall` 在大目录下一次列出上千条。
      */
-    suspend fun untrackedFilesIn(dir: String): List<String> {
-        val raw = git("ls-files", "--others", "--exclude-standard", "--", dir)
+    suspend fun untrackedFilesIn(dir: String, operation: FrozenGitOperation = captureOperation()): List<String> {
+        val raw = git(operation, "ls-files", "--others", "--exclude-standard", "--", dir)
         if (raw.isBlank() || raw.startsWith("fatal:")) return emptyList()
         return raw.split('\n').mapNotNull { it.removeSuffix("\r").trim().ifBlank { null } }
             .map { unquoteGitPath(it) }
     }
 
     /** 仓库是否已有提交（HEAD 可解析）。空仓库里 `reset HEAD` / `ls-tree HEAD` 都会失败。 */
-    private suspend fun hasHead(): Boolean =
-        runCatching { git("rev-parse", "--verify", "HEAD").trim() }
+    private suspend fun hasHead(operation: FrozenGitOperation): Boolean =
+        gitAttempt { git(operation, "rev-parse", "--verify", "HEAD").trim() }
             .getOrDefault("")
             .let { it.isNotBlank() && !it.startsWith("fatal") }
 
     /** 指定路径在 HEAD 提交中是否存在。 */
-    private suspend fun existsInHead(path: String): Boolean =
-        runCatching { git("ls-tree", "HEAD", "--", path).trim() }
+    private suspend fun existsInHead(path: String, operation: FrozenGitOperation): Boolean =
+        gitAttempt { git(operation, "ls-tree", "HEAD", "--", path).trim() }
             .getOrDefault("")
             .let { it.isNotBlank() && !it.startsWith("fatal") }
 
@@ -490,7 +606,7 @@ class GitRepository @Inject constructor(
      * 故不再在此预查 host 凭据：三端（UI/终端/AI）共用同一 helper 兜底，逻辑单一来源。remote 不存在
      * 或真实失败由 [gitChecked] 据退出码抛 [GitCommandFailureException]，上层 toast。
      */
-    suspend fun pull(): String = gitChecked("pull")
+    suspend fun pull(operation: FrozenGitOperation = captureOperation()): String = gitChecked(operation, "pull")
 
     /**
      * 推送：有上游则 `git push`；当前分支无上游时自动 `git push --set-upstream <remote> <branch>` 首推建关联，
@@ -498,53 +614,53 @@ class GitRepository @Inject constructor(
      * remote 取 `git remote` 首个（多 remote 默认第一；无 remote 已被上层 hasRemote 门控挡掉）；
      * 分支取 `git rev-parse --abbrev-ref HEAD`。凭据仍由容器 credential.helper 链兜底注入。
      */
-    suspend fun push(): String {
-        val hasUpstream = runCatching { git("rev-parse", "--abbrev-ref", "@{upstream}").trim() }
+    suspend fun push(operation: FrozenGitOperation = captureOperation()): String {
+        val hasUpstream = gitAttempt { git(operation, "rev-parse", "--abbrev-ref", "@{upstream}").trim() }
             .getOrDefault("")
             .takeIf { it.isNotBlank() && it != "HEAD" && !it.startsWith("fatal") } != null
-        if (hasUpstream) return gitChecked("push")
-        val remote = git("remote").split('\n').firstOrNull { it.removeSuffix("\r").isNotBlank() }?.removeSuffix("\r")?.trim()
+        if (hasUpstream) return gitChecked(operation, "push")
+        val remote = git(operation, "remote").split('\n').firstOrNull { it.removeSuffix("\r").isNotBlank() }?.removeSuffix("\r")?.trim()
             ?: throw GitCommandFailureException("未配置远程仓库")
-        val branch = git("rev-parse", "--abbrev-ref", "HEAD").removeSuffix("\r").trim()
+        val branch = git(operation, "rev-parse", "--abbrev-ref", "HEAD").removeSuffix("\r").trim()
             .takeIf { it.isNotBlank() && it != "HEAD" }
             ?: throw GitCommandFailureException("无法确定当前分支（处于 detached HEAD）")
-        return gitChecked("push", "--set-upstream", remote, branch)
+        return gitChecked(operation, "push", "--set-upstream", remote, branch)
     }
 
     /**
      * 当前是否为 master 分支的首次推送（即当前分支为 master 且尚未建立 upstream 跟踪关系）。
      * 供 UI 弹窗询问用户是否重命名为现代通用的 main 分支。
      */
-    suspend fun isFirstPushOfMaster(): Boolean {
-        val hasUpstream = runCatching { git("rev-parse", "--abbrev-ref", "@{upstream}").trim() }
+    suspend fun isFirstPushOfMaster(operation: FrozenGitOperation = captureOperation()): Boolean {
+        val hasUpstream = gitAttempt { git(operation, "rev-parse", "--abbrev-ref", "@{upstream}").trim() }
             .getOrDefault("")
             .takeIf { it.isNotBlank() && it != "HEAD" && !it.startsWith("fatal") } != null
         if (hasUpstream) return false
-        val branch = git("rev-parse", "--abbrev-ref", "HEAD").removeSuffix("\r").trim()
+        val branch = git(operation, "rev-parse", "--abbrev-ref", "HEAD").removeSuffix("\r").trim()
         return branch == "master"
     }
 
     /** 将当前 master 分支重命名为 main 并执行首次推送。 */
-    suspend fun renameMasterToMainAndPush(): String {
-        renameBranch("master", "main")
-        return push()
+    suspend fun renameMasterToMainAndPush(operation: FrozenGitOperation = captureOperation()): String {
+        renameBranch("master", "main", operation)
+        return push(operation)
     }
 
     /** 本地标签列表，按创建时间倒序（最新在前）。 */
-    suspend fun listTags(): List<GitTag> = loadAllRefs().tags
+    suspend fun listTags(operation: FrozenGitOperation = captureOperation()): List<GitTag> = loadAllRefs(operation).tags
 
     /**
      * 创建新分支。name 为新分支名；startPoint 为基准分支名（null/空 → 从当前 HEAD）；
      * checkout=true 则创建并切换（`git checkout -b`），否则仅创建不切换（`git branch`）。
      * 起点不存在或分支名非法时由 [gitChecked] 据退出码抛 [GitCommandFailureException]，上层 toast。
      */
-    suspend fun createBranch(name: String, startPoint: String?, checkout: Boolean): String {
+    suspend fun createBranch(name: String, startPoint: String?, checkout: Boolean, operation: FrozenGitOperation = captureOperation()): String {
         return if (checkout) {
-            if (startPoint.isNullOrBlank()) gitChecked("checkout", "-b", name)
-            else gitChecked("checkout", "-b", name, startPoint)
+            if (startPoint.isNullOrBlank()) gitChecked(operation, "checkout", "-b", name)
+            else gitChecked(operation, "checkout", "-b", name, startPoint)
         } else {
-            if (startPoint.isNullOrBlank()) gitChecked("branch", name)
-            else gitChecked("branch", name, startPoint)
+            if (startPoint.isNullOrBlank()) gitChecked(operation, "branch", name)
+            else gitChecked(operation, "branch", name, startPoint)
         }
     }
 
@@ -552,45 +668,45 @@ class GitRepository @Inject constructor(
      * 安全删除本地分支（`git branch -d`）：仅删除已合并到上游的分支，未合并时 git 报错
      * 由 [gitChecked] 据退出码抛 [GitCommandFailureException]，上层 toast。当前分支不可删（git 自身拦截）。
      */
-    suspend fun deleteBranch(name: String): String = gitChecked("branch", "-d", name)
+    suspend fun deleteBranch(name: String, operation: FrozenGitOperation = captureOperation()): String = gitChecked(operation, "branch", "-d", name)
 
     /**
      * 重命名本地分支（`git branch -m <old> <new>`）。当前分支也可重命名：传单参数 `git branch -m <new>`
      * 重命名当前分支；这里统一用双参数形式，由上层保证 oldName 非空。名字非法或已存在时由 [gitChecked]
      * 据退出码抛 [GitCommandFailureException]，上层 toast。
      */
-    suspend fun renameBranch(oldName: String, newName: String): String =
-        gitChecked("branch", "-m", oldName, newName)
+    suspend fun renameBranch(oldName: String, newName: String, operation: FrozenGitOperation = captureOperation()): String =
+        gitChecked(operation, "branch", "-m", oldName, newName)
 
     /**
      * 创建轻量标签（`git tag <name>`），指向当前 HEAD 或指定提交。
      */
-    suspend fun createTag(name: String, commitHash: String? = null): String =
-        if (commitHash.isNullOrBlank()) gitChecked("tag", name)
-        else gitChecked("tag", name, commitHash)
+    suspend fun createTag(name: String, commitHash: String? = null, operation: FrozenGitOperation = captureOperation()): String =
+        if (commitHash.isNullOrBlank()) gitChecked(operation, "tag", name)
+        else gitChecked(operation, "tag", name, commitHash)
 
     /**
      * 重置当前分支到指定提交。
      * [mode] 可以是 "soft" 或 "mixed"。
      */
-    suspend fun resetToCommit(commitHash: String, mode: String = "mixed"): String =
-        gitChecked("reset", "--$mode", commitHash)
+    suspend fun resetToCommit(commitHash: String, mode: String = "mixed", operation: FrozenGitOperation = captureOperation()): String =
+        gitChecked(operation, "reset", "--$mode", commitHash)
 
     /**
      * 将忽略规则追加到工作区的 .gitignore 文件中。
      * 无论 .gitignore 是否已存在均可自动创建与追加；通过 engine 执行以同时兼容本地与远程模式。
      */
-    suspend fun addToGitignore(pattern: String): String {
+    suspend fun addToGitignore(pattern: String, operation: FrozenGitOperation = captureOperation()): String {
         val normalized = pattern.trim()
         if (normalized.isBlank()) return ""
         // 先检查 .gitignore 是否已有该规则
         val checkCmd = "grep -F -x -- ${shellQuote(normalized)} .gitignore"
-        val checkResult = engine.runCommandSyncUnbounded(checkCmd, repoCwd())
+        val checkResult = execute(operation, checkCmd)
         if (checkResult.exitCode == 0) return normalized // 已存在，无需重复追加
 
         // 不存在则通过 printf 安全追加（如果文件不存在则自动创建）
         val appendCmd = "printf '%s\\n' ${shellQuote(normalized)} >> .gitignore"
-        val appendResult = engine.runCommandSyncUnbounded(appendCmd, repoCwd())
+        val appendResult = execute(operation, appendCmd)
         if (appendResult.exitCode != 0) {
             throw GitCommandFailureException(appendResult.output.ifBlank { "写入 .gitignore 失败" })
         }
@@ -600,21 +716,21 @@ class GitRepository @Inject constructor(
     /**
      * 删除本地标签（`git tag -d <name>`）。不存在时由 [gitChecked] 据退出码抛 [GitCommandFailureException]，上层 toast。
      */
-    suspend fun deleteTag(name: String): String = gitChecked("tag", "-d", name)
+    suspend fun deleteTag(name: String, operation: FrozenGitOperation = captureOperation()): String = gitChecked(operation, "tag", "-d", name)
 
     /**
      * 删除远程分支（`git push <remote> --delete <branch>`）。ref 形如 `origin/feature`，拆出 remote 与分支名；
      * 无 remote 前缀时按 `origin` 兜底。会改远端，失败由 [gitChecked] 抛 [GitCommandFailureException]。
      */
-    suspend fun deleteRemoteBranch(ref: String): String {
+    suspend fun deleteRemoteBranch(ref: String, operation: FrozenGitOperation = captureOperation()): String {
         val remote = ref.substringBefore('/', "origin")
         val branch = ref.substringAfter('/', ref)
-        return gitChecked("push", remote, "--delete", branch)
+        return gitChecked(operation, "push", remote, "--delete", branch)
     }
 
     /** 是否正在处于未完成的合并状态（MERGE_HEAD 存在）。 */
-    private suspend fun hasMergeHead(): Boolean =
-        runCatching { git("rev-parse", "-q", "--verify", "MERGE_HEAD").trim() }
+    private suspend fun hasMergeHead(operation: FrozenGitOperation): Boolean =
+        gitAttempt { git(operation, "rev-parse", "-q", "--verify", "MERGE_HEAD").trim() }
             .getOrDefault("")
             .let { it.isNotBlank() && !it.startsWith("fatal") }
 
@@ -622,12 +738,12 @@ class GitRepository @Inject constructor(
      * 切换到指定分支或标签。branch 可以是本地分支名、远程分支名或 tag 名。
      * 远程分支用 `git checkout -b <local> <remote>` 创建本地跟踪分支，去掉远程前缀（如 origin/）。
      */
-    suspend fun checkout(branch: String, isRemote: Boolean): String {
+    suspend fun checkout(branch: String, isRemote: Boolean, operation: FrozenGitOperation = captureOperation()): String {
         return if (isRemote) {
             val localName = branch.substringAfter('/', branch)
-            gitChecked("checkout", "-b", localName, "--track", branch)
+            gitChecked(operation, "checkout", "-b", localName, "--track", branch)
         } else {
-            gitChecked("checkout", branch)
+            gitChecked(operation, "checkout", branch)
         }
     }
 
@@ -637,21 +753,21 @@ class GitRepository @Inject constructor(
      * [noFf] 为 true 时即使可快进也强制生成合并提交（`--no-ff`）。
      * 遇到冲突或脏工作区时由 [gitChecked] 抛 [GitCommandFailureException]。
      */
-    suspend fun mergeBranch(branch: String, noFf: Boolean = false): String {
-        return if (noFf) gitChecked("merge", "--no-ff", branch)
-        else gitChecked("merge", branch)
+    suspend fun mergeBranch(branch: String, noFf: Boolean = false, operation: FrozenGitOperation = captureOperation()): String {
+        return if (noFf) gitChecked(operation, "merge", "--no-ff", branch)
+        else gitChecked(operation, "merge", branch)
     }
 
     /**
      * 中止当前进行中的合并（`git merge --abort`）。
      */
-    suspend fun abortMerge(): String = gitChecked("merge", "--abort")
+    suspend fun abortMerge(operation: FrozenGitOperation = captureOperation()): String = gitChecked(operation, "merge", "--abort")
 
     /**
      * 列出所有储藏记录。
      */
-    suspend fun stashList(): List<GitStash> = withContext(Dispatchers.Default) {
-        val raw = runCatching { git("stash", "list", "--pretty=format:%gd%x1f%s%x1f%ar") }
+    suspend fun stashList(operation: FrozenGitOperation = captureOperation()): List<GitStash> = withContext(Dispatchers.Default) {
+        val raw = gitAttempt { git(operation, "stash", "list", "--pretty=format:%gd%x1f%s%x1f%ar") }
             .getOrDefault("")
         if (raw.isBlank() || raw.startsWith("fatal:")) return@withContext emptyList()
         raw.split('\n').mapNotNull { line ->
@@ -667,38 +783,38 @@ class GitRepository @Inject constructor(
      * 储藏工作区改动。
      * [message] 可选说明；[includeUntracked] 为 true 时包含未跟踪文件（`-u`）。
      */
-    suspend fun stashSave(message: String? = null, includeUntracked: Boolean = false): String {
+    suspend fun stashSave(message: String? = null, includeUntracked: Boolean = false, operation: FrozenGitOperation = captureOperation()): String {
         val args = mutableListOf("stash", "push")
         if (includeUntracked) args.add("-u")
         if (!message.isNullOrBlank()) {
             args.add("-m")
             args.add(message.trim())
         }
-        return gitChecked(*args.toTypedArray())
+        return gitChecked(operation, *args.toTypedArray())
     }
 
     /**
      * 弹出指定储藏（应用并删除），默认为最近的一条 `stash@{0}`。
      */
-    suspend fun stashPop(index: String = "stash@{0}"): String =
-        gitChecked("stash", "pop", index)
+    suspend fun stashPop(index: String = "stash@{0}", operation: FrozenGitOperation = captureOperation()): String =
+        gitChecked(operation, "stash", "pop", index)
 
     /**
      * 应用指定储藏（保留记录），默认为最近的一条 `stash@{0}`。
      */
-    suspend fun stashApply(index: String = "stash@{0}"): String =
-        gitChecked("stash", "apply", index)
+    suspend fun stashApply(index: String = "stash@{0}", operation: FrozenGitOperation = captureOperation()): String =
+        gitChecked(operation, "stash", "apply", index)
 
     /**
      * 丢弃指定储藏，默认为 `stash@{0}`。
      */
-    suspend fun stashDrop(index: String = "stash@{0}"): String =
-        gitChecked("stash", "drop", index)
+    suspend fun stashDrop(index: String = "stash@{0}", operation: FrozenGitOperation = captureOperation()): String =
+        gitChecked(operation, "stash", "drop", index)
 
     /**
      * 清空所有储藏记录。
      */
-    suspend fun stashClear(): String = gitChecked("stash", "clear")
+    suspend fun stashClear(operation: FrozenGitOperation = captureOperation()): String = gitChecked(operation, "stash", "clear")
 
     /**
      * 写入提交署名，**优先项目级**：当前工作区（~/workspace/.git/config）已有项目级署名时写 local，
@@ -706,22 +822,22 @@ class GitRepository @Inject constructor(
      * 这样 UI 与终端 `git config user.name` 读到的同一份——优先项目级、无则退全局，对齐 git 自身解析顺序。
      * 空值跳过对应项不动现有配置。由 UI 在用户保存身份时显式调用。
      */
-    suspend fun setUserIdentity(name: String, email: String) {
-        if (name.isNotBlank()) gitChecked("config", if (hasLocalConfig("user.name")) "--local" else "--global", "user.name", name)
-        if (email.isNotBlank()) gitChecked("config", if (hasLocalConfig("user.email")) "--local" else "--global", "user.email", email)
+    suspend fun setUserIdentity(name: String, email: String, operation: FrozenGitOperation = captureOperation()) {
+        if (name.isNotBlank()) gitChecked(operation, "config", if (hasLocalConfig("user.name", operation)) "--local" else "--global", "user.name", name)
+        if (email.isNotBlank()) gitChecked(operation, "config", if (hasLocalConfig("user.email", operation)) "--local" else "--global", "user.email", email)
     }
 
     /** 当前工作区是否有项目级（`--local`）配置值。非 git 仓库或无值时返回 false。 */
-    private suspend fun hasLocalConfig(key: String): Boolean =
-        runCatching { git("config", "--local", "--get", key).trim() }.getOrDefault("").isNotBlank()
+    private suspend fun hasLocalConfig(key: String, operation: FrozenGitOperation): Boolean =
+        gitAttempt { git(operation, "config", "--local", "--get", key).trim() }.getOrDefault("").isNotBlank()
 
     /** 读取 git 当前实际生效的 user.name（按 git 解析顺序：local→global→system），UI 回显与提交按钮判空用。失败返回空串。 */
-    suspend fun getUserName(): String =
-        runCatching { git("config", "--get", "user.name").trim() }.getOrDefault("").removeSuffix("\r")
+    suspend fun getUserName(operation: FrozenGitOperation = captureOperation()): String =
+        gitAttempt { git(operation, "config", "--get", "user.name").trim() }.getOrDefault("").removeSuffix("\r")
 
     /** 读取 git 当前实际生效的 user.email（local→global→system），UI 回显与编辑框初值。失败返回空串。 */
-    suspend fun getUserEmail(): String =
-        runCatching { git("config", "--get", "user.email").trim() }.getOrDefault("").removeSuffix("\r")
+    suspend fun getUserEmail(operation: FrozenGitOperation = captureOperation()): String =
+        gitAttempt { git(operation, "config", "--get", "user.email").trim() }.getOrDefault("").removeSuffix("\r")
 
     /**
      * 写入仓库地址 remote.origin.url，**仅写项目级**：remote.origin.url 是单个仓库的远端地址，
@@ -732,20 +848,20 @@ class GitRepository @Inject constructor(
      * 故此处始终写 `--local`（当前工作区须是 git 仓库），非仓库时抛 [GitCommandFailureException] 提示用户，
      * 不再退到 global 兑底。同时顺手清掉全局可能残留的 remote.origin.url（历史版本误写下的），一次性消除污染。
      */
-    suspend fun setRepoUrl(url: String) {
+    suspend fun setRepoUrl(url: String, operation: FrozenGitOperation = captureOperation()) {
         if (url.isNotBlank()) {
-            gitChecked("config", "--local", "remote.origin.url", url)
+            gitChecked(operation, "config", "--local", "remote.origin.url", url)
         } else {
             // 空值删除 local 的 remote.origin.url，git config --unset 对不存在的 key 返回非零但不影响其它配置
-            runCatching { gitChecked("config", "--local", "--unset", "remote.origin.url") }
+            gitAttempt { gitChecked(operation, "config", "--local", "--unset", "remote.origin.url") }
         }
         // 清除全局残留的 remote.origin.url（历史误写），避免污染后续 git clone 等命令。
-        runCatching { git("config", "--global", "--unset", "remote.origin.url") }
+        gitAttempt { git(operation, "config", "--global", "--unset", "remote.origin.url") }
     }
 
     /** 读取 git 当前实际生效的 remote.origin.url（local→global→system），UI 回显与编辑框初值。失败返回空串。 */
-    suspend fun getRepoUrl(): String =
-        runCatching { git("config", "--get", "remote.origin.url").trim() }.getOrDefault("").removeSuffix("\r")
+    suspend fun getRepoUrl(operation: FrozenGitOperation = captureOperation()): String =
+        gitAttempt { git(operation, "config", "--get", "remote.origin.url").trim() }.getOrDefault("").removeSuffix("\r")
 
     /**
      * 读取指定 ref（提交/分支/标签）下某文件的完整内容（`git show <ref>:<path>`）。
@@ -753,17 +869,17 @@ class GitRepository @Inject constructor(
      * 文件在指定 ref 不存在时（如新增文件的首个提交）git 报错输出 `fatal:`，此处检测到即返回空串，
      * 上层据空串判定为「新增/删除」，整个文件按全增或全删呈现。
      */
-    suspend fun showFileContent(ref: String, path: String): String {
-        if (refBlobSize("$ref:$path") > MAX_DIFF_FILE_BYTES) throw GitOutputTooLargeException()
-        val out = git("show", "$ref:$path")
+    suspend fun showFileContent(ref: String, path: String, operation: FrozenGitOperation = captureOperation()): String {
+        if (refBlobSize("$ref:$path", operation) > MAX_DIFF_FILE_BYTES) throw GitOutputTooLargeException()
+        val out = git(operation, "show", "$ref:$path")
         // git show 对不存在的路径输出 fatal 到 stderr，runCommandSync 合并了 stdout+stderr。
         // 检测到 fatal 前缀视为该版本无此文件，返回空串让 diff 按全增/全删处理。
         return if (out.startsWith("fatal:") || out.startsWith("error:")) "" else out
     }
 
     /** 指定 ref 下文件（`<ref>:<path>` / `:<path>`）的字节数；取不到（不存在/非法 ref）时返回 0。 */
-    private suspend fun refBlobSize(spec: String): Long =
-        runCatching { git("cat-file", "-s", spec).trim().toLong() }.getOrDefault(0L)
+    private suspend fun refBlobSize(spec: String, operation: FrozenGitOperation): Long =
+        gitAttempt { git(operation, "cat-file", "-s", spec).trim().toLong() }.getOrDefault(0L)
 
     /**
      * 读取工作区当前文件内容。用于工作区改动 diff：与 `HEAD:<path>` 对比看出未暂存的改动。
@@ -773,10 +889,13 @@ class GitRepository @Inject constructor(
      * [WorkspaceRepository.currentPath] 是远端绝对路径，本地 File 读不到（会静默变空串，
      * diff 显示成整文件删除），故退回在执行后端里 `cat` 取内容。
      */
-    suspend fun worktreeFileContent(path: String): String {
-        val local = withContext(Dispatchers.IO) {
-            runCatching {
-                java.io.File(repoCwd(), path)
+    suspend fun worktreeFileContent(path: String, operation: FrozenGitOperation = captureOperation()): String {
+        operation.execution()
+        operation.checkCurrent()
+        val local = if (operation.mode == ExecutionMode.REMOTE_SSH) null else withContext(Dispatchers.IO) {
+            operation.checkCurrent()
+            gitAttempt {
+                java.io.File(operation.repoRoot, path)
                     .takeIf { it.isFile }
                     ?.also { if (it.length() > MAX_DIFF_FILE_BYTES) throw GitOutputTooLargeException() }
                     ?.readText()
@@ -785,19 +904,17 @@ class GitRepository @Inject constructor(
                 null
             }
         }
+        operation.checkCurrent()
         if (local != null) return local
-        val result = engine.runCommandSyncUnbounded(
-            "cat -- ${shellQuote(path)}",
-            repoCwd()
-        )
+        val result = execute(operation, "cat -- ${shellQuote(path)}")
         if (result.outputTruncated) throw GitOutputTooLargeException()
         return if (result.exitCode == 0) result.output else ""
     }
 
     /** 读取暂存区当前文件内容（index）。文件尚未暂存时返回空串。 */
-    suspend fun indexFileContent(path: String): String {
-        if (refBlobSize(":$path") > MAX_DIFF_FILE_BYTES) throw GitOutputTooLargeException()
-        val out = git("show", ":$path")
+    suspend fun indexFileContent(path: String, operation: FrozenGitOperation = captureOperation()): String {
+        if (refBlobSize(":$path", operation) > MAX_DIFF_FILE_BYTES) throw GitOutputTooLargeException()
+        val out = git(operation, "show", ":$path")
         return if (out.startsWith("fatal:") || out.startsWith("error:")) "" else out
     }
 

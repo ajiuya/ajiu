@@ -45,6 +45,7 @@ class RootCommandManagerTest {
     private data class Fixture(
         val store: RootMemoryDataStore,
         val repository: RootAccessSettingsRepository,
+        val authority: RootAuthorityCoordinator,
         val factory: FakeRootProcessFactory,
         val manager: RootCommandManager
     )
@@ -55,7 +56,8 @@ class RootCommandManagerTest {
         val store = RootMemoryDataStore()
         val repository = RootAccessSettingsRepository(store, backgroundScope)
         val factory = FakeRootProcessFactory()
-        return Fixture(store, repository, factory, RootCommandManager(repository, factory, backgroundScope, dispatcher))
+        val authority = RootAuthorityCoordinator(repository, backgroundScope)
+        return Fixture(store, repository, authority, factory, RootCommandManager(authority, factory, backgroundScope, dispatcher))
     }
 
     private suspend fun Fixture.permit(command: String = "printf done", session: String = "s1"): String {
@@ -87,7 +89,8 @@ class RootCommandManagerTest {
         }
         val repository = RootAccessSettingsRepository(dataStore, backgroundScope)
         val factory = FakeRootProcessFactory()
-        val manager = RootCommandManager(repository, factory, backgroundScope, StandardTestDispatcher(testScheduler))
+        val authority = RootAuthorityCoordinator(repository, backgroundScope)
+        val manager = RootCommandManager(authority, factory, backgroundScope, StandardTestDispatcher(testScheduler))
         val authorityId = UUID.randomUUID().toString()
         val wrongGeneration = async { manager.authorize("s1", "printf done", 0, authorityId) }
         val correctGeneration = async { manager.authorize("s1", "printf done", 19, authorityId) }
@@ -303,7 +306,8 @@ class RootCommandManagerTest {
         val store = RootMemoryDataStore()
         val repository = RootAccessSettingsRepository(store, backgroundScope)
         val factory = FakeRootProcessFactory()
-        val manager = RootCommandManager(repository, factory, backgroundScope, StandardTestDispatcher(testScheduler))
+        val authority = RootAuthorityCoordinator(repository, backgroundScope)
+        val manager = RootCommandManager(authority, factory, backgroundScope, StandardTestDispatcher(testScheduler))
         manager.setEnabled(true)
         val before = manager.accessSnapshot()
         val permit = manager.authorize("s1", "printf done", before.generation, before.authorityId)!!
@@ -422,6 +426,65 @@ class RootCommandManagerTest {
         assertNotEquals(before.authorityId, after.authorityId)
         assertEquals(RootCommandManager.EXIT_INTERRUPTED, execution.await().exitCode)
         assertReclaimed(fixture, process)
+    }
+
+    @Test
+    fun sharedCoordinatorStopsToolCommandsBeforeRuntimeCleanupAndPersistence() = runTest {
+        val fixture = fixture()
+        fixture.manager.setEnabled(true)
+        val before = fixture.manager.accessSnapshot()
+        val process = FakeRootProcess(output = "", alive = true)
+        fixture.factory.next = process
+        val unused = fixture.permit()
+        val execution = async { fixture.manager.execute("printf done", 60_000, "s1", fixture.permit()) }
+        runCurrent()
+        val cleanupStarted = CompletableDeferred<Unit>()
+        val cleanupFinished = CompletableDeferred<Unit>()
+        val registration = fixture.authority.registerRevocation(
+            onRevoke = { assertTrue(process.destroyed) },
+            awaitStopped = {
+                cleanupStarted.complete(Unit)
+                cleanupFinished.await()
+            }
+        )
+        val closing = async { fixture.authority.setEnabled(false) }
+        runCurrent()
+        assertTrue(cleanupStarted.isCompleted)
+        assertFalse(closing.isCompleted)
+        assertReclaimed(fixture, process)
+        assertEquals(RootCommandManager.EXIT_INTERRUPTED, execution.await().exitCode)
+        assertTrue(fixture.store.data.value[booleanPreferencesKey("enabled")] == true)
+        assertFalse(fixture.manager.accessState.value.enabled)
+        assertNull(fixture.manager.authorize("s1", "printf done", before.generation, before.authorityId))
+        assertEquals(RootCommandManager.EXIT_DISABLED,
+            fixture.manager.execute("printf done", 1_000, "s1", unused).exitCode)
+        cleanupFinished.complete(Unit)
+        closing.await()
+        registration.close()
+        assertFalse(fixture.manager.accessSnapshot().enabled)
+        fixture.manager.setEnabled(true)
+        assertEquals(RootCommandManager.EXIT_APPROVAL_REQUIRED,
+            fixture.manager.execute("printf done", 1_000, "s1", unused).exitCode)
+        assertEquals(1, fixture.factory.commands.size)
+    }
+
+    @Test
+    fun timeoutsAreClampedToOneMillisecondAndThirtyMinutes() = runTest {
+        val fixture = fixture()
+        fixture.manager.setEnabled(true)
+        for ((requested, actual) in listOf(-1L to 1L, Long.MAX_VALUE to RootCommandManager.MAX_TIMEOUT_MS)) {
+            val process = FakeRootProcess(output = "", alive = true)
+            fixture.factory.next = process
+            val execution = async { fixture.manager.execute("printf done", requested, "s1", fixture.permit()) }
+            runCurrent()
+            advanceTimeBy(actual - 1L)
+            runCurrent()
+            assertFalse(execution.isCompleted)
+            advanceTimeBy(1L)
+            runCurrent()
+            assertEquals(RootCommandManager.EXIT_TIMEOUT, execution.await().exitCode)
+            assertReclaimed(fixture, process)
+        }
     }
 
     private fun assertReclaimed(fixture: Fixture, process: FakeRootProcess) {

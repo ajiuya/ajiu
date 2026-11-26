@@ -58,6 +58,200 @@ class ToolPermissionPolicyEngineTest {
         if (elevate) put("elevate", JsonPrimitive(true))
     }
 
+    private fun assertDefaultAllowHostIdentity(
+        result: ToolPermissionPolicyEngine.EvalResult,
+        shizukuIdentity: ShizukuIdentity? = null
+    ) {
+        if (shizukuIdentity == null) {
+            assertEquals(42L, result.rootGeneration)
+            assertEquals("root-authority", result.rootAuthorityId)
+            assertNull(result.shizukuIdentity)
+        } else {
+            assertEquals(shizukuIdentity, result.shizukuIdentity)
+            assertNull(result.rootGeneration)
+            assertNull(result.rootAuthorityId)
+        }
+    }
+
+    private fun assertHostWriteReview(result: ToolPermissionPolicyEngine.EvalResult, label: String = "host review") {
+        assertEquals(label, Verdict.ASK, result.verdict)
+        assertNotNull(label, result.sessionGrant)
+        assertTrue(label, result.sessionGrant.orEmpty().startsWith(SessionPermissionGrantRepository.HOST_WRITE_GRANT_PREFIX))
+        assertNotNull(label, result.askTitle)
+        assertNotNull(label, result.approvalNote)
+        assertNull(result.denyReason)
+    }
+
+    private fun keepOnlyLegacyGrants() {
+        coEvery { grants.isAllowed(any(), match { it.startsWith(SessionPermissionGrantRepository.HOST_WRITE_GRANT_PREFIX) }) } returns false
+    }
+
+    @Test
+    fun defaultAllowHostSystem_rootIdAllowsWithFrozenAuthority() = runTest {
+        coEvery { rootManager.accessSnapshot() } returns RootAccessState(true, 42, "root-authority")
+
+        val result = engine().evaluate("Root", commandArgs("id"), "s1")
+
+        assertEquals(Verdict.ALLOW, result.verdict)
+        assertNull(result.sessionGrant)
+        assertNull(result.denyReason)
+        assertNull(result.askTitle)
+        assertDefaultAllowHostIdentity(result)
+        coVerify(exactly = 0) { grants.allow(any(), any()) }
+    }
+
+    @Test
+    fun defaultAllowHostSystem_rootOrdinaryFileOperationsAllow() = runTest {
+        coEvery { rootManager.accessSnapshot() } returns RootAccessState(true, 42, "root-authority")
+        val evaluator = engine()
+        for (command in listOf(
+            "cat /data/local/tmp/ajiu-default-allow.txt",
+            "touch /sdcard/Download/ajiu-default-allow.txt",
+            "printf ready > /data/local/tmp/ajiu-default-allow.txt"
+        )) {
+            val result = evaluator.evaluate("Root", commandArgs(command), "s1")
+
+            assertEquals(command, Verdict.ALLOW, result.verdict)
+            assertNull(result.sessionGrant)
+            assertNull(result.denyReason)
+            assertDefaultAllowHostIdentity(result)
+        }
+    }
+
+    @Test
+    fun hostWritePolicy_opaqueScriptsAndDynamicWritersNeedReview() = runTest {
+        coEvery { rootManager.accessSnapshot() } returns RootAccessState(true, 42, "root-authority")
+        val identity = ShizukuIdentity(2000, "shell-connection")
+        val evaluator = engine()
+        for (toolName in listOf("Root", "Shizuku")) {
+            for (command in listOf(
+                "sh /data/local/tmp/unknown-script.sh",
+                "sh -c '\$AJIU_UNKNOWN_SCRIPT'",
+                "rm -rf \"\$TARGET\"",
+                "sh -c 'su -c id'"
+            )) {
+                val result = evaluator.evaluate(toolName, commandArgs(command), "s1")
+
+                val knownReadonly = command == "sh -c 'su -c id'"
+                if (knownReadonly) {
+                    assertEquals("$toolName: $command", Verdict.ALLOW, result.verdict)
+                    assertNull(result.sessionGrant)
+                    assertTrue(result.hostSystemUncertainties.isEmpty())
+                } else {
+                    assertHostWriteReview(result, "$toolName: $command")
+                    assertTrue(result.hostSystemUncertainties.isNotEmpty())
+                }
+                assertNull(result.denyReason)
+                assertDefaultAllowHostIdentity(result, identity.takeIf { toolName == "Shizuku" })
+            }
+        }
+    }
+
+    @Test
+    fun hostWritePolicy_unclassifiedPmAmRequireReviewWithRealIdentity() = runTest {
+        val evaluator = engine()
+        for (identity in listOf(
+            ShizukuIdentity(2000, "shell-connection"),
+            ShizukuIdentity(0, "root-connection")
+        )) {
+            every { shizukuManager.accessSnapshot() } returns identity
+            for (command in listOf("pm list packages", "am get-current-user")) {
+                val result = evaluator.evaluate("Shizuku", commandArgs(command), "s1")
+
+                assertHostWriteReview(result, "$identity: $command")
+                assertTrue(result.hostSystemUncertainties.isNotEmpty())
+                assertDefaultAllowHostIdentity(result, identity)
+            }
+        }
+        coVerify(exactly = 0) { rootManager.accessSnapshot() }
+    }
+
+    @Test
+    fun hostWritePolicy_directReadsAllowAndWritesOfferSourceGrantWithFrozenIdentity() = runTest {
+        coEvery { rootManager.accessSnapshot() } returns RootAccessState(true, 42, "root-authority")
+        val evaluator = engine()
+        for ((toolName, identity) in listOf(
+            "Root" to null,
+            "Shizuku" to ShizukuIdentity(2000, "shell-connection"),
+            "Shizuku" to ShizukuIdentity(0, "root-connection")
+        )) {
+            if (identity != null) every { shizukuManager.accessSnapshot() } returns identity
+            for (command in listOf(
+                "cat /system/build.prop",
+                "touch /vendor/ajiu-default-allow.conf",
+                "cat < /system/build.prop",
+                "printf ready > /system/ajiu-default-allow.conf",
+                "cat /sys/class/power_supply/battery/status",
+                "touch /sys/ajiu-default-allow"
+            )) {
+                val result = evaluator.evaluate(toolName, commandArgs(command), "s1")
+
+                if (command.startsWith("cat")) {
+                    assertEquals("$toolName $identity: $command", Verdict.ALLOW, result.verdict)
+                    assertNull(result.sessionGrant)
+                    assertNull(result.askTitle)
+                    assertNull(result.approvalNote)
+                } else {
+                    assertHostWriteReview(result, "$toolName $identity: $command")
+                }
+                assertNull(result.denyReason)
+                assertDefaultAllowHostIdentity(result, identity)
+            }
+        }
+        coVerify(exactly = 0) { grants.allow(any(), any()) }
+    }
+
+    @Test
+    fun defaultAllowHostSystem_hostFileAskCannotBeBypassedByElevationOrLegacyGrants() = runTest {
+        coEvery { rootManager.accessSnapshot() } returns RootAccessState(true, 42, "root-authority")
+        // Legacy channel/exact/elevation grants never stand in for the new source-wide approval.
+        coEvery { grants.isAllowed(any(), any()) } returns true
+        keepOnlyLegacyGrants()
+        val evaluator = engine()
+        for ((toolName, identity) in listOf(
+            "Root" to null,
+            "Shizuku" to ShizukuIdentity(2000, "shell-connection"),
+            "Shizuku" to ShizukuIdentity(0, "root-connection")
+        )) {
+            if (identity != null) every { shizukuManager.accessSnapshot() } returns identity
+            for (command in listOf("cat /system/build.prop", "printf ready > /sys/ajiu-default-allow")) {
+                for (elevate in listOf(false, true)) {
+                    val result = evaluator.evaluate(toolName, commandArgs(command, elevate = elevate), "s1")
+
+                    if (command.startsWith("cat")) {
+                        assertEquals("$toolName $identity: $command elevate=$elevate", Verdict.ALLOW, result.verdict)
+                        assertNull(result.sessionGrant)
+                    } else {
+                        assertHostWriteReview(result, "$toolName $identity: $command elevate=$elevate")
+                    }
+                    assertNull(result.denyReason)
+                    assertDefaultAllowHostIdentity(result, identity)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun defaultAllowHostSystem_literalPathsAndExecutableLocationsDoNotAsk() = runTest {
+        coEvery { rootManager.accessSnapshot() } returns RootAccessState(true, 42, "root-authority")
+        val evaluator = engine()
+        for ((toolName, identity) in listOf(
+            "Root" to null,
+            "Shizuku" to ShizukuIdentity(2000, "shell-connection"),
+            "Shizuku" to ShizukuIdentity(0, "root-connection")
+        )) {
+            if (identity != null) every { shizukuManager.accessSnapshot() } returns identity
+            for (command in listOf("echo '/system/x'", "printf '%s' '/sys/x'", "/system/bin/id")) {
+                val result = evaluator.evaluate(toolName, commandArgs(command), "s1")
+
+                assertEquals("$toolName $identity: $command", Verdict.ALLOW, result.verdict)
+                assertNull(result.sessionGrant)
+                assertNull(result.denyReason)
+                assertDefaultAllowHostIdentity(result, identity)
+            }
+        }
+    }
+
     @Test
     fun ordinaryTools_withoutDeny_areAutomaticallyAllowed() = runTest {
         val evaluator = engine()
@@ -202,7 +396,7 @@ class ToolPermissionPolicyEngineTest {
     }
 
     @Test
-    fun nullRedirects_preserveRootShizukuAndExactSessionApprovals() = runTest {
+    fun nullRedirects_preserveLegacyShellApprovalsAndDefaultAllowHostChannels() = runTest {
         val evaluator = engine()
         val command = "sudo id 2>/dev/null"
         val approval = evaluator.evaluate("Bash", commandArgs(command), "s1")
@@ -218,17 +412,18 @@ class ToolPermissionPolicyEngineTest {
         assertEquals("root:$otherCommand", other.sessionGrant)
 
         val shizuku = evaluator.evaluate("Shizuku", commandArgs("id 2>/dev/null"), "s1")
-        assertEquals(Verdict.ASK, shizuku.verdict)
-        assertEquals("tool:Shizuku:2000:shell-connection", shizuku.sessionGrant)
+        assertEquals(Verdict.ALLOW, shizuku.verdict)
+        assertNull(shizuku.sessionGrant)
+        assertEquals(ShizukuIdentity(2000, "shell-connection"), shizuku.shizukuIdentity)
         coEvery { grants.isAllowed("s1", "tool:Shizuku:2000:shell-connection") } returns true
         assertEquals(Verdict.ALLOW, evaluator.evaluate("Shizuku", commandArgs("id 2>/dev/null"), "s1").verdict)
-        assertEquals(Verdict.DENY, evaluator.evaluate("Shizuku", commandArgs(command, elevate = true), "s1").verdict)
+        assertEquals(Verdict.ALLOW, evaluator.evaluate("Shizuku", commandArgs(command, elevate = true), "s1").verdict)
 
         coEvery { rootManager.accessSnapshot() } returns RootAccessState(true, 42, "root-authority")
         coEvery { grants.isAllowed(any(), any()) } returns true
         for ((rootCommand, verdict) in listOf(
             "id 2>/dev/null" to Verdict.ALLOW,
-            "rm -rf /data 2>/dev/null" to Verdict.ASK
+            "rm -rf /data 2>/dev/null" to Verdict.ALLOW
         )) {
             val result = evaluator.evaluate("Root", commandArgs(rootCommand, elevate = true), "s1")
             assertEquals(rootCommand, verdict, result.verdict)
@@ -236,7 +431,8 @@ class ToolPermissionPolicyEngineTest {
             assertEquals("root-authority", result.rootAuthorityId)
             assertNull(result.sessionGrant)
         }
-        assertEquals(Verdict.DENY, evaluator.evaluate("Root", commandArgs("rm -rf /data 2>/dev/null"), "s1").verdict)
+        // The mock explicitly approves every key, including the new host-write source scope.
+        assertEquals(Verdict.ALLOW, evaluator.evaluate("Root", commandArgs("rm -rf /data 2>/dev/null"), "s1").verdict)
     }
 
     @Test
@@ -253,7 +449,7 @@ class ToolPermissionPolicyEngineTest {
         assertEquals(Verdict.ALLOW, evaluator.evaluate("Bash", commandArgs("git pull origin main")).verdict)
         assertEquals(Verdict.ALLOW, evaluator.evaluate("Bash", commandArgs("git clone repository")).verdict)
         assertEquals(Verdict.ASK, evaluator.evaluate("Bash", commandArgs("sudo id"), "s1").verdict)
-        assertEquals(Verdict.ASK, evaluator.evaluate("Shizuku", commandArgs("pm list packages"), "s1").verdict)
+        assertHostWriteReview(evaluator.evaluate("Shizuku", commandArgs("pm list packages"), "s1"), "unclassified pm")
         assertEquals(Verdict.DENY, evaluator.evaluate("Bash", commandArgs("rm -rf /"), "s1").verdict)
     }
 
@@ -394,31 +590,30 @@ class ToolPermissionPolicyEngineTest {
     }
 
     @Test
-    fun shizuku_defaultsToAskAndOffersToolScopedSessionGrant() = runTest {
+    fun shizuku_unclassifiedCommandOffersReviewAndKeepsRealIdentity() = runTest {
         val result = engine().evaluate("Shizuku", commandArgs("pm list packages"), "s1")
 
-        assertEquals(Verdict.ASK, result.verdict)
-        assertEquals("tool:Shizuku:2000:shell-connection", result.sessionGrant)
+        assertHostWriteReview(result)
+        assertTrue(result.hostSystemUncertainties.isNotEmpty())
         assertEquals(ShizukuIdentity(2000, "shell-connection"), result.shizukuIdentity)
         assertNull(result.rootGeneration)
         assertNull(result.rootAuthorityId)
-        assertNotNull(result.approvalNote)
         coVerify(exactly = 0) { grants.allow(any(), any()) }
     }
 
     @Test
-    fun shizukuGrant_allowsDifferentCommandsOnlyInGrantedSession() = runTest {
+    fun shizukuLegacyGrant_cannotApproveUnclassifiedCommandsInAnySession() = runTest {
         coEvery { grants.isAllowed("s1", "tool:Shizuku:2000:shell-connection") } returns true
         val evaluator = engine()
 
         for (command in listOf("pm list packages", "am get-current-user")) {
             val result = evaluator.evaluate("Shizuku", commandArgs(command), "s1")
-            assertEquals(command, Verdict.ALLOW, result.verdict)
+            assertHostWriteReview(result, command)
             assertEquals(ShizukuIdentity(2000, "shell-connection"), result.shizukuIdentity)
             assertNull(result.rootGeneration)
             assertNull(result.rootAuthorityId)
         }
-        assertEquals(Verdict.ASK, evaluator.evaluate("Shizuku", commandArgs("pm list packages"), "s2").verdict)
+        assertHostWriteReview(evaluator.evaluate("Shizuku", commandArgs("pm list packages"), "s2"), "other session")
     }
 
     @Test
@@ -604,12 +799,12 @@ class ToolPermissionPolicyEngineTest {
     }
 
     @Test
-    fun privilegedGrant_doesNotBypassOpaqueDestructiveProtection() = runTest {
+    fun hostOpaqueReview_doesNotChangeLegacyBashDestructiveProtection() = runTest {
         coEvery { grants.isAllowed("s1", "tool:Shizuku:2000:shell-connection") } returns true
         coEvery { grants.isAllowed("s1", "root:sudo cat > /etc/passwd") } returns true
         val evaluator = engine()
 
-        assertEquals(Verdict.DENY, evaluator.evaluate("Shizuku", commandArgs("rm -rf \$(pwd)/build"), "s1").verdict)
+        assertHostWriteReview(evaluator.evaluate("Shizuku", commandArgs("rm -rf \$(pwd)/build"), "s1"), "dynamic host writer")
         assertEquals(Verdict.DENY, evaluator.evaluate("Bash", commandArgs("sudo cat > /etc/passwd"), "s1").verdict)
     }
 
@@ -701,16 +896,16 @@ class ToolPermissionPolicyEngineTest {
     }
 
     @Test
-    fun hostRootChannel_alwaysAsksOnceAndCarriesEnableGeneration() = runTest {
+    fun hostRootChannel_defaultsToAllowAndCarriesEnableGeneration() = runTest {
         coEvery { rootManager.accessSnapshot() } returns RootAccessState(true, 42, "root-authority")
         val result = engine().evaluate("Root", commandArgs("id"), "s1")
-        assertEquals(Verdict.ASK, result.verdict)
-        assertEquals("tool:Root:root-authority:42", result.sessionGrant)
+        assertEquals(Verdict.ALLOW, result.verdict)
+        assertNull(result.sessionGrant)
         assertEquals(42L, result.rootGeneration)
         assertEquals("root-authority", result.rootAuthorityId)
         assertNull(result.shizukuIdentity)
-        assertNotNull(result.askTitle)
-        assertNotNull(result.approvalNote)
+        assertNull(result.askTitle)
+        assertNull(result.approvalNote)
         coVerify(exactly = 0) { grants.allow(any(), any()) }
     }
 
@@ -723,22 +918,24 @@ class ToolPermissionPolicyEngineTest {
     }
 
     @Test
-    fun hostRootDestructiveAndroidPathsRequireElevationAndFreshApproval() = runTest {
+    fun hostRootRecognizableSystemWritesAskButOrdinaryStorageAllowsWithoutElevation() = runTest {
         coEvery { rootManager.accessSnapshot() } returns RootAccessState(true, 9, "root-authority")
         coEvery { grants.isAllowed(any(), any()) } returns true
+        keepOnlyLegacyGrants()
         for (path in listOf("/data", "/sdcard", "/storage/emulated/0", "/system", "/vendor")) {
             val command = "rm -rf $path"
-            assertEquals(path, Verdict.DENY, engine().evaluate("Root", commandArgs(command), "s1").verdict)
+            val expected = if (path in setOf("/sdcard", "/storage/emulated/0")) Verdict.ALLOW else Verdict.ASK
+            assertEquals(path, expected, engine().evaluate("Root", commandArgs(command), "s1").verdict)
             val result = engine().evaluate("Root", commandArgs(command, elevate = true), "s1")
-            assertEquals(path, Verdict.ASK, result.verdict)
-            assertNull(result.sessionGrant)
+            assertEquals(path, expected, result.verdict)
+            if (expected == Verdict.ASK) assertHostWriteReview(result, path) else assertNull(result.sessionGrant)
             assertEquals(9L, result.rootGeneration)
             assertEquals("root-authority", result.rootAuthorityId)
         }
     }
 
     @Test
-    fun shizukuCannotReuseSessionGrantForExplicitHostRoot() = runTest {
+    fun shizukuSuReferencesAllowButNeverManufactureRootIdentity() = runTest {
         coEvery { grants.isAllowed(any(), any()) } returns true
         for (command in listOf(
             "su -c id", "sudo id", "echo \$(su -c id)",
@@ -747,42 +944,49 @@ class ToolPermissionPolicyEngineTest {
             "for n in 1; do su -c id; done",
             "sh -c 'if true; then su -c id; fi'"
         )) {
-            assertEquals(command, Verdict.DENY, engine().evaluate("Shizuku", commandArgs(command, elevate = true), "s1").verdict)
+            val result = engine().evaluate("Shizuku", commandArgs(command, elevate = true), "s1")
+            assertEquals(command, Verdict.ALLOW, result.verdict)
+            assertNull(result.sessionGrant)
+            assertEquals(ShizukuIdentity(2000, "shell-connection"), result.shizukuIdentity)
+            assertNull(result.rootGeneration)
+            assertNull(result.rootAuthorityId)
         }
     }
 
     @Test
-    fun hostRootSessionGrant_allowsDifferentCommandsWithFrozenAuthorityMetadata() = runTest {
+    fun hostRootLegacyGrant_doesNotAffectAllowWithFrozenAuthorityMetadata() = runTest {
         coEvery { rootManager.accessSnapshot() } returns RootAccessState(true, 42, "root-authority")
         coEvery { grants.isAllowed("s1", "tool:Root:root-authority:42") } returns true
         val evaluator = engine()
 
         for (command in listOf("id", "pm list packages", "su -c id", "echo sudo")) {
             val result = evaluator.evaluate("Root", commandArgs(command), "s1")
-            assertEquals(command, Verdict.ALLOW, result.verdict)
+            if (command == "pm list packages") assertHostWriteReview(result, command) else {
+                assertEquals(command, Verdict.ALLOW, result.verdict)
+                assertNull(result.sessionGrant)
+            }
             assertEquals(42L, result.rootGeneration)
             assertEquals("root-authority", result.rootAuthorityId)
             assertNull(result.shizukuIdentity)
-            assertNull(result.sessionGrant)
         }
     }
 
     @Test
-    fun hostRootSessionGrant_doesNotCrossSessions() = runTest {
+    fun hostRootOrdinaryCommands_doNotNeedGrantsInEitherSession() = runTest {
         coEvery { rootManager.accessSnapshot() } returns RootAccessState(true, 42, "root-authority")
         coEvery { grants.isAllowed("s1", "tool:Root:root-authority:42") } returns true
         val evaluator = engine()
 
         assertEquals(Verdict.ALLOW, evaluator.evaluate("Root", commandArgs("id"), "s1").verdict)
         val other = evaluator.evaluate("Root", commandArgs("id"), "s2")
-        assertEquals(Verdict.ASK, other.verdict)
-        assertEquals("tool:Root:root-authority:42", other.sessionGrant)
+        assertEquals(Verdict.ALLOW, other.verdict)
+        assertNull(other.sessionGrant)
         assertEquals(42L, other.rootGeneration)
         assertEquals("root-authority", other.rootAuthorityId)
     }
 
     @Test
-    fun hostRootSessionGrant_closeAndReopenRequiresApprovalForNewGeneration() = runTest {
+    fun hostRootCloseAndReopen_returnsOnlyTheCurrentGeneration() = runTest {
         coEvery { grants.isAllowed("s1", "tool:Root:root-authority:42") } returns true
         val evaluator = engine()
         coEvery { rootManager.accessSnapshot() } returns RootAccessState(true, 42, "root-authority")
@@ -795,21 +999,21 @@ class ToolPermissionPolicyEngineTest {
 
         coEvery { rootManager.accessSnapshot() } returns RootAccessState(true, 44, "root-authority")
         val reopened = evaluator.evaluate("Root", commandArgs("id"), "s1")
-        assertEquals(Verdict.ASK, reopened.verdict)
-        assertEquals("tool:Root:root-authority:44", reopened.sessionGrant)
+        assertEquals(Verdict.ALLOW, reopened.verdict)
+        assertNull(reopened.sessionGrant)
         assertEquals(44L, reopened.rootGeneration)
         assertEquals("root-authority", reopened.rootAuthorityId)
     }
 
     @Test
-    fun hostRootSessionGrant_cannotTransferToAnotherLocalAuthority() = runTest {
+    fun hostRootAllow_usesActualLocalAuthorityRatherThanPriorGrantMetadata() = runTest {
         coEvery { grants.isAllowed("s1", "tool:Root:root-authority:42") } returns true
         coEvery { rootManager.accessSnapshot() } returns RootAccessState(true, 42, "other-local-authority")
 
         val result = engine().evaluate("Root", commandArgs("id"), "s1")
 
-        assertEquals(Verdict.ASK, result.verdict)
-        assertEquals("tool:Root:other-local-authority:42", result.sessionGrant)
+        assertEquals(Verdict.ALLOW, result.verdict)
+        assertNull(result.sessionGrant)
         assertEquals("other-local-authority", result.rootAuthorityId)
         assertEquals(42L, result.rootGeneration)
     }
@@ -830,7 +1034,7 @@ class ToolPermissionPolicyEngineTest {
     }
 
     @Test
-    fun legacyPrivilegedGrants_cannotAuthorizeEitherHostRootChannel() = runTest {
+    fun legacyPrivilegedGrants_doNotReplaceEitherHostChannelsActualIdentity() = runTest {
         coEvery { rootManager.accessSnapshot() } returns RootAccessState(true, 42, "root-authority")
         every { shizukuManager.accessSnapshot() } returns ShizukuIdentity(0, "root-connection")
         for (legacy in listOf("tool:Shizuku", "root:id", "root:su -c id", "tool:Root", "root:root-authority:42")) {
@@ -840,14 +1044,17 @@ class ToolPermissionPolicyEngineTest {
 
         val root = evaluator.evaluate("Root", commandArgs("id"), "s1")
         val shizukuRoot = evaluator.evaluate("Shizuku", commandArgs("id"), "s1")
-        assertEquals(Verdict.ASK, root.verdict)
-        assertEquals("tool:Root:root-authority:42", root.sessionGrant)
-        assertEquals(Verdict.ASK, shizukuRoot.verdict)
-        assertEquals("tool:Shizuku:0:root-connection", shizukuRoot.sessionGrant)
+        assertEquals(Verdict.ALLOW, root.verdict)
+        assertNull(root.sessionGrant)
+        assertEquals(42L, root.rootGeneration)
+        assertEquals("root-authority", root.rootAuthorityId)
+        assertEquals(Verdict.ALLOW, shizukuRoot.verdict)
+        assertNull(shizukuRoot.sessionGrant)
+        assertEquals(ShizukuIdentity(0, "root-connection"), shizukuRoot.shizukuIdentity)
     }
 
     @Test
-    fun independentRootAndRootShizukuSessionGrants_areIsolatedBothWays() = runTest {
+    fun independentRootAndRootShizuku_allowsRetainDistinctAuthorityTypes() = runTest {
         coEvery { rootManager.accessSnapshot() } returns RootAccessState(true, 42, "root-authority")
         every { shizukuManager.accessSnapshot() } returns ShizukuIdentity(0, "root-connection")
         val evaluator = engine()
@@ -855,32 +1062,39 @@ class ToolPermissionPolicyEngineTest {
 
         assertEquals(Verdict.ALLOW, evaluator.evaluate("Root", commandArgs("id"), "s1").verdict)
         val shizukuRoot = evaluator.evaluate("Shizuku", commandArgs("id"), "s1")
-        assertEquals(Verdict.ASK, shizukuRoot.verdict)
-        assertEquals("tool:Shizuku:0:root-connection", shizukuRoot.sessionGrant)
+        assertEquals(Verdict.ALLOW, shizukuRoot.verdict)
+        assertNull(shizukuRoot.sessionGrant)
+        assertNull(shizukuRoot.rootGeneration)
+        assertNull(shizukuRoot.rootAuthorityId)
+        assertEquals(ShizukuIdentity(0, "root-connection"), shizukuRoot.shizukuIdentity)
 
         coEvery { grants.isAllowed("s1", "tool:Root:root-authority:42") } returns false
         coEvery { grants.isAllowed("s1", "tool:Shizuku:0:root-connection") } returns true
         assertEquals(Verdict.ALLOW, evaluator.evaluate("Shizuku", commandArgs("id"), "s1").verdict)
-        assertEquals(Verdict.ASK, evaluator.evaluate("Root", commandArgs("id"), "s1").verdict)
+        val root = evaluator.evaluate("Root", commandArgs("id"), "s1")
+        assertEquals(Verdict.ALLOW, root.verdict)
+        assertEquals(42L, root.rootGeneration)
+        assertEquals("root-authority", root.rootAuthorityId)
+        assertNull(root.shizukuIdentity)
     }
 
     @Test
-    fun shizukuShellGrant_cannotUpgradeToRootEvenOnMatchingConnectionId() = runTest {
+    fun shizukuIdentityChange_returnsActualUidEvenOnMatchingConnectionId() = runTest {
         coEvery { grants.isAllowed("s1", "tool:Shizuku") } returns true
         coEvery { grants.isAllowed("s1", "tool:Shizuku:2000:shell-connection") } returns true
         every { shizukuManager.accessSnapshot() } returns ShizukuIdentity(0, "shell-connection")
 
         val result = engine().evaluate("Shizuku", commandArgs("id"), "s1")
 
-        assertEquals(Verdict.ASK, result.verdict)
-        assertEquals("tool:Shizuku:0:shell-connection", result.sessionGrant)
+        assertEquals(Verdict.ALLOW, result.verdict)
+        assertNull(result.sessionGrant)
         assertEquals(ShizukuIdentity(0, "shell-connection"), result.shizukuIdentity)
-        assertNotNull(result.askTitle)
-        assertNotNull(result.approvalNote)
+        assertNull(result.askTitle)
+        assertNull(result.approvalNote)
     }
 
     @Test
-    fun shizukuSessionGrant_serviceConnectionChangesRequireNewApproval() = runTest {
+    fun shizukuConnectionChanges_denyUnknownAndCarryOnlyActualNewConnection() = runTest {
         val evaluator = engine()
         for (uid in listOf(2000, 0)) {
             coEvery { grants.isAllowed("s1", "tool:Shizuku:$uid:first-connection") } returns true
@@ -892,8 +1106,8 @@ class ToolPermissionPolicyEngineTest {
 
             every { shizukuManager.accessSnapshot() } returns ShizukuIdentity(uid, "second-connection")
             val changed = evaluator.evaluate("Shizuku", commandArgs("id"), "s1")
-            assertEquals(Verdict.ASK, changed.verdict)
-            assertEquals("tool:Shizuku:$uid:second-connection", changed.sessionGrant)
+            assertEquals(Verdict.ALLOW, changed.verdict)
+            assertNull(changed.sessionGrant)
             assertEquals(ShizukuIdentity(uid, "second-connection"), changed.shizukuIdentity)
         }
     }
@@ -921,8 +1135,8 @@ class ToolPermissionPolicyEngineTest {
         val evaluator = engine()
         for (command in listOf("id", "su -c id", "sudo id", "echo sudo", "echo \$(su -c id)", "sh -c 'su -c id'")) {
             val result = evaluator.evaluate("Shizuku", commandArgs(command), "s1")
-            assertEquals(command, Verdict.ASK, result.verdict)
-            assertEquals("tool:Shizuku:0:root-connection", result.sessionGrant)
+            assertEquals(command, Verdict.ALLOW, result.verdict)
+            assertNull(result.sessionGrant)
             assertEquals(identity, result.shizukuIdentity)
             assertNull(result.rootGeneration)
             assertNull(result.rootAuthorityId)
@@ -930,38 +1144,45 @@ class ToolPermissionPolicyEngineTest {
     }
 
     @Test
-    fun rootShizuku_protectsAndroidPathsDespiteOrdinaryAlwaysGrantAndRequiresFreshElevation() = runTest {
+    fun rootShizuku_systemWritesAskRegardlessOfElevationAndOrdinaryStorageAllows() = runTest {
         val identity = ShizukuIdentity(0, "root-connection")
         every { shizukuManager.accessSnapshot() } returns identity
         coEvery { grants.isAllowed(any(), any()) } returns true
+        keepOnlyLegacyGrants()
         val evaluator = engine()
         for (path in listOf("/data", "/sdcard", "/storage/emulated/0", "/system", "/vendor", "/product", "/odm", "/metadata", "/persist")) {
             for (command in listOf("rm -rf $path", "su -c 'rm -rf $path'")) {
-                val denied = evaluator.evaluate("Shizuku", commandArgs(command), "s1")
-                assertEquals(command, Verdict.DENY, denied.verdict)
-                assertEquals("resource:${R.string.tool_safety_denied_with_elevation}", denied.denyReason)
-                assertEquals(listOf("resource:${R.string.root_safety_android_delete}"), formatArgs[R.string.tool_safety_denied_with_elevation])
-                assertNull(denied.sessionGrant)
+                val expected = if (path in setOf("/sdcard", "/storage/emulated/0")) Verdict.ALLOW else Verdict.ASK
+                val ordinary = evaluator.evaluate("Shizuku", commandArgs(command), "s1")
+                assertEquals(command, expected, ordinary.verdict)
+                assertNull(ordinary.denyReason)
+                if (expected == Verdict.ASK) assertHostWriteReview(ordinary, command) else assertNull(ordinary.sessionGrant)
+                assertEquals(identity, ordinary.shizukuIdentity)
 
                 val elevated = evaluator.evaluate("Shizuku", commandArgs(command, elevate = true), "s1")
-                assertEquals(command, Verdict.ASK, elevated.verdict)
-                assertNull(elevated.sessionGrant)
+                assertEquals(command, expected, elevated.verdict)
+                if (expected == Verdict.ASK) assertHostWriteReview(elevated, command) else assertNull(elevated.sessionGrant)
                 assertEquals(identity, elevated.shizukuIdentity)
-                assertNotNull(elevated.askTitle)
-                assertNotNull(elevated.approvalNote)
+                if (expected == Verdict.ASK) {
+                    assertEquals("resource:${R.string.tool_host_system_file_confirmation_title}", elevated.askTitle)
+                    assertNotNull(elevated.approvalNote)
+                } else {
+                    assertNull(elevated.askTitle)
+                    assertNull(elevated.approvalNote)
+                }
             }
         }
     }
 
     @Test
-    fun shizukuShellOrdinaryAlwaysGrant_cannotSkipFreshDestructiveElevation() = runTest {
+    fun shizukuShellLegacyGrantsAndElevation_doNotBypassWritesOrUnknownReview() = runTest {
         coEvery { grants.isAllowed(any(), any()) } returns true
+        keepOnlyLegacyGrants()
         val evaluator = engine()
         for (command in listOf("rm -rf /", "cat > /etc/passwd", "rm -rf \$(pwd)/build")) {
-            assertEquals(command, Verdict.DENY, evaluator.evaluate("Shizuku", commandArgs(command), "s1").verdict)
+            assertHostWriteReview(evaluator.evaluate("Shizuku", commandArgs(command), "s1"), command)
             val result = evaluator.evaluate("Shizuku", commandArgs(command, elevate = true), "s1")
-            assertEquals(command, Verdict.ASK, result.verdict)
-            assertNull(result.sessionGrant)
+            assertHostWriteReview(result, command)
             assertEquals(ShizukuIdentity(2000, "shell-connection"), result.shizukuIdentity)
         }
     }
@@ -980,10 +1201,11 @@ class ToolPermissionPolicyEngineTest {
     }
 
     @Test
-    fun hostRootRelativeRm_withoutElevationIsDeniedDespiteOrdinaryAlwaysGrants() = runTest {
+    fun hostRootRelativeRm_unknownDirectoryNeedsSourceReviewWithoutElevation() = runTest {
         coEvery { rootManager.accessSnapshot() } returns RootAccessState(true, 42, "root-authority")
         every { shizukuManager.accessSnapshot() } returns ShizukuIdentity(0, "root-connection")
         coEvery { grants.isAllowed(any(), any()) } returns true
+        keepOnlyLegacyGrants()
         val evaluator = engine()
         for (toolName in listOf("Root", "Shizuku")) {
             for (command in listOf(
@@ -991,20 +1213,20 @@ class ToolPermissionPolicyEngineTest {
                 "rm -rf ../data", "rm -rf data/../data", "rm -rf ./data/local/tmp/scratch"
             )) {
                 val result = evaluator.evaluate(toolName, commandArgs(command), "s1")
-                assertEquals("$toolName: $command", Verdict.DENY, result.verdict)
-                assertEquals("resource:${R.string.tool_safety_denied_with_elevation}", result.denyReason)
-                assertEquals(listOf("resource:${R.string.root_safety_relative_delete}"), formatArgs[R.string.tool_safety_denied_with_elevation])
-                assertNull(result.sessionGrant)
+                assertHostWriteReview(result, "$toolName: $command")
+                assertTrue(result.hostSystemTargets.isEmpty())
+                assertTrue(result.hostSystemUncertainties.isNotEmpty())
             }
         }
     }
 
     @Test
-    fun hostRootRelativeRm_elevationAlwaysRequiresFreshApprovalWithFrozenIdentity() = runTest {
+    fun hostRootRelativeRm_elevationDoesNotBypassReviewOrChangeFrozenIdentity() = runTest {
         coEvery { rootManager.accessSnapshot() } returns RootAccessState(true, 42, "root-authority")
         val identity = ShizukuIdentity(0, "root-connection")
         every { shizukuManager.accessSnapshot() } returns identity
         coEvery { grants.isAllowed(any(), any()) } returns true
+        keepOnlyLegacyGrants()
         val evaluator = engine()
         for (toolName in listOf("Root", "Shizuku")) {
             for (command in listOf(
@@ -1012,11 +1234,8 @@ class ToolPermissionPolicyEngineTest {
                 "rm -rf ../data", "rm -rf data/../data", "rm -rf ./data/local/tmp/scratch"
             )) {
                 val result = evaluator.evaluate(toolName, commandArgs(command, elevate = true), "s1")
-                assertEquals("$toolName: $command", Verdict.ASK, result.verdict)
-                assertNull(result.sessionGrant)
-                assertNull(result.denyReason)
-                assertNotNull(result.askTitle)
-                assertNotNull(result.approvalNote)
+                assertHostWriteReview(result, "$toolName: $command")
+                assertTrue(result.hostSystemUncertainties.isNotEmpty())
                 if (toolName == "Root") {
                     assertEquals(42L, result.rootGeneration)
                     assertEquals("root-authority", result.rootAuthorityId)
@@ -1031,28 +1250,30 @@ class ToolPermissionPolicyEngineTest {
     }
 
     @Test
-    fun hostRootRelativeRm_directoryChangesAndWrappersCannotHideTheRelativeTarget() = runTest {
+    fun hostRootRelativeRm_ambiguousDirectoryChangesNeedReviewEvenWithoutRecognizableTargets() = runTest {
         coEvery { rootManager.accessSnapshot() } returns RootAccessState(true, 42, "root-authority")
         every { shizukuManager.accessSnapshot() } returns ShizukuIdentity(0, "root-connection")
         coEvery { grants.isAllowed(any(), any()) } returns true
+        keepOnlyLegacyGrants()
         val evaluator = engine()
         for (toolName in listOf("Root", "Shizuku")) {
-            for (command in listOf(
-                "cd /; rm -f data/local/tmp/scratch",
-                "cd /data && rm -f local/tmp/scratch",
-                "cd /tmp; rm -f ../data/local/tmp/scratch",
-                "sh -c 'cd /; rm -f data/local/tmp/scratch'",
-                "su -c 'cd /; rm -f data/local/tmp/scratch'",
-                "cd /; command rm -f data/local/tmp/scratch"
+            for ((command, expected) in listOf(
+                "cd /; rm -f data/local/tmp/scratch" to Verdict.ASK,
+                "cd /data && rm -f local/tmp/scratch" to Verdict.ALLOW,
+                "cd /tmp; rm -f ../data/local/tmp/scratch" to Verdict.ASK,
+                "sh -c 'cd /; rm -f data/local/tmp/scratch'" to Verdict.ASK,
+                "su -c 'cd /; rm -f data/local/tmp/scratch'" to Verdict.ASK,
+                "cd /; command rm -f data/local/tmp/scratch" to Verdict.ASK,
+                "cd /system; rm -f probe" to Verdict.ASK,
+                "sh -c 'cd /sys; command rm -f probe'" to Verdict.ASK
             )) {
-                val denied = evaluator.evaluate(toolName, commandArgs(command), "s1")
-                assertEquals("$toolName: $command", Verdict.DENY, denied.verdict)
-                assertEquals("resource:${R.string.tool_safety_denied_with_elevation}", denied.denyReason)
-                assertEquals(listOf("resource:${R.string.root_safety_relative_delete}"), formatArgs[R.string.tool_safety_denied_with_elevation])
-                assertNull(denied.sessionGrant)
-                val elevated = evaluator.evaluate(toolName, commandArgs(command, elevate = true), "s1")
-                assertEquals("$toolName: $command", Verdict.ASK, elevated.verdict)
-                assertNull(elevated.sessionGrant)
+                for (elevate in listOf(false, true)) {
+                    val result = evaluator.evaluate(toolName, commandArgs(command, elevate = elevate), "s1")
+                    assertEquals("$toolName: $command elevate=$elevate", expected, result.verdict)
+                    assertNull(result.denyReason)
+                    if (expected == Verdict.ASK) assertHostWriteReview(result, command) else assertNull(result.sessionGrant)
+                    assertEquals(expected == Verdict.ASK, result.hostSystemTargets.isNotEmpty() || result.hostSystemUncertainties.isNotEmpty())
+                }
             }
         }
     }
@@ -1077,7 +1298,7 @@ class ToolPermissionPolicyEngineTest {
     }
 
     @Test
-    fun hostRootAbsoluteSafeRm_keepsNormalApprovalAndOrdinaryAlwaysGrantBehavior() = runTest {
+    fun hostRootAbsoluteOrdinaryRm_doesNotNeedElevationOrAnyLegacyGrant() = runTest {
         coEvery { rootManager.accessSnapshot() } returns RootAccessState(true, 42, "root-authority")
         val identity = ShizukuIdentity(0, "root-connection")
         every { shizukuManager.accessSnapshot() } returns identity
@@ -1092,8 +1313,8 @@ class ToolPermissionPolicyEngineTest {
             )) {
                 coEvery { grants.isAllowed("s1", grant) } returns false
                 val approval = evaluator.evaluate(toolName, commandArgs(command), "s1")
-                assertEquals("$toolName: $command", Verdict.ASK, approval.verdict)
-                assertEquals(grant, approval.sessionGrant)
+                assertEquals("$toolName: $command", Verdict.ALLOW, approval.verdict)
+                assertNull(approval.sessionGrant)
 
                 coEvery { grants.isAllowed("s1", grant) } returns true
                 for (elevate in listOf(false, true)) {
@@ -1116,7 +1337,7 @@ class ToolPermissionPolicyEngineTest {
     }
 
     @Test
-    fun relativeRm_otherShellChannelsRetainTheirOriginalPolicy() = runTest {
+    fun relativeRm_legacyShellAllowsButShizukuUnknownDirectoryNeedsReview() = runTest {
         val evaluator = engine()
         for (toolName in listOf("Bash", "terminal", "Shizuku")) {
             for (command in listOf(
@@ -1124,12 +1345,12 @@ class ToolPermissionPolicyEngineTest {
                 "rm -rf ../data", "rm -rf data/../data", "cd /; rm -f data/local/tmp/scratch"
             )) {
                 val result = evaluator.evaluate(toolName, commandArgs(command, toolName), "s1")
-                assertEquals("$toolName: $command", if (toolName == "Shizuku") Verdict.ASK else Verdict.ALLOW, result.verdict)
                 assertNull(result.denyReason)
                 if (toolName == "Shizuku") {
-                    assertEquals("tool:Shizuku:2000:shell-connection", result.sessionGrant)
+                    assertHostWriteReview(result, "$toolName: $command")
                     assertEquals(ShizukuIdentity(2000, "shell-connection"), result.shizukuIdentity)
                 } else {
+                    assertEquals("$toolName: $command", Verdict.ALLOW, result.verdict)
                     assertNull(result.sessionGrant)
                 }
             }
@@ -1137,7 +1358,7 @@ class ToolPermissionPolicyEngineTest {
         coEvery { grants.isAllowed("s1", "tool:Shizuku:2000:shell-connection") } returns true
         for (elevate in listOf(false, true)) {
             val result = evaluator.evaluate("Shizuku", commandArgs("cd /; rm -f data/local/tmp/scratch", elevate = elevate), "s1")
-            assertEquals(Verdict.ALLOW, result.verdict)
+            assertHostWriteReview(result, "legacy grant does not approve unknown directory")
             assertEquals(ShizukuIdentity(2000, "shell-connection"), result.shizukuIdentity)
             assertNull(result.denyReason)
         }
@@ -1148,8 +1369,8 @@ class ToolPermissionPolicyEngineTest {
         coEvery { rootManager.accessSnapshot() } returns RootAccessState(true, 42, "root-authority")
         val evaluator = engine()
         val calls = listOf(
-            "Root" to commandArgs("id"),
-            "Shizuku" to commandArgs("pm list packages"),
+            "Root" to commandArgs("touch /sys/probe"),
+            "Shizuku" to commandArgs("touch /sys/probe"),
             "Bash" to commandArgs("sudo id"),
             "terminal" to commandArgs("su -c id", "terminal"),
             "Bash" to commandArgs("rm -rf /", elevate = true),

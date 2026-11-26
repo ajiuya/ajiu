@@ -90,10 +90,19 @@ import com.aicode.core.ui.SwipeToDeleteRow
 import com.aicode.core.theme.Spacing
 import com.aicode.core.theme.semanticColors
 import com.aicode.feature.agent.domain.container.ContainerProfile
+import com.aicode.feature.agent.domain.container.LocalContainerRuntime
 import com.aicode.feature.agent.domain.container.RootfsSource
 import com.aicode.feature.settings.data.repository.ExecutionMode
 import com.aicode.feature.settings.data.repository.DEFAULT_REMOTE_WORKSPACE_ROOT
 import com.aicode.feature.settings.presentation.ContainerResetUiState
+import com.aicode.feature.settings.presentation.ContainerProfileAdditionUiState
+import com.aicode.feature.settings.presentation.immutableContainerProfile
+import com.aicode.feature.settings.presentation.newContainerProfile
+import com.aicode.feature.agent.domain.root.RootAccessState
+import com.aicode.feature.settings.presentation.ChrootInstanceAction
+import com.aicode.feature.settings.presentation.ChrootSettingsUiState
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeAuthorization
+import com.aicode.feature.settings.data.repository.DownloadedImageRecord
 import com.aicode.feature.workspace.domain.model.RemoteConnection
 import com.aicode.feature.workspace.domain.model.RemoteProtocol
 import compose.icons.FeatherIcons
@@ -106,6 +115,9 @@ import compose.icons.feathericons.Server
 import compose.icons.feathericons.Trash2
 import java.io.File
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import sh.calvin.reorderable.ReorderableItem
@@ -127,9 +139,8 @@ internal fun ContainerSection(
     showAddSheetExternal: Boolean = false,
     onDismissAddSheet: () -> Unit = {},
     onSelect: (String) -> Unit,
-    onSetDefaultContainer: (String) -> Unit = {},
-    onSaveCustom: (ContainerProfile) -> Unit,
-    onEditCustom: (ContainerProfile) -> Unit,
+    onSaveCustom: (ContainerProfile, Boolean, RootAccessState) -> Unit,
+    onEditCustom: (ContainerProfile, Boolean) -> Unit,
     onDeleteProfile: (ContainerProfile) -> Unit,
     onSwitchConfirmed: () -> Unit = {},
     onResetProfile: (ContainerProfile) -> Unit = {},
@@ -137,6 +148,15 @@ internal fun ContainerSection(
     resetState: ContainerResetUiState? = null,
     onRestoreBuiltin: () -> Unit = {},
     remoteConnections: List<RemoteConnection> = emptyList(),
+    downloadedImages: List<DownloadedImageRecord> = emptyList(),
+    chrootUiState: ChrootSettingsUiState = ChrootSettingsUiState(),
+    onChrootInstanceAction: (String, ChrootInstanceAction) -> Unit = { _, _ -> },
+    onChrootAuthorization: (LocalRuntimeAuthorization) -> Unit = {},
+    onChrootConfirm: () -> Unit = {},
+    onChrootCancel: () -> Unit = {},
+    onChrootClearError: () -> Unit = {},
+    onCancelAddition: () -> Unit = {},
+    onClearAdditionResult: () -> Unit = {},
     /** 长按拖拽排序落库（顺序即列表存储顺序）。 */
     onReorder: (fromIndex: Int, toIndex: Int) -> Unit = { _, _ -> }
 ) {
@@ -150,92 +170,105 @@ internal fun ContainerSection(
     var pendingSwitch by remember { mutableStateOf<ContainerProfile?>(null) }
     var pendingReset by remember { mutableStateOf<ContainerProfile?>(null) }
 
-    if (profiles.isEmpty()) {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(Spacing.xl),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
-        ) {
-            Text(
-                text = stringResource(R.string.container_empty),
-                style = MaterialTheme.typography.titleMedium,
-                color = MaterialTheme.colorScheme.onSurface
-            )
-            Text(
-                text = stringResource(R.string.container_empty_desc),
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(top = Spacing.xs, bottom = Spacing.lg)
-            )
-            Button(onClick = onRestoreBuiltin) {
-                Text(stringResource(R.string.container_restore_builtin))
+    Column(Modifier.fillMaxSize()) {
+        ContainerAdditionFeedback(chrootUiState.addition, onCancelAddition, onClearAdditionResult)
+        if (profiles.isEmpty()) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(Spacing.xl),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center
+            ) {
+                Text(
+                    text = stringResource(R.string.container_empty),
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                Text(
+                    text = stringResource(R.string.container_empty_desc),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = Spacing.xs, bottom = Spacing.lg)
+                )
+                Button(onClick = onRestoreBuiltin, enabled = chrootUiState.workingProfileId == null) {
+                    Text(stringResource(R.string.container_restore_builtin))
+                }
             }
-        }
-    } else {
-        // 与「供应商」页一致：一行一张独立圆角卡片（8dp 间距），长按行内容拖拽排序
-        val listState = rememberLazyListState()
-        val reorderableState = rememberReorderableLazyListState(listState) { from, to ->
-            onReorder(from.index, to.index)
-        }
-        LazyColumn(
-            state = listState,
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(horizontal = Spacing.lg)
-                .padding(bottom = Spacing.xl),
-            contentPadding = PaddingValues(top = Spacing.sm),
-            verticalArrangement = Arrangement.spacedBy(Spacing.sm)
-        ) {
-            itemsIndexed(
-                items = profiles,
-                key = { _, profile -> profile.id }
-            ) { _, profile ->
-                ReorderableItem(
-                    state = reorderableState,
-                    key = profile.id
-                ) { isDragging ->
-                    val dragScale by animateFloatAsState(
-                        targetValue = if (isDragging) 0.95f else 1f,
-                        animationSpec = tween(durationMillis = if (isDragging) 120 else 220),
-                        label = "containerDragScale"
-                    )
-                    val dragElevation by animateDpAsState(
-                        targetValue = if (isDragging) 8.dp else 0.dp,
-                        animationSpec = tween(durationMillis = if (isDragging) 120 else 220),
-                        label = "containerDragElevation"
-                    )
-                    Surface(
-                        shape = RoundedCornerShape(Radius.lg),
-                        color = MaterialTheme.semanticColors.cardSurface,
-                        shadowElevation = dragElevation,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .zIndex(if (isDragging) 1f else 0f)
-                            .graphicsLayer {
-                                scaleX = dragScale
-                                scaleY = dragScale
-                            }
-                    ) {
-                        ContainerRow(
-                            profile = profile,
-                            active = profile.id == activeProfileId,
-                            defaultContainerId = defaultContainerId,
-                            osId = osMap[profile.id],
-                            subtitle = profileSubtitle(context, profile, remoteConnections),
-                            onSelect = { if (profile.id != activeProfileId) pendingSwitch = profile },
-                            onEdit = { editingProfile = profile },
-                            onDelete = { deletingProfile = profile },
-                            dragModifier = Modifier.longPressDraggableHandle(
-                                onDragStarted = {
-                                    hapticFeedback.performHapticFeedback(HapticFeedbackType.GestureThresholdActivate)
-                                },
-                                onDragStopped = {
-                                    hapticFeedback.performHapticFeedback(HapticFeedbackType.GestureEnd)
-                                }
-                            )
+        } else {
+            // 与「供应商」页一致：一行一张独立圆角卡片（8dp 间距），长按行内容拖拽排序
+            val listState = rememberLazyListState()
+            val reorderableState = rememberReorderableLazyListState(listState) { from, to ->
+                if (chrootUiState.workingProfileId == null) onReorder(from.index, to.index)
+            }
+            LazyColumn(
+                state = listState,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(horizontal = Spacing.lg)
+                    .padding(bottom = Spacing.xl),
+                contentPadding = PaddingValues(top = Spacing.sm),
+                verticalArrangement = Arrangement.spacedBy(Spacing.sm)
+            ) {
+                itemsIndexed(
+                    items = profiles,
+                    key = { _, profile -> profile.id }
+                ) { _, profile ->
+                    ReorderableItem(
+                        state = reorderableState,
+                        key = profile.id
+                    ) { isDragging ->
+                        val dragScale by animateFloatAsState(
+                            targetValue = if (isDragging) 0.95f else 1f,
+                            animationSpec = tween(durationMillis = if (isDragging) 120 else 220),
+                            label = "containerDragScale"
                         )
+                        val dragElevation by animateDpAsState(
+                            targetValue = if (isDragging) 8.dp else 0.dp,
+                            animationSpec = tween(durationMillis = if (isDragging) 120 else 220),
+                            label = "containerDragElevation"
+                        )
+                        Surface(
+                            shape = RoundedCornerShape(Radius.lg),
+                            color = MaterialTheme.semanticColors.cardSurface,
+                            shadowElevation = dragElevation,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .zIndex(if (isDragging) 1f else 0f)
+                                .graphicsLayer {
+                                    scaleX = dragScale
+                                    scaleY = dragScale
+                                }
+                        ) {
+                            ContainerRow(
+                                profile = profile,
+                                active = profile.id == activeProfileId,
+                                defaultContainerId = defaultContainerId,
+                                osId = osMap[profile.id],
+                                subtitle = if (profile.isChroot) context.getString(chrootStatusResource(
+                                    chrootUiState.states[profile.id],
+                                    chrootUiState.workingAction.takeIf { chrootUiState.workingProfileId == profile.id }
+                                )) else profileSubtitle(context, profile, remoteConnections),
+                                deleteEnabled = chrootUiState.workingProfileId == null && (!profile.isChroot ||
+                                    chrootUiState.states[profile.id]?.let {
+                                        it.journalHealthy && !it.recoveryRequired && !it.busy && it.rootEnabled && chrootUiState.rootState.enabled
+                                    } == true),
+                                onSelect = { if (chrootUiState.workingProfileId == null && profile.id != activeProfileId) pendingSwitch = profile },
+                                onEdit = { if (chrootUiState.workingProfileId == null) editingProfile = profile },
+                                onDelete = {
+                                    if (profile.isChroot) onChrootInstanceAction(profile.id, ChrootInstanceAction.REMOVE)
+                                    else deletingProfile = profile
+                                },
+                                dragModifier = Modifier.longPressDraggableHandle(
+                                    onDragStarted = {
+                                        hapticFeedback.performHapticFeedback(HapticFeedbackType.GestureThresholdActivate)
+                                    },
+                                    onDragStopped = {
+                                        hapticFeedback.performHapticFeedback(HapticFeedbackType.GestureEnd)
+                                    }
+                                )
+                            )
+                        }
                     }
                 }
             }
@@ -247,46 +280,43 @@ internal fun ContainerSection(
             initial = null,
             defaultContainerId = defaultContainerId,
             remoteConnections = remoteConnections,
+            downloadedImages = downloadedImages,
+            chrootUiState = chrootUiState,
             onDismiss = {
                 showAddSheetInternal = false
                 onDismissAddSheet()
             },
-            onConfirm = { profile, setDefault ->
-                val id = "custom-${System.currentTimeMillis()}"
+            onConfirm = { profile, setDefault, rootAtConsent ->
                 val final = if (profile.mode == ExecutionMode.REMOTE_SSH) {
-                    profile.copy(id = id, name = profile.name.ifBlank { context.getString(R.string.container_remote_ssh) })
+                    profile.copy(name = profile.name.ifBlank { context.getString(R.string.container_remote_ssh) })
                 } else {
-                    profile.copy(id = id, name = profile.name.ifBlank { context.getString(R.string.container_custom_image) })
+                    profile.copy(name = profile.name.ifBlank { context.getString(R.string.container_custom_image) })
                 }
-                onSaveCustom(final)
-                if (setDefault) onSetDefaultContainer(final.id)
+                onSaveCustom(final, setDefault, rootAtConsent)
                 showAddSheetInternal = false
                 onDismissAddSheet()
             }
         )
     }
 
-    editingProfile?.let { editing ->
+    editingProfile?.let { selected -> profiles.firstOrNull { it.id == selected.id } }?.let { editing ->
         ProfileEditSheet(
             initial = editing,
             defaultContainerId = defaultContainerId,
             remoteConnections = remoteConnections,
+            chrootUiState = chrootUiState,
+            onChrootInstanceAction = onChrootInstanceAction,
+            onChrootAuthorization = onChrootAuthorization,
             onDismiss = { editingProfile = null },
             onReset = { pendingReset = editing },
-            onConfirm = { profile, setDefault ->
-                onEditCustom(profile.copy(id = editing.id))
-                // 本地镜像才可作默认容器；关闭默认时若原本就是默认则回退内置 Alpine。
-                if (profile.mode == ExecutionMode.LOCAL_PROOT) {
-                    if (setDefault) {
-                        onSetDefaultContainer(editing.id)
-                    } else if (editing.id == defaultContainerId) {
-                        onSetDefaultContainer(ContainerProfile.BUILTIN_ID)
-                    }
-                }
+            onConfirm = { profile, setDefault, _ ->
+                onEditCustom(profile.copy(id = editing.id), setDefault)
                 editingProfile = null
             }
         )
     }
+
+    ChrootSettingsDialogs(chrootUiState, onChrootConfirm, onChrootCancel, onChrootClearError)
 
     deletingProfile?.let { deleting ->
         AlertDialog(
@@ -308,7 +338,12 @@ internal fun ContainerSection(
         AlertDialog(
             onDismissRequest = { pendingSwitch = null },
             title = { Text(stringResource(R.string.container_switch_image)) },
-            text = { Text(stringResource(R.string.container_switch_confirm, target.name)) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(Spacing.sm)) {
+                    Text(stringResource(R.string.container_switch_confirm, target.name))
+                    if (target.isChroot) Text(stringResource(R.string.container_chroot_selection_notice))
+                }
+            },
             confirmButton = {
                 TextButton(onClick = {
                     onSwitchConfirmed()
@@ -353,6 +388,70 @@ internal fun ContainerSection(
     }
 }
 
+internal fun containerProfileSubmitLabel(
+    isNew: Boolean,
+    isChroot: Boolean,
+    importing: Boolean = false,
+    download: Boolean = false
+): Int = when {
+    importing -> R.string.container_importing
+    !isNew -> R.string.common_save
+    isChroot -> R.string.container_chroot_add_and_create
+    download -> R.string.container_download_import
+    else -> R.string.common_add
+}
+
+/** The add button is explicit consent to the disk write/Root create, not a source-use grant. */
+@Composable
+internal fun ContainerChrootAddNotice(root: RootAccessState) {
+    Text(
+        stringResource(R.string.container_chroot_add_create_notice),
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant
+    )
+    if (!root.enabled) {
+        Text(
+            stringResource(R.string.container_chroot_root_disabled),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.error
+        )
+    }
+}
+
+/** Shared by Container and Downloads; results are state, not replayable creation events. */
+@Composable
+internal fun ContainerAdditionFeedback(
+    state: ContainerProfileAdditionUiState?,
+    onCancel: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    if (state == null) return
+    SettingsGroup {
+        Column(Modifier.fillMaxWidth().padding(Spacing.md), verticalArrangement = Arrangement.spacedBy(Spacing.sm)) {
+            if (state.profileName.isNotBlank()) Text(state.profileName, style = MaterialTheme.typography.titleSmall)
+            val message = when {
+                state.inProgress && state.creatingInstance -> R.string.container_chroot_status_installing
+                state.inProgress -> R.string.container_profile_adding
+                state.completed && state.createsInstance -> R.string.container_chroot_add_create_success
+                state.completed -> R.string.container_profile_added
+                state.cancelled -> R.string.container_profile_add_cancelled
+                else -> state.error ?: R.string.container_profile_add_failed
+            }
+            Text(stringResource(message), style = MaterialTheme.typography.bodySmall,
+                color = if (state.error != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
+            if (state.saved && state.createsInstance && !state.completed && !state.inProgress) {
+                Text(stringResource(R.string.container_chroot_add_create_failed), style = MaterialTheme.typography.bodySmall)
+            }
+            if (state.inProgress) {
+                CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                TextButton(onClick = onCancel) { Text(stringResource(R.string.common_cancel)) }
+            } else {
+                TextButton(onClick = onDismiss) { Text(stringResource(R.string.common_close)) }
+            }
+        }
+    }
+}
+
 /** 删除确认的补充说明：内置可恢复、自定义本地清 rootfs、远程 SSH 无额外说明。 */
 private fun deleteHint(context: Context, profile: ContainerProfile): String = when {
     profile.isBuiltin -> context.getString(R.string.container_builtin_restorable)
@@ -372,6 +471,7 @@ private fun ContainerRow(
     defaultContainerId: String = ContainerProfile.BUILTIN_ID,
     osId: String?,
     subtitle: String,
+    deleteEnabled: Boolean = true,
     onSelect: () -> Unit,
     onEdit: () -> Unit,
     onDelete: () -> Unit,
@@ -382,6 +482,7 @@ private fun ContainerRow(
 
     SwipeToDeleteRow(
         onDelete = onDelete,
+        deleteEnabled = deleteEnabled,
         onClick = onSelect
     ) {
         Row(
@@ -450,6 +551,12 @@ private fun ContainerRow(
                             SourceBadge(
                                 text = stringResource(R.string.container_builtin_badge),
                                 color = MaterialTheme.colorScheme.primary
+                            )
+                        } else if (profile.isChroot) {
+                            Spacer(modifier = Modifier.width(Spacing.xs))
+                            SourceBadge(
+                                text = stringResource(R.string.container_runtime_chroot),
+                                color = MaterialTheme.colorScheme.tertiary
                             )
                         } else if (profile.mode == ExecutionMode.REMOTE_SSH) {
                             Spacer(modifier = Modifier.width(Spacing.xs))
@@ -534,9 +641,13 @@ private fun ProfileEditSheet(
     initial: ContainerProfile?,
     defaultContainerId: String = ContainerProfile.BUILTIN_ID,
     remoteConnections: List<RemoteConnection>,
+    downloadedImages: List<DownloadedImageRecord> = emptyList(),
+    chrootUiState: ChrootSettingsUiState = ChrootSettingsUiState(),
+    onChrootInstanceAction: (String, ChrootInstanceAction) -> Unit = { _, _ -> },
+    onChrootAuthorization: (LocalRuntimeAuthorization) -> Unit = {},
     onDismiss: () -> Unit,
     onReset: (() -> Unit)? = null,
-    onConfirm: (ContainerProfile, Boolean) -> Unit
+    onConfirm: (ContainerProfile, Boolean, RootAccessState) -> Unit
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val configuration = LocalConfiguration.current
@@ -546,12 +657,20 @@ private fun ProfileEditSheet(
     val remoteScrollState = rememberScrollState()
     val scope = rememberCoroutineScope()
     var importing by remember { mutableStateOf(false) }
+    var importJob by remember { mutableStateOf<Job?>(null) }
+    var importFailed by remember { mutableStateOf(false) }
+    val dismiss = { importJob?.cancel(); onDismiss() }
+    val chrootState = initial?.takeIf { it.isChroot }?.let { chrootUiState.states[it.id] }
+    val chrootEditable = initial?.isChroot != true || (chrootState != null && chrootState.journalHealthy &&
+        !chrootState.recoveryRequired && !chrootState.busy && chrootUiState.workingProfileId == null)
     // SFTP 通道才适合 SSH exec（FTP/LOCAL 不走 sshj）
     val sshConnections = remoteConnections.filter { it.protocol == RemoteProtocol.SFTP }
     // 编辑内置 Alpine 时保持 Asset 来源（可选导入覆盖）
     val initialAsset = initial?.rootfsSource as? RootfsSource.Asset
 
     var mode by remember { mutableStateOf(initial?.mode ?: ExecutionMode.LOCAL_PROOT) }
+    var runtime by remember { mutableStateOf(initial?.localRuntime ?: LocalContainerRuntime.PROOT) }
+    var useBundledImage by remember { mutableStateOf(initial?.rootfsSource is RootfsSource.Asset) }
     var name by remember { mutableStateOf(initial?.name ?: "") }
     // 是否设为默认容器（仅本地镜像生效；默认容器是远程模式下本地 MCP 等服务的运行容器）
     var setAsDefault by remember { mutableStateOf(initial?.id == defaultContainerId) }
@@ -582,7 +701,12 @@ private fun ProfileEditSheet(
     }
     val pickLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument()
-    ) { uri -> if (uri != null) pickedUri = uri.toString() }
+    ) { uri ->
+        if (uri != null) {
+            pickedUri = uri.toString()
+            useBundledImage = false
+        }
+    }
     // 远程 SSH 字段
     val initialSsh = (initial?.rootfsSource as? RootfsSource.RemoteSsh)
     var selectedConnId by remember { mutableStateOf(initialSsh?.connectionId ?: sshConnections.firstOrNull()?.id ?: "") }
@@ -590,7 +714,7 @@ private fun ProfileEditSheet(
     var connExpanded by remember { mutableStateOf(false) }
 
     AdaptiveModalBottomSheet(
-        onDismissRequest = onDismiss,
+        onDismissRequest = dismiss,
         sheetState = sheetState,
         containerColor = MaterialTheme.colorScheme.surface,
         contentWindowInsets = { WindowInsets(0.dp) },
@@ -624,9 +748,10 @@ private fun ProfileEditSheet(
                     modifier = Modifier.weight(1f),
                     textAlign = TextAlign.Center
                 )
-                if (initial != null && onReset != null) {
+                if (initial != null && !initial.isChroot && onReset != null) {
                     IconButton(
                         onClick = onReset,
+                        enabled = !importing && chrootUiState.workingProfileId == null,
                         modifier = Modifier.size(36.dp)
                     ) {
                         Icon(
@@ -650,7 +775,7 @@ private fun ProfileEditSheet(
                     stringResource(R.string.container_remote_ssh)
                 ),
                 onSelect = { mode = modes[it] },
-                enabled = initial == null
+                enabled = initial == null && !importing
             )
 
             // 中间可滚动表单区域：通过 weight(1f) 撑满剩余高度，杜绝左右 tab 切换时高度跳动
@@ -673,27 +798,48 @@ private fun ProfileEditSheet(
                             label = stringResource(R.string.common_name)
                         )
 
+                        ContainerRuntimePicker(
+                            runtime = runtime,
+                            locked = initial != null || importing,
+                            onChange = { runtime = it }
+                        )
+                        if (initial?.isChroot == true) {
+                            ChrootProfileSettings(initial, chrootUiState, onChrootInstanceAction, onChrootAuthorization)
+                        }
+                        if (runtime == LocalContainerRuntime.CHROOT) {
+                            Text(
+                                stringResource(R.string.container_chroot_limits),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+
+                        if (runtime == LocalContainerRuntime.CHROOT && initial == null) {
+                            ContainerChrootAddNotice(chrootUiState.rootState)
+                        }
+
                         ContainerField(
                             value = shellPath,
                             onValueChange = { shellPath = it },
                             label = stringResource(R.string.container_shell_path)
                         )
 
-                        MountListEditor(
-                            title = stringResource(R.string.container_extra_bindings),
-                            items = bindingsList,
-                            emptyText = stringResource(R.string.container_no_bindings),
-                            addText = stringResource(R.string.container_add_binding)
-                        )
-
-                        StringListEditor(
-                            title = stringResource(R.string.container_extra_proot_args),
-                            items = argsList,
-                            itemLabel = stringResource(R.string.container_arg_value),
-                            itemHint = "-k",
-                            emptyText = stringResource(R.string.container_no_args),
-                            addText = stringResource(R.string.container_add_arg)
-                        )
+                        if (runtime == LocalContainerRuntime.PROOT) {
+                            MountListEditor(
+                                title = stringResource(R.string.container_extra_bindings),
+                                items = bindingsList,
+                                emptyText = stringResource(R.string.container_no_bindings),
+                                addText = stringResource(R.string.container_add_binding)
+                            )
+                            StringListEditor(
+                                title = stringResource(R.string.container_extra_proot_args),
+                                items = argsList,
+                                itemLabel = stringResource(R.string.container_arg_value),
+                                itemHint = "-k",
+                                emptyText = stringResource(R.string.container_no_args),
+                                addText = stringResource(R.string.container_add_arg)
+                            )
+                        }
 
                         PairListEditor(
                             title = stringResource(R.string.container_env_vars),
@@ -707,10 +853,10 @@ private fun ProfileEditSheet(
                         )
 
                         // 内置镜像固定为内置来源，不支持导入覆盖，隐藏文件选择
-                        if (initial?.rootfsSource !is RootfsSource.Asset) {
+                        if (initial?.rootfsSource !is RootfsSource.Asset && initial?.isChroot != true) {
                             Spacer(modifier = Modifier.size(Spacing.xs))
                             Surface(
-                                onClick = { pickLauncher.launch(arrayOf("*/*")) },
+                                onClick = { if (!importing) pickLauncher.launch(arrayOf("*/*")) },
                                 color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f)
                             ) {
                                 Row(
@@ -733,6 +879,28 @@ private fun ProfileEditSheet(
                                         maxLines = 1,
                                         overflow = TextOverflow.Ellipsis
                                     )
+                                }
+                            }
+                        }
+
+                        if (runtime == LocalContainerRuntime.CHROOT && initial == null) {
+                            TextButton(onClick = { useBundledImage = true; pickedUri = null }, enabled = !importing) {
+                                Text(stringResource(R.string.container_chroot_use_bundled))
+                            }
+                            if (useBundledImage) {
+                                Text(stringResource(R.string.container_chroot_bundled_selected))
+                            }
+                            if (downloadedImages.isNotEmpty()) {
+                                SettingsGroupHeader(stringResource(R.string.container_chroot_downloaded_images))
+                                SettingsGroup {
+                                    downloadedImages.forEachIndexed { index, image ->
+                                        if (index > 0) SettingsDivider()
+                                        SettingsRow(
+                                            title = Uri.parse(image.fileUri).lastPathSegment ?: image.entryId,
+                                            enabled = !importing,
+                                            onClick = { pickedUri = image.fileUri; useBundledImage = false }
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -763,7 +931,7 @@ private fun ProfileEditSheet(
                             }
                             AppSwitch(
                                 checked = setAsDefault,
-                                onCheckedChange = { setAsDefault = it }
+                                onCheckedChange = { if (!importing) setAsDefault = it }
                             )
                         }
                     }
@@ -830,39 +998,55 @@ private fun ProfileEditSheet(
                 }
             }
 
+            if (importFailed) {
+                Text(stringResource(R.string.container_chroot_import_failed), color = MaterialTheme.colorScheme.error)
+            }
             Spacer(modifier = Modifier.size(Spacing.xs))
             Button(
                 onClick = {
-                    importing = true
-                    scope.launch {
-                        val finalUri = pickedUri?.let { uri ->
-                            withContext(Dispatchers.IO) { copyImageToPrivate(context, uri, initial?.id) }
-                                ?: pickedUri
-                        } ?: pickedUri
-                        importing = false
-                        val profile = buildProfile(
-                            initial = initial,
-                            mode = mode,
-                            name = name,
-                            shellPath = shellPath,
-                            bindings = bindingsList
-                                .filter { it.first.isNotBlank() && it.second.isNotBlank() }
+                    if (!importing && chrootUiState.workingProfileId == null) {
+                        // Freeze all fields and the Root generation BEFORE the asynchronous private copy.
+                        val draft = buildContainerProfile(
+                            initial = initial, mode = mode, runtime = runtime, useBundledImage = useBundledImage,
+                            name = name, shellPath = shellPath,
+                            bindings = bindingsList.filter { it.first.isNotBlank() && it.second.isNotBlank() }
                                 .map { (local, container) -> "${local.trim()}:${container.trim()}" },
                             args = argsList.map { it.trim() }.filter { it.isNotEmpty() },
-                            env = envList
-                                .map { it.first.trim() to it.second }
-                                .filter { it.first.isNotEmpty() }
-                                .toMap(),
-                            pickedUri = finalUri,
-                            selectedConnId = selectedConnId,
-                            remotePath = remotePath
+                            env = envList.map { it.first.trim() to it.second }.filter { it.first.isNotEmpty() }.toMap(),
+                            pickedUri = pickedUri, selectedConnId = selectedConnId, remotePath = remotePath
                         )
-                        if (profile != null) {
-                            onConfirm(profile, setAsDefault && profile.mode == ExecutionMode.LOCAL_PROOT)
+                        if (draft != null) {
+                            val captured = if (initial == null) newContainerProfile(draft) else immutableContainerProfile(draft.copy(id = initial.id))
+                            val selectedUri = pickedUri
+                            val selectedDefault = setAsDefault && captured.mode == ExecutionMode.LOCAL_PROOT
+                            val rootAtConsent = chrootUiState.rootState
+                            importing = true
+                            importFailed = false
+                            importJob = scope.launch {
+                                val finalUri = if (captured.mode != ExecutionMode.LOCAL_PROOT || selectedUri == initialUri) selectedUri
+                                else selectedUri?.let { uri ->
+                                    withContext(Dispatchers.IO) { copyImageToPrivate(context, uri, captured.id) }
+                                        ?: selectedUri.takeIf { !captured.isChroot }
+                                }
+                                currentCoroutineContext().ensureActive()
+                                if (captured.isChroot && selectedUri != null && finalUri == null) {
+                                    importFailed = true
+                                    importing = false
+                                } else {
+                                    val final = if (captured.mode == ExecutionMode.LOCAL_PROOT && finalUri != null) {
+                                        captured.copy(rootfsSource = RootfsSource.LocalFile(finalUri))
+                                    } else captured
+                                    // Keep importing=true until dismissed, even if a stale double click fires.
+                                    onConfirm(final, selectedDefault, rootAtConsent)
+                                }
+                            }
                         }
                     }
                 },
-                enabled = !importing && canConfirm(mode, pickedUri, initialAsset, selectedConnId, sshConnections),
+                enabled = !importing && chrootEditable && chrootUiState.workingProfileId == null && canConfirm(
+                    mode, pickedUri, initialAsset, selectedConnId, sshConnections,
+                    useBundledImage && runtime == LocalContainerRuntime.CHROOT
+                ),
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(44.dp),
@@ -872,15 +1056,39 @@ private fun ProfileEditSheet(
                 Spacer(modifier = Modifier.width(8.dp))
                 Text(
                     stringResource(
-                        when {
-                            importing -> R.string.container_importing
-                            initial == null -> R.string.common_add
-                            else -> R.string.common_save
-                        }
+                        containerProfileSubmitLabel(
+                            isNew = initial == null,
+                            isChroot = mode == ExecutionMode.LOCAL_PROOT && runtime == LocalContainerRuntime.CHROOT,
+                            importing = importing
+                        )
                     ),
                     style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold)
                 )
             }
+        }
+    }
+}
+
+@Composable
+internal fun ContainerRuntimePicker(
+    runtime: LocalContainerRuntime,
+    locked: Boolean,
+    onChange: (LocalContainerRuntime) -> Unit
+) {
+    SettingsGroup {
+        Column(Modifier.padding(Spacing.md), verticalArrangement = Arrangement.spacedBy(Spacing.sm)) {
+            Text(stringResource(R.string.container_runtime_title), style = MaterialTheme.typography.titleSmall)
+            SegmentedTabs(
+                selected = if (runtime == LocalContainerRuntime.CHROOT) 1 else 0,
+                labels = listOf(stringResource(R.string.container_runtime_proot), stringResource(R.string.container_runtime_chroot)),
+                onSelect = { onChange(if (it == 1) LocalContainerRuntime.CHROOT else LocalContainerRuntime.PROOT) },
+                enabled = !locked
+            )
+            Text(
+                stringResource(R.string.container_runtime_locked),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
         }
     }
 }
@@ -1162,9 +1370,11 @@ private fun PairListEditor(
  * 据表单状态构造 ContainerProfile；校验不通过返回 null（按钮已 disabled，此处再兜底）。
  * 本地镜像：选了文件 → 导入的自定义容器（isBuiltin=false）；未选文件且原为内置 → 保持内置 Asset 来源（isBuiltin=true）。
  */
-private fun buildProfile(
+internal fun buildContainerProfile(
     initial: ContainerProfile?,
     mode: ExecutionMode,
+    runtime: LocalContainerRuntime,
+    useBundledImage: Boolean,
     name: String,
     shellPath: String,
     bindings: List<String>,
@@ -1174,22 +1384,30 @@ private fun buildProfile(
     selectedConnId: String,
     remotePath: String
 ): ContainerProfile? {
+    if (initial != null && (initial.mode != mode || initial.localRuntime != runtime)) return null
     return when (mode) {
         ExecutionMode.LOCAL_PROOT -> {
             val assetSource = initial?.rootfsSource as? RootfsSource.Asset
+                ?: RootfsSource.Asset("alpine-rootfs.bin").takeIf { useBundledImage && runtime == LocalContainerRuntime.CHROOT }
             val rootfsSource = if (pickedUri != null) RootfsSource.LocalFile(pickedUri) else assetSource ?: return null
+            if (initial?.isChroot == true && rootfsSource != initial.rootfsSource) return null
             ContainerProfile(
                 id = "", // 由调用方覆写
                 name = name,
                 rootfsSource = rootfsSource,
                 shellPath = shellPath.ifBlank { null },
-                extraBindings = bindings,
-                // 本地导入镜像默认注入 proot 参数；与用户手动添加走同一路径（extraArgs），拼接位置一致。
-                extraArgs = if (args.isEmpty() && rootfsSource is RootfsSource.LocalFile)
-                    ContainerProfile.DEFAULT_PROOT_ARGS else args,
+                extraBindings = if (runtime == LocalContainerRuntime.CHROOT) emptyList() else bindings,
+                extraArgs = when {
+                    runtime == LocalContainerRuntime.CHROOT -> emptyList()
+                    args.isEmpty() && rootfsSource is RootfsSource.LocalFile -> ContainerProfile.DEFAULT_PROOT_ARGS
+                    else -> args
+                },
                 env = env,
-                isBuiltin = rootfsSource is RootfsSource.Asset,
-                mode = ExecutionMode.LOCAL_PROOT
+                isBuiltin = runtime == LocalContainerRuntime.PROOT && rootfsSource is RootfsSource.Asset,
+                mode = ExecutionMode.LOCAL_PROOT,
+                createdAt = initial?.createdAt ?: 0,
+                localRuntime = runtime,
+                chrootInstance = initial?.chrootInstance
             )
         }
 
@@ -1213,9 +1431,10 @@ private fun canConfirm(
     pickedUri: String?,
     initialAsset: RootfsSource.Asset?,
     selectedConnId: String,
-    sshConnections: List<RemoteConnection>
+    sshConnections: List<RemoteConnection>,
+    useBundledImage: Boolean = false
 ): Boolean = when (mode) {
-    ExecutionMode.LOCAL_PROOT -> pickedUri != null || initialAsset != null
+    ExecutionMode.LOCAL_PROOT -> pickedUri != null || initialAsset != null || useBundledImage
     ExecutionMode.REMOTE_SSH -> sshConnections.isNotEmpty() && selectedConnId.isNotBlank()
 }
 
@@ -1243,6 +1462,7 @@ private fun copyImageToPrivate(context: Context, uriString: String, profileId: S
  * 否则下载页记录还在但文件没了；手动导入的副本（import_*）照旧清理。
  */
 private fun deleteImageCopy(profile: ContainerProfile) {
+    if (profile.isChroot) return
     val src = profile.rootfsSource as? RootfsSource.LocalFile ?: return
     if (!src.uri.startsWith("file://")) return
     runCatching {

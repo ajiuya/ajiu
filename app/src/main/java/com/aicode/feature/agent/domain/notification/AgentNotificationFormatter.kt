@@ -162,16 +162,21 @@ object AgentNotificationFormatter {
             NotificationOutcome.COMPLETED -> "completed"
             NotificationOutcome.FAILED -> "failed"
             NotificationOutcome.STOPPED -> "stopped"
+            NotificationOutcome.UNKNOWN -> "unknown"
         }
     }
 
     private fun PendingNotification.summaryText(): String = when (kind) {
-        AgentNotificationKind.BACKGROUND_TASK ->
-            "后台任务「$title」已${if (outcome == NotificationOutcome.STOPPED) "被终止" else "结束（退出码 ${exitCode ?: "未知"}）"}"
+        AgentNotificationKind.BACKGROUND_TASK -> when (outcome) {
+            NotificationOutcome.UNKNOWN -> "后台任务「$title」退出结果未知，需核验"
+            NotificationOutcome.STOPPED -> "后台任务「$title」已被终止"
+            else -> "后台任务「$title」已结束（退出码 ${exitCode ?: "未知"}）"
+        }
         AgentNotificationKind.SUBAGENT -> when (outcome) {
             NotificationOutcome.COMPLETED -> "子代理「$title」已执行完成"
             NotificationOutcome.FAILED -> "子代理「$title」已执行失败"
             NotificationOutcome.STOPPED -> "子代理「$title」已被用户手动终止，任务未完成"
+            NotificationOutcome.UNKNOWN -> "子代理「$title」结果未知，需核验"
         }
         AgentNotificationKind.AGENT_MESSAGE -> when (action) {
             AgentMessageAction.ADD_INSTRUCTION -> "给${targetTitle?.takeIf { it.isNotBlank() } ?: title}代理添加指令"

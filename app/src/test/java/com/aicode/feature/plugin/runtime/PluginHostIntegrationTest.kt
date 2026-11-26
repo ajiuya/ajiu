@@ -81,7 +81,7 @@ class PluginHostIntegrationTest {
     private val app get() = RuntimeEnvironment.getApplication()
     private val modes = ExecutionModeHolder()
     private val selection = MutableStateFlow(WorkspaceRepository.Selection(Workspace("work", "/work", WorkspaceType.INTERNAL)))
-    private val execution = WorkspaceExecutionContext(modes.currentMode(), "work", mockk(),
+    private var execution = WorkspaceExecutionContext(modes.currentMode(), "work", mockk(),
         WorkspacePathMapper.ExecutionMapping(ContainerProfile.BUILTIN_ALPINE, File("/work"), File("/fixture/rootfs"), File("/fixture/global"), "/root"), null) {}
     private val commands = mockk<CommandEngine>()
     private val registry = ToolRegistry()
@@ -110,10 +110,18 @@ class PluginHostIntegrationTest {
         val workspaces = mockk<WorkspaceRepository>()
         every { workspaces.selection } returns selection
         val contexts = mockk<WorkspaceExecutionContextFactory>()
-        coEvery { contexts.freeze(any()) } returns execution
+        coEvery { contexts.freeze(any(), any(), any()) } answers {
+            val owner = secondArg<com.aicode.feature.agent.domain.container.runtime.RuntimeOwner?>()
+            val check = thirdArg<(() -> Unit)?>() ?: {}
+            check()
+            WorkspaceExecutionContext(modes.currentMode(), "work", mockk(), execution.localMapping, null,
+                runtimeOwner = owner, checkSource = check).also { execution = it }
+        }
         val settings = mockk<ContainerSettingsRepository>()
         every { settings.activeProfileSelectionRevisions } returns MutableStateFlow(0L)
         every { settings.activeProfileSelectionRevision } returns 0L
+        every { settings.profileConfigurationRevision } returns 0L
+        every { settings.profileConfigurationRevisions } returns MutableStateFlow(0L)
         val ssh = mockk<RemoteSshConnection>()
         every { ssh.identityState } returns MutableStateFlow<RemoteConnectionIdentity?>(null)
         val folders = mockk<LocalFolderGrantRepository>()
@@ -296,6 +304,78 @@ class PluginHostIntegrationTest {
         assertEquals(JsonPrimitive("saved"), call.await())
         page.checkCurrent()
         page.close()
+    }
+
+    @Test fun runtimeOwnerIsBoundToPluginSourceRatherThanRandomInvocationOrChat() = runBlocking<Unit> {
+        val first = gateway.captureContext(capture, session.sessionId, session.projectRoot, session)
+        val second = gateway.captureContext(capture, session.sessionId, session.projectRoot, session)
+        assertNotEquals(first.invocationId, second.invocationId)
+        assertEquals(first.runtimeOwner, second.runtimeOwner)
+        assertEquals(com.aicode.feature.agent.domain.container.runtime.RuntimeOwnerKind.PLUGIN, first.runtimeOwner?.kind)
+        val authority = first.runtimeContext()
+        assertSame(first.sourceIdentity, authority.sourceIdentity)
+        assertNotSame(first.sourceIdentity, authority.authorityIdentity)
+        val guarded = authority.guarded(first::checkCurrent).withBackgroundAuthority(Any()).withIdleCallbacks()
+        assertEquals(first.runtimeOwner, guarded.runtimeOwner)
+        assertSame(first.sourceIdentity, guarded.sourceIdentity)
+    }
+
+    @Test fun retainingAndChildContextsPreserveSourceOwnershipWithoutSharingInvocationLifetime() = runBlocking<Unit> {
+        val original = gateway.captureContext(capture)
+        val retained = original.retainSource()
+        val child = original.child()
+        assertNotEquals(original.invocationId, retained.invocationId)
+        assertSame(original.sourceIdentity, retained.sourceIdentity)
+        assertSame(original.runtimeContext().authorityIdentity, retained.runtimeContext().authorityIdentity)
+        assertEquals(original.runtimeOwner, child.runtimeContext().runtimeOwner)
+        original.close()
+        try { child.checkCurrent(); fail("Expected parent invocation closure") } catch (_: CancellationException) { }
+        retained.checkCurrent()
+        manager.disable(capture.id)
+        assertTrue(runCatching { retained.checkCurrent() }.exceptionOrNull() is com.aicode.feature.plugin.domain.PluginCaptureException)
+    }
+
+    @Test fun contentAndActivationChangesReplaceRuntimeOwnerAndInvalidateOldSource() = runBlocking<Unit> {
+        val original = gateway.captureContext(capture)
+        val oldOwner = original.runtimeOwner
+        val manifest = PluginCoreFixtures.manifest(runtime = """{"type":"python","entry":"module.py"}""", version = "2.0.0")
+        PluginCoreFixtures.install(manager, PluginCoreFixtures.archive(manifest, listOf("module.py" to "value = 2".toByteArray())))
+        val updated = PluginCoreFixtures.activate(manager)
+        val replacement = gateway.captureContext(updated)
+        assertNotEquals(capture.contentHash, updated.contentHash)
+        assertNotEquals(oldOwner, replacement.runtimeOwner)
+        assertTrue(runCatching { original.checkCurrent() }.exceptionOrNull() is com.aicode.feature.plugin.domain.PluginCaptureException)
+        replacement.checkCurrent()
+    }
+
+    @Test fun runtimeContextCannotBeCreatedWithoutAnExplicitOwnerAndSource() = runBlocking<Unit> {
+        val root = manager.dataDirectory(capture.id)
+        val missingOwner = PluginInvocationContext(capture, null, "", null, root, kotlinx.coroutines.flow.emptyFlow(), sourceIdentity = "source") {}
+        assertEquals("CONTEXT_REQUIRED", error { missingOwner.runtimeContext() })
+        val missingSource = PluginInvocationContext(capture, null, "", null, root, kotlinx.coroutines.flow.emptyFlow(),
+            runtimeOwner = com.aicode.feature.agent.domain.container.runtime.RuntimeOwner(
+                com.aicode.feature.agent.domain.container.runtime.RuntimeOwnerKind.PLUGIN, "missing-source")) {}
+        assertEquals("CONTEXT_REQUIRED", error { missingSource.runtimeContext() })
+    }
+
+    @Test fun workspaceLessBackgroundCannotAcquireAChrootRuntimeThroughDefaultProfile() = runBlocking<Unit> {
+        var starts = 0
+        val processFactory = object : PluginRuntimeProcessFactory {
+            override suspend fun captureProfile() = ContainerProfile.BUILTIN_ALPINE.copy(
+                localRuntime = com.aicode.feature.agent.domain.container.LocalContainerRuntime.CHROOT)
+            override fun containerPath(file: File) = file.path
+            override suspend fun start(launch: PluginLocalLaunch): Process { starts++; throw AssertionError("Unexpected launch") }
+        }
+        val ownedRuntime = PluginRuntimeManager(manager, processFactory)
+        val background = gateway.captureBackgroundContext(capture)
+        try {
+            try {
+                ownedRuntime.invoke(capture, requireNotNull(capture.content.runtime), "report", empty,
+                    background.runtimeContext(), { _, _ -> empty })
+                fail("Expected missing workspace runtime capture")
+            } catch (failure: PluginProcessException) { assertEquals("PLUGIN_CONTEXT_REQUIRED", failure.code) }
+            assertEquals(0, starts)
+        } finally { background.close(); ownedRuntime.close(); withTimeout(5_000) { ownedRuntime.awaitClosed() } }
     }
 
     @Test fun registeredToolIsBoundToOfferedInstanceAcrossDisableAndReenable() = runBlocking<Unit> {

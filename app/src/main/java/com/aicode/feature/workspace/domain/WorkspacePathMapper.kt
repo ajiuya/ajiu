@@ -2,11 +2,16 @@ package com.aicode.feature.workspace.domain
 
 import com.aicode.feature.agent.domain.container.ContainerInstaller
 import com.aicode.feature.agent.domain.container.ContainerProfile
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeAuthorizationRequired
 import com.aicode.feature.settings.data.repository.ContainerSettingsRepository
+import com.aicode.feature.settings.data.repository.ContainerProfileSnapshot
 import com.aicode.feature.workspace.data.repository.WorkspaceRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.io.File
 import java.nio.file.FileSystemLoopException
@@ -26,7 +31,7 @@ import javax.inject.Singleton
  * 这样文件类工具（read/write/edit）无需进 PRoot 即可读写整个容器文件系统，与 `execute_command` 看到的一致。
  *
  * **profile 感知**：rootfs 目录随当前选中 profile 变化（内置 Alpine 用 filesDir/rootfs，自定义用 filesDir/rootfs_<id>）。
- * [currentProfile] 缓存自 [ContainerSettingsRepository]，避免同步读 DataStore；启动首帧为内置 Alpine，等同改动前。
+ * [currentProfile] 缓存自 [ContainerSettingsRepository]，避免同步读 DataStore；[runtimeProfileState] 标记首帧是否已加载。
  *
  * 用本映射器统一：
  * - 工具入参（AI 给的路径）经 [toHostFile] 落到宿主真实文件；
@@ -46,27 +51,27 @@ class WorkspacePathMapper @Inject constructor(
         const val AICODE_ROOT = "/root/.aicode"
     }
 
-    /**
-     * 当前选中的 profile（缓存，避免同步读 DataStore）。启动首帧为内置 Alpine，等同改动前。
-     * profile 切换后由 flow collector 更新；切换瞬间与引擎缓存可能短暂不一致，但 ensureInstalled 与文件工具
-     * 调用之间有自然顺序，实际不影响。
-     */
-    @Volatile
-    private var currentProfile: ContainerProfile = ContainerProfile.BUILTIN_ALPINE
+    internal data class RuntimeProfileState(
+        val profile: ContainerProfile,
+        val ready: Boolean,
+        val epoch: Long
+    )
+
+    private val _runtimeProfileState = MutableStateFlow(RuntimeProfileState(ContainerProfile.BUILTIN_ALPINE, false, 0L))
+    internal val runtimeProfileState = _runtimeProfileState.asStateFlow()
+    private val currentProfile: ContainerProfile get() = _runtimeProfileState.value.profile
 
     init {
         CoroutineScope(Dispatchers.IO).launch {
-            containerSettingsRepository.activeProfileIdFlow.collect { id ->
-                currentProfile = resolveProfile(id)
+            combine(
+                containerSettingsRepository.activeProfileIdFlow,
+                containerSettingsRepository.customProfilesFlow
+            ) { id, profiles ->
+                profiles.firstOrNull { it.id == id } ?: profiles.firstOrNull() ?: ContainerProfile.BUILTIN_ALPINE
+            }.collect { profile ->
+                _runtimeProfileState.update { previous -> RuntimeProfileState(profile, true, previous.epoch + 1) }
             }
         }
-    }
-
-    private suspend fun resolveProfile(id: String): ContainerProfile {
-        val profiles = containerSettingsRepository.customProfilesFlow.first()
-        return profiles.firstOrNull { it.id == id }
-            ?: profiles.firstOrNull()
-            ?: ContainerProfile.BUILTIN_ALPINE
     }
 
     internal data class ExecutionMapping(
@@ -74,18 +79,75 @@ class WorkspacePathMapper @Inject constructor(
         val workspaceRoot: File,
         val rootfsRoot: File,
         val aicodeRoot: File,
-        val home: String
+        val home: String,
+        val configurationRevision: Long = 0L,
+        val workspaceSourcePath: String = workspaceRoot.absolutePath,
+        val rootfsSourcePath: String = rootfsRoot.absolutePath,
+        val aicodeSourcePath: String = aicodeRoot.absolutePath,
+        val selectionRevision: Long = 0L,
+        val workspaceSelection: WorkspaceRepository.Selection? = null
     )
 
-    internal fun captureExecutionMapping(): ExecutionMapping {
-        val profile = currentProfile
+    internal data class WorkspaceSource(val workspaceRoot: File, val sourcePath: String, val selection: WorkspaceRepository.Selection? = null)
+
+    internal fun captureWorkspaceSource(): WorkspaceSource {
+        val selection = workspaceRepository.selection.value
+        val path = workspaceRepository.currentPath()
+        return WorkspaceSource(File(path).canonicalFile, path, selection).also(::checkWorkspaceSource)
+    }
+
+    internal fun checkWorkspaceSource(source: WorkspaceSource) {
+        if (workspaceRepository.currentPath() != source.sourcePath ||
+            (source.selection != null && workspaceRepository.selection.value !== source.selection)) {
+            throw java.util.concurrent.CancellationException("Workspace mount source changed")
+        }
+    }
+
+    internal fun captureExecutionMapping(snapshot: ContainerProfileSnapshot? = null): ExecutionMapping {
+        val profile = snapshot?.activeProfile ?: currentProfile
+        if (profile.isChroot) throw LocalRuntimeAuthorizationRequired()
+        val workspace = captureWorkspaceSource()
+        val rootfs = containerInstaller.rootfsDirFor(profile)
+        val aicode = containerInstaller.aicodeDir
         return ExecutionMapping(
             profile,
-            File(workspaceRepository.currentPath()).canonicalFile,
-            containerInstaller.rootfsDirFor(profile).canonicalFile,
-            containerInstaller.aicodeDir.canonicalFile,
-            pathHomeResolver.home()
+            workspace.workspaceRoot,
+            rootfs.canonicalFile,
+            aicode.canonicalFile,
+            pathHomeResolver.home(),
+            snapshot?.configurationRevision ?: containerSettingsRepository.profileConfigurationRevision,
+            workspace.sourcePath,
+            rootfs.absolutePath,
+            aicode.absolutePath,
+            snapshot?.selectionRevision ?: containerSettingsRepository.activeProfileSelectionRevision,
+            workspace.selection
         )
+    }
+
+    internal fun checkExecutionMapping(mapping: ExecutionMapping) {
+        if (containerSettingsRepository.profileConfigurationRevision != mapping.configurationRevision ||
+            containerSettingsRepository.activeProfileSelectionRevision != mapping.selectionRevision ||
+            currentProfile != mapping.profile || workspaceRepository.currentPath() != mapping.workspaceSourcePath ||
+            (mapping.workspaceSelection != null && workspaceRepository.selection.value !== mapping.workspaceSelection) ||
+            containerInstaller.rootfsDirFor(mapping.profile).absolutePath != mapping.rootfsSourcePath ||
+            containerInstaller.aicodeDir.absolutePath != mapping.aicodeSourcePath ||
+            pathHomeResolver.home() != mapping.home) {
+            throw java.util.concurrent.CancellationException("Local workspace execution mapping changed")
+        }
+    }
+
+    internal fun isChrootRuntime(): Boolean = currentProfile.isChroot
+
+    internal fun requireHostRuntime() {
+        val execution = WorkspaceExecutionContext.current()
+        if (execution != null) {
+            execution.requireMode(com.aicode.feature.settings.data.repository.ExecutionMode.LOCAL_PROOT)
+            if (execution.localRuntimeCapture != null || execution.localMapping?.profile?.isChroot == true) {
+                throw java.io.IOException("CHROOT files require their captured runtime backend")
+            }
+        } else if (currentProfile.isChroot) {
+            throw LocalRuntimeAuthorizationRequired()
+        }
     }
 
     private fun executionMapping(): ExecutionMapping? = WorkspaceExecutionContext.current()?.let {
@@ -125,6 +187,7 @@ class WorkspacePathMapper @Inject constructor(
      * `/root/.aicode` 必须先于通用 `/`→rootfs 规则匹配，否则会落到 rootfs 内的临时副本（升级即丢）。
      */
     fun toHostFile(path: String): File {
+        requireHostRuntime()
         val root = hostRoot()
         val wsRoot = resolvedContainerRoot()
         val p = expandHome(path.trim())
@@ -140,6 +203,7 @@ class WorkspacePathMapper @Inject constructor(
     }
 
     fun resolveFile(path: String, followFinalLink: Boolean = true): File {
+        requireHostRuntime()
         val expanded = expandHome(path.trim())
         val absolute = if (expanded.startsWith("/")) expanded else "${resolvedContainerRoot()}/$expanded"
         val pending = ArrayDeque(absolute.split('/').filter { it.isNotEmpty() })
@@ -186,6 +250,7 @@ class WorkspacePathMapper @Inject constructor(
      * 判断顺序无歧义。
      */
     fun toContainerPath(hostPath: String): String {
+        requireHostRuntime()
         val rootPath = hostRoot().absolutePath.replace('\\', '/')
         val aicodePath = aicodeRoot().absolutePath.replace('\\', '/')
         val rootfsPath = rootfsRoot().absolutePath.replace('\\', '/')

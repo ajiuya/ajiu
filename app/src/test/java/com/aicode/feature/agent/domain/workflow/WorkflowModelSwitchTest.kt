@@ -151,7 +151,7 @@ class WorkflowModelSwitchTest {
         recoveryRepository = mockk(relaxed = true),
         pluginHooks = hooks,
         workspaceExecutionContextFactory = mockk {
-            coEvery { freeze(any()) } returns WorkspaceExecutionContext(
+            coEvery { freeze(any(), any()) } returns WorkspaceExecutionContext(
                 ExecutionMode.LOCAL_PROOT, "model-switch-test", mockk(), null, null
             ) {}
         }
@@ -193,7 +193,7 @@ class WorkflowModelSwitchTest {
             beforeCompaction(request)
             CompactionResult(request.messages, compacted = false)
         }
-        coEvery { policy.evaluate(any(), any(), any()) } returns
+        coEvery { policy.evaluate(any(), any(), any(), any()) } returns
             ToolPermissionPolicyEngine.EvalResult(ToolPermissionPolicyEngine.Verdict.ALLOW)
         every { outputStore.process(any(), any(), any()) } answers { thirdArg<ToolResult>() }
         coEvery { hooks.beforeTool(any(), any(), any()) } answers { PluginBeforeTool(thirdArg()) }

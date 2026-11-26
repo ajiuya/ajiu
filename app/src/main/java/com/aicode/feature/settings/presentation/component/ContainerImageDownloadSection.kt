@@ -2,7 +2,6 @@ package com.aicode.feature.settings.presentation.component
 
 import android.net.Uri
 import android.os.Build
-import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -43,7 +42,6 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.painter.Painter
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
@@ -59,6 +57,7 @@ import com.aicode.core.ui.SelectionActionBar
 import com.aicode.core.ui.SelectionActionIconButton
 import com.aicode.core.ui.SwipeToDeleteRow
 import com.aicode.feature.agent.domain.container.ContainerImageEntry
+import com.aicode.feature.agent.domain.container.LocalContainerRuntime
 import com.aicode.feature.agent.domain.container.ContainerImageEol
 import com.aicode.feature.agent.domain.container.displayLabel
 import com.aicode.feature.agent.domain.container.eolStatus
@@ -66,12 +65,12 @@ import com.aicode.feature.agent.domain.container.hasNewerVersion
 import com.aicode.feature.settings.data.repository.DownloadedImageRecord
 import com.aicode.feature.settings.data.repository.effectiveVersion
 import com.aicode.feature.settings.presentation.ContainerImageDownloadUiState
+import com.aicode.feature.settings.presentation.ChrootSettingsUiState
 import compose.icons.FeatherIcons
 import compose.icons.feathericons.ChevronRight
 import compose.icons.feathericons.HardDrive
 import compose.icons.feathericons.Trash2
 import java.io.File
-import kotlinx.coroutines.launch
 
 /** 字节数转可读体积；容器镜像下载与更新包下载共用（同包内 internal，避免各写一份）。 */
 internal fun formatBytes(bytes: Long): String = when {
@@ -108,11 +107,14 @@ internal fun ContainerImageDownloadSection(
     selection: ListSelectionState,
     onDownload: (ContainerImageEntry) -> Unit,
     onCancel: () -> Unit,
-    onImport: (String, String) -> Unit,
+    onImport: (String, String, LocalContainerRuntime) -> Unit,
     onDelete: (String) -> Unit,
-    onBatchDelete: (Set<String>) -> Unit
+    onBatchDelete: (Set<String>) -> Unit,
+    chrootUiState: ChrootSettingsUiState = ChrootSettingsUiState(),
+    onCancelAddition: () -> Unit = {},
+    onClearAdditionResult: () -> Unit = {}
 ) {
-    val context = LocalContext.current
+    val operationsEnabled = chrootUiState.workingProfileId == null
     var detailEntry by remember { mutableStateOf<ContainerImageEntry?>(null) }
     var deleteEntry by remember { mutableStateOf<ContainerImageEntry?>(null) }
     var showBatchDeleteConfirm by remember { mutableStateOf(false) }
@@ -142,6 +144,7 @@ internal fun ContainerImageDownloadSection(
             .padding(horizontal = Spacing.lg)
             .padding(bottom = Spacing.xl)
     ) {
+        ContainerAdditionFeedback(chrootUiState.addition, onCancelAddition, onClearAdditionResult)
         if (selection.isActive) {
             SelectionActionBar(
                 selectedCount = selection.selectedCount,
@@ -154,7 +157,7 @@ internal fun ContainerImageDownloadSection(
                 SelectionActionIconButton(
                     icon = FeatherIcons.Trash2,
                     contentDescription = stringResource(R.string.common_batch_delete),
-                    enabled = selection.selectedCount > 0,
+                    enabled = operationsEnabled && selection.selectedCount > 0,
                     onClick = { showBatchDeleteConfirm = true },
                     tint = MaterialTheme.colorScheme.error
                 )
@@ -189,7 +192,8 @@ internal fun ContainerImageDownloadSection(
                         state = state,
                         isDownloaded = record != null && fileExists,
                         onOpenDetail = { detailEntry = entry },
-                        onDelete = { deleteEntry = entry },
+                        onDelete = { if (operationsEnabled) deleteEntry = entry },
+                        operationsEnabled = operationsEnabled,
                         selectionMode = selection.isActive,
                         selected = selection.isSelected(entry.id),
                         onToggleSelect = { selection.toggle(entry.id) }
@@ -207,7 +211,7 @@ internal fun ContainerImageDownloadSection(
             onConfirm = {
                 showBatchDeleteConfirm = false
                 selection.exit()
-                onBatchDelete(targets)
+                if (operationsEnabled) onBatchDelete(targets)
             },
             onDismiss = { showBatchDeleteConfirm = false }
         )
@@ -226,16 +230,14 @@ internal fun ContainerImageDownloadSection(
             record = downloadedImages[entry.id],
             sourceUnavailable = entry.id in sourceUnavailableIds,
             sourceName = selectedSourceName,
-            onDownload = { onDownload(entry) },
+            onDownload = { if (operationsEnabled) onDownload(entry) },
             onCancel = onCancel,
-            onImport = { fileUri ->
-                onImport(entry.id, fileUri)
-                Toast.makeText(
-                    context,
-                    context.getString(R.string.container_download_imported_toast),
-                    Toast.LENGTH_SHORT
-                ).show()
+            onImport = { fileUri, runtime ->
+                if (operationsEnabled) onImport(entry.id, fileUri, runtime)
             },
+            chrootUiState = chrootUiState,
+            onCancelAddition = onCancelAddition,
+            onClearAdditionResult = onClearAdditionResult,
             onDismiss = { detailEntry = null }
         )
     }
@@ -247,7 +249,7 @@ internal fun ContainerImageDownloadSection(
             text = { Text(stringResource(R.string.container_download_delete_confirm, entry.displayLabel(imageVersions[entry.id]))) },
             confirmButton = {
                 TextButton(onClick = {
-                    onDelete(entry.id)
+                    if (operationsEnabled) onDelete(entry.id)
                     deleteEntry = null
                 }) { Text(stringResource(R.string.common_delete)) }
             },
@@ -312,7 +314,8 @@ private fun DownloadImageRow(
     onDelete: () -> Unit,
     selectionMode: Boolean = false,
     selected: Boolean = false,
-    onToggleSelect: () -> Unit = {}
+    onToggleSelect: () -> Unit = {},
+    operationsEnabled: Boolean = true
 ) {
     val light = MaterialTheme.colorScheme.background.luminance() > 0.5f
 
@@ -321,7 +324,7 @@ private fun DownloadImageRow(
     SwipeToDeleteRow(
         onDelete = onDelete,
         onClick = onOpenDetail,
-        deleteEnabled = isDownloaded,
+        deleteEnabled = isDownloaded && operationsEnabled,
         selectionMode = selectionMode,
         selected = selected,
         onToggleSelect = onToggleSelect,
@@ -445,10 +448,16 @@ private fun ImageDetailSheet(
     sourceName: String,
     onDownload: () -> Unit,
     onCancel: () -> Unit,
-    onImport: (String) -> Unit,
-    onDismiss: () -> Unit
+    onImport: (String, LocalContainerRuntime) -> Unit,
+    onDismiss: () -> Unit,
+    chrootUiState: ChrootSettingsUiState = ChrootSettingsUiState(),
+    onCancelAddition: () -> Unit = {},
+    onClearAdditionResult: () -> Unit = {}
 ) {
     val sheetState = rememberModalBottomSheetState()
+    var importRuntime by remember(entry.id) { mutableStateOf(LocalContainerRuntime.PROOT) }
+    var importSubmitted by remember(entry.id) { mutableStateOf(false) }
+    val operationsEnabled = chrootUiState.workingProfileId == null
     val fileExists = record?.let { File(Uri.parse(it.fileUri).path ?: "").exists() } == true
     val isDownloaded = record != null && fileExists
     val downloading = state as? ContainerImageDownloadUiState.Downloading
@@ -463,6 +472,7 @@ private fun ImageDetailSheet(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
                 .padding(horizontal = Spacing.lg)
                 .padding(bottom = Spacing.xl)
         ) {
@@ -530,6 +540,7 @@ private fun ImageDetailSheet(
                 )
             }
 
+            ContainerAdditionFeedback(chrootUiState.addition, onCancelAddition, onClearAdditionResult)
             Column(modifier = Modifier.padding(top = Spacing.md), verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(4.dp)) {
                 if (entry.sizeBytes > 0) {
                     Text(
@@ -596,20 +607,32 @@ private fun ImageDetailSheet(
                     }
                 }
                 isDownloaded -> {
+                    ContainerRuntimePicker(runtime = importRuntime, locked = !operationsEnabled, onChange = { importRuntime = it })
+                    if (importRuntime == LocalContainerRuntime.CHROOT) {
+                        ContainerChrootAddNotice(chrootUiState.rootState)
+                    }
                     Row(horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(10.dp)) {
                         OutlinedButton(
                             onClick = onDownload,
+                            enabled = operationsEnabled,
                             modifier = Modifier.weight(1f).height(44.dp),
                             shape = RoundedCornerShape(12.dp)
                         ) {
                             Text(stringResource(R.string.container_download_redownload))
                         }
                         Button(
-                            onClick = { onImport(record!!.fileUri) },
+                            onClick = {
+                                if (operationsEnabled && !importSubmitted) {
+                                    importSubmitted = true
+                                    onImport(record!!.fileUri, importRuntime)
+                                }
+                            },
+                            enabled = operationsEnabled && !importSubmitted,
                             modifier = Modifier.weight(1f).height(44.dp),
                             shape = RoundedCornerShape(12.dp)
                         ) {
-                            Text(stringResource(R.string.container_download_import))
+                            Text(stringResource(containerProfileSubmitLabel(isNew = true,
+                                isChroot = importRuntime == LocalContainerRuntime.CHROOT, download = true)))
                         }
                     }
                 }
@@ -623,6 +646,7 @@ private fun ImageDetailSheet(
                         )
                         Button(
                             onClick = onDownload,
+                            enabled = operationsEnabled,
                             modifier = Modifier.fillMaxWidth().height(44.dp),
                             shape = RoundedCornerShape(12.dp)
                         ) {
@@ -641,7 +665,7 @@ private fun ImageDetailSheet(
                     }
                     Button(
                         onClick = onDownload,
-                        enabled = !sourceUnavailable,
+                        enabled = !sourceUnavailable && operationsEnabled,
                         modifier = Modifier.fillMaxWidth().height(44.dp),
                         shape = RoundedCornerShape(12.dp)
                     ) {

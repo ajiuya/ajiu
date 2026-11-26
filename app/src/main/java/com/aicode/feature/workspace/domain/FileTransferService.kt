@@ -2,6 +2,8 @@ package com.aicode.feature.workspace.domain
 
 import android.net.Uri
 import com.aicode.feature.agent.domain.tool.WorkspaceFileLock
+import com.aicode.feature.workspace.domain.chroot.ChrootFileAccess
+import com.aicode.feature.workspace.domain.chroot.ChrootTransferBackend
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -20,7 +22,7 @@ sealed interface TransferResult {
     data class Failed(val reason: String) : TransferResult
 }
 
-class TransferConfirmation internal constructor(internal val plan: TransferPlan) {
+class TransferConfirmation internal constructor(internal val plan: TransferTicketPlan) {
     val source: String get() = plan.source
     val target: String get() = plan.target
     val cut: Boolean get() = plan.cut
@@ -33,19 +35,54 @@ class TransferCancellationException internal constructor(
     init { initCause(cause) }
 }
 
+internal sealed interface TransferTicketPlan {
+    val execution: WorkspaceExecutionContext
+    val source: String
+    val target: String
+    val cut: Boolean
+}
+
 internal class TransferPlan(
-    val execution: WorkspaceExecutionContext,
+    override val execution: WorkspaceExecutionContext,
     val capture: RouteCapture,
-    val source: String,
-    val target: String,
-    val cut: Boolean,
+    override val source: String,
+    override val target: String,
+    override val cut: Boolean,
     val reader: TransferReader,
     val destination: TransferBackend,
     val sourceVersion: TransferVersion,
     val targetVersion: TransferVersion?,
     val checkPaths: (committed: Boolean) -> Unit,
     val sameBackend: FileAccessProvider? = null,
+) : TransferTicketPlan
+
+internal sealed interface ChrootUploadSelection {
+    val uri: Uri
+    class File(override val uri: Uri) : ChrootUploadSelection
+    class Directory(override val uri: Uri) : ChrootUploadSelection
+}
+
+internal class ChrootUploadRequest(
+    val targetDirectory: String,
+    val selection: ChrootUploadSelection,
+    val directoryIdentity: ChrootFileAccess.UploadDirectoryIdentity,
+    val checkOriginalScope: () -> Unit,
 )
+
+internal class ChrootUploadPlan(
+    override val execution: WorkspaceExecutionContext,
+    val request: ChrootUploadRequest,
+    override val source: String,
+    override val target: String,
+    val name: String,
+    val physicalSource: String?,
+    val targetEntry: String,
+    val targetReal: String,
+    val sourceVersion: TransferVersion,
+    val targetVersion: TransferVersion,
+) : TransferTicketPlan {
+    override val cut: Boolean = false
+}
 
 @Singleton
 class FileTransferService @Inject constructor(
@@ -105,13 +142,45 @@ class FileTransferService @Inject constructor(
         if (execution.fileCacheIdentity != plan.execution.fileCacheIdentity || execution.mode != plan.execution.mode) {
             throw CancellationException("Transfer confirmation execution changed")
         }
-        return runTransfer(plan.execution, checkScope) { check, record ->
-            plan.capture.checkCurrent()
-            plan.checkPaths(false)
-            if (transferVersion(plan.reader, check) != plan.sourceVersion || transferVersion(plan.destination, check) != plan.targetVersion) {
-                throw IOException("Transfer source or target changed after confirmation was requested")
+        return when (plan) {
+            is TransferPlan -> runTransfer(plan.execution, checkScope) { check, record ->
+                plan.capture.checkCurrent()
+                plan.checkPaths(false)
+                if (transferVersion(plan.reader, check) != plan.sourceVersion || transferVersion(plan.destination, check) != plan.targetVersion) {
+                    throw IOException("Transfer source or target changed after confirmation was requested")
+                }
+                execute(plan, check, record)
             }
-            execute(plan, check, record)
+            is ChrootUploadPlan -> confirmUpload(execution, plan, checkScope)
+        }
+    }
+
+    private suspend fun confirmUpload(
+        execution: WorkspaceExecutionContext,
+        plan: ChrootUploadPlan,
+        checkScope: () -> Unit,
+    ): TransferResult {
+        val original = plan.execution
+        if (execution.runtimeOwner != original.runtimeOwner ||
+            execution.localRuntimeCapture?.digest != original.localRuntimeCapture?.digest ||
+            execution.localRuntimeCapture?.instance != original.localRuntimeCapture?.instance ||
+            execution.localRuntimeCapture?.configurationRevision != original.localRuntimeCapture?.configurationRevision) {
+            throw CancellationException("Upload confirmation execution changed")
+        }
+        return runTransfer(original, { plan.request.checkOriginalScope(); checkScope() }) { check, _ ->
+            val request = plan.request
+            val capture = routing.capture(original, listOf(request.targetDirectory), check)
+            val provider = capture.endpoint(request.targetDirectory).transferBackend as? ChrootFileAccess
+                ?: throw CancellationException("Upload confirmation backend changed")
+            provider.captureUploadDirectory(request.targetDirectory) { check(); capture.checkCurrent() }.use { directory ->
+                if (directory.identity != request.directoryIdentity) throw IOException("Upload target directory changed after confirmation was requested")
+                val checkBatch = { check(); capture.checkCurrent(); directory.checkCurrent() }
+                val input = when (val selection = request.selection) {
+                    is ChrootUploadSelection.File -> uploads.files(listOf(selection.uri), checkBatch).single()
+                    is ChrootUploadSelection.Directory -> uploads.directory(selection.uri, checkBatch)
+                }
+                upload(original, capture, request.targetDirectory, input, checkBatch, request, plan)
+            }
         }
     }
 
@@ -123,9 +192,38 @@ class FileTransferService @Inject constructor(
     ): List<TransferResult> = withContext(Dispatchers.IO + execution) {
         val check = { WorkspaceExecutionContext.blockingContext()[Job]?.ensureActive(); execution.checkCurrent(); checkScope() }
         val results = ArrayList<TransferResult>()
+        var directoryCleanupUnknown = false
         try {
             val capture = routing.capture(execution, listOf(targetDir), check)
             val targetDirectory = capture.endpoint(targetDir)
+            val provider = targetDirectory.transferBackend
+            if (provider is ChrootFileAccess) {
+                val pending = ArrayList<TransferResult>()
+                val directory = provider.captureUploadDirectory(targetDir) { check(); capture.checkCurrent() }
+                var failure: Throwable? = null
+                try {
+                    val checkBatch = { check(); capture.checkCurrent(); directory.checkCurrent() }
+                    val inputs = uploads.files(uris, checkBatch)
+                    if (inputs.size != uris.size) throw IOException("Upload selection changed")
+                    for ((uri, input) in uris.zip(inputs)) {
+                        checkBatch()
+                        val request = ChrootUploadRequest(targetDir, ChrootUploadSelection.File(uri), directory.identity, checkScope)
+                        pending += upload(execution, capture, targetDir, input, checkBatch, request)
+                    }
+                } catch (problem: Throwable) {
+                    failure = problem
+                    throw problem
+                } finally {
+                    try { directory.close() } catch (cleanup: Throwable) {
+                        directoryCleanupUnknown = true
+                        val primary = failure
+                        if (primary == null) throw cleanup
+                        if (primary !== cleanup) primary.addSuppressed(cleanup)
+                    }
+                    if (!directoryCleanupUnknown) results += pending
+                }
+                return@withContext results
+            }
             val identity = targetDirectory.resolvePath(true)
             val entry = targetDirectory.resolvePath(false)
             fun checkBatch() {
@@ -144,9 +242,13 @@ class FileTransferService @Inject constructor(
         } catch (failure: CancellationException) {
             throw failure
         } catch (failure: IOException) {
-            results + TransferResult.Failed(failure.message ?: "Unable to upload files")
+            results + TransferResult.Failed(if (directoryCleanupUnknown) {
+                "Upload directory worker cleanup could not be confirmed; targets may already have been committed"
+            } else failure.message ?: "Unable to upload files")
         } catch (failure: SecurityException) {
-            results + TransferResult.Failed(failure.message ?: "Upload permission denied")
+            results + TransferResult.Failed(if (directoryCleanupUnknown) {
+                "Upload directory worker cleanup could not be confirmed; targets may already have been committed"
+            } else failure.message ?: "Upload permission denied")
         }
     }
 
@@ -158,6 +260,14 @@ class FileTransferService @Inject constructor(
     ): TransferResult = runTransfer(execution, checkScope) { check, _ ->
         val capture = routing.capture(execution, listOf(targetDir), check)
         val directory = capture.endpoint(targetDir)
+        val provider = directory.transferBackend
+        if (provider is ChrootFileAccess) {
+            return@runTransfer provider.captureUploadDirectory(targetDir) { check(); capture.checkCurrent() }.use { validation ->
+                val checkBatch = { check(); capture.checkCurrent(); validation.checkCurrent() }
+                val request = ChrootUploadRequest(targetDir, ChrootUploadSelection.Directory(treeUri), validation.identity, checkScope)
+                upload(execution, capture, targetDir, uploads.directory(treeUri, checkBatch), checkBatch, request)
+            }
+        }
         val identity = directory.resolvePath(true)
         val entry = directory.resolvePath(false)
         fun checkBatch() {
@@ -174,13 +284,22 @@ class FileTransferService @Inject constructor(
         targetDir: String,
         input: FileUploadInput,
         check: () -> Unit,
+        request: ChrootUploadRequest? = null,
+        confirmation: ChrootUploadPlan? = null,
     ): TransferResult {
         val target = targetDir.trimEnd('/') + "/" + input.name
+        if (confirmation != null && (input.source != confirmation.source || input.name != confirmation.name ||
+                input.physicalSource != confirmation.physicalSource || target != confirmation.target)) {
+            throw IOException("Upload source selection changed after confirmation was requested")
+        }
         val endpoint = capture.endpoint(target)
         capture.guardMutablePath(target)
         if (!endpoint.provider.isDirectory(targetDir)) throw IOException("Upload target directory does not exist")
         val targetEntry = endpoint.resolvePath(false)
         val targetReal = endpoint.resolvePath(true)
+        if (confirmation != null && (targetEntry != confirmation.targetEntry || targetReal != confirmation.targetReal)) {
+            throw IOException("Upload target path changed after confirmation was requested")
+        }
         fun checkPaths(committed: Boolean) {
             check()
             capture.guardMutablePath(target)
@@ -206,7 +325,16 @@ class FileTransferService @Inject constructor(
         val targetVersion = transferVersion(destination, check)
         checkPaths(false)
         val plan = TransferPlan(execution, capture, input.source, target, false, input.reader, destination, version, targetVersion, ::checkPaths)
-        return if (targetVersion != null) TransferResult.Conflict(TransferConfirmation(plan)) else execute(plan, check)
+        if (confirmation != null) {
+            if (version != confirmation.sourceVersion || targetVersion != confirmation.targetVersion) {
+                throw IOException("Upload source or target changed after confirmation was requested")
+            }
+            return execute(plan, check)
+        }
+        if (targetVersion == null) return execute(plan, check)
+        val ticket: TransferTicketPlan = if (request == null) plan else ChrootUploadPlan(execution, request, input.source, target,
+            input.name, input.physicalSource, targetEntry, targetReal, version, targetVersion)
+        return TransferResult.Conflict(TransferConfirmation(ticket))
     }
 
     private suspend fun execute(plan: TransferPlan, check: () -> Unit, record: (TransferProgress) -> Unit = {}): TransferResult {
@@ -286,6 +414,7 @@ class FileTransferService @Inject constructor(
         is LocalFileAccess -> HostTransferBackend({ relative, follow -> provider.transferFile(logicalChild(endpoint.path, relative), follow || (followRoot && relative.isEmpty())) }, check)
         is InternalLocalFolderAccess -> HostTransferBackend({ relative, follow -> provider.readFileForTransfer(logicalChild(endpoint.path, relative), follow || (followRoot && relative.isEmpty())) }, check)
         is RemoteSftpFileAccess -> provider.transferBackend(if (followRoot) endpoint.resolvePath(true) else endpoint.path, check)
+        is ChrootFileAccess -> provider.transferBackend(if (followRoot) endpoint.resolvePath(true) else endpoint.path, check)
         else -> throw IOException("This backend does not support safe file transfers")
     }
 
@@ -314,6 +443,7 @@ internal class TransferOperation(
     private val checkAfterCommitPaths: () -> Unit = checkPaths,
 ) {
     fun run(version: TransferVersion, expectedTarget: TransferVersion?): TransferResult {
+        (target as? ChrootTransferBackend)?.validateSource(version)
         val stage = target.createStage(version.kind)
         var failure: Throwable? = null
         try {

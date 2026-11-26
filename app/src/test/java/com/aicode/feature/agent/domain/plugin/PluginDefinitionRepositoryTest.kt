@@ -3,6 +3,7 @@ package com.aicode.feature.agent.domain.plugin
 import com.aicode.core.watch.FileChangeHub
 import com.aicode.feature.agent.domain.container.ContainerInstaller
 import com.aicode.feature.agent.domain.skill.GlobalDirectorySkillSource
+import com.aicode.feature.agent.domain.skill.LocalSkillDefinitionSource
 import com.aicode.feature.agent.domain.skill.ProjectDirectorySkillSource
 import com.aicode.feature.agent.domain.skill.SkillConfigRepository
 import com.aicode.feature.agent.domain.skill.SkillForm
@@ -28,6 +29,7 @@ import com.aicode.feature.workspace.domain.FileAccessProvider
 import com.aicode.feature.workspace.domain.ProjectAicodeRoot
 import com.aicode.testutil.TestFileAccessProvider
 import io.mockk.Called
+import io.mockk.coEvery
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.verify
@@ -66,8 +68,13 @@ class PluginDefinitionRepositoryTest {
             return AgentConfigSnapshot(agentConfigSourceIdentity(), "revision", files)
         }
     }
+    private val localDefinitions = mockk<LocalSkillDefinitionSource>().apply {
+        every { sourceIdentity() } returns "plugin-metadata"
+        coEvery { capture() } returns null
+        every { sourceSignals() } returns emptyFlow()
+    }
     private val skills by lazy {
-        SkillRepository(GlobalDirectorySkillSource(fileAccess), ProjectDirectorySkillSource(fileAccess), skillConfig, fileAccess, pluginSource)
+        SkillRepository(GlobalDirectorySkillSource(fileAccess), ProjectDirectorySkillSource(fileAccess), skillConfig, fileAccess, pluginSource, localDefinitions)
     }
     private val agents by lazy {
         AgentDefinitionRepository(GlobalDirectoryAgentSource(fileAccess), ProjectDirectoryAgentSource(fileAccess), agentConfig, fileAccess, pluginSource)
@@ -304,7 +311,7 @@ class PluginDefinitionRepositoryTest {
         val hub = mockk<FileChangeHub>()
         every { hub.watchAicode(any(), any(), any(), any(), any()) } returns emptyFlow()
         every { hub.watchWorkspace(any(), any(), any(), any(), any()) } returns emptyFlow()
-        val skillConfig = SkillConfigRepository(installer, projectRoot, hub, access)
+        val skillConfig = SkillConfigRepository(installer, projectRoot, hub, access, localDefinitions)
         val agentConfig = AgentDefinitionConfigRepository(installer, projectRoot, hub, access)
         assertThrows(PluginDefinitionReadOnlyException::class.java) { skillConfig.setDisabled("any", true, SkillScope.PLUGIN) }
         assertThrows(PluginDefinitionReadOnlyException::class.java) { agentConfig.setDisabled("any", true, AgentDefinitionScope.PLUGIN) }

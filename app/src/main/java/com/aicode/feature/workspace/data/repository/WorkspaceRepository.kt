@@ -36,6 +36,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.encodeToString
 import java.io.File
 import java.io.IOException
+import java.util.UUID
 import java.nio.file.Files
 import java.nio.file.LinkOption.NOFOLLOW_LINKS
 import java.nio.file.NoSuchFileException
@@ -150,7 +151,9 @@ class WorkspaceRepository @Inject constructor(
     private val _current = MutableStateFlow<Workspace?>(null)
     val current: StateFlow<Workspace?> = _current.asStateFlow()
 
-    internal class Selection(val workspace: Workspace?)
+    internal class Selection(val workspace: Workspace?) {
+        val id: String = UUID.randomUUID().toString()
+    }
     private val _selection = MutableStateFlow(Selection(null))
     internal val selection: StateFlow<Selection> = _selection.asStateFlow()
 
@@ -627,6 +630,20 @@ class WorkspaceRepository @Inject constructor(
                 ?: "/"
         }
         return _current.value?.path ?: projectsRoot.absolutePath
+    }
+
+    internal fun localMcpWorkspace(sourceIdentity: String): String {
+        require(sourceIdentity.isNotBlank())
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+            .digest(sourceIdentity.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it.toInt() and 255) }
+        val base = File(projectsRoot, ".mcp")
+        val directory = File(base, digest)
+        for (current in listOf(projectsRoot, base, directory)) {
+            if (!Files.exists(current.toPath(), NOFOLLOW_LINKS)) current.mkdir()
+            val stat = Files.readAttributes(current.toPath(), BasicFileAttributes::class.java, NOFOLLOW_LINKS)
+            if (!stat.isDirectory || stat.isSymbolicLink) throw IOException("Local MCP workspace is not an ordinary private directory")
+        }
+        return directory.absolutePath
     }
 
     /** 仅保留字母数字、下划线、连字符、点和空格，去掉路径分隔符等危险字符。 */

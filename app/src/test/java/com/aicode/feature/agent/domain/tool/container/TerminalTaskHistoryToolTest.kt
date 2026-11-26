@@ -1,6 +1,8 @@
 package com.aicode.feature.agent.domain.tool.container
 
 import com.aicode.feature.agent.domain.model.AgentContext
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwner
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwnerKind
 import com.aicode.feature.agent.domain.tool.ToolResult
 import com.aicode.feature.agent.domain.tool.ToolStreamEvent
 import com.aicode.feature.terminal.data.repository.TerminalTaskHistoryRepository
@@ -43,6 +45,7 @@ import org.junit.Test
 @OptIn(ExperimentalCoroutinesApi::class)
 class TerminalTaskHistoryToolTest {
     private val dispatcher = StandardTestDispatcher()
+    private val owner = RuntimeOwner(RuntimeOwnerKind.AGENT, SESSION_ID)
     private val scope = TerminalTaskScope(
         profileId = "local-profile",
         rootfsSourceIdentity = "a".repeat(64),
@@ -249,7 +252,7 @@ class TerminalTaskHistoryToolTest {
             exitCode = 7
         )
         val running = record(historyId = RUNNING_HISTORY_ID, title = "Running snapshot", status = TerminalTaskStatus.RUNNING)
-        every { provider.listTabs() } returns listOf(
+        every { provider.listOwnedTabs(owner) } returns listOf(
             TabInfo("term-live", "Live shell", isBackground = false, running = true, command = null),
             TabInfo("term-done", "Completed live tab", isBackground = true, running = false, command = "echo done", historyId = FINISHED_HISTORY_ID)
         )
@@ -272,29 +275,26 @@ class TerminalTaskHistoryToolTest {
 
         coVerify(exactly = 2) { history.list(scope, SESSION_ID) }
         coVerify(exactly = 0) { history.read(any(), any(), any()) }
-        verify(exactly = 2) { provider.listTabs() }
+        verify(exactly = 2) { provider.listOwnedTabs(owner) }
         confirmVerified(provider)
     }
 
     @Test
-    fun listingWithoutSessionStillListsLiveTabsButDoesNotAccessHistory() = runTest(dispatcher) {
-        every { provider.listTabs() } returns emptyList()
-
+    fun listingWithoutSessionRejectsBeforeAccessingLiveTabsOrHistory() = runTest(dispatcher) {
         for (sessionId in listOf(null, "", " \t")) {
             for (entry in EntryPoint.entries) {
-                assertEquals("当前没有终端标签。", successText(invoke(entry, args(), context(sessionId))))
+                assertError(invoke(entry, args(), context(sessionId)), "TERMINAL_OWNER_REQUIRED")
             }
         }
 
         verifyNoHistoryAccess()
         verify { resolver wasNot Called }
-        verify(exactly = 6) { provider.listTabs() }
-        confirmVerified(provider)
+        verify { provider wasNot Called }
     }
 
     @Test
     fun listingOutsideLocalScopeStillListsLiveTabsWithoutReadingHistory() = runTest(dispatcher) {
-        every { provider.listTabs() } returns emptyList()
+        every { provider.listOwnedTabs(owner) } returns emptyList()
         coEvery { resolver.capture() } returns null
 
         for (entry in EntryPoint.entries) {
@@ -302,14 +302,14 @@ class TerminalTaskHistoryToolTest {
         }
 
         verifyNoHistoryAccess()
-        verify(exactly = 2) { provider.listTabs() }
+        verify(exactly = 2) { provider.listOwnedTabs(owner) }
         confirmVerified(provider)
     }
 
     @Test
     fun scopeChangeDuringListingRejectsBothThePreviousScopesLiveTabsAndHistory() = runTest(dispatcher) {
         val liveTitle = "PRIVATE_PREVIOUS_LIVE_TITLE"
-        every { provider.listTabs() } returns listOf(
+        every { provider.listOwnedTabs(owner) } returns listOf(
             TabInfo("term-previous", liveTitle, isBackground = true, running = false, command = null, historyId = HISTORY_ID)
         )
         val record = record(title = "PRIVATE_PREVIOUS_SCOPE_TITLE")
@@ -326,7 +326,7 @@ class TerminalTaskHistoryToolTest {
 
         coVerify(exactly = 2) { history.list(scope, SESSION_ID) }
         coVerify(exactly = 4) { resolver.capture() }
-        verify(exactly = 2) { provider.listTabs() }
+        verify(exactly = 2) { provider.listOwnedTabs(owner) }
         confirmVerified(provider)
     }
 
@@ -358,7 +358,7 @@ class TerminalTaskHistoryToolTest {
 
     @Test
     fun aHistoryUuidPassedAsTabIdDoesNotFallBackToTheHistoryRepository() = runTest(dispatcher) {
-        every { provider.getTabOutput(HISTORY_ID) } returns null
+        every { provider.getOwnedTabOutput(HISTORY_ID, owner) } returns null
         stubOwnedRecord(record(output = "PRIVATE_HISTORY_OUTPUT"))
 
         for (entry in EntryPoint.entries) {
@@ -367,7 +367,7 @@ class TerminalTaskHistoryToolTest {
             assertFalse(error.message.contains("PRIVATE_HISTORY_OUTPUT"))
         }
 
-        verify(exactly = 2) { provider.getTabOutput(HISTORY_ID) }
+        verify(exactly = 2) { provider.getOwnedTabOutput(HISTORY_ID, owner) }
         confirmVerified(provider)
         verify { resolver wasNot Called }
         verifyNoHistoryAccess()
@@ -375,13 +375,15 @@ class TerminalTaskHistoryToolTest {
 
     @Test
     fun aLiveTabReadRemainsALiveReadWithoutHistoryAccess() = runTest(dispatcher) {
-        every { provider.getTabOutput("term-live") } returns RAW_OUTPUT
+        every { provider.getOwnedTabOutput("term-live", owner) } returns RAW_OUTPUT
+        every { provider.listOwnedTabs(owner) } returns listOf(TabInfo("term-live", "Live", false, true, null))
 
         for (entry in EntryPoint.entries) {
             assertEquals(RAW_OUTPUT, successText(invoke(entry, args("read", "tab_id" to "term-live"))))
         }
 
-        verify(exactly = 2) { provider.getTabOutput("term-live") }
+        verify(exactly = 2) { provider.getOwnedTabOutput("term-live", owner) }
+        verify(exactly = 2) { provider.listOwnedTabs(owner) }
         confirmVerified(provider)
         verify { resolver wasNot Called }
         verifyNoHistoryAccess()
@@ -456,7 +458,7 @@ class TerminalTaskHistoryToolTest {
 
     @Test
     fun historyListingStorageFailureExplicitlyReportsUnknownResultsRatherThanAnEmptyList() = runTest(dispatcher) {
-        every { provider.listTabs() } returns emptyList()
+        every { provider.listOwnedTabs(owner) } returns emptyList()
         coEvery { history.list(scope, SESSION_ID) } throws IOException("PRIVATE_STORAGE_PATH")
 
         for (entry in EntryPoint.entries) {
@@ -468,7 +470,7 @@ class TerminalTaskHistoryToolTest {
         }
 
         coVerify(exactly = 2) { history.list(scope, SESSION_ID) }
-        verify(exactly = 2) { provider.listTabs() }
+        verify(exactly = 2) { provider.listOwnedTabs(owner) }
         confirmVerified(provider)
     }
 
@@ -489,7 +491,8 @@ class TerminalTaskHistoryToolTest {
 
     @Test
     fun streamingHistoryListingPreservesTheOriginalContextSessionId() = runTest(dispatcher) {
-        every { provider.listTabs() } returns emptyList()
+        val streamOwner = RuntimeOwner(RuntimeOwnerKind.AGENT, "stream-origin-session")
+        every { provider.listOwnedTabs(streamOwner) } returns emptyList()
         coEvery { history.list(scope, "stream-origin-session") } returns listOf(record(sourceSessionId = "stream-origin-session"))
 
         val text = successText(invoke(EntryPoint.STREAM, args(), context("stream-origin-session")))
@@ -497,7 +500,7 @@ class TerminalTaskHistoryToolTest {
         assertTrue(text.contains("history_id=$HISTORY_ID  [UNKNOWN]"))
         coVerify(exactly = 1) { history.list(scope, "stream-origin-session") }
         coVerify(exactly = 0) { history.list(scope, SESSION_ID) }
-        verify(exactly = 1) { provider.listTabs() }
+        verify(exactly = 1) { provider.listOwnedTabs(streamOwner) }
         confirmVerified(provider)
     }
 
@@ -517,7 +520,7 @@ class TerminalTaskHistoryToolTest {
     @Test
     fun historyListingCancellationPreservesItsOriginalCauseThroughBothEntryPoints() = runTest(dispatcher) {
         val cancellation = CancellationException("history list cancelled")
-        every { provider.listTabs() } returns emptyList()
+        every { provider.listOwnedTabs(owner) } returns emptyList()
         coEvery { history.list(scope, SESSION_ID) } throws cancellation
 
         for (entry in EntryPoint.entries) {
@@ -525,7 +528,7 @@ class TerminalTaskHistoryToolTest {
         }
 
         coVerify(exactly = 2) { history.list(scope, SESSION_ID) }
-        verify(exactly = 2) { provider.listTabs() }
+        verify(exactly = 2) { provider.listOwnedTabs(owner) }
         confirmVerified(provider)
     }
 

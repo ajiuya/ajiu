@@ -90,6 +90,7 @@ class ChatNotificationRowTest {
                     NotificationOutcome.COMPLETED -> "completed"
                     NotificationOutcome.FAILED -> "failed"
                     NotificationOutcome.STOPPED -> "stopped"
+                    NotificationOutcome.UNKNOWN -> "unknown"
                 }
                 for ((raw, toolResult) in listOf(
                     injector.inject("", listOf(pending)) to false,

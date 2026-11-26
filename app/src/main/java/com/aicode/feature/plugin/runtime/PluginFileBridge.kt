@@ -28,6 +28,7 @@ import com.aicode.feature.workspace.domain.WorkspaceExecutionContext
 import com.aicode.feature.workspace.domain.WorkspacePathMapper
 import com.aicode.feature.workspace.domain.isLocalFolderPath
 import com.aicode.feature.workspace.domain.localRootPath
+import com.aicode.feature.workspace.domain.chroot.ChrootFileAccess
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
@@ -265,10 +266,11 @@ private data class Request(val method: String, val source: Name, val dest: Name?
             if (raw.length > MAX_PATH || raw != raw.trim() || unsafeText(raw) || '\\' in raw) invalid()
             val execution = context.execution
             val mapping = execution?.localMapping
-            val home = mapping?.home ?: execution?.remoteSource?.identity?.home
+            val home = mapping?.home ?: execution?.localRuntimeCapture?.let { "/root" } ?: execution?.remoteSource?.identity?.home
             val expanded = when { raw == "~" -> home ?: noWorkspace(); raw.startsWith("~/") && !raw.startsWith(WORKSPACE) -> (home ?: noWorkspace()).trimEnd('/') + raw.removePrefix("~"); else -> raw }
             val remote = execution?.remoteSource?.workspaceRoot?.trimEnd('/')
-            val workspaceAliases = listOfNotNull(remote, mapping?.home?.trimEnd('/')?.plus("/workspace"))
+            val workspaceAliases = listOfNotNull(remote, mapping?.home?.trimEnd('/')?.plus("/workspace"),
+                execution?.localRuntimeCapture?.let { "/root/workspace" })
             val roots = listOfNotNull(mapping?.let { WorkspacePathMapper.AICODE_ROOT }) + mapping?.profile?.extraBindings.orEmpty().mapNotNull {
                 it.substringAfter(':', it).trim().takeIf { path -> path.startsWith('/') && path != "/" }?.trimEnd('/')
             }
@@ -319,10 +321,14 @@ private class FileScope(
 ) {
     private val execution = context.execution
     private val route = if (root == DATA) null else routing.capture(execution ?: noWorkspace(), listOf(root), check)
-    private val physical = if (root == DATA) context.dataDirectory.absolutePath else requireNotNull(route).endpoint(root).resolvePath(false).trimEnd('/').ifEmpty { "/" }
-    private val host = route?.endpoint(root)?.physicalNamespace == "host"
+    private val endpoint = route?.endpoint(root)
+    private val physicalNamespace = endpoint?.physicalNamespace ?: "host"
+    private val routeIdentity = endpoint?.identity
+    private val physical = if (root == DATA) context.dataDirectory.absolutePath else requireNotNull(endpoint).resolvePath(false).trimEnd('/').ifEmpty { "/" }
+    private val host = endpoint?.physicalNamespace == "host"
     private val storage = context.dataDirectory.absoluteFile.parentFile?.takeIf { it.name == "data" }?.parentFile
     private val registry = storage?.parentFile?.parentFile?.resolve("plugin-registry.json")
+    private val guestManagement = if (execution?.localRuntimeCapture != null && root != DATA && !host) "/root/.aicode/plugins" else null
 
     init {
         if (route != null && (context.workspacePath.isBlank() || unsafeText(context.workspacePath))) noWorkspace()
@@ -334,7 +340,7 @@ private class FileScope(
 
     fun display(relative: String): String = if (root == WORKSPACE) child(physical, relative) else logical(relative)
     private fun logical(relative: String): String = Name(root, relative).logical
-    private fun management(path: String): Boolean = host && (within(path, context.dataDirectory.absolutePath) ||
+    private fun management(path: String): Boolean = guestManagement?.let { within(path, it) } == true || host && (within(path, context.dataDirectory.absolutePath) ||
         storage?.let { within(path, it.absolutePath) } == true || registry?.let {
             path == it.absolutePath || path == "${it.absolutePath}.install" ||
                 (File(path).parentFile == it.parentFile && File(path).name.startsWith(".${it.name}."))
@@ -350,6 +356,7 @@ private class FileScope(
         } else {
             val path = logical(relative)
             val endpoint = route.endpoint(path)
+            if (endpoint.identity != routeIdentity || endpoint.physicalNamespace != physicalNamespace) changed()
             val provider = endpoint.provider
             if (provider.resolvePath(path, false) != expected) throw forbiddenError()
         }
@@ -370,6 +377,7 @@ private class FileScope(
         // Use only this endpoint's safe transfer API: its general copy, delete or write method may traverse a tree or replace a shared temporary file.
         return when (val provider = route?.endpoint(path)?.transferBackend) {
             is RemoteSftpFileAccess -> provider.transferBackend(path, check)
+            is ChrootFileAccess -> provider.transferBackend(path, check)
             null, is InternalLocalFolderAccess, is LocalFileAccess -> HostTransferBackend({ sub, follow -> hostFile(child(relative, sub), follow) }, check)
             else -> unsupported()
         }
@@ -410,7 +418,8 @@ private class FileScope(
         val dest = request.dest?.relative
         for (relative in listOf(source) + if (targetScope === this) listOfNotNull(dest) else emptyList()) {
             val path = child(physical, relative)
-            if (relative.isEmpty() || management(path) || (host && listOfNotNull(context.dataDirectory, storage, registry).any { within(it.absolutePath, path) })) throw forbiddenError()
+            if (relative.isEmpty() || management(path) || guestManagement?.let { within(it, path) } == true ||
+                (host && listOfNotNull(context.dataDirectory, storage, registry).any { within(it.absolutePath, path) })) throw forbiddenError()
             route?.let { capture ->
                 try { capture.guardMutablePath(logical(relative)) } catch (_: IOException) { check(); throw forbiddenError() }
             }
@@ -418,7 +427,7 @@ private class FileScope(
         if (dest != null) {
             val target = requireNotNull(targetScope)
             if (target !== this) target.guard(Request("fs.write", requireNotNull(request.dest), null, null))
-            if (host == target.host && (host || execution?.remoteSource?.identity == target.execution?.remoteSource?.identity)) {
+            if (physicalNamespace == target.physicalNamespace) {
                 if (within(child(physical, source), child(target.physical, dest)) || within(child(target.physical, dest), child(physical, source))) throw conflict()
             }
             if (target === this) route?.guardTransfer(logical(source), logical(dest))

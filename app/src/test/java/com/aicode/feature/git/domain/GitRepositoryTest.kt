@@ -11,6 +11,13 @@ import com.aicode.feature.git.domain.model.GitTag
 import com.aicode.feature.git.domain.model.GraphCommit
 import com.aicode.feature.settings.data.repository.ExecutionModeHolder
 import com.aicode.feature.workspace.data.repository.WorkspaceRepository
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwner
+import com.aicode.feature.settings.data.repository.ContainerSettingsRepository
+import com.aicode.feature.workspace.domain.WorkspaceExecutionContext
+import com.aicode.feature.workspace.domain.WorkspaceExecutionContextFactory
+import com.aicode.feature.workspace.domain.model.Workspace
+import com.aicode.feature.workspace.domain.model.WorkspaceType
+import kotlinx.coroutines.flow.MutableStateFlow
 import io.mockk.coEvery
 import io.mockk.every
 import io.mockk.mockk
@@ -21,6 +28,26 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+
+internal fun gitRepositoryForTest(
+    engine: CommandEngine,
+    workspace: WorkspaceRepository,
+    modes: ExecutionModeHolder,
+    path: String
+): GitRepository {
+    every { workspace.selection } returns MutableStateFlow(WorkspaceRepository.Selection(Workspace("test", path, WorkspaceType.INTERNAL)))
+    val settings = mockk<ContainerSettingsRepository>()
+    every { settings.activeProfileSelectionRevision } returns 0L
+    every { settings.profileConfigurationRevision } returns 0L
+    val factory = mockk<WorkspaceExecutionContextFactory>()
+    coEvery { factory.freeze(any(), any(), any()) } answers {
+        val owner = secondArg<RuntimeOwner?>()
+        val check = thirdArg<(() -> Unit)?>() ?: {}
+        check()
+        WorkspaceExecutionContext(modes.currentMode(), "git-test", mockk(), null, null, runtimeOwner = owner, checkSource = check)
+    }
+    return GitRepository(engine, workspace, modes, factory, settings)
+}
 
 /**
  * [GitRepository] 的输出解析逻辑（mock 掉 CommandEngine 与 WorkspaceRepository）。
@@ -42,7 +69,7 @@ class GitRepositoryTest {
         }
         val workspace = mockk<WorkspaceRepository>()
         every { workspace.currentPath() } returns workPath
-        return GitRepository(engine, workspace, ExecutionModeHolder())
+        return gitRepositoryForTest(engine, workspace, ExecutionModeHolder(), workPath)
     }
 
     // ── status()：porcelain v1 -b 解析 ───────────────────────────
@@ -396,7 +423,7 @@ class GitRepositoryTest {
         every { workspace.currentPath() } returns workPath
         val slot = slot<String>()
         coEvery { engine.runCommandSyncUnbounded(capture(slot), any(), any()) } returns CommandResult("", 0)
-        val repo = GitRepository(engine, workspace, ExecutionModeHolder())
+        val repo = gitRepositoryForTest(engine, workspace, ExecutionModeHolder(), workPath)
 
         repo.commit("fix: 表格 | 分号; 括号(1)")
         // '|' 是 shell 管道符，整条消息必须单引号包裹传递
@@ -410,7 +437,7 @@ class GitRepositoryTest {
         every { workspace.currentPath() } returns workPath
         val slot = slot<String>()
         coEvery { engine.runCommandSyncUnbounded(capture(slot), any(), any()) } returns CommandResult("", 0)
-        val repo = GitRepository(engine, workspace, ExecutionModeHolder())
+        val repo = gitRepositoryForTest(engine, workspace, ExecutionModeHolder(), workPath)
 
         repo.commit("it's fixed")
         // 内嵌单引号关闭-转义-重开：it'\''s fixed

@@ -13,6 +13,10 @@ import com.aicode.feature.git.domain.GitCommandFailureException
 import com.aicode.feature.git.domain.GitOutputTooLargeException
 import com.aicode.feature.git.domain.GitErrorMessage
 import com.aicode.feature.git.domain.GitRepository
+import com.aicode.feature.git.domain.FrozenGitOperation
+import com.aicode.feature.git.domain.GitOperationExpiredException
+import com.aicode.feature.git.domain.GitWorkspaceRequiredException
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeAuthorizationRequired
 import com.aicode.feature.git.domain.model.GitBranch
 import com.aicode.feature.git.domain.model.GitCommit
 import com.aicode.feature.git.domain.model.GitFileChange
@@ -133,6 +137,48 @@ class GitViewModel @Inject constructor(
     private val _state = MutableStateFlow(GitUiState())
     val state: StateFlow<GitUiState> = _state.asStateFlow()
 
+    private var displayedOperation: FrozenGitOperation? = null
+    private var pendingPushOperation: FrozenGitOperation? = null
+
+    private fun captureUiOperation(): FrozenGitOperation? = try {
+        (displayedOperation ?: repository.captureOperation()).also { it.checkCurrent() }
+    } catch (failure: Exception) {
+        showOperationFailure(failure)
+        null
+    }
+
+    private fun showOperationFailure(failure: Exception) {
+        val message = when (failure) {
+            is GitOperationExpiredException -> context.getString(R.string.git_execution_source_changed)
+            is GitWorkspaceRequiredException -> context.getString(R.string.git_execution_workspace_required)
+            is LocalRuntimeAuthorizationRequired -> context.getString(R.string.local_runtime_authorization_required)
+            else -> context.getString(R.string.git_toast_refresh_failed, failure.message)
+        }
+        _state.update { it.copy(loading = false, busy = false, branchesLoading = false, graphLoadingMore = false,
+            stashesLoading = false, checkoutLoading = null, untrackedDirLoading = null, loadingCommit = null,
+            generatingCommitMessage = false, diffVisible = false,
+            toast = message) }
+    }
+
+    private fun launchOperation(operation: FrozenGitOperation, block: suspend () -> Unit) {
+        viewModelScope.launch {
+            try {
+                operation.checkCurrent()
+                block()
+            } catch (failure: Exception) {
+                if (failure is CancellationException) throw failure
+                val displayed = displayedOperation
+                if (displayed == null || displayed === operation || displayed.owner == operation.owner ||
+                    runCatching { displayed.checkCurrent() }.isFailure) showOperationFailure(failure)
+            }
+        }
+    }
+
+    private fun publish(operation: FrozenGitOperation, transform: (GitUiState) -> GitUiState) {
+        operation.checkCurrent()
+        _state.update(transform)
+    }
+
     init { refresh() }
 
     /** 仓库快照：并发拉取 status/graph/remote（+可选 identity）的结果。不含全量分支/标签——
@@ -147,25 +193,25 @@ class GitViewModel @Inject constructor(
     )
 
     /** 并发拉取轻量快照：status + graph(本地 refs) + remote + 可选 identity。 */
-    private suspend fun loadSnapshot(includeIdentity: Boolean): RepoSnapshot = coroutineScope {
-        val s = async { repository.status() }
-        val localRefs = async { repository.localRefsOnly() }
-        val r = async { repository.hasRemote() }
-        val id = async { if (includeIdentity) repository.getUserName().isNotBlank() else false }
-        val g = async { repository.graph(refs = localRefs.await()) }
+    private suspend fun loadSnapshot(operation: FrozenGitOperation, includeIdentity: Boolean): RepoSnapshot = coroutineScope {
+        val s = async { repository.status(operation) }
+        val localRefs = async { repository.localRefsOnly(operation) }
+        val r = async { repository.hasRemote(operation) }
+        val id = async { if (includeIdentity) repository.getUserName(operation).isNotBlank() else false }
+        val g = async { repository.graph(refs = localRefs.await(), operation = operation) }
         val status = s.await()
-        RepoSnapshot(status, g.await(), r.await(), id.await(), reloadExpandedUntrackedDirs(status))
+        RepoSnapshot(status, g.await(), r.await(), id.await(), reloadExpandedUntrackedDirs(operation, status))
     }
 
     /**
      * 刷新后重查已展开的未跟踪目录，保住展开态。只保留仍出现在 [GitStatus.untracked] 里的目录——
      * 目录被暂存或删除后就不该再留着陈旧的文件列表。
      */
-    private suspend fun reloadExpandedUntrackedDirs(status: GitStatus): Map<String, List<String>> {
+    private suspend fun reloadExpandedUntrackedDirs(operation: FrozenGitOperation, status: GitStatus): Map<String, List<String>> {
         val dirs = _state.value.untrackedDirFiles.keys.filter { it in status.untracked }
         if (dirs.isEmpty()) return emptyMap()
         return coroutineScope {
-            dirs.map { dir -> dir to async { repository.untrackedFilesIn(dir) } }
+            dirs.map { dir -> dir to async { repository.untrackedFilesIn(dir, operation) } }
                 .associate { (dir, deferred) -> dir to deferred.await() }
         }
     }
@@ -184,21 +230,26 @@ class GitViewModel @Inject constructor(
      * 不置 busy，只读不阻塞写操作。已加载过则跳过；写操作后需手动调 [refreshBranchesIfLoaded] 同步。
      */
     fun loadBranches() {
+        val operation = captureUiOperation() ?: return
+        loadBranches(operation)
+    }
+
+    private fun loadBranches(operation: FrozenGitOperation) {
         if (_state.value.branchesLoading || _state.value.branchesLoaded) return
-        _state.update { it.copy(branchesLoading = true) }
-        viewModelScope.launch {
+        publish(operation) { it.copy(branchesLoading = true) }
+        launchOperation(operation) {
             try {
-                val allRefs = repository.loadAllRefs()
+                val allRefs = repository.loadAllRefs(operation)
                 // 用全量 refs 更新 graph 标注（远程分支+标签补全）。
-                val graph = repository.graphAppend(_state.value.graph.commits, allRefs.refsByCommit)
+                val graph = repository.graphAppend(_state.value.graph.commits, allRefs.refsByCommit, operation = operation)
                 val commits = graph.toGitCommits()
-                _state.update {
+                publish(operation) {
                     it.copy(branches = allRefs.branches, tags = allRefs.tags, graph = graph, commits = commits, branchesLoading = false, branchesLoaded = true)
                 }
             } catch (e: Exception) {
-                if (e is CancellationException) throw e
+                if (e is CancellationException || e is GitOperationExpiredException || e is LocalRuntimeAuthorizationRequired) throw e
                 FileLogger.e(TAG, "加载分支列表失败", e)
-                _state.update { it.copy(branchesLoading = false, toast = context.getString(R.string.git_toast_load_branches_failed, e.message)) }
+                publish(operation) { it.copy(branchesLoading = false, toast = context.getString(R.string.git_toast_load_branches_failed, e.message)) }
             }
         }
     }
@@ -206,14 +257,14 @@ class GitViewModel @Inject constructor(
     /**
      * 写操作后同步刷新已加载的分支/标签（若已加载过）。未加载过则不主动拉，保持延迟加载语义。
      */
-    private fun refreshBranchesIfLoaded() {
+    private fun refreshBranchesIfLoaded(operation: FrozenGitOperation) {
         if (!_state.value.branchesLoaded) return
-        viewModelScope.launch {
+        launchOperation(operation) {
             try {
-                val allRefs = repository.loadAllRefs()
-                _state.update { it.copy(branches = allRefs.branches, tags = allRefs.tags) }
+                val allRefs = repository.loadAllRefs(operation)
+                publish(operation) { it.copy(branches = allRefs.branches, tags = allRefs.tags) }
             } catch (e: Exception) {
-                if (e is CancellationException) throw e
+                if (e is CancellationException || e is GitOperationExpiredException || e is LocalRuntimeAuthorizationRequired) throw e
                 FileLogger.e(TAG, "刷新分支列表失败", e)
             }
         }
@@ -221,37 +272,45 @@ class GitViewModel @Inject constructor(
 
     fun refresh() {
         if (_state.value.busy) return
-        // 容器未就绪时不执行 git 命令，直接提示用户去终端页完成初始化，避免误显示"非 Git 仓库"。
-        repository.notReadyHint()?.let { hint ->
-            _state.update { it.copy(loading = false, toast = hint) }
+        var operation = try { repository.captureOperation() } catch (failure: Exception) {
+            showOperationFailure(failure)
             return
         }
-        _state.update { it.copy(loading = true, toast = null) }
-        viewModelScope.launch {
+        displayedOperation = operation
+        pendingPushOperation = null
+        publish(operation) { it.copy(loading = true, toast = null) }
+        launchOperation(operation) {
             try {
+                repository.notReadyHint(operation)?.let { hint ->
+                    publish(operation) { it.copy(loading = false, toast = hint) }
+                    return@launchOperation
+                }
                 // 发现工作区里的 git 仓库（根 + 一层子目录），选中当前或默认仓库。
-                val repos = repository.discoverRepos()
-                val subdirs = repository.listSubdirectories()
-                val workspaceRoot = repository.workspaceRoot()
+                val repos = repository.discoverRepos(operation)
+                val subdirs = repository.listSubdirectories(operation)
+                val workspaceRoot = repository.workspaceRoot(operation)
                 val current = repository.currentRepoPath
                 // 当前选中仓库已不在发现列表（如切换了工作区）时回退默认：工作区根优先，否则第一个子目录仓库。
                 val effectiveRepo = current?.takeIf { it in repos } ?: repos.firstOrNull()
-                repository.setRepoPath(effectiveRepo)
+                repository.setRepoPath(effectiveRepo, operation)
+                operation = repository.captureOperation()
+                displayedOperation = operation
                 if (effectiveRepo == null) {
-                    _state.update { it.copy(loading = false, notARepo = true, repos = repos, subdirs = subdirs, workspaceRoot = workspaceRoot, currentRepo = null) }
-                    return@launch
+                    publish(operation) { it.copy(loading = false, notARepo = true, repos = repos, subdirs = subdirs, workspaceRoot = workspaceRoot, currentRepo = null) }
+                    return@launchOperation
                 }
-                val snap = loadSnapshot(includeIdentity = true)
+                val snap = loadSnapshot(operation, includeIdentity = true)
                 val commits = snap.graph.toGitCommits()
-                _state.update {
-                    it.copy(loading = false, notARepo = false, status = snap.status, commits = commits, graph = snap.graph, hasRemote = snap.hasRemote, hasIdentity = snap.hasIdentity, untrackedDirFiles = snap.untrackedDirFiles, branchesLoaded = false, branchesLoading = false, branches = emptyList(), tags = emptyList(), repos = repos, subdirs = subdirs, workspaceRoot = workspaceRoot, currentRepo = effectiveRepo)
+                publish(operation) {
+                    it.copy(commitFiles = emptyMap(), commitDetailHash = null, stashes = emptyList(),
+                        diffVisible = false, diffPath = null, diffData = null, loading = false, notARepo = false, status = snap.status, commits = commits, graph = snap.graph, hasRemote = snap.hasRemote, hasIdentity = snap.hasIdentity, untrackedDirFiles = snap.untrackedDirFiles, branchesLoaded = false, branchesLoading = false, branches = emptyList(), tags = emptyList(), repos = repos, subdirs = subdirs, workspaceRoot = workspaceRoot, currentRepo = effectiveRepo)
                 }
                 // 页面已打开：后台拉取全量分支/标签，用户切到 BRANCHES tab 时无需再等。
-                loadBranches()
+                loadBranches(operation)
             } catch (e: Exception) {
-                if (e is CancellationException) throw e
+                if (e is CancellationException || e is GitOperationExpiredException || e is LocalRuntimeAuthorizationRequired) throw e
                 FileLogger.e(TAG, "刷新失败", e)
-                _state.update { it.copy(loading = false, toast = context.getString(R.string.git_toast_refresh_failed, e.message)) }
+                publish(operation) { it.copy(loading = false, toast = context.getString(R.string.git_toast_refresh_failed, e.message)) }
             }
         }
     }
@@ -259,117 +318,122 @@ class GitViewModel @Inject constructor(
     /** 执行一个写操作：置 busy → 跑命令 → 刷新 → 反馈。操作间互斥。 */
     private fun runAction(
         @StringRes nameRes: Int,
-        action: suspend () -> String,
-        onComplete: (suspend () -> Unit)? = null
+        action: suspend (FrozenGitOperation) -> String,
+        operation: FrozenGitOperation? = captureUiOperation(),
+        onComplete: (suspend (FrozenGitOperation) -> Unit)? = null
     ) {
-        if (_state.value.busy) return
-        _state.update { it.copy(busy = true, toast = null) }
-        viewModelScope.launch {
+        if (_state.value.busy || operation == null) return
+        try { operation.checkCurrent() } catch (failure: Exception) { showOperationFailure(failure); return }
+        publish(operation) { it.copy(busy = true, toast = null) }
+        launchOperation(operation) {
             val name = context.getString(nameRes)
             val msg = try {
-                action()
+                action(operation)
+                operation.checkCurrent()
                 context.getString(R.string.git_toast_action_success, name)
             } catch (e: Exception) {
-                if (e is CancellationException) throw e
+                if (e is CancellationException || e is GitOperationExpiredException || e is LocalRuntimeAuthorizationRequired) throw e
                 FileLogger.e(TAG, "${name}失败", e)
                 val reason = (e as? GitCommandFailureException)?.output ?: e.message
                 context.getString(R.string.git_toast_action_failed, name, GitErrorMessage.friendly(reason ?: ""))
             }
             // 刷新以反映新状态；失败也刷新，让 UI 与仓库一致。
             try {
-                if (repository.isRepo()) {
-                    val snap = loadSnapshot(includeIdentity = false)
+                if (repository.isRepo(operation)) {
+                    val snap = loadSnapshot(operation, includeIdentity = false)
                     val commits = snap.graph.toGitCommits()
-                    _state.update { it.copy(busy = false, status = snap.status, commits = commits, graph = snap.graph, hasRemote = snap.hasRemote, untrackedDirFiles = snap.untrackedDirFiles, notARepo = false, toast = msg) }
-                    refreshBranchesIfLoaded()
-                    onComplete?.invoke()
+                    publish(operation) { it.copy(busy = false, status = snap.status, commits = commits, graph = snap.graph, hasRemote = snap.hasRemote, untrackedDirFiles = snap.untrackedDirFiles, notARepo = false, toast = msg) }
+                    refreshBranchesIfLoaded(operation)
+                    onComplete?.invoke(operation)
                 } else {
-                    _state.update { it.copy(busy = false, notARepo = true, toast = msg) }
+                    publish(operation) { it.copy(busy = false, notARepo = true, toast = msg) }
                 }
             } catch (e: Exception) {
-                if (e is CancellationException) throw e
-                _state.update { it.copy(busy = false, toast = context.getString(R.string.git_toast_action_refresh_failed, msg)) }
+                if (e is CancellationException || e is GitOperationExpiredException || e is LocalRuntimeAuthorizationRequired) throw e
+                publish(operation) { it.copy(busy = false, toast = context.getString(R.string.git_toast_action_refresh_failed, msg)) }
             }
         }
     }
 
-    fun stage(path: String) = runAction(R.string.git_stage, { repository.stage(path) })
-    fun unstage(path: String) = runAction(R.string.git_unstage, { repository.unstage(path) })
-    fun stageAll() = runAction(R.string.git_action_stage_all, { repository.stageAll() })
-    fun unstageAll() = runAction(R.string.git_action_unstage_all, { repository.unstageAll() })
+    fun stage(path: String) = runAction(R.string.git_stage, { operation -> repository.stage(path, operation) })
+    fun unstage(path: String) = runAction(R.string.git_unstage, { operation -> repository.unstage(path, operation) })
+    fun stageAll() = runAction(R.string.git_action_stage_all, { operation -> repository.stageAll(operation) })
+    fun unstageAll() = runAction(R.string.git_action_unstage_all, { operation -> repository.unstageAll(operation) })
 
     /**
      * 回退单个文件的改动。[staged] 为 true 时连已暂存内容一起还原到上次提交，否则只回退未暂存改动
      * （被删除的文件由此取回）。改动未提交过，回退后无法再找回，故 UI 侧须先二次确认。
      */
     fun revertFile(path: String, staged: Boolean) =
-        runAction(R.string.git_action_revert, {
-            if (staged) repository.revertToHead(path) else repository.revertWorktree(path)
+        runAction(R.string.git_action_revert, { operation ->
+            if (staged) repository.revertToHead(path, operation) else repository.revertWorktree(path, operation)
         })
 
     /** 回退全部未暂存改动，已暂存内容保持不动。 */
-    fun revertAllUnstaged() = runAction(R.string.git_action_revert_all, { repository.revertAllWorktree() })
+    fun revertAllUnstaged() = runAction(R.string.git_action_revert_all, { operation -> repository.revertAllWorktree(operation) })
 
     /** 删除未跟踪的文件或目录。这些文件从未提交过，删除后 git 无法恢复。 */
     fun deleteUntracked(path: String) =
-        runAction(R.string.git_action_delete_file, { repository.deleteUntracked(path) })
+        runAction(R.string.git_action_delete_file, { operation -> repository.deleteUntracked(path, operation) })
 
     /**
      * 展开/收起一个折叠的未跟踪目录（`git status` 把新目录显示成 `dir/` 一行）。展开时按需查询目录下
      * 未跟踪文件，使其可单独查看差异或删除。不置 busy——只读查询不该阻塞写操作。
      */
     fun toggleUntrackedDir(dir: String) {
+        val operation = captureUiOperation() ?: return
         if (dir in _state.value.untrackedDirFiles) {
-            _state.update { it.copy(untrackedDirFiles = it.untrackedDirFiles - dir) }
+            publish(operation) { it.copy(untrackedDirFiles = it.untrackedDirFiles - dir) }
             return
         }
         if (_state.value.untrackedDirLoading != null) return
-        _state.update { it.copy(untrackedDirLoading = dir) }
-        viewModelScope.launch {
+        publish(operation) { it.copy(untrackedDirLoading = dir) }
+        launchOperation(operation) {
             val files = try {
-                repository.untrackedFilesIn(dir)
+                repository.untrackedFilesIn(dir, operation)
             } catch (e: Exception) {
-                if (e is CancellationException) throw e
+                if (e is CancellationException || e is GitOperationExpiredException || e is LocalRuntimeAuthorizationRequired) throw e
                 FileLogger.e(TAG, "加载未跟踪目录失败: $dir", e)
                 emptyList()
             }
-            _state.update {
+            publish(operation) {
                 it.copy(untrackedDirFiles = it.untrackedDirFiles + (dir to files), untrackedDirLoading = null)
             }
         }
     }
     fun commit(message: String, amend: Boolean = false) =
-        runAction(R.string.git_action_commit, { repository.commit(message, amend) })
+        runAction(R.string.git_action_commit, { operation -> repository.commit(message, amend, operation) })
 
     /**
      * 调用 AI 根据暂存差异生成提交信息。
      */
     fun generateCommitMessage(onResult: (String) -> Unit) {
+        val operation = captureUiOperation() ?: return
         if (_state.value.generatingCommitMessage) return
-        _state.update { it.copy(generatingCommitMessage = true) }
-        viewModelScope.launch {
+        publish(operation) { it.copy(generatingCommitMessage = true) }
+        launchOperation(operation) {
             try {
-                val diff = repository.diffForCommitMessage()
+                val diff = repository.diffForCommitMessage(operation)
                 if (diff.isBlank()) {
-                    _state.update { it.copy(generatingCommitMessage = false, toast = context.getString(R.string.git_toast_no_diff_for_commit)) }
-                    return@launch
+                    publish(operation) { it.copy(generatingCommitMessage = false, toast = context.getString(R.string.git_toast_no_diff_for_commit)) }
+                    return@launchOperation
                 }
                 val message = agentWorkflow.generateCommitMessage(diff)
-                _state.update { it.copy(generatingCommitMessage = false) }
+                publish(operation) { it.copy(generatingCommitMessage = false) }
                 if (!message.isNullOrBlank()) {
                     onResult(message)
                 } else {
-                    _state.update { it.copy(toast = context.getString(R.string.git_toast_generate_commit_failed)) }
+                    publish(operation) { it.copy(toast = context.getString(R.string.git_toast_generate_commit_failed)) }
                 }
             } catch (e: Exception) {
-                if (e is CancellationException) throw e
+                if (e is CancellationException || e is GitOperationExpiredException || e is LocalRuntimeAuthorizationRequired) throw e
                 FileLogger.e(TAG, "生成提交信息异常", e)
-                _state.update { it.copy(generatingCommitMessage = false, toast = context.getString(R.string.git_toast_generate_commit_failed)) }
+                publish(operation) { it.copy(generatingCommitMessage = false, toast = context.getString(R.string.git_toast_generate_commit_failed)) }
             }
         }
     }
     /** 在当前工作区执行 `git init` 初始化仓库；成功后 runAction 末尾自动刷新（notARepo 翻 false）。 */
-    fun initRepo() = runAction(R.string.git_action_init, { repository.initRepo() })
+    fun initRepo() = runAction(R.string.git_action_init, { operation -> repository.initRepo(operation) })
 
     /** 显示仓库选择弹窗（列出工作区发现的 git 仓库）。 */
     fun showRepoPicker() = _state.update { it.copy(repoPickerVisible = true) }
@@ -382,74 +446,86 @@ class GitViewModel @Inject constructor(
      * 先校验目标路径是 git 仓库，通过后设置当前仓库路径并刷新。
      */
     fun switchRepo(path: String) {
+        val operation = captureUiOperation() ?: return
         if (_state.value.busy) return
-        _state.update { it.copy(repoPickerVisible = false) }
-        viewModelScope.launch {
+        publish(operation) { it.copy(repoPickerVisible = false) }
+        launchOperation(operation) {
             try {
-                if (!repository.isGitRepo(path)) {
-                    _state.update { it.copy(toast = context.getString(R.string.git_toast_not_repo)) }
-                    return@launch
+                if (!repository.isGitRepo(path, operation)) {
+                    publish(operation) { it.copy(toast = context.getString(R.string.git_toast_not_repo)) }
+                    return@launchOperation
                 }
-                repository.setRepoPath(path)
+                repository.setRepoPath(path, operation)
                 refresh()
             } catch (e: Exception) {
-                if (e is CancellationException) throw e
+                if (e is CancellationException || e is GitOperationExpiredException || e is LocalRuntimeAuthorizationRequired) throw e
                 FileLogger.e(TAG, "切换仓库失败", e)
-                _state.update { it.copy(toast = context.getString(R.string.git_toast_switch_repo_failed, e.message)) }
+                publish(operation) { it.copy(toast = context.getString(R.string.git_toast_switch_repo_failed, e.message)) }
             }
         }
     }
 
     /** 在当前工作区克隆远程仓库；成功后 runAction 末尾自动刷新进仓库态。 */
-    fun cloneRepo(url: String) = runAction(R.string.git_action_clone, { repository.cloneRepo(url) })
+    fun cloneRepo(url: String) = runAction(R.string.git_action_clone, { operation -> repository.cloneRepo(url, operation) })
     fun pull() {
+        val operation = captureUiOperation() ?: return
         if (!_state.value.hasRemote) {
-            _state.update { it.copy(toast = context.getString(R.string.git_toast_no_remote_pull)) }
+            publish(operation) { it.copy(toast = context.getString(R.string.git_toast_no_remote_pull)) }
             return
         }
-        runAction(R.string.git_pull, { repository.pull() })
+        runAction(R.string.git_pull, { captured -> repository.pull(captured) }, operation)
     }
     fun push(onPromptRenameMaster: () -> Unit = {}) {
+        val operation = captureUiOperation() ?: return
         if (!_state.value.hasRemote) {
-            _state.update { it.copy(toast = context.getString(R.string.git_toast_no_remote_push)) }
+            publish(operation) { it.copy(toast = context.getString(R.string.git_toast_no_remote_push)) }
             return
         }
-        viewModelScope.launch {
-            if (repository.isFirstPushOfMaster()) {
+        launchOperation(operation) {
+            if (repository.isFirstPushOfMaster(operation)) {
+                operation.checkCurrent()
+                pendingPushOperation = operation
                 onPromptRenameMaster()
             } else {
-                runAction(R.string.git_push, { repository.push() })
+                runAction(R.string.git_push, { captured -> repository.push(captured) }, operation)
             }
         }
     }
 
     /** 用户在首次推送 master 时选择重命名为 main 并推送。 */
-    fun pushRenameMasterToMain() =
-        runAction(R.string.git_push, { repository.renameMasterToMainAndPush() })
+    fun pushRenameMasterToMain() {
+        val operation = pendingPushOperation ?: return
+        pendingPushOperation = null
+        runAction(R.string.git_push, { captured -> repository.renameMasterToMainAndPush(captured) }, operation)
+    }
 
     /** 用户在首次推送 master 时选择保留 master 直接推送。 */
-    fun pushDirectly() =
-        runAction(R.string.git_push, { repository.push() })
+    fun pushDirectly() {
+        val operation = pendingPushOperation ?: captureUiOperation() ?: return
+        pendingPushOperation = null
+        runAction(R.string.git_push, { captured -> repository.push(captured) }, operation)
+    }
 
     /**
      * 打开某条提交的详情弹层。若文件清单尚未加载则懒加载（不置 [GitUiState.busy]，
      * 因为这是只读查看，不应阻塞 status/branches 的写操作）。
      */
     fun openCommitDetail(hash: String) {
+        val operation = captureUiOperation() ?: return
         val current = _state.value
         if (current.commitDetailHash == hash) return
-        _state.update { it.copy(commitDetailHash = hash) }
+        publish(operation) { it.copy(commitDetailHash = hash) }
         if (hash in current.commitFiles) return
-        _state.update { it.copy(loadingCommit = hash) }
-        viewModelScope.launch {
+        publish(operation) { it.copy(loadingCommit = hash) }
+        launchOperation(operation) {
             val files = try {
-                repository.commitFiles(hash)
+                repository.commitFiles(hash, operation)
             } catch (e: Exception) {
-                if (e is CancellationException) throw e
+                if (e is CancellationException || e is GitOperationExpiredException || e is LocalRuntimeAuthorizationRequired) throw e
                 FileLogger.e(TAG, "加载提交文件失败: $hash", e)
                 emptyList()
             }
-            _state.update {
+            publish(operation) {
                 it.copy(commitFiles = it.commitFiles + (hash to files), loadingCommit = null)
             }
         }
@@ -465,18 +541,19 @@ class GitViewModel @Inject constructor(
      * 守卫：正在加载或无更多时直接返回。失败 toast 提示且保留 hasMore 允许重试。
      */
     fun loadMoreCommits() {
+        val operation = captureUiOperation() ?: return
         val current = _state.value
         if (current.graphLoadingMore || !current.graph.hasMore) return
-        _state.update { it.copy(graphLoadingMore = true) }
-        viewModelScope.launch {
+        publish(operation) { it.copy(graphLoadingMore = true) }
+        launchOperation(operation) {
             try {
-                val graph = repository.graphAppend(current.graph.commits, current.graph.refs)
+                val graph = repository.graphAppend(current.graph.commits, current.graph.refs, operation = operation)
                 val commits = graph.toGitCommits()
-                _state.update { it.copy(graph = graph, commits = commits, graphLoadingMore = false) }
+                publish(operation) { it.copy(graph = graph, commits = commits, graphLoadingMore = false) }
             } catch (e: Exception) {
-                if (e is CancellationException) throw e
+                if (e is CancellationException || e is GitOperationExpiredException || e is LocalRuntimeAuthorizationRequired) throw e
                 FileLogger.e(TAG, "加载更多提交失败", e)
-                _state.update { it.copy(graphLoadingMore = false, toast = context.getString(R.string.git_toast_load_more_failed, e.message)) }
+                publish(operation) { it.copy(graphLoadingMore = false, toast = context.getString(R.string.git_toast_load_more_failed, e.message)) }
             }
         }
     }
@@ -485,31 +562,32 @@ class GitViewModel @Inject constructor(
      * 切换到指定分支或标签。成功后刷新全量状态。
      */
     fun checkoutBranch(ref: String, isRemote: Boolean = false) {
+        val operation = captureUiOperation() ?: return
         if (_state.value.busy || _state.value.checkoutLoading != null) return
-        _state.update { it.copy(checkoutLoading = ref, toast = null) }
-        viewModelScope.launch {
+        publish(operation) { it.copy(checkoutLoading = ref, toast = null) }
+        launchOperation(operation) {
             val msg = try {
-                repository.checkout(ref, isRemote)
+                repository.checkout(ref, isRemote, operation)
                 context.getString(R.string.git_toast_checkout_success, ref)
             } catch (e: Exception) {
-                if (e is CancellationException) throw e
+                if (e is CancellationException || e is GitOperationExpiredException || e is LocalRuntimeAuthorizationRequired) throw e
                 FileLogger.e(TAG, "切换分支失败", e)
                 val reason = (e as? GitCommandFailureException)?.output ?: e.message
                 context.getString(R.string.git_toast_checkout_failed, GitErrorMessage.friendly(reason ?: ""))
             }
             try {
-                if (repository.isRepo()) {
-                    val snap = loadSnapshot(includeIdentity = false)
+                if (repository.isRepo(operation)) {
+                    val snap = loadSnapshot(operation, includeIdentity = false)
                     val commits = snap.graph.toGitCommits()
-                    _state.update { it.copy(checkoutLoading = null, status = snap.status, commits = commits, graph = snap.graph, hasRemote = snap.hasRemote, notARepo = false, toast = msg) }
+                    publish(operation) { it.copy(checkoutLoading = null, status = snap.status, commits = commits, graph = snap.graph, hasRemote = snap.hasRemote, notARepo = false, toast = msg) }
                     // 切换分支后分支列表可能变化，若已加载过则刷新。
-                    refreshBranchesIfLoaded()
+                    refreshBranchesIfLoaded(operation)
                 } else {
-                    _state.update { it.copy(checkoutLoading = null, notARepo = true, toast = msg) }
+                    publish(operation) { it.copy(checkoutLoading = null, notARepo = true, toast = msg) }
                 }
             } catch (e: Exception) {
-                if (e is CancellationException) throw e
-                _state.update { it.copy(checkoutLoading = null, toast = context.getString(R.string.git_toast_action_refresh_failed, msg)) }
+                if (e is CancellationException || e is GitOperationExpiredException || e is LocalRuntimeAuthorizationRequired) throw e
+                publish(operation) { it.copy(checkoutLoading = null, toast = context.getString(R.string.git_toast_action_refresh_failed, msg)) }
             }
         }
     }
@@ -520,7 +598,7 @@ class GitViewModel @Inject constructor(
      */
     fun createBranch(name: String, startPoint: String?, checkout: Boolean) {
         if (name.isBlank()) return
-        runAction(R.string.git_action_create_branch, { repository.createBranch(name, startPoint, checkout) })
+        runAction(R.string.git_action_create_branch, { operation -> repository.createBranch(name, startPoint, checkout, operation) })
     }
 
     /**
@@ -528,7 +606,7 @@ class GitViewModel @Inject constructor(
      */
     fun deleteBranch(name: String) {
         if (name.isBlank()) return
-        runAction(R.string.git_action_delete_branch, { repository.deleteBranch(name) })
+        runAction(R.string.git_action_delete_branch, { operation -> repository.deleteBranch(name, operation) })
     }
 
     /**
@@ -536,7 +614,7 @@ class GitViewModel @Inject constructor(
      */
     fun deleteRemoteBranch(ref: String) {
         if (ref.isBlank()) return
-        runAction(R.string.git_action_delete_remote_branch, { repository.deleteRemoteBranch(ref) })
+        runAction(R.string.git_action_delete_remote_branch, { operation -> repository.deleteRemoteBranch(ref, operation) })
     }
 
     /**
@@ -544,7 +622,7 @@ class GitViewModel @Inject constructor(
      */
     fun renameBranch(oldName: String, newName: String) {
         if (oldName.isBlank() || newName.isBlank()) return
-        runAction(R.string.git_action_rename_branch, { repository.renameBranch(oldName, newName) })
+        runAction(R.string.git_action_rename_branch, { operation -> repository.renameBranch(oldName, newName, operation) })
     }
 
     /**
@@ -552,7 +630,7 @@ class GitViewModel @Inject constructor(
      */
     fun createTag(name: String, commitHash: String? = null) {
         if (name.isBlank()) return
-        runAction(R.string.git_action_create_tag, { repository.createTag(name, commitHash) })
+        runAction(R.string.git_action_create_tag, { operation -> repository.createTag(name, commitHash, operation) })
     }
 
     /**
@@ -560,7 +638,7 @@ class GitViewModel @Inject constructor(
      */
     fun resetToCommit(commitHash: String, mode: String = "mixed") {
         if (commitHash.isBlank()) return
-        runAction(R.string.git_reset_to_commit, { repository.resetToCommit(commitHash, mode) })
+        runAction(R.string.git_reset_to_commit, { operation -> repository.resetToCommit(commitHash, mode, operation) })
     }
 
     /**
@@ -568,7 +646,7 @@ class GitViewModel @Inject constructor(
      */
     fun addToGitignore(pattern: String) {
         if (pattern.isBlank()) return
-        runAction(R.string.git_add_to_gitignore, { repository.addToGitignore(pattern) })
+        runAction(R.string.git_add_to_gitignore, { operation -> repository.addToGitignore(pattern, operation) })
     }
 
     /**
@@ -576,7 +654,7 @@ class GitViewModel @Inject constructor(
      */
     fun deleteTag(name: String) {
         if (name.isBlank()) return
-        runAction(R.string.git_action_delete_tag, { repository.deleteTag(name) })
+        runAction(R.string.git_action_delete_tag, { operation -> repository.deleteTag(name, operation) })
     }
 
     /**
@@ -584,24 +662,29 @@ class GitViewModel @Inject constructor(
      */
     fun mergeBranch(branch: String, noFf: Boolean = false) {
         if (branch.isBlank()) return
-        runAction(R.string.git_action_merge, { repository.mergeBranch(branch, noFf) })
+        runAction(R.string.git_action_merge, { operation -> repository.mergeBranch(branch, noFf, operation) })
     }
 
     /**
      * 中止当前进行中的合并。
      */
     fun abortMerge() {
-        runAction(R.string.git_action_abort_merge, { repository.abortMerge() })
+        runAction(R.string.git_action_abort_merge, { operation -> repository.abortMerge(operation) })
     }
 
     /**
      * 加载储藏列表。
      */
     fun loadStashes() {
-        viewModelScope.launch {
-            _state.update { it.copy(stashesLoading = true) }
-            val list = runCatching { repository.stashList() }.getOrDefault(emptyList())
-            _state.update { it.copy(stashes = list, stashesLoading = false) }
+        val operation = captureUiOperation() ?: return
+        loadStashes(operation)
+    }
+
+    private fun loadStashes(operation: FrozenGitOperation) {
+        launchOperation(operation) {
+            publish(operation) { it.copy(stashesLoading = true) }
+            val list = repository.stashList(operation)
+            publish(operation) { it.copy(stashes = list, stashesLoading = false) }
         }
     }
 
@@ -609,8 +692,8 @@ class GitViewModel @Inject constructor(
      * 储藏工作区改动。
      */
     fun stashSave(message: String? = null, includeUntracked: Boolean = false) {
-        runAction(R.string.git_action_stash, { repository.stashSave(message, includeUntracked) }) {
-            loadStashes()
+        runAction(R.string.git_action_stash, { operation -> repository.stashSave(message, includeUntracked, operation) }) { operation ->
+            loadStashes(operation)
         }
     }
 
@@ -618,8 +701,8 @@ class GitViewModel @Inject constructor(
      * 弹出指定储藏（应用并删除）。
      */
     fun stashPop(index: String = "stash@{0}") {
-        runAction(R.string.git_stash_pop, { repository.stashPop(index) }) {
-            loadStashes()
+        runAction(R.string.git_stash_pop, { operation -> repository.stashPop(index, operation) }) { operation ->
+            loadStashes(operation)
         }
     }
 
@@ -627,8 +710,8 @@ class GitViewModel @Inject constructor(
      * 应用指定储藏（保留记录）。
      */
     fun stashApply(index: String = "stash@{0}") {
-        runAction(R.string.git_stash_apply, { repository.stashApply(index) }) {
-            loadStashes()
+        runAction(R.string.git_stash_apply, { operation -> repository.stashApply(index, operation) }) { operation ->
+            loadStashes(operation)
         }
     }
 
@@ -636,8 +719,8 @@ class GitViewModel @Inject constructor(
      * 丢弃指定储藏。
      */
     fun stashDrop(index: String) {
-        runAction(R.string.git_stash_drop, { repository.stashDrop(index) }) {
-            loadStashes()
+        runAction(R.string.git_stash_drop, { operation -> repository.stashDrop(index, operation) }) { operation ->
+            loadStashes(operation)
         }
     }
 
@@ -645,8 +728,8 @@ class GitViewModel @Inject constructor(
      * 清空全部储藏记录。
      */
     fun stashClear() {
-        runAction(R.string.git_stash_clear, { repository.stashClear() }) {
-            loadStashes()
+        runAction(R.string.git_stash_clear, { operation -> repository.stashClear(operation) }) { operation ->
+            loadStashes(operation)
         }
     }
 
@@ -660,15 +743,7 @@ class GitViewModel @Inject constructor(
  * hash 为提交 hash，path 为文件路径。后台线程算 diff + 高亮，完成后填 diffData。
  */
     fun loadCommitFileDiff(hash: String, path: String) {
-        openDiff(path)
-        viewModelScope.launch {
-            val data = runCatching { computeDiff(path, "${hash}^", hash, repository::showFileContent) }
-                .getOrElse { e ->
-                    FileLogger.e(TAG, "加载提交文件 diff 失败: $path", e)
-                    null
-                }
-            finishDiff(data)
-        }
+        loadDiff(path, "${hash}^", hash) { operation, ref, file -> repository.showFileContent(ref, file, operation) }
     }
 
     /**
@@ -676,17 +751,17 @@ class GitViewModel @Inject constructor(
  * path 为文件路径。用 showFileContent("HEAD", path) 取版本库快照，用 worktreeFileContent(path) 取工作区当前内容。
  */
     fun loadWorktreeDiff(path: String) {
-        loadDiff(path, "HEAD", REF_WORKTREE) { ref, p ->
-            if (ref == REF_WORKTREE) repository.worktreeFileContent(p)
-            else repository.showFileContent(ref, p)
+        loadDiff(path, "HEAD", REF_WORKTREE) { operation, ref, p ->
+            if (ref == REF_WORKTREE) repository.worktreeFileContent(p, operation)
+            else repository.showFileContent(ref, p, operation)
         }
     }
 
     /** 加载某文件的暂存区差异（HEAD vs index）。 */
     fun loadStagedDiff(path: String) {
-        loadDiff(path, "HEAD", REF_INDEX) { ref, p ->
-            if (ref == REF_INDEX) repository.indexFileContent(p)
-            else repository.showFileContent(ref, p)
+        loadDiff(path, "HEAD", REF_INDEX) { operation, ref, p ->
+            if (ref == REF_INDEX) repository.indexFileContent(p, operation)
+            else repository.showFileContent(ref, p, operation)
         }
     }
 
@@ -694,8 +769,8 @@ class GitViewModel @Inject constructor(
      * 加载未跟踪文件的差异：版本库里没有任何版本，旧侧恒为空，整个文件按全新增呈现。
      */
     fun loadUntrackedDiff(path: String) {
-        loadDiff(path, REF_EMPTY, REF_WORKTREE) { ref, p ->
-            if (ref == REF_WORKTREE) repository.worktreeFileContent(p) else ""
+        loadDiff(path, REF_EMPTY, REF_WORKTREE) { operation, ref, p ->
+            if (ref == REF_WORKTREE) repository.worktreeFileContent(p, operation) else ""
         }
     }
 
@@ -703,16 +778,19 @@ class GitViewModel @Inject constructor(
         path: String,
         oldRef: String,
         newRef: String,
-        contentProvider: suspend (String, String) -> String
+        contentProvider: suspend (FrozenGitOperation, String, String) -> String
     ) {
+        val operation = captureUiOperation() ?: return
         openDiff(path)
-        viewModelScope.launch {
+        launchOperation(operation) {
             val data = runCatching {
-                computeDiff(path, oldRef, newRef, contentProvider)
+                computeDiff(path, oldRef, newRef) { ref, file -> contentProvider(operation, ref, file) }
             }.getOrElse { e ->
+                if (e is CancellationException || e is GitOperationExpiredException || e is LocalRuntimeAuthorizationRequired) throw e
                 FileLogger.e(TAG, "加载 diff 失败: $path", e)
                 null
             }
+            operation.checkCurrent()
             finishDiff(data)
         }
     }

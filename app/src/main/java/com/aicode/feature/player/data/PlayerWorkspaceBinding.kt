@@ -1,6 +1,7 @@
 package com.aicode.feature.player.data
 
 import com.aicode.feature.agent.domain.memory.ProjectMemoryCapture
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwner
 import com.aicode.feature.agent.domain.memory.ProjectMemoryIdentity
 import com.aicode.feature.agent.domain.memory.ProjectMemoryIdentityResolver
 import com.aicode.feature.workspace.data.repository.WorkspaceRepository
@@ -13,6 +14,7 @@ import com.aicode.feature.workspace.domain.LocalFileAccess
 import com.aicode.feature.workspace.domain.RemoteSftpFileAccess
 import com.aicode.feature.workspace.domain.WorkspaceExecutionContext
 import com.aicode.feature.workspace.domain.WorkspaceExecutionContextFactory
+import com.aicode.feature.workspace.domain.chroot.ChrootFileAccess
 import com.aicode.feature.workspace.domain.identityCheckedRead
 import com.aicode.feature.workspace.domain.isLocalFolderPath
 import com.aicode.feature.workspace.domain.parseLocalFolderPath
@@ -80,13 +82,21 @@ internal class PlayerWorkspaceBinding(
 
     companion object {
         suspend fun capture(repository: WorkspaceRepository, resolver: ProjectMemoryIdentityResolver,
-            factory: WorkspaceExecutionContextFactory, owner: Job): PlayerWorkspaceBinding? {
+            factory: WorkspaceExecutionContextFactory, owner: Job, root: String,
+            runtimeOwner: RuntimeOwner?, checkSource: (() -> Unit)? = null): PlayerWorkspaceBinding? {
             val workspace = repository.current.value?.takeIf { it.available } ?: return null
+            val selection = repository.selection.value
+            fun checkWorkspace() {
+                checkSource?.invoke()
+                if (repository.selection.value !== selection || repository.current.value != workspace) {
+                    throw CancellationException("Player workspace changed")
+                }
+            }
+            checkWorkspace()
             val capture = resolver.capture(workspace.path) ?: return null
-            val execution = factory.freeze(capture)
-            return PlayerWorkspaceBinding(execution, capture, owner) {
-                if (repository.current.value != workspace) throw CancellationException("Player workspace changed")
-            }.also { it.checkCurrent(); capture.assertCurrent() }
+            val execution = factory.freezeForPaths(listOf(root), capture, runtimeOwner, ::checkWorkspace)
+            return PlayerWorkspaceBinding(execution, capture, owner, ::checkWorkspace)
+                .also { it.checkCurrent(); capture.assertCurrent() }
         }
     }
 }
@@ -99,6 +109,13 @@ private class PlayerCapturedFileAccess(
     private val snapshot = execution.localFolderSnapshot
     private val hostUsed = AtomicBoolean()
     private val host = InternalLocalFolderAccess(snapshot, execution, check)
+    private val guestRoots = mutableMapOf<String, ChrootFileAccess.BoundedReadRoot>()
+
+    private fun guestRoot(backend: ChrootFileAccess, root: String): ChrootFileAccess.BoundedReadRoot =
+        synchronized(guestRoots) {
+            if (!guestRoots.containsKey(root) && guestRoots.size >= 64) throw IOException("Player read root limit exceeded")
+            guestRoots.getOrPut(root) { backend.captureReadRoot(root) }
+        }
 
     fun checkLocalFolders() {
         if (hostUsed.get()) snapshot.checkCurrent()
@@ -145,7 +162,8 @@ private class PlayerCapturedFileAccess(
         if (backend === host) hostPlaybackPath(path, root)
         else {
             if (isLocalFolderPath(root)) throw IOException("Media path outside playback root")
-            (backend as? RemoteSftpFileAccess)?.checkPlaybackPath(path, root, execution.fileCacheIdentity)
+            if (backend is ChrootFileAccess) guestRoot(backend, root).checkPath(path)
+            else (backend as? RemoteSftpFileAccess)?.checkPlaybackPath(path, root, execution.fileCacheIdentity)
         }
         Unit
     }
@@ -167,7 +185,8 @@ private class PlayerCapturedFileAccess(
             }
         } else {
             if (isLocalFolderPath(root)) throw IOException("Media path outside playback root")
-            (backend as? RemoteSftpFileAccess)?.openPlaybackRead(path, root, execution.fileCacheIdentity)
+            if (backend is ChrootFileAccess) guestRoot(backend, root).openRead(path, 512L * 1024 * 1024)
+            else (backend as? RemoteSftpFileAccess)?.openPlaybackRead(path, root, execution.fileCacheIdentity)
                 ?: backend.openRead(path, execution.fileCacheIdentity)
         }
     }

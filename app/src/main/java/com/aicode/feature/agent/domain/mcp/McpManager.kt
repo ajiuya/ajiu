@@ -3,6 +3,13 @@ package com.aicode.feature.agent.domain.mcp
 import com.aicode.core.util.FileLogger
 import com.aicode.feature.agent.domain.container.ContainerProfile
 import com.aicode.feature.agent.domain.container.LinuxContainerEngine
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeCommands
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwner
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwnerKind
+import com.aicode.feature.plugin.data.PluginFiles
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.flow.merge
 import com.aicode.feature.agent.domain.mcp.auth.McpOAuthException
 import com.aicode.feature.agent.domain.mcp.auth.McpOAuthManager
 import com.aicode.feature.agent.domain.tool.ToolRegistry
@@ -54,7 +61,8 @@ class McpManager @Inject constructor(
     private val workspaceRepository: WorkspaceRepository,
     private val containerSettingsRepository: ContainerSettingsRepository,
     private val oauthManager: McpOAuthManager,
-    private val pluginManager: PluginManager
+    private val pluginManager: PluginManager,
+    private val runtimeCommands: LocalRuntimeCommands
 ) {
     private companion object {
         const val TAG = "McpManager"
@@ -73,6 +81,74 @@ class McpManager @Inject constructor(
     private var pluginRevisions = emptyMap<String, PluginRevision>()
     private val pluginStatuses = MutableStateFlow<List<McpServerStatus>>(emptyList())
     private val started = AtomicBoolean()
+    private val connectionGeneration = AtomicLong()
+    private class StdioSource(val key: String, val selection: Any, val owner: RuntimeOwner,
+        val workspace: String, val profile: ContainerProfile, val configurationRevision: Long,
+        val fingerprint: String, private val checkSource: () -> Unit) {
+        @Volatile var active = true
+        @Volatile var connected = false
+        fun checkCurrent() {
+            if (!active) throw CancellationException("MCP connection source was revoked")
+            checkSource()
+        }
+    }
+    private val stdioSources = ConcurrentHashMap<String, StdioSource>()
+    private val sourceChanges by lazy {
+        merge(workspaceRepository.selection.map { Unit }, containerSettingsRepository.activeProfileSelectionRevisions.map { Unit },
+            containerSettingsRepository.profileConfigurationRevisions.map { Unit }, configRepository.effectiveEntriesFlow.map { Unit },
+            pluginManager.snapshot.map { Unit })
+    }
+
+    private suspend fun stdioTransport(cfg: McpServerConfig, entry: McpServerEntry? = null,
+        pluginCapture: PluginCapture? = null): StdioTransport {
+        entry?.let(configRepository::checkEntryCurrent)
+        val selection = workspaceRepository.selection.value
+        if (entry != null && (entry.workspaceSelectionId.isBlank() || entry.workspaceSelectionId != selection.id)) {
+            throw CancellationException("MCP configuration workspace source changed")
+        }
+        val sourceWorkspace = (if (entry == null) selection.workspace?.takeIf { it.available }?.path else entry.workspacePath)
+            ?: throw IllegalStateException("MCP stdio requires an available workspace")
+        val snapshot = containerSettingsRepository.captureProfileSnapshot()
+        val active = snapshot.activeProfile
+        val profile = if (active.mode == ExecutionMode.REMOTE_SSH) snapshot.profiles.firstOrNull {
+            it.id == snapshot.defaultContainerId && it.mode == ExecutionMode.LOCAL_PROOT
+        } ?: ContainerProfile.BUILTIN_ALPINE else active
+        val pluginSource = pluginCapture?.let { listOf(it.id, it.installRevision, it.contentHash, it.activationEpoch).joinToString("|") }
+        val key = PluginFiles.sha256(listOf(entry?.scope, entry?.sourceIdentity, entry?.configurationRevision,
+            entry?.overlaySourceIdentity, entry?.overlayRevision,
+            pluginSource, configRepository.serialize(listOf(cfg)), profile, snapshot.selectionRevision,
+            snapshot.configurationRevision, snapshot.defaultContainerId, active, sourceWorkspace).joinToString("\u0000").toByteArray(Charsets.UTF_8))
+        if (workspaceRepository.selection.value !== selection) throw CancellationException("MCP workspace selection changed")
+        entry?.let(configRepository::checkEntryCurrent)
+        val workspace = if (active.mode == ExecutionMode.REMOTE_SSH && profile.isChroot) {
+            workspaceRepository.localMcpWorkspace(key)
+        } else sourceWorkspace
+        if (workspaceRepository.selection.value !== selection) throw CancellationException("MCP workspace selection changed")
+        entry?.let(configRepository::checkEntryCurrent)
+        val source = synchronized(stdioSources) {
+            val old = stdioSources[cfg.name]
+            if (old != null && !old.connected && old.key == key && old.selection === selection && runCatching { old.checkCurrent() }.isSuccess) old else {
+                old?.active = false
+                val generation = connectionGeneration.incrementAndGet()
+                val fingerprint = "$key:$generation"
+                StdioSource(key, selection, RuntimeOwner(RuntimeOwnerKind.MCP, fingerprint), workspace, profile,
+                    snapshot.configurationRevision, fingerprint) {
+                    if (workspaceRepository.selection.value !== selection) throw CancellationException("MCP workspace selection changed")
+                    containerSettingsRepository.checkProfileSnapshot(snapshot)
+                    entry?.let(configRepository::checkEntryCurrent)
+                    pluginCapture?.checkActive()
+                }.also { stdioSources[cfg.name] = it }
+            }
+        }
+        source.checkCurrent()
+        if (!profile.isChroot) containerEngine.notReadyHintFor(profile)?.let { throw IllegalStateException(it) }
+        val capture = if (profile.isChroot) runtimeCommands.capture(profile, source.configurationRevision, workspace,
+            source.owner, source.fingerprint, source::checkCurrent) else null
+        source.checkCurrent()
+        return StdioTransport(cfg.name, containerEngine, cfg.command!!, cfg.args, workspace, cfg.env, profile,
+            runtimeCommands = runtimeCommands, runtimeCapture = capture, checkSource = source::checkCurrent,
+            sourceChanges = sourceChanges)
+    }
 
     init {
         pluginManager.registerRevocationListener { id ->
@@ -80,7 +156,10 @@ class McpManager @Inject constructor(
                 oauthManager.cancel(it.config.name)
             }
             synchronized(activeClients) {
-                pluginClients.filterValues { it.capture.id == id }.keys.toList().forEach(::teardownPluginServer)
+                pluginClients.filterValues { it.capture.id == id }.keys.toList().forEach { name ->
+                    stdioSources.remove(name)?.active = false
+                    teardownPluginServer(name)
+                }
                 pendingPluginClients.filterValues { it.first.id == id }.keys.toList().forEach { name ->
                     pendingPluginClients.remove(name)?.second?.close()
                 }
@@ -128,6 +207,9 @@ class McpManager @Inject constructor(
                 reloadStdioServers()
             }
         }
+        scope.launch {
+            containerSettingsRepository.profileConfigurationRevisions.drop(1).collect { reloadStdioServers() }
+        }
         // 默认容器变化：远程模式下 stdio server 运行在默认容器上，同样需要重建。
         scope.launch {
             containerSettingsRepository.defaultContainerIdFlow.drop(1).collect {
@@ -139,7 +221,7 @@ class McpManager @Inject constructor(
     }
 
     suspend fun reload() = reloadMutex.withLock {
-        val servers = configRepository.getEffectiveServers().filterNot { it.name.startsWith(PLUGIN_MCP_PREFIX) }
+        val servers = configRepository.getEffectiveEntries().filterNot { it.server.name.startsWith(PLUGIN_MCP_PREFIX) }
         FileLogger.i(TAG, "重新加载 MCP 配置，共 ${servers.size} 个 server")
 
         teardown()
@@ -150,7 +232,8 @@ class McpManager @Inject constructor(
         }
 
         // 先把所有 server 置为「连接中/禁用」，UI 立即有反馈。
-        _statuses.value = servers.map { cfg ->
+        _statuses.value = servers.map { entry ->
+            val cfg = entry.server
             McpServerStatus(
                 name = cfg.name,
                 state = if (cfg.enabled) McpServerStatus.State.CONNECTING else McpServerStatus.State.DISABLED
@@ -159,41 +242,38 @@ class McpManager @Inject constructor(
 
         // 并行连接所有启用的 server；各自独立失败。
         val results = withContext(Dispatchers.IO) {
-            servers.filter { it.enabled }.map { cfg ->
-                async { connectOne(cfg) }
+            servers.filter { it.server.enabled }.map { entry ->
+                async { connectOne(entry) }
             }.awaitAll()
         }
 
         // 合并禁用项与连接结果，保持原始顺序。
         val byName = results.associateBy { it.name }
-        _statuses.value = servers.map { cfg ->
-            byName[cfg.name] ?: McpServerStatus(cfg.name, McpServerStatus.State.DISABLED)
+        _statuses.value = servers.map { entry ->
+            byName[entry.server.name] ?: McpServerStatus(entry.server.name, McpServerStatus.State.DISABLED)
         }
     }
 
-    private suspend fun connectOne(cfg: McpServerConfig): McpServerStatus {
+    private suspend fun connectOne(entry: McpServerEntry): McpServerStatus {
+        val cfg = entry.server
+        var ownedClient: McpClient? = null
+        val checkSource = {
+            configRepository.checkEntryCurrent(entry)
+            val selection = workspaceRepository.selection.value
+            if (entry.workspaceSelectionId.isBlank() || entry.workspaceSelectionId != selection.id ||
+                entry.workspacePath != selection.workspace?.takeIf { it.available }?.path) {
+                throw CancellationException("MCP configuration workspace source changed")
+            }
+        }
         val t0 = System.currentTimeMillis()
         return try {
+            checkSource()
             FileLogger.i(TAG, "[${cfg.name}] 开始连接（${if (cfg.isStdio) "stdio" else "HTTP"}）")
             if (!cfg.isStdio && cfg.auth != null) {
                 oauthManager.prepare(cfg)
             }
             val transport = if (cfg.isStdio) {
-                // stdio server 跑在「运行时容器」上：本地模式用当前容器，远程 SSH 模式用默认容器。
-                // 容器未就绪不自动初始化，直接失败并引导去终端页完成初始化。
-                val runtimeProfile = resolveMcpRuntimeProfile()
-                containerEngine.notReadyHintFor(runtimeProfile)?.let {
-                    throw IllegalStateException(it)
-                }
-                StdioTransport(
-                    serverName = cfg.name,
-                    engine = containerEngine,
-                    program = cfg.command!!,
-                    programArgs = cfg.args,
-                    projectPath = workspaceRepository.currentPath(),
-                    extraEnv = cfg.env,
-                    runtimeProfile = runtimeProfile
-                )
+                stdioTransport(cfg, entry)
             } else {
                 StreamableHttpTransport(
                     endpoint = cfg.url.orEmpty(),
@@ -202,18 +282,24 @@ class McpManager @Inject constructor(
                     authorizationProvider = { oauthManager.cachedToken(cfg.name) }
                 )
             }
+            checkSource()
             val client = McpClient(serverName = cfg.name, transport = transport)
+            ownedClient = client
             client.connect()
+            checkSource()
 
-            val tools = client.tools.map { McpTool(client, it) }
+            val tools = client.tools.map { McpTool(client, it, checkSource) }
             val enabledTools = tools.filter { it.remoteName !in cfg.disabledTools }
             synchronized(activeClients) {
+                checkSource()
+                if (cfg.isStdio) stdioSources[cfg.name]?.connected = true
                 activeClients[cfg.name] = client
                 enabledTools.forEach { tool ->
                     toolRegistry.register(tool.name, tool)
                     registeredToolNames.add(tool.name)
                 }
             }
+            ownedClient = null
             FileLogger.i(TAG, "[${cfg.name}] 连接成功，注册 ${enabledTools.size}/${tools.size} 个工具（${System.currentTimeMillis() - t0}ms）")
             McpServerStatus(cfg.name, McpServerStatus.State.CONNECTED, toolCount = enabledTools.size)
         } catch (e: McpAuthRequiredException) {
@@ -225,6 +311,8 @@ class McpManager @Inject constructor(
         } catch (e: Exception) {
             FileLogger.e(TAG, "[${cfg.name}] 连接失败（${System.currentTimeMillis() - t0}ms）", e)
             McpServerStatus(cfg.name, McpServerStatus.State.FAILED, error = e.message)
+        } finally {
+            ownedClient?.close()
         }
     }
 
@@ -240,7 +328,8 @@ class McpManager @Inject constructor(
      */
     suspend fun reloadServer(name: String) = reloadMutex.withLock {
         if (name.startsWith(PLUGIN_MCP_PREFIX)) { syncPluginServersLocked(forceName = name); return@withLock }
-        val cfg = configRepository.getEffectiveServers().firstOrNull { it.name == name } ?: return@withLock
+        val entry = configRepository.getEffectiveEntries().firstOrNull { it.server.name == name } ?: return@withLock
+        val cfg = entry.server
         teardownServer(name)
         if (_statuses.value.none { it.name == name }) {
             _statuses.value = _statuses.value + McpServerStatus(name, McpServerStatus.State.CONNECTING)
@@ -251,7 +340,7 @@ class McpManager @Inject constructor(
             }
             return@withLock
         }
-        reconnectOne(cfg)
+        reconnectOne(entry)
     }
 
     /**
@@ -260,11 +349,12 @@ class McpManager @Inject constructor(
      */
     suspend fun reconnectUnconnected() = reloadMutex.withLock {
         syncPluginServersLocked()
-        val servers = configRepository.getEffectiveServers().filter { it.enabled && !it.name.startsWith(PLUGIN_MCP_PREFIX) }
-        for (cfg in servers) {
+        val servers = configRepository.getEffectiveEntries().filter { it.server.enabled && !it.server.name.startsWith(PLUGIN_MCP_PREFIX) }
+        for (entry in servers) {
+            val cfg = entry.server
             val connected = synchronized(activeClients) { activeClients.containsKey(cfg.name) }
             if (connected) continue
-            reconnectOne(cfg)
+            reconnectOne(entry)
         }
     }
 
@@ -276,14 +366,15 @@ class McpManager @Inject constructor(
         scope.launch { reconnectUnconnected() }
     }
 
-    private suspend fun reconnectOne(cfg: McpServerConfig) {
+    private suspend fun reconnectOne(entry: McpServerEntry) {
+        val cfg = entry.server
         if (_statuses.value.none { it.name == cfg.name }) {
             _statuses.value = _statuses.value + McpServerStatus(cfg.name, McpServerStatus.State.CONNECTING)
         }
         _statuses.value = _statuses.value.map {
             if (it.name == cfg.name) McpServerStatus(cfg.name, McpServerStatus.State.CONNECTING) else it
         }
-        val result = withContext(Dispatchers.IO) { connectOne(cfg) }
+        val result = withContext(Dispatchers.IO) { connectOne(entry) }
         _statuses.value = _statuses.value.map { if (it.name == cfg.name) result else it }
     }
 
@@ -314,17 +405,19 @@ class McpManager @Inject constructor(
      */
     private suspend fun reloadStdioServers() = reloadMutex.withLock {
         syncPluginServersLocked(forceStdio = true)
-        val servers = configRepository.getEffectiveServers().filter { it.enabled && it.isStdio && !it.name.startsWith(PLUGIN_MCP_PREFIX) }
+        val servers = configRepository.getEffectiveEntries().filter { it.server.enabled && it.server.isStdio && !it.server.name.startsWith(PLUGIN_MCP_PREFIX) }
         if (servers.isEmpty()) return@withLock
         FileLogger.i(TAG, "容器配置变化，重建 ${servers.size} 个 stdio MCP server")
-        for (cfg in servers) {
+        for (entry in servers) {
+            val cfg = entry.server
             teardownServer(cfg.name)
-            reconnectOne(cfg)
+            reconnectOne(entry)
         }
     }
 
     /** 删除 server 时仅断开其连接并反注册其工具，不影响其他 server。 */
     suspend fun removeServer(name: String) = reloadMutex.withLock {
+        stdioSources.remove(name)?.active = false
         teardownServer(name)
         _statuses.value = _statuses.value.filterNot { it.name == name }
     }
@@ -335,7 +428,7 @@ class McpManager @Inject constructor(
      */
     suspend fun removeServers(names: Collection<String>) = reloadMutex.withLock {
         if (names.isEmpty()) return@withLock
-        names.forEach { teardownServer(it) }
+        names.forEach { stdioSources.remove(it)?.active = false; teardownServer(it) }
         _statuses.value = _statuses.value.filterNot { it.name in names }
     }
 
@@ -373,6 +466,7 @@ class McpManager @Inject constructor(
     private fun teardownServer(name: String) {
         synchronized(activeClients) {
             val client = activeClients.remove(name) ?: return
+            stdioSources[name]?.takeIf { it.connected }?.active = false
             runCatching { client.close() }
             client.tools.forEach { tool ->
                 toolRegistry.unregister(tool.name)
@@ -424,9 +518,7 @@ class McpManager @Inject constructor(
             try {
                 capture.checkCurrent()
                 val transport = if (config.isStdio) {
-                    val profile = resolveMcpRuntimeProfile()
-                    containerEngine.notReadyHintFor(profile)?.let { throw IllegalStateException(it) }
-                    StdioTransport(config.name, containerEngine, config.command!!, config.args, workspaceRepository.currentPath(), config.env, profile)
+                    stdioTransport(config, pluginCapture = capture)
                 } else {
                     if (config.auth != null) oauthManager.prepare(config)
                     StreamableHttpTransport(config.url.orEmpty(), okHttpClient, config.headers,
@@ -445,6 +537,7 @@ class McpManager @Inject constructor(
                     if (activeClients.containsKey(config.name) || enabledTools.any { toolRegistry.getTool(it.name) != null }) {
                         throw IllegalStateException("Plugin MCP namespace is already owned")
                     }
+                    if (config.isStdio) stdioSources[config.name]?.connected = true
                     pluginClients[config.name] = PluginConnection(revision, capture, client, enabledTools)
                     enabledTools.forEach { toolRegistry.register(it.name, it) }
                 }
@@ -464,6 +557,7 @@ class McpManager @Inject constructor(
 
     private fun teardownPluginServer(name: String) = synchronized(activeClients) {
         val entry = pluginClients.remove(name) ?: return@synchronized
+        stdioSources[name]?.takeIf { it.connected }?.active = false
         entry.tools.forEach { tool -> if (toolRegistry.getTool(tool.name) === tool) toolRegistry.unregister(tool.name) }
         entry.client.close()
     }
@@ -472,7 +566,10 @@ class McpManager @Inject constructor(
         synchronized(activeClients) {
             registeredToolNames.forEach { toolRegistry.unregister(it) }
             registeredToolNames.clear()
-            activeClients.values.forEach { runCatching { it.close() } }
+            activeClients.forEach { (name, client) ->
+                stdioSources[name]?.takeIf { it.connected }?.active = false
+                runCatching { client.close() }
+            }
             activeClients.clear()
         }
     }

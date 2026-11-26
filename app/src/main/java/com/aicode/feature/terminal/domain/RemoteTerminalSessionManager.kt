@@ -5,6 +5,8 @@ import android.content.ClipboardManager
 import android.content.Context
 import com.aicode.core.util.FileLogger
 import com.aicode.feature.agent.domain.container.RemoteSshConnection
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwner
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwnerKind
 import com.aicode.feature.agent.domain.container.acquireSshResource
 import com.aicode.feature.agent.domain.container.withSshSetup
 import com.aicode.feature.agent.domain.tool.explorer.shellQuote
@@ -12,6 +14,7 @@ import com.aicode.feature.settings.data.repository.ExecutionMode
 import com.aicode.feature.settings.data.repository.ExecutionModeHolder
 import dagger.hilt.android.qualifiers.ApplicationContext
 import com.aicode.feature.workspace.data.repository.WorkspaceRepository
+import com.aicode.feature.workspace.domain.ExecutionSourceChangedException
 import com.aicode.feature.workspace.domain.WorkspaceExecutionContext
 import net.schmizz.sshj.connection.channel.direct.Session
 import com.termux.terminal.TerminalSession
@@ -102,11 +105,20 @@ class RemoteTerminalSessionManager @Inject constructor(
         notify: Boolean,
         sourceSessionId: String?
     ): String {
+        sourceSessionId?.let { RuntimeOwner(RuntimeOwnerKind.AGENT, it) }
         if (!ensureRemote()) throw IllegalStateException("非远程模式或 SSH 未连接")
         val id = openShellTab(command, isBackground = true, notify = notify, title = title, sourceSessionId = sourceSessionId)
         monitorBackgroundExit(id)
         FileLogger.i(TAG, "后台命令标签 $id: $command")
         return id
+    }
+
+    override suspend fun startOwnedBackgroundCommand(command: String, title: String?, notify: Boolean, owner: RuntimeOwner): String {
+        require(owner.kind == RuntimeOwnerKind.AGENT)
+        val execution = WorkspaceExecutionContext.current() ?: throw ExecutionSourceChangedException()
+        require(execution.runtimeOwner == owner) { "Terminal execution owner mismatch" }
+        execution.requireMode(ExecutionMode.REMOTE_SSH)
+        return startBackgroundCommand(command, title, notify, owner.scopeId)
     }
 
     override suspend fun startPluginCommand(command: String, title: String?, owner: TerminalResourceOwner, onOutput: (ByteArray) -> Unit): String {
@@ -209,7 +221,8 @@ class RemoteTerminalSessionManager @Inject constructor(
                 sourceMode = ExecutionMode.REMOTE_SSH.name,
                 channelGeneration = channelGeneration,
                 ownerPluginId = owner?.pluginId,
-                ownerResourceId = owner?.resourceId
+                ownerResourceId = owner?.resourceId,
+                capturedExecution = execution
             )
             execution?.checkCurrent()
             connection.checkIdentity(identity)
@@ -252,6 +265,19 @@ class RemoteTerminalSessionManager @Inject constructor(
         return true
     }
 
+    private fun ownedInputTab(id: String, owner: RuntimeOwner): TerminalTab? =
+        tab(id)?.takeIf { it.runState is RunState.Running && it.isAccessibleTo(owner) }
+            ?.also { it.checkOwnedInputExecution() }
+
+    override fun sendOwnedInput(id: String, owner: RuntimeOwner, input: String, appendNewline: Boolean): Boolean =
+        ownedInputTab(id, owner)?.let { sendInput(it.id, input, appendNewline) } ?: false
+
+    override fun writeOwnedText(id: String, owner: RuntimeOwner, text: String): Boolean =
+        ownedInputTab(id, owner)?.let { writeToTab(it.id, text) } ?: false
+
+    override fun writeOwnedBytes(id: String, owner: RuntimeOwner, vararg bytes: Int): Boolean =
+        ownedInputTab(id, owner)?.let { writeBytesToTab(it.id, *bytes) } ?: false
+
     override fun getTabOutput(id: String): String? {
         val tab = tab(id) ?: return null
         return runCatching { tab.readOutput() }.getOrDefault("")
@@ -263,9 +289,20 @@ class RemoteTerminalSessionManager @Inject constructor(
             title = it.title,
             isBackground = it.isBackground,
             running = it.runState is RunState.Running,
-            command = it.command
+            command = it.command,
+            runtimeOwner = it.runtimeOwner
         )
     }
+
+    override fun resizeOwnedTab(id: String, owner: RuntimeOwner, columns: Int, rows: Int): Boolean {
+        require(columns in 1..4096 && rows in 1..4096)
+        val tab = tab(id)?.takeIf { it.runState is RunState.Running && it.isAccessibleTo(owner) } ?: return false
+        tab.session.updateSize(columns, rows)
+        return true
+    }
+
+    override fun signalOwnedTab(id: String, owner: RuntimeOwner, signal: Int): Boolean =
+        signal == 2 && writeOwnedBytes(id, owner, 3)
 
     override fun closeTab(id: String): Boolean {
         val tab = tab(id) ?: return false

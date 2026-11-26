@@ -46,10 +46,14 @@ class ShizukuTool @Inject constructor(
 
     override val description =
         "通过 Shizuku 在宿主 Android 系统上执行 pm/am/cmd 等命令，用于辅助调试。" +
-            "需已安装、运行并授权 Shizuku，支持 ADB shell 与 Root 启动。默认需用户确认，可选择本会话始终允许；" +
-            "授权按当前服务身份和会话隔离，不同会话不共享，显式禁止规则与高危保护仍优先。"
+            "需已安装、运行并授权 Shizuku，按服务的真实 ADB shell 或 Root 身份执行，不会赋予额外 Root 权限。" +
+            "可确认只读的宿主系统文件操作默认放行；修改宿主或未知脚本、动态路径等无法确认是否只读时先审批，实际只读的脚本也可能弹窗。" +
+            "可仅本次允许，或本聊天会话始终允许 Shizuku 同一来源及身份的全部后续宿主修改与不确定操作，包含不同命令和目标，不限当前命令。" +
+            "新会话授权仅存内存，进程重启清除；来源、身份、连接代次及相关 Root 代际、配置内容或选择、实例变化后需重审，不跨会话或工具。" +
+            "显式禁止、Root 通道适用的总开关与真实系统授权仍有效，宽授权不是无限 OS Root 权限；每次执行仍消耗绑定完整命令和当前身份的单次内部许可。" +
+            "判断只是有限静态识别，不执行或打开脚本判定，不是运行时拦截或沙箱；不能保证符号链接、PATH 解析或任意程序的实际副作用。"
 
-    override val permissionPolicy = ToolPermissionPolicy.ASK
+    override val permissionPolicy = ToolPermissionPolicy.AUTO_APPROVE
     override val capabilities = setOf(ToolCapability.EXECUTE_COMMANDS)
 
     override val parameters: Map<String, ToolParameter> = mapOf(
@@ -68,7 +72,7 @@ class ShizukuTool @Inject constructor(
         "elevate" to ToolParameter(
             name = "elevate",
             type = ParameterType.BOOLEAN,
-            description = "请求对被高危策略拦截的命令单独审批，不绕过禁止规则或系统授权。",
+            description = "旧版兼容参数，不是发起宿主审批的前提；不能覆盖显式禁止、宿主修改或不确定操作审批、适用的 Root 总开关或真实系统授权。",
             required = false
         )
     )

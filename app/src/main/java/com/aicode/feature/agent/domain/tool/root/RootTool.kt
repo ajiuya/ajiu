@@ -31,11 +31,18 @@ class RootTool @Inject constructor(
     override val name = NAME
     override val description =
         "Execute a command on the Android host using the user's existing su/Magisk authorization. " +
-            "Requires the device-local Root switch and authorization for the current session, with allow-once or allow-session choices. " +
-            "Each execution still consumes a one-time permit for its full command. Disabling Root revokes session authorization. " +
+            "Requires the device-local Root switch and actual OS authorization. Confirmed read-only host-system-file operations are allowed by default; " +
+            "host modifications or scripts/dynamic paths not confirmed read-only require approval first. " +
+            "Allow once or allow all subsequent host modifications and uncertain operations in this chat session for Root with the same source and identity, " +
+            "including different commands and targets, not just this command. Session grants are memory-only and cleared on process restart; " +
+            "source, identity, Root generation, profile/configuration contents or selection, or instance changes require fresh approval. " +
+            "Explicit deny rules, the Root switch, and actual OS authorization still apply; this is not unlimited OS Root permission. " +
+            "Each execution still consumes an identity-bound, single-use internal permit for its full command. Disabling Root revokes pending approvals and unused permits and invalidates related grants. " +
+            "Recognition is limited and static: it does not execute or open scripts to classify them and is not runtime interception or a sandbox; " +
+            "symlinks, PATH resolution, and arbitrary program side effects cannot be guaranteed. Even an actually read-only script may prompt. " +
             "This is not container root and does not grant root to an unrooted device. " +
-            "Stopping a managed process cannot undo completed writes or reclaim arbitrary detached daemons."
-    override val permissionPolicy = ToolPermissionPolicy.ASK
+            "Stopping a managed process cannot undo completed writes or guarantee termination of arbitrary detached daemons."
+    override val permissionPolicy = ToolPermissionPolicy.AUTO_APPROVE
     override val capabilities = setOf(ToolCapability.EXECUTE_COMMANDS)
     override val parameters = mapOf(
         "command" to ToolParameter(
@@ -53,7 +60,7 @@ class RootTool @Inject constructor(
         "elevate" to ToolParameter(
             name = "elevate",
             type = ParameterType.BOOLEAN,
-            description = "Request approval to retry a command rejected by the safety policy; does not bypass approval or the Root switch.",
+            description = "Legacy compatibility flag, not a prerequisite for host approval; cannot override explicit deny rules, the host modification/uncertain-operation approval policy, the Root switch, or actual OS authorization.",
             required = false
         )
     )

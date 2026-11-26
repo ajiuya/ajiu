@@ -1,5 +1,8 @@
 package com.aicode.feature.terminal.domain
 
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwner
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwnerKind
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeCleanup
 import com.aicode.feature.settings.data.repository.ExecutionMode
 import com.aicode.feature.settings.data.repository.ExecutionModeHolder
 import io.mockk.coEvery
@@ -95,6 +98,29 @@ class DelegatingTerminalSessionProviderTest {
         coVerify(exactly = 1) { local.closePluginTab("term-1", owner) }
         coVerify(exactly = 0) { remote.closePluginTab(any(), any()) }
         verify(exactly = 0) { remote.writePluginInput(any(), any(), any(), any()) }
+    }
+
+    @Test
+    fun aiScopedOperationsForwardTheExactCallerOwnerWithoutUsingNativeUiMethods() = runBlocking<Unit> {
+        val owner = RuntimeOwner(RuntimeOwnerKind.AGENT, "origin-session")
+        coEvery { local.startOwnedBackgroundCommand("local", null, true, owner) } returns "term-local"
+        coEvery { remote.startOwnedBackgroundCommand("remote", null, false, owner) } returns "term-remote"
+        every { local.sendOwnedInput("term-local", owner, "input", false) } returns true
+        every { remote.writeOwnedBytes("term-remote", owner, 3) } returns true
+        every { remote.listOwnedTabs(owner) } returns emptyList()
+        coEvery { local.closeOwnedTab("term-local", owner) } returns TerminalCloseResult(LocalRuntimeCleanup.UNKNOWN)
+        assertEquals("term-local", provider.startOwnedBackgroundCommand("local", null, true, owner))
+        assertTrue(provider.sendOwnedInput("term-local", owner, "input", false))
+        assertEquals(TerminalCloseResult(LocalRuntimeCleanup.UNKNOWN), provider.closeOwnedTab("term-local", owner))
+        holder.setMode(ExecutionMode.REMOTE_SSH)
+        assertEquals("term-remote", provider.startOwnedBackgroundCommand("remote", null, false, owner))
+        assertTrue(provider.writeOwnedBytes("term-remote", owner, 3))
+        assertTrue(provider.listOwnedTabs(owner).isEmpty())
+        coVerify(exactly = 0) { local.startBackgroundCommand(any(), any(), any(), any()) }
+        coVerify(exactly = 0) { remote.startBackgroundCommand(any(), any(), any(), any()) }
+        verify(exactly = 0) { local.sendInput(any(), any(), any()) }
+        verify(exactly = 0) { remote.writeBytesToTab("term-remote", 3) }
+        verify(exactly = 0) { local.closeTab(any()) }
     }
 
     @Test

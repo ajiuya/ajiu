@@ -2,14 +2,26 @@ package com.aicode.feature.agent.domain.permission
 
 import android.content.Context
 import com.aicode.R
+import com.aicode.feature.agent.domain.container.ChrootInstance
+import com.aicode.feature.agent.domain.container.LocalContainerRuntime
 import com.aicode.feature.agent.domain.permission.ShellCommandParser.BlockerKind
+import com.aicode.feature.agent.domain.root.RootAccessState
 import com.aicode.feature.agent.domain.root.RootCommandManager
 import com.aicode.feature.agent.domain.shizuku.ShizukuIdentity
 import com.aicode.feature.agent.domain.shizuku.ShizukuManager
+import com.aicode.feature.settings.data.repository.ContainerSettingsRepository
+import com.aicode.feature.settings.data.repository.ExecutionMode
+import com.aicode.feature.settings.data.repository.ExecutionModeHolder
+import com.aicode.feature.workspace.data.repository.WorkspaceRepository
+import com.aicode.feature.workspace.domain.WorkspaceExecutionContext
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
+import java.nio.ByteBuffer
+import java.security.MessageDigest
+import java.util.Collections
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -19,12 +31,15 @@ class ToolPermissionPolicyEngine @Inject constructor(
     private val sessionPermissionGrants: SessionPermissionGrantRepository,
     @param:ApplicationContext private val appContext: Context,
     private val rootCommandManager: RootCommandManager,
-    private val shizukuManager: ShizukuManager
+    private val shizukuManager: ShizukuManager,
+    // Defaults preserve legacy explicit constructors; Hilt injects the real singleton dependencies.
+    private val modeHolder: ExecutionModeHolder? = null,
+    private val containerSettings: ContainerSettingsRepository? = null,
+    private val workspaceRepository: WorkspaceRepository? = null
 ) {
     private companion object {
         const val SHIZUKU_TOOL = "Shizuku"
         const val ROOT_TOOL = "Root"
-        val HOST_ROOT_REFERENCE = Regex("(?<![A-Za-z0-9_])(?:su|sudo)(?![A-Za-z0-9_])")
         const val TERMINAL_TOOL = "terminal"
         const val HOME_DIR = "/root"
         const val HOME_TOKEN = "\$HOME"
@@ -43,6 +58,23 @@ class ToolPermissionPolicyEngine @Inject constructor(
 
     enum class Verdict { ALLOW, DENY, ASK }
 
+    enum class PermissionNamespace { HOST, PROOT_GUEST, CHROOT_GUEST, REMOTE }
+
+    /** Value-only evidence: never retains mutable flows, selected-profile providers or live lists. */
+    data class PermissionSource(
+        val namespace: PermissionNamespace,
+        val mode: ExecutionMode? = null,
+        val modeSelectionRevision: Long? = null,
+        val selectedProfileId: String? = null,
+        val profileSelectionRevision: Long? = null,
+        val profileConfigurationRevision: Long? = null,
+        val activeProfileId: String? = null,
+        val localRuntime: LocalContainerRuntime? = null,
+        val chrootInstance: ChrootInstance? = null,
+        val workspaceSelectionId: String? = null,
+        val workspacePath: String? = null
+    )
+
     data class EvalResult(
         val verdict: Verdict,
         val denyReason: String? = null,
@@ -51,10 +83,22 @@ class ToolPermissionPolicyEngine @Inject constructor(
         val askTitle: String? = null,
         val rootGeneration: Long? = null,
         val rootAuthorityId: String? = null,
-        val shizukuIdentity: ShizukuIdentity? = null
+        val shizukuIdentity: ShizukuIdentity? = null,
+        val permissionSource: PermissionSource? = null,
+        val hostSystemTargets: Set<String> = emptySet(),
+        val channelUnavailable: Boolean = false,
+        val hostSystemUncertainties: Set<String> = emptySet(),
+        // CHROOT file/command review authority, never a Root tool command-permit request.
+        val hostWriteRootGeneration: Long? = null,
+        val hostWriteRootAuthorityId: String? = null
     )
 
-    suspend fun evaluate(toolName: String, args: Map<String, JsonElement>, sessionId: String? = null): EvalResult {
+    suspend fun evaluate(
+        toolName: String,
+        args: Map<String, JsonElement>,
+        sessionId: String? = null,
+        execution: WorkspaceExecutionContext? = null
+    ): EvalResult {
         val rules = rulesRepo.loadEffectiveForCurrentProject().filter {
             it.toolName == toolName && it.decision == PermissionDecision.DENY
         }
@@ -62,27 +106,11 @@ class ToolPermissionPolicyEngine @Inject constructor(
             return EvalResult(Verdict.DENY, denyReason = appContext.getString(R.string.tool_permission_rule_denied))
         }
         val action = (args["action"] as? JsonPrimitive)?.content?.trim()?.lowercase()
-        val rootState = if (toolName == ROOT_TOOL) rootCommandManager.accessSnapshot() else null
-        if (rootState != null && (!rootState.enabled || rootState.authorityId.isBlank())) {
-            return EvalResult(Verdict.DENY, denyReason = appContext.getString(R.string.root_access_disabled))
-        }
         val shellTool = toolName == "Bash" || toolName == SHIZUKU_TOOL || toolName == ROOT_TOOL ||
             (toolName == TERMINAL_TOOL && action in setOf("start", "send"))
-        if (!shellTool) return EvalResult(Verdict.ALLOW)
-
         val commandKey = if (toolName == TERMINAL_TOOL && action == "send") "input" else "command"
-        val command = (args[commandKey] as? JsonPrimitive)?.content ?: return EvalResult(Verdict.ALLOW)
-        val shizukuIdentity = if (toolName == SHIZUKU_TOOL) {
-            shizukuManager.accessSnapshot()
-                ?: return EvalResult(Verdict.DENY, denyReason = appContext.getString(R.string.shizuku_identity_unavailable))
-        } else null
-        if (toolName == SHIZUKU_TOOL && shizukuIdentity?.uid != 0 &&
-            (ShellCommandParser.requiresRootApproval(command) || HOST_ROOT_REFERENCE.containsMatchIn(command))
-        ) {
-            return EvalResult(Verdict.DENY, denyReason = appContext.getString(R.string.root_shizuku_use_root_tool))
-        }
-        val analysis = ShellCommandParser.analyze(command)
-        val executableSegments = ShellCommandParser.executableSegments(command)
+        val command = if (shellTool) (args[commandKey] as? JsonPrimitive)?.takeIf { it.isString }?.content else null
+        val executableSegments = command?.let(ShellCommandParser::executableSegments).orEmpty()
         val denied = rules.firstOrNull { rule ->
             executableSegments.any { ShellCommandParser.matches(rule.pattern, it) }
         }
@@ -98,7 +126,66 @@ class ToolPermissionPolicyEngine @Inject constructor(
             )
         }
 
-        val safetyReason = checkCatastrophicRm(executableSegments, hostRoot = toolName == ROOT_TOOL || shizukuIdentity?.uid == 0) ?: if (!analysis.analyzable && looksDestructive(command, analysis, executableSegments)) {
+        val sourceCapture = capturePermissionSource(toolName, execution)
+        val source = sourceCapture.value
+        val rootState = if (toolName == ROOT_TOOL) rootCommandManager.accessSnapshot() else null
+        if (rootState != null && (!rootState.enabled || rootState.authorityId.isBlank())) {
+            return EvalResult(Verdict.DENY, denyReason = appContext.getString(R.string.root_access_disabled), permissionSource = source, channelUnavailable = true)
+        }
+        val shizukuIdentity = if (toolName == SHIZUKU_TOOL) {
+            shizukuManager.accessSnapshot()
+                ?: return EvalResult(Verdict.DENY, denyReason = appContext.getString(R.string.shizuku_identity_unavailable), permissionSource = source, channelUnavailable = true)
+        } else null
+        if (source.namespace == PermissionNamespace.HOST || source.namespace == PermissionNamespace.CHROOT_GUEST) {
+            val namespace = if (source.namespace == PermissionNamespace.HOST) HostSystemFileAccessClassifier.Namespace.HOST
+                else HostSystemFileAccessClassifier.Namespace.CHROOT_GUEST
+            val assessment = if (command != null) HostSystemFileAccessClassifier.assessCommand(command, namespace)
+                else HostSystemFileAccessClassifier.assessFileTool(toolName, args, namespace)
+            val targets = immutable(assessment.targets)
+            val interactiveInput = source.namespace == PermissionNamespace.CHROOT_GUEST &&
+                toolName == TERMINAL_TOOL && action in setOf("send", "key")
+            val uncertainties = immutable(assessment.uncertainties + if (interactiveInput) setOf("interactive-terminal-input") else emptySet())
+            val writes = targets.filter { it.startsWith("WRITE:") || it.startsWith("READ_WRITE:") }.sorted()
+            val needsReview = writes.isNotEmpty() || uncertainties.isNotEmpty()
+            // Ordinary guest work and proven reads need no additional Root access. Host writes and
+            // unknown CHROOT behavior do: bind their separate proof slots to the live Root epoch.
+            val hostWriteRoot = if (source.namespace == PermissionNamespace.CHROOT_GUEST && needsReview) {
+                rootCommandManager.accessSnapshot()
+            } else null
+            sourceCapture.checkCurrent()
+            if (hostWriteRoot != null && (!hostWriteRoot.enabled || hostWriteRoot.authorityId.isBlank())) {
+                return EvalResult(
+                    Verdict.DENY, denyReason = appContext.getString(R.string.root_access_disabled),
+                    permissionSource = source, hostSystemTargets = targets,
+                    hostSystemUncertainties = uncertainties, channelUnavailable = true
+                )
+            }
+            val result = if (!needsReview) EvalResult(Verdict.ALLOW) else {
+                val title = appContext.getString(R.string.tool_host_system_file_confirmation_title)
+                // READ evidence remains in the proof but is never described as needing write approval.
+                val note = if (uncertainties.isEmpty()) {
+                    appContext.getString(R.string.tool_host_system_file_confirmation_reason, writes.joinToString("\n"))
+                } else {
+                    appContext.getString(R.string.tool_host_system_file_uncertain_reason, (writes + uncertainties.sorted()).joinToString("\n"))
+                }
+                val grant = hostWriteGrant(toolName, source, rootState ?: hostWriteRoot, shizukuIdentity)
+                if (grant == null) EvalResult(Verdict.ASK, askTitle = title, approvalNote = note)
+                else approval(sessionId, grant, title, note)
+            }
+            sourceCapture.checkCurrent()
+            // ALLOW still needs native, exact-command, single-use permits. Never manufacture an identity.
+            return result.copy(
+                rootGeneration = rootState?.generation, rootAuthorityId = rootState?.authorityId,
+                shizukuIdentity = shizukuIdentity, permissionSource = source, hostSystemTargets = targets,
+                hostSystemUncertainties = uncertainties, hostWriteRootGeneration = hostWriteRoot?.generation,
+                hostWriteRootAuthorityId = hostWriteRoot?.authorityId
+            )
+        }
+        if (command == null) return EvalResult(Verdict.ALLOW, permissionSource = source)
+
+        // Legacy PRoot/SSH policy deliberately remains unchanged.
+        val analysis = ShellCommandParser.analyze(command)
+        val safetyReason = checkCatastrophicRm(executableSegments) ?: if (!analysis.analyzable && looksDestructive(command, analysis, executableSegments)) {
             val constructs = analysis.blockers.joinToString("\n") { blocker ->
                 val resource = when (blocker.kind) {
                     BlockerKind.COMMAND_SUBSTITUTION -> R.string.tool_safety_blocker_command_substitution
@@ -124,22 +211,19 @@ class ToolPermissionPolicyEngine @Inject constructor(
             if ((args["elevate"] as? JsonPrimitive)?.booleanOrNull != true) {
                 return EvalResult(
                     Verdict.DENY,
-                    denyReason = appContext.getString(R.string.tool_safety_denied_with_elevation, safetyReason)
+                    denyReason = appContext.getString(R.string.tool_safety_denied_with_elevation, safetyReason),
+                    permissionSource = source
                 )
             }
-            if (rootState != null) return rootApproval(sessionId, rootState.generation, rootState.authorityId, forceOnce = true)
-            if (shizukuIdentity != null) return shizukuApproval(sessionId, shizukuIdentity, forceOnce = true)
             return approval(
                 sessionId,
                 "elevate:$command",
                 appContext.getString(R.string.tool_elevation_confirmation_title),
                 appContext.getString(R.string.tool_elevation_confirmation_reason)
-            )
+            ).copy(permissionSource = source)
         }
 
         return when {
-            rootState != null -> rootApproval(sessionId, rootState.generation, rootState.authorityId)
-            shizukuIdentity != null -> shizukuApproval(sessionId, shizukuIdentity)
             ShellCommandParser.requiresRootApproval(command) -> approval(
                 sessionId,
                 "root:$command",
@@ -147,28 +231,112 @@ class ToolPermissionPolicyEngine @Inject constructor(
                 appContext.getString(R.string.tool_root_confirmation_reason)
             )
             else -> EvalResult(Verdict.ALLOW)
+        }.copy(permissionSource = source)
+    }
+
+    private data class CapturedPermissionSource(val value: PermissionSource, val checkCurrent: () -> Unit)
+
+    private suspend fun capturePermissionSource(toolName: String, execution: WorkspaceExecutionContext?): CapturedPermissionSource {
+        // Explicit host channels are independent of the currently selected guest/workspace.
+        if (toolName == ROOT_TOOL || toolName == SHIZUKU_TOOL) {
+            return CapturedPermissionSource(PermissionSource(PermissionNamespace.HOST)) {}
         }
+        execution?.checkCurrent()
+        val revision = modeHolder?.modeSelectionRevision
+        val mode = execution?.mode ?: modeHolder?.currentMode() ?: ExecutionMode.LOCAL_PROOT
+        if (modeHolder != null && modeHolder.currentMode() != mode) throw CancellationException("Workspace execution mode changed")
+        // Capture before the suspending profile read: A -> B -> A must not repair a torn snapshot.
+        val workspaceBefore = if (mode == ExecutionMode.LOCAL_PROOT) workspaceRepository?.selection?.value else null
+        val profile = if (execution != null) execution.profileSnapshot else containerSettings?.captureProfileSnapshot()
+        if (execution != null && profile == null && containerSettings != null) {
+            throw CancellationException("Captured workspace profile is unavailable")
+        }
+        if (profile != null && mode == ExecutionMode.LOCAL_PROOT && profile.selectedProfileId != profile.activeProfile.id) {
+            throw CancellationException("Workspace execution source is not ready")
+        }
+        val active = profile?.activeProfile ?: execution?.localMapping?.profile
+        val namespace = when {
+            mode == ExecutionMode.REMOTE_SSH -> PermissionNamespace.REMOTE
+            active?.isChroot == true || execution?.localRuntimeCapture != null -> PermissionNamespace.CHROOT_GUEST
+            else -> PermissionNamespace.PROOT_GUEST
+        }
+        val frozenWorkspace = execution?.runtimeWorkspaceSource
+        val workspaceSelection = if (namespace == PermissionNamespace.CHROOT_GUEST && workspaceRepository != null) {
+            if (execution == null) workspaceBefore else frozenWorkspace?.selection
+        } else null
+        val workspacePath = if (workspaceSelection == null) null else {
+            if (execution == null) workspaceSelection.workspace?.path else frozenWorkspace?.sourcePath
+        }
+        val checkCurrent = {
+            execution?.checkCurrent()
+            if (modeHolder != null && (modeHolder.currentMode() != mode || modeHolder.modeSelectionRevision != revision)) {
+                throw CancellationException("Workspace execution mode changed")
+            }
+            profile?.let { containerSettings?.checkProfileSnapshot(it) }
+            if (namespace == PermissionNamespace.CHROOT_GUEST && workspaceRepository != null) {
+                if (workspaceRepository.selection.value !== workspaceBefore ||
+                    (workspaceSelection != null && workspaceSelection !== workspaceBefore) ||
+                    (workspaceSelection != null && workspacePath != workspaceBefore?.workspace?.path)) {
+                    throw CancellationException("Workspace permission source changed")
+                }
+            }
+            Unit
+        }
+        checkCurrent()
+        return CapturedPermissionSource(
+            PermissionSource(
+                namespace, mode, revision, profile?.selectedProfileId, profile?.selectionRevision,
+                profile?.configurationRevision, active?.id, active?.localRuntime, active?.chrootInstance,
+                workspaceSelection?.id, workspacePath
+            ), checkCurrent
+        )
     }
 
-    private suspend fun rootApproval(
-        sessionId: String?, generation: Long, authorityId: String, forceOnce: Boolean = false
-    ): EvalResult {
-        val title = appContext.getString(R.string.root_confirmation_title)
-        val note = appContext.getString(R.string.root_confirmation_reason)
-        val result = if (forceOnce) EvalResult(Verdict.ASK, askTitle = title, approvalNote = note)
-            else approval(sessionId, "tool:Root:$authorityId:$generation", title, note)
-        return result.copy(rootGeneration = generation, rootAuthorityId = authorityId)
+    /** A missing source component permits one-shot review only, never an unbound broad grant. */
+    private fun hostWriteGrant(
+        toolName: String,
+        source: PermissionSource,
+        root: RootAccessState?,
+        shizuku: ShizukuIdentity?
+    ): String? {
+        when (source.namespace) {
+            PermissionNamespace.HOST -> when (toolName) {
+                ROOT_TOOL -> if (root == null || !root.enabled || root.authorityId.isBlank()) return null
+                SHIZUKU_TOOL -> if (shizuku == null) return null
+                else -> return null
+            }
+            PermissionNamespace.CHROOT_GUEST -> {
+                if (modeHolder == null || containerSettings == null || workspaceRepository == null ||
+                    source.mode != ExecutionMode.LOCAL_PROOT || source.modeSelectionRevision == null ||
+                    source.selectedProfileId.isNullOrBlank() || source.profileSelectionRevision == null ||
+                    source.profileConfigurationRevision == null || source.activeProfileId != source.selectedProfileId ||
+                    source.localRuntime != LocalContainerRuntime.CHROOT || source.chrootInstance?.id.isNullOrBlank() ||
+                    source.workspaceSelectionId.isNullOrBlank() || source.workspacePath.isNullOrBlank() ||
+                    root == null || !root.enabled || root.authorityId.isBlank()) return null
+            }
+            else -> return null
+        }
+        // Length-framed nullable UTF-8 fields avoid delimiter/null collisions. No command, target,
+        // content, prompt or secret-bearing arguments ever participate in this source-wide key.
+        val material = listOf(
+            toolName, source.namespace.name, source.mode?.name, source.modeSelectionRevision?.toString(),
+            source.selectedProfileId, source.profileSelectionRevision?.toString(), source.profileConfigurationRevision?.toString(),
+            source.activeProfileId, source.localRuntime?.name, source.chrootInstance?.id,
+            source.chrootInstance?.device?.toString(), source.chrootInstance?.inode?.toString(), source.chrootInstance?.installGeneration?.toString(),
+            source.workspaceSelectionId, source.workspacePath, root?.authorityId, root?.generation?.toString(),
+            shizuku?.uid?.toString(), shizuku?.connectionId
+        )
+        val digest = MessageDigest.getInstance("SHA-256")
+        for (field in material) {
+            val bytes = field?.toByteArray(Charsets.UTF_8)
+            digest.update(ByteBuffer.allocate(Int.SIZE_BYTES).putInt(bytes?.size ?: -1).array())
+            if (bytes != null) digest.update(bytes)
+        }
+        val hash = digest.digest().joinToString("") { (it.toInt() and 0xff).toString(16).padStart(2, '0') }
+        return SessionPermissionGrantRepository.HOST_WRITE_GRANT_PREFIX + hash
     }
 
-    private suspend fun shizukuApproval(
-        sessionId: String?, identity: ShizukuIdentity, forceOnce: Boolean = false
-    ): EvalResult {
-        val title = if (identity.uid == 0) appContext.getString(R.string.shizuku_root_confirmation_title) else null
-        val note = appContext.getString(if (identity.uid == 0) R.string.shizuku_root_confirmation_reason else R.string.tool_shizuku_confirmation_reason)
-        val result = if (forceOnce) EvalResult(Verdict.ASK, askTitle = title, approvalNote = note)
-            else approval(sessionId, "tool:Shizuku:${identity.uid}:${identity.connectionId}", title, note)
-        return result.copy(shizukuIdentity = identity)
-    }
+    private fun immutable(values: Collection<String>): Set<String> = Collections.unmodifiableSet(LinkedHashSet(values))
 
     private suspend fun approval(sessionId: String?, grant: String, title: String?, note: String): EvalResult {
         if (!sessionId.isNullOrBlank() && sessionPermissionGrants.isAllowed(sessionId, grant)) {
@@ -191,21 +359,11 @@ class ToolPermissionPolicyEngine @Inject constructor(
             DESTRUCTIVE_PROGRAM.matches(ShellCommandParser.programPrefix(it)?.substringAfterLast('/').orEmpty())
         }
 
-    private fun checkCatastrophicRm(segments: List<List<String>>, hostRoot: Boolean): String? {
+    private fun checkCatastrophicRm(segments: List<List<String>>): String? {
         for (segment in segments) {
             val info = ShellCommandParser.parseRmInfo(segment)
             if (!info.isRm) continue
             for (path in info.targetPaths) {
-                if (hostRoot) {
-                    val normalized = normalizePath(path.trim())
-                    if (!normalized.startsWith('/')) {
-                        return appContext.getString(R.string.root_safety_relative_delete)
-                    }
-                    val androidPaths = setOf("/data", "/storage", "/sdcard", "/system", "/vendor", "/product", "/odm", "/metadata", "/persist")
-                    if (androidPaths.any { normalized == it || normalized.startsWith("$it/") || normalized.startsWith("$it*") }) {
-                        return appContext.getString(R.string.root_safety_android_delete)
-                    }
-                }
                 catastrophicReasonFor(path)?.let { return it }
             }
         }

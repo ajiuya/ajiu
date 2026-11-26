@@ -13,6 +13,9 @@ plugins {
 }
 
 val roomDeviceTest = providers.gradleProperty("roomDeviceTest").map { it == "true" }.getOrElse(false)
+val chrootDeviceTest = providers.gradleProperty("chrootDeviceTest").map { it == "true" }.getOrElse(false)
+val chrootProductDeviceTest = providers.gradleProperty("chrootProductDeviceTest").map { it == "true" }.getOrElse(false)
+require(listOf(roomDeviceTest, chrootDeviceTest, chrootProductDeviceTest).count { it } <= 1) { "Choose one fixed device verification suite" }
 
 val keystorePropertiesFile = providers.gradleProperty("releaseSigningProperties")
     .map { file(it) }
@@ -122,8 +125,12 @@ android {
             .map { it.also { name -> require(name.isNotBlank()) } }
             .getOrElse(gitVersionName())
 
-        testInstrumentationRunner = if (roomDeviceTest) "com.aicode.testing.RoomVerificationInstrumentation"
-            else "androidx.test.runner.AndroidJUnitRunner"
+        testInstrumentationRunner = when {
+            roomDeviceTest -> "com.aicode.testing.RoomVerificationInstrumentation"
+            chrootDeviceTest -> "com.aicode.testing.ChrootVerificationInstrumentation"
+            chrootProductDeviceTest -> "com.aicode.testing.ChrootProductVerificationInstrumentation"
+            else -> "androidx.test.runner.AndroidJUnitRunner"
+        }
         vectorDrawables {
             useSupportLibrary = true
         }
@@ -240,7 +247,11 @@ android {
                 "**/libproot-loader.so",
                 "**/libproot-loader32.so",
                 "**/libtalloc.so",
-                "**/libandroid-shmem.so"
+                "**/libandroid-shmem.so",
+                "**/libajiu_chroot_runtime.so",
+                "**/libajiu_chroot_installer.so",
+                "**/libajiu_file_worker.so",
+                "**/libajiu_chroot_broker.so"
             )
         }
         resources {

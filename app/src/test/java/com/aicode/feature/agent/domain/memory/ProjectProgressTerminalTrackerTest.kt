@@ -21,6 +21,38 @@ class ProjectProgressTerminalTrackerTest {
     private val args = "{\"action\":\"start\"}"
     private val result = "{\"status\":\"success\",\"data\":{\"tab_id\":\"tab-1\"}}"
 
+    @Test fun unknownExitRetainsBackgroundPendingWithoutInventingAnExitCode() {
+        val f = fixture()
+        val collector = collector(f)
+        val tracker = ProjectProgressTerminalTracker()
+        tracker.register("session", collector)
+        collector.record("terminal", args, false, "call")
+        tracker.started("session", collector, args, result, false)
+        collector.save("completed")
+        tracker.finished("session", "tab-1", null, "local_proot")
+        val entry = f.journal.listRecent(f.project.id).single()
+        assertEquals("background_pending", entry.status)
+        assertTrue(entry.body.contains("exit_status=unknown"))
+        assertFalse(entry.body.contains("exit_code=-1"))
+        tracker.finished("session", "tab-1", 0, "local_proot")
+        assertEquals(entry, f.journal.read(entry.id))
+    }
+
+    @Test fun unknownBeforeStartIsNotDroppedOrReplacedByLaterSuccess() {
+        val f = fixture()
+        val collector = collector(f)
+        val tracker = ProjectProgressTerminalTracker()
+        tracker.register("session", collector)
+        collector.record("terminal", args, false, "call")
+        tracker.finished("session", "tab-1", null, "local_proot")
+        tracker.started("session", collector, args, result, false)
+        collector.save("completed")
+        val entry = f.journal.listRecent(f.project.id).single()
+        assertEquals("background_pending", entry.status)
+        assertTrue(entry.body.contains("exit_status=unknown"))
+        assertFalse(entry.body.contains("exit_code=0"))
+    }
+
     @Test fun completionBeforeStartIsCorrelatedExactlyOnceWithinTheSameOwnerAndMode() {
         val f = fixture()
         val collector = collector(f)

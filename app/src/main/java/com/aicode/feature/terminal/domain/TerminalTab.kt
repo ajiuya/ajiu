@@ -1,5 +1,11 @@
 package com.aicode.feature.terminal.domain
 
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeProcess
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeTaskResult
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwner
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwnerKind
+import com.aicode.feature.workspace.domain.ExecutionSourceChangedException
+import com.aicode.feature.workspace.domain.WorkspaceExecutionContext
 import com.termux.terminal.TerminalSession
 import com.termux.view.TerminalView
 
@@ -8,7 +14,7 @@ import com.termux.view.TerminalView
  */
 sealed interface RunState {
     data object Running : RunState
-    data class Finished(val exitCode: Int) : RunState
+    data class Finished(val exitCode: Int, val exitKnown: Boolean = true) : RunState
 }
 
 /** 后台任务完成通知携带的终端输出行数。 */
@@ -59,7 +65,8 @@ data class TabFinishedEvent(
     val sourceMode: String? = null,
     val channelGeneration: String? = null,
     val historyId: String? = null,
-    val historyError: String? = null
+    val historyError: String? = null,
+    val exitKnown: Boolean = true
 )
 
 /**
@@ -87,7 +94,11 @@ class TerminalTab(
     val ownerPluginId: String? = null,
     val ownerResourceId: String? = null,
     val historyId: String? = null,
-    historyError: String? = null
+    historyError: String? = null,
+    val runtimeOwner: RuntimeOwner = terminalRuntimeOwner(id, sourceSessionId),
+    val runtimeTask: LocalRuntimeProcess? = null,
+    /** Actual source used to create this session, never reconstructed from the selected profile. */
+    val capturedExecution: WorkspaceExecutionContext? = null
 ) {
     var historyError: String? = historyError
         internal set
@@ -122,12 +133,19 @@ class TerminalTab(
 
     internal fun finish(exitCode: Int): Boolean {
         if (runState !is RunState.Running) return false
+        val task = runtimeTask
+        val runtimeResult = task?.taskState?.value
+        if (task != null && runtimeResult == null) return false
         val completedCommand = isBackground && notifyOnExit
-        runState = RunState.Finished(if (completedCommand) markerExitCode ?: exitCode else exitCode)
+        runState = when (runtimeResult) {
+            LocalRuntimeTaskResult.Unknown -> RunState.Finished(-1, exitKnown = false)
+            is LocalRuntimeTaskResult.Exited -> RunState.Finished(runtimeResult.terminalStatus)
+            null -> RunState.Finished(if (completedCommand) markerExitCode ?: exitCode else exitCode)
+        }
         commandFinished = true
         onUserInput = {}
         // backend 关闭可能同步回调；先冻结逻辑结果，不能让强杀状态覆盖命令退出码。
-        if (completedCommand) runCatching { session.finishIfRunning() }
+        if (completedCommand && task == null) runCatching { session.finishIfRunning() }
         return true
     }
 
@@ -152,5 +170,28 @@ data class TabInfo(
     val running: Boolean,
     val command: String?,
     val historyId: String? = null,
-    val historyError: String? = null
+    val historyError: String? = null,
+    val runtimeOwner: RuntimeOwner? = null,
+    val taskStatus: String? = null,
+    val cleanupStatus: String? = null,
+    val exitCode: Int? = null,
+    val exitKnown: Boolean = true
 )
+
+internal fun terminalRuntimeOwner(tabId: String, sourceSessionId: String?): RuntimeOwner =
+    if (sourceSessionId == null) RuntimeOwner(RuntimeOwnerKind.TERMINAL, tabId)
+    else RuntimeOwner(RuntimeOwnerKind.AGENT, sourceSessionId)
+
+internal fun TerminalTab.isAccessibleTo(owner: RuntimeOwner): Boolean =
+    ownerPluginId == null && runtimeOwner == owner
+
+/** Only AI-owned writes use this guard; native interactive/raw input keeps its existing semantics. */
+internal fun TerminalTab.checkOwnedInputExecution() {
+    val captured = capturedExecution ?: throw ExecutionSourceChangedException()
+    val current = WorkspaceExecutionContext.current() ?: throw ExecutionSourceChangedException()
+    current.checkCurrent()
+    if (captured.mode != current.mode || captured.fileCacheIdentity != current.fileCacheIdentity) {
+        throw ExecutionSourceChangedException()
+    }
+    captured.checkCurrent()
+}

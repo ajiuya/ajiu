@@ -4,6 +4,7 @@ import android.system.Os
 import com.aicode.feature.plugin.data.PluginFiles
 import com.aicode.feature.plugin.domain.PluginCapture
 import com.aicode.feature.workspace.domain.WorkspaceExecutionContext
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwner
 import java.io.File
 import java.nio.file.Files
 import java.nio.file.LinkOption.NOFOLLOW_LINKS
@@ -29,11 +30,13 @@ class PluginInvocationContext internal constructor(
     internal val dataDirectory: File,
     private val sourceChanges: Flow<Unit>,
     internal val allowsTool: (String) -> Boolean = { true },
-    val sourceIdentity: Any = Any(),
+    val sourceIdentity: Any = MISSING_SOURCE,
     val background: Boolean = false,
     val persistentIdentity: String = "",
     val allowIdleCallbacks: Boolean = false,
     internal val backgroundAuthority: Any? = null,
+    val runtimeOwner: RuntimeOwner? = null,
+    private val invocationAuthority: Any = Any(),
     private val sourceCheck: () -> Unit
 ) : AutoCloseable {
     val invocationId: String = UUID.randomUUID().toString()
@@ -44,12 +47,12 @@ class PluginInvocationContext internal constructor(
     internal fun retainSource(): PluginInvocationContext {
         checkCurrent()
         return PluginInvocationContext(capture, execution, workspacePath, sessionId, dataDirectory,
-            sourceChanges, allowsTool, sourceIdentity, background, persistentIdentity, allowIdleCallbacks, backgroundAuthority, sourceCheck)
+            sourceChanges, allowsTool, sourceIdentity, background, persistentIdentity, allowIdleCallbacks, backgroundAuthority, runtimeOwner, invocationAuthority, sourceCheck)
     }
 
     internal fun child(): PluginInvocationContext = PluginInvocationContext(capture, execution, workspacePath, sessionId,
         dataDirectory, changes, allowsTool, sourceIdentity, background, persistentIdentity, allowIdleCallbacks, backgroundAuthority,
-        ::checkCurrent)
+        runtimeOwner, invocationAuthority, ::checkCurrent)
 
     private val dataIdentity = directoryIdentity()
 
@@ -101,11 +104,20 @@ class PluginInvocationContext internal constructor(
     }
 
     private val runtimeAuthority by lazy {
+        val owner = runtimeOwner ?: throw PluginHostException("CONTEXT_REQUIRED", "A plugin runtime source owner is required")
+        if (sourceIdentity === MISSING_SOURCE) throw PluginHostException("CONTEXT_REQUIRED", "A plugin execution source is required")
         val authority = PluginRuntimeContext(workspacePath, sessionId, invocationId, ::checkCurrent)
-        val bound = backgroundAuthority?.let(authority::withBackgroundAuthority) ?: authority
+            .withExecutionSource(sourceIdentity, owner, execution?.localRuntimeCapture, execution?.profileSnapshot?.activeProfile?.takeIf {
+                it.mode == com.aicode.feature.settings.data.repository.ExecutionMode.LOCAL_PROOT
+            } ?: execution?.localMapping?.profile)
+        val bound = authority.withBackgroundAuthority(backgroundAuthority ?: invocationAuthority)
         if (allowIdleCallbacks) bound.withIdleCallbacks() else bound
     }
-    internal fun runtimeContext(): PluginRuntimeContext = runtimeAuthority
+    internal fun runtimeContext(): PluginRuntimeContext = runtimeAuthority.also { checkCurrent() }
+
+    private companion object {
+        val MISSING_SOURCE = Any()
+    }
 
     internal suspend fun <T> whileCurrent(block: suspend () -> T): T = coroutineScope {
         val operation = async(start = CoroutineStart.LAZY) { checkIntegrity(); block().also { checkIntegrity() } }

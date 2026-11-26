@@ -3,7 +3,19 @@ package com.aicode.feature.agent.domain.mcp
 import com.aicode.core.util.FileLogger
 import com.aicode.feature.agent.domain.container.ContainerProfile
 import com.aicode.feature.agent.domain.container.LinuxContainerEngine
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeCapture
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeCommands
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeProcess
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeCleanup
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwnerKind
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.emptyFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -40,7 +52,11 @@ class StdioTransport(
     private val projectPath: String?,
     private val extraEnv: Map<String, String> = emptyMap(),
     private val runtimeProfile: ContainerProfile = ContainerProfile.BUILTIN_ALPINE,
-    private val json: Json = DEFAULT_JSON
+    private val json: Json = DEFAULT_JSON,
+    private val runtimeCommands: LocalRuntimeCommands? = null,
+    private val runtimeCapture: LocalRuntimeCapture? = null,
+    private val checkSource: () -> Unit = {},
+    private val sourceChanges: Flow<Unit> = emptyFlow()
 ) : McpTransport {
 
     private companion object {
@@ -61,6 +77,7 @@ class StdioTransport(
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val startMutex = Mutex()
     private val writeMutex = Mutex()
     private val idCounter = AtomicLong(0)
@@ -71,6 +88,21 @@ class StdioTransport(
     @Volatile private var process: Process? = null
     @Volatile private var writer: BufferedWriter? = null
     @Volatile private var closed = false
+    private val lifecycleLock = Any()
+
+    init {
+        scope.launch {
+            sourceChanges.collect {
+                try { checkCurrent() } catch (_: Exception) { close() }
+            }
+        }
+    }
+
+    private fun checkCurrent() {
+        if (closed) throw McpException(message = "[$serverName] transport is closed")
+        checkSource()
+        runtimeCapture?.checkCurrent()
+    }
 
     override suspend fun request(method: String, params: JsonObject?): JsonRpcResponse {
         ensureStarted()
@@ -84,14 +116,17 @@ class StdioTransport(
             writeLine(json.encodeToString(JsonRpcRequest.serializer(), payload))
         } catch (e: Exception) {
             pending.remove(id)
+            if (e is CancellationException) throw e
             throw McpException(message = "[$serverName] 写入 stdin 失败: ${e.message}", cause = e)
         }
 
-        val response = withTimeoutOrNull(REQUEST_TIMEOUT_MS) { deferred.await() }
+        val response = try { withTimeoutOrNull(REQUEST_TIMEOUT_MS) { deferred.await() } }
+            finally { pending.remove(id) }
         if (response == null) {
             pending.remove(id)
             throw McpException(message = "[$serverName] 请求 $method 超时（${REQUEST_TIMEOUT_MS}ms）")
         }
+        checkCurrent()
         response.error?.let {
             throw McpException(rpcCode = it.code, message = "$method 返回错误 [${it.code}] ${it.message}")
         }
@@ -102,46 +137,101 @@ class StdioTransport(
         ensureStarted()
         val payload = JsonRpcNotification(method = method, params = params)
         FileLogger.d(TAG, "→ notify [$serverName] $method")
-        runCatching { writeLine(json.encodeToString(JsonRpcNotification.serializer(), payload)) }
-            .onFailure { FileLogger.w(TAG, "[$serverName] 发送通知 $method 失败: ${it.message}") }
+        try { writeLine(json.encodeToString(JsonRpcNotification.serializer(), payload)) }
+        catch (failure: Exception) {
+            if (failure is CancellationException) throw failure
+            FileLogger.w(TAG, "[$serverName] notification $method could not be sent")
+        }
     }
 
     override fun close() {
-        if (closed) return
-        closed = true
-        FileLogger.i(TAG, "[$serverName] 关闭 stdio 传输")
-        scope.cancel()
-        runCatching { writer?.close() }
-        runCatching { process?.destroy() }
-        writer = null
-        process = null
-        failAllPending("transport 已关闭")
+        val owned = synchronized(lifecycleLock) {
+            if (closed) return
+            closed = true
+            val captured = process
+            process = null
+            writer = null
+            captured
+        }
+        failAllPending("transport is closed")
+        if (owned == null) { scope.cancel(); return }
+        stopOwned(owned)
+    }
+
+    private fun stopOwned(owned: Process) {
+        val stopRequested = runCatching {
+            if (owned is LocalRuntimeProcess) owned.stop() else owned.destroy()
+        }.isSuccess
+        cleanupScope.launch {
+            try {
+                val verified = stopRequested && if (owned is LocalRuntimeProcess) {
+                    withTimeoutOrNull(10_000L) { owned.awaitCleanup() } == LocalRuntimeCleanup.VERIFIED
+                } else owned.waitFor(EXIT_WAIT_MS, TimeUnit.MILLISECONDS)
+                if (!verified) FileLogger.w(TAG, "[$serverName] process cleanup is unknown")
+            } finally {
+                runCatching { owned.outputStream.close() }
+                runCatching { owned.inputStream.close() }
+                runCatching { owned.errorStream.close() }
+                scope.cancel()
+                cleanupScope.cancel()
+            }
+        }
     }
 
     /** 惰性启动子进程并挂上 stdout 读循环 / stderr 排空。串行化避免并发重复启动。 */
     private suspend fun ensureStarted() = startMutex.withLock {
+        checkCurrent()
         if (process != null) return@withLock
-        if (closed) throw McpException(message = "[$serverName] transport 已关闭")
-
-        FileLogger.i(TAG, "[$serverName] 启动 stdio server: $program ${programArgs.joinToString(" ")}")
-        val p = try {
-            engine.startStdioProcess(program, programArgs, projectPath, extraEnv, runtimeProfile)
-        } catch (e: Exception) {
-            throw McpException(message = "[$serverName] 启动子进程失败: ${e.message}", cause = e)
+        val startup = scope.async { startOwned() }
+        try { startup.await() } catch (failure: Exception) {
+            close()
+            startup.cancel()
+            throw failure
         }
-        process = p
-        writer = p.outputStream.bufferedWriter()
-        scope.launch { readLoop(p) }
-        scope.launch { drainStderr(p) }
+    }
+
+    private suspend fun startOwned() {
+        checkCurrent()
+        FileLogger.i(TAG, "[$serverName] starting stdio server")
+        var acquired: Process? = null
+        try {
+            val p = if (runtimeProfile.isChroot) {
+                val capture = runtimeCapture ?: throw McpException(message = "MCP runtime authorization is required for this server source")
+                if (capture.owner.kind != RuntimeOwnerKind.MCP || capture.profileId != runtimeProfile.id) {
+                    throw McpException(message = "MCP runtime capture belongs to another execution source")
+                }
+                val commands = runtimeCommands ?: throw McpException(message = "MCP runtime commands are unavailable")
+                commands.startStdio(capture, program, programArgs, extraEnv = extraEnv)
+            } else {
+                engine.startStdioProcess(program, programArgs, projectPath, extraEnv, runtimeProfile)
+            }
+            acquired = p
+            currentCoroutineContext().ensureActive()
+            synchronized(lifecycleLock) {
+                checkCurrent()
+                writer = p.outputStream.bufferedWriter()
+                process = p
+                acquired = null
+            }
+            scope.launch { readLoop(p) }
+            scope.launch { drainStderr(p) }
+        } catch (failure: Exception) {
+            if (failure is CancellationException || failure is McpException) throw failure
+            throw McpException(message = "[$serverName] stdio process could not start", cause = failure)
+        } finally {
+            acquired?.let(::stopOwned)
+        }
     }
 
     /** 同步化写入一行（多个并发请求共享一条 stdin）。 */
     private suspend fun writeLine(line: String) = writeMutex.withLock {
+        checkCurrent()
         val w = writer ?: throw McpException(message = "[$serverName] transport 未启动")
         withContext(Dispatchers.IO) {
             w.write(line)
             w.write("\n")
             w.flush()
+            checkCurrent()
         }
     }
 

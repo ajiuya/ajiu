@@ -1,4 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Ajiu Workbench (Debug)</string>
+    <string name="chroot_verification_visible_message">Verifying chroot. Please keep this page visible; it will close automatically when verification ends.</string>
 </resources>

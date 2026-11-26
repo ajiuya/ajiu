@@ -8,6 +8,7 @@ import com.aicode.feature.agent.domain.container.LinuxContainerEngine
 import com.aicode.feature.agent.domain.container.RemoteSshEngine
 import com.aicode.feature.agent.domain.memory.ProjectMemoryCapture
 import com.aicode.feature.agent.domain.memory.ProjectMemoryIdentity
+import com.aicode.feature.settings.data.repository.ContainerProfileSnapshot
 import com.aicode.feature.settings.data.repository.ContainerSettingsRepository
 import com.aicode.feature.settings.data.repository.ExecutionMode
 import com.aicode.feature.settings.data.repository.ExecutionModeHolder
@@ -26,6 +27,8 @@ import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.toList
@@ -61,6 +64,7 @@ class WorkspaceExecutionContextTest {
     private lateinit var access: DelegatingFileAccess
     private lateinit var factory: WorkspaceExecutionContextFactory
     private var homePath = "/root"
+    private val mapperProfiles = MutableStateFlow(listOf(ContainerProfile.BUILTIN_ALPINE))
 
     @Before
     fun prepare() {
@@ -68,12 +72,15 @@ class WorkspaceExecutionContextTest {
         rootfs = temporary.newFolder("rootfs")
         val configRoot = temporary.newFolder("config")
         every { workspace.currentPath() } answers { root.absolutePath }
+        every { workspace.selection } returns MutableStateFlow(WorkspaceRepository.Selection(null))
         every { installer.rootfsDirFor(any()) } answers { rootfs }
         every { installer.aicodeDir } returns configRoot
         every { settings.activeProfileIdFlow } returns flowOf(ContainerProfile.BUILTIN_ID)
         val mapperSettings = mockk<ContainerSettingsRepository>()
         val mapperInitialized = CompletableDeferred<Job>()
-        every { mapperSettings.customProfilesFlow } returns flowOf(listOf(ContainerProfile.BUILTIN_ALPINE))
+        every { mapperSettings.profileConfigurationRevision } returns 0L
+        every { mapperSettings.activeProfileSelectionRevision } returns 0L
+        every { mapperSettings.customProfilesFlow } returns mapperProfiles
         every { mapperSettings.activeProfileIdFlow } returns flow {
             emit(ContainerProfile.BUILTIN_ID)
             mapperInitialized.complete(currentCoroutineContext()[Job]!!)
@@ -94,6 +101,20 @@ class WorkspaceExecutionContextTest {
             every { snapshot() } returns LocalFolderSnapshot.EMPTY
         }
         every { settings.activeProfileSelectionRevision } returns 0L
+        every { settings.profileConfigurationRevision } returns 0L
+        coEvery { settings.captureProfileSnapshot() } coAnswers {
+            ContainerProfileSnapshot(
+                settings.activeProfileIdFlow.first(), ContainerProfile.BUILTIN_ID, listOf(ContainerProfile.BUILTIN_ALPINE),
+                settings.activeProfileSelectionRevision, settings.profileConfigurationRevision, settings
+            )
+        }
+        every { settings.checkProfileSnapshot(any()) } answers {
+            val snapshot = firstArg<ContainerProfileSnapshot>()
+            if (snapshot.selectionRevision != settings.activeProfileSelectionRevision ||
+                snapshot.configurationRevision != settings.profileConfigurationRevision) {
+                throw CancellationException("Profile changed")
+            }
+        }
         access = DelegatingFileAccess(holder, local, remote, localFolders)
         factory = WorkspaceExecutionContextFactory(access, holder, local, remote, settings, localFolders)
     }
@@ -174,8 +195,9 @@ class WorkspaceExecutionContextTest {
         homePath = "/home/other"
         assertTrue(runCatching { withContext(execution) { access.writeFile("~/probe", "no") } }.exceptionOrNull() is CancellationException)
         homePath = "/root"
-        WorkspacePathMapper::class.java.getDeclaredField("currentProfile").apply { isAccessible = true }
-            .set(mapper, ContainerProfile.BUILTIN_ALPINE.copy(id = "other-profile"))
+        val replacement = ContainerProfile.BUILTIN_ALPINE.copy(id = "other-profile")
+        mapperProfiles.value = listOf(replacement)
+        withTimeout(5_000) { mapper.runtimeProfileState.first { it.ready && it.profile == replacement } }
         assertTrue(runCatching { withContext(execution) { access.writeFile("/root/probe", "no") } }.exceptionOrNull() is CancellationException)
         assertFalse(File(oldRootfs, "root/probe").exists())
     }

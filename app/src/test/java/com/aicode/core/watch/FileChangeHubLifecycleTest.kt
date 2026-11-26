@@ -3,9 +3,21 @@ package com.aicode.core.watch
 import android.app.Application
 import android.os.FileObserver
 import com.aicode.feature.agent.domain.container.ContainerInstaller
+import com.aicode.feature.agent.domain.container.ContainerProfile
+import com.aicode.feature.agent.domain.container.LocalContainerRuntime
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeAuthorizationRequired
+import com.aicode.feature.settings.data.repository.ContainerSettingsRepository
+import com.aicode.feature.settings.data.repository.ExecutionMode
 import com.aicode.feature.settings.data.repository.ExecutionModeHolder
 import com.aicode.feature.workspace.data.repository.WorkspaceRepository
+import com.aicode.feature.workspace.domain.FileAccessProvider
+import com.aicode.feature.workspace.domain.PathHomeResolver
+import com.aicode.feature.workspace.domain.WorkspaceExecutionContext
 import com.aicode.feature.workspace.domain.WorkspacePathMapper
+import com.aicode.feature.workspace.domain.WorkspaceExecutionContextFactory
+import com.aicode.feature.workspace.domain.model.Workspace
+import io.mockk.coEvery
+import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.spyk
@@ -17,19 +29,30 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.ContinuationInterceptor
 import kotlin.coroutines.CoroutineContext
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.take
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestCoroutineScheduler
 import kotlinx.coroutines.test.TestScope
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -38,6 +61,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertSame
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Rule
@@ -73,8 +97,13 @@ class FileChangeHubLifecycleTest {
     private fun TestScope.hub(
         mainDispatcher: CoroutineDispatcher = StandardTestDispatcher(testScheduler),
         ioDispatcher: CoroutineDispatcher = coroutineContext[ContinuationInterceptor] as CoroutineDispatcher,
-        realSnapshot: Boolean = false
-    ) = FileChangeHub(workspace, installer, mapper, ExecutionModeHolder(), ioDispatcher, mainDispatcher,
+        realSnapshot: Boolean = false,
+        executionFactory: WorkspaceExecutionContextFactory? = null,
+        profileChanges: Flow<Long> = flowOf(0L),
+        modeHolder: ExecutionModeHolder = ExecutionModeHolder(),
+        remoteHub: RemoteFileWatchHub = RemoteFileWatchHub(),
+        pathMapper: WorkspacePathMapper = mapper
+    ) = FileChangeHub(workspace, installer, pathMapper, modeHolder, ioDispatcher, mainDispatcher,
         observerFactory = { path, mask, accept ->
             @Suppress("DEPRECATION")
             object : FileObserver(path, mask) {
@@ -85,7 +114,7 @@ class FileChangeHubLifecycleTest {
             scans++
             assertEquals(4096, limit)
             if (realSnapshot) snapshotOfScope(key, limit) else ScopeSnapshot(snapshotEntries, snapshotComplete)
-        })
+        }, remoteFileWatchHub = remoteHub, executionFactory = executionFactory, profileChanges = profileChanges)
 
     private fun FileChangeHub.watch(root: File, recursive: Boolean = false, poll: Boolean = false,
         filter: WatchFilter = LOCAL_FILTER): Flow<FileChangeBatch> = watchHostDir(root,
@@ -94,6 +123,639 @@ class FileChangeHubLifecycleTest {
 
     private fun TestScope.collect(flow: Flow<FileChangeBatch>, received: MutableList<FileChangeBatch> = mutableListOf()): Job =
         backgroundScope.launch(start = CoroutineStart.UNDISPATCHED) { flow.toList(received) }
+
+    @Test
+    fun watchWorkspaceColdChrootWithoutInstanceOrAuthorizationDoesNotMapHostOrFreezeExecution() = runTest {
+        val root = temporary.newFolder("workspace")
+        val profile = ContainerProfile.BUILTIN_ALPINE.copy(id = "uncreated-chroot", isBuiltin = false,
+            localRuntime = LocalContainerRuntime.CHROOT, chrootInstance = null)
+        val executionFactory = mockk<WorkspaceExecutionContextFactory>()
+        every { workspace.current } returns MutableStateFlow<Workspace?>(Workspace("workspace", root.path))
+        every { workspace.currentPath() } returns root.path
+        every { mapper.isChrootRuntime() } returns profile.isChroot
+        every { mapper.runtimeProfileState } returns MutableStateFlow(WorkspacePathMapper.RuntimeProfileState(profile, true, 1L))
+        every { mapper.toHostFile(any()) } throws LocalRuntimeAuthorizationRequired()
+        val hub = hub(executionFactory = executionFactory)
+        val errors = mutableListOf<LocalRuntimeAuthorizationRequired>()
+        val received = mutableListOf<FileChangeBatch>()
+        val beforeScans = scans
+        val beforeStarts = RecordingFileObserver.started.size
+        val collector = backgroundScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            try {
+                hub.watchWorkspace(filter = LOCAL_FILTER, batchWindowMs = 0).toList(received)
+            } catch (error: LocalRuntimeAuthorizationRequired) {
+                errors += error
+            }
+        }
+        runCurrent()
+        advanceTimeBy(6000)
+        runCurrent()
+        assertEquals(beforeScans, scans)
+        assertEquals(beforeStarts, RecordingFileObserver.started.size)
+        assertTrue(RecordingFileObserver.active.isEmpty())
+        assertTrue(received.isEmpty())
+        coVerify(exactly = 0) { executionFactory.freeze(any(), any(), any()) }
+        assertTrue("CHROOT workspace collection leaked authorization errors: $errors", errors.isEmpty())
+        assertTrue(collector.isActive)
+        verify(exactly = 0) { mapper.toHostFile(any()) }
+        collector.cancelAndJoin()
+    }
+
+    @Test
+    fun watchWorkspaceProotToChrootStopsObserverAndPollingWithoutEndingCollector() = runTest {
+        val root = temporary.newFolder("workspace")
+        var profile = ContainerProfile.BUILTIN_ALPINE
+        val changes = MutableStateFlow(0L)
+        val state = MutableStateFlow(WorkspacePathMapper.RuntimeProfileState(profile, true, 1L))
+        val executionFactory = mockk<WorkspaceExecutionContextFactory>()
+        every { workspace.current } returns MutableStateFlow<Workspace?>(Workspace("workspace", root.path))
+        every { workspace.currentPath() } returns root.path
+        every { mapper.isChrootRuntime() } answers { profile.isChroot }
+        every { mapper.runtimeProfileState } returns state
+        every { mapper.toHostFile(any()) } answers {
+            if (profile.isChroot) throw LocalRuntimeAuthorizationRequired()
+            root
+        }
+        val hub = hub(executionFactory = executionFactory, profileChanges = changes)
+        val errors = mutableListOf<LocalRuntimeAuthorizationRequired>()
+        val received = mutableListOf<FileChangeBatch>()
+        val collector = backgroundScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            try {
+                hub.watchWorkspace(filter = LOCAL_FILTER, batchWindowMs = 0).toList(received)
+            } catch (error: LocalRuntimeAuthorizationRequired) {
+                errors += error
+            }
+        }
+        runCurrent()
+        val old = RecordingFileObserver.active.getValue(root.path)
+        assertEquals(1, scans)
+        assertEquals(1, RecordingFileObserver.started.size)
+        val beforeScans = scans
+        val beforeStarts = RecordingFileObserver.started.size
+        profile = profile.copy(localRuntime = LocalContainerRuntime.CHROOT, chrootInstance = null)
+        state.value = WorkspacePathMapper.RuntimeProfileState(profile, true, state.value.epoch + 1)
+        changes.value++
+        runCurrent()
+        old.onEvent(FileObserver.CLOSE_WRITE, "late.txt")
+        snapshotEntries = mapOf("late-poll.txt" to "f:1:1")
+        advanceTimeBy(6000)
+        runCurrent()
+        assertEquals(beforeScans, scans)
+        assertEquals(beforeStarts, RecordingFileObserver.started.size)
+        assertEquals(listOf(old), RecordingFileObserver.stopped.map { it.second })
+        assertTrue(RecordingFileObserver.active.isEmpty())
+        assertTrue(received.isEmpty())
+        coVerify(exactly = 0) { executionFactory.freeze(any(), any(), any()) }
+        assertTrue("CHROOT switch leaked authorization errors: $errors", errors.isEmpty())
+        assertTrue(collector.isActive)
+        verify(exactly = 1) { mapper.toHostFile(any()) }
+        collector.cancelAndJoin()
+    }
+
+    @Test
+    fun watchWorkspaceWaitsForReadyAndRebuildsFromActualCachePublicationAfterSelectionChanges() = runTest {
+        val root = temporary.newFolder("workspace")
+        val state = workspaceState(root, ready = false)
+        val changes = MutableStateFlow(0L)
+        val hub = hub(profileChanges = changes)
+        val received = mutableListOf<FileChangeBatch>()
+        val collector = collect(hub.watchWorkspace(filter = LOCAL_FILTER, batchWindowMs = 0), received)
+        runCurrent()
+        advanceTimeBy(6000)
+        runCurrent()
+        assertEquals(0, scans)
+        assertTrue(RecordingFileObserver.started.isEmpty())
+        verify(exactly = 0) { mapper.toHostFile(any()) }
+        val chroot = ContainerProfile.BUILTIN_ALPINE.copy(localRuntime = LocalContainerRuntime.CHROOT, chrootInstance = null)
+        changes.value++
+        runCurrent()
+        state.publish(chroot)
+        runCurrent()
+        assertEquals(0, scans)
+        assertTrue(RecordingFileObserver.started.isEmpty())
+        verify(exactly = 0) { mapper.toHostFile(any()) }
+        changes.value++
+        runCurrent()
+        assertTrue(RecordingFileObserver.active.isEmpty())
+        state.publish(ContainerProfile.BUILTIN_ALPINE)
+        runCurrent()
+        assertEquals(1, scans)
+        assertEquals(1, RecordingFileObserver.started.size)
+        val old = RecordingFileObserver.active.getValue(root.path)
+        state.publish(chroot)
+        runCurrent()
+        val stoppedScans = scans
+        old.onEvent(FileObserver.CLOSE_WRITE, "stale.txt")
+        advanceTimeBy(6000)
+        runCurrent()
+        assertEquals(stoppedScans, scans)
+        assertTrue(RecordingFileObserver.active.isEmpty())
+        assertTrue(received.isEmpty())
+        changes.value++
+        runCurrent()
+        assertTrue(RecordingFileObserver.active.isEmpty())
+        state.publish(ContainerProfile.BUILTIN_ALPINE)
+        runCurrent()
+        val current = RecordingFileObserver.active.getValue(root.path)
+        assertNotSame(old, current)
+        current.onEvent(FileObserver.CLOSE_WRITE, "restored.txt")
+        runCurrent()
+        assertEquals(listOf("~/workspace/restored.txt"), received.flatMap { it.changes }.map { it.containerPath })
+        assertEquals(stoppedScans + 1, scans)
+        assertTrue(collector.isActive)
+        verify(exactly = 2) { mapper.toHostFile(any()) }
+        collector.cancelAndJoin()
+        runCurrent()
+        assertTrue(RecordingFileObserver.active.isEmpty())
+    }
+
+    @Test
+    fun watchWorkspaceSameIdChrootAbaEpochDropsEventsBeforeQueuedRebuildAndRestartsPolling() = runTest {
+        val root = temporary.newFolder("workspace")
+        val state = workspaceState(root)
+        val hub = hub()
+        val received = mutableListOf<FileChangeBatch>()
+        val collector = collect(hub.watchWorkspace(filter = LOCAL_FILTER, batchWindowMs = 300), received)
+        runCurrent()
+        val firstState = state.value
+        val old = RecordingFileObserver.active.getValue(root.path)
+        old.onEvent(FileObserver.CLOSE_WRITE, "queued-before-switch.txt")
+        runCurrent()
+        state.publish(firstState.profile.copy(localRuntime = LocalContainerRuntime.CHROOT, chrootInstance = null))
+        old.onEvent(FileObserver.CLOSE_WRITE, "after-cache-switch.txt")
+        old.onEvent(IN_IGNORED, null)
+        state.publish(firstState.profile)
+        assertEquals(firstState.profile, state.value.profile)
+        assertTrue(state.value.epoch > firstState.epoch)
+        runCurrent()
+        val current = RecordingFileObserver.active.getValue(root.path)
+        assertNotSame(old, current)
+        assertEquals(listOf(old), RecordingFileObserver.stopped.map { it.second })
+        old.onEvent(FileObserver.CLOSE_WRITE, "late-after-aba.txt")
+        advanceTimeBy(300)
+        runCurrent()
+        assertTrue(received.isEmpty())
+        current.onEvent(FileObserver.CLOSE_WRITE, "current.txt")
+        advanceTimeBy(300)
+        runCurrent()
+        assertEquals(listOf("~/workspace/current.txt"), received.flatMap { it.changes }.map { it.containerPath })
+        assertEquals(2, scans)
+        snapshotEntries = mapOf("fresh-poll.txt" to "f:1:1")
+        advanceTimeBy(2000)
+        runCurrent()
+        advanceTimeBy(300)
+        runCurrent()
+        assertEquals(3, scans)
+        assertEquals(listOf("~/workspace/current.txt", "~/workspace/fresh-poll.txt"),
+            received.flatMap { it.changes }.map { it.containerPath })
+        assertTrue(collector.isActive)
+        verify(exactly = 2) { mapper.toHostFile(any()) }
+        collector.cancelAndJoin()
+    }
+
+    @Test
+    fun watchWorkspaceSameIdProfileContentsRebuildWithoutSelectionSignal() = runTest {
+        val root = temporary.newFolder("workspace")
+        val state = workspaceState(root)
+        val hub = hub()
+        val collector = collect(hub.watchWorkspace(filter = LOCAL_FILTER, batchWindowMs = 0))
+        runCurrent()
+        val old = RecordingFileObserver.active.getValue(root.path)
+        val initial = state.value
+        state.publish(initial.profile.copy(env = mapOf("EDITOR" to "vim")))
+        runCurrent()
+        assertEquals(initial.profile.id, state.value.profile.id)
+        assertTrue(state.value.epoch > initial.epoch)
+        assertNotSame(old, RecordingFileObserver.active.getValue(root.path))
+        assertEquals(2, RecordingFileObserver.started.size)
+        assertEquals(listOf(old), RecordingFileObserver.stopped.map { it.second })
+        assertEquals(2, scans)
+        assertTrue(collector.isActive)
+        collector.cancelAndJoin()
+    }
+
+    @Test
+    fun watchWorkspaceTypedAuthorizationRaceKeepsOuterFlowAliveForProotRecovery() = runTest {
+        val root = temporary.newFolder("workspace")
+        val state = workspaceState(root)
+        val proot = state.value.profile
+        val executionFactory = mockk<WorkspaceExecutionContextFactory>()
+        var race = true
+        every { mapper.toHostFile(any()) } answers {
+            if (race) {
+                race = false
+                state.publish(proot.copy(localRuntime = LocalContainerRuntime.CHROOT, chrootInstance = null))
+                throw LocalRuntimeAuthorizationRequired()
+            }
+            root
+        }
+        val hub = hub(executionFactory = executionFactory)
+        val errors = mutableListOf<LocalRuntimeAuthorizationRequired>()
+        val received = mutableListOf<FileChangeBatch>()
+        val collector = backgroundScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            try {
+                hub.watchWorkspace(filter = LOCAL_FILTER, batchWindowMs = 0).toList(received)
+            } catch (error: LocalRuntimeAuthorizationRequired) {
+                errors += error
+            }
+        }
+        runCurrent()
+        assertTrue(errors.isEmpty())
+        assertTrue(collector.isActive)
+        assertEquals(0, scans)
+        assertTrue(RecordingFileObserver.started.isEmpty())
+        state.publish(proot)
+        runCurrent()
+        RecordingFileObserver.active.getValue(root.path).onEvent(FileObserver.CLOSE_WRITE, "recovered.txt")
+        runCurrent()
+        assertEquals(listOf("~/workspace/recovered.txt"), received.flatMap { it.changes }.map { it.containerPath })
+        assertEquals(1, scans)
+        verify(exactly = 2) { mapper.toHostFile(any()) }
+        coVerify(exactly = 0) { executionFactory.freeze(any(), any(), any()) }
+        collector.cancelAndJoin()
+    }
+
+    @Test
+    fun watchWorkspaceCacheChangeAfterHostMappingRejectsStaleAttachment() = runTest {
+        val root = temporary.newFolder("workspace")
+        val state = workspaceState(root)
+        val proot = state.value.profile
+        var race = true
+        every { mapper.toHostFile(any()) } answers {
+            if (race) {
+                race = false
+                state.publish(proot.copy(localRuntime = LocalContainerRuntime.CHROOT, chrootInstance = null))
+            }
+            root
+        }
+        val hub = hub()
+        val collector = collect(hub.watchWorkspace(filter = LOCAL_FILTER, batchWindowMs = 0))
+        runCurrent()
+        assertEquals(0, scans)
+        assertTrue(RecordingFileObserver.started.isEmpty())
+        assertTrue(collector.isActive)
+        state.publish(proot)
+        runCurrent()
+        assertEquals(1, scans)
+        assertEquals(1, RecordingFileObserver.started.size)
+        collector.cancelAndJoin()
+    }
+
+    @Test
+    fun watchWorkspaceCacheChangeBeforeQueuedIoStartDoesNotScanOrStartObserver() = runTest {
+        val root = temporary.newFolder("workspace")
+        val state = workspaceState(root)
+        val ioDispatcher = QueuedObserverDispatcher()
+        val hub = hub(ioDispatcher = ioDispatcher)
+        val collector = collect(hub.watchWorkspace(filter = LOCAL_FILTER, batchWindowMs = 0))
+        runCurrent()
+        assertEquals(1, ioDispatcher.size)
+        state.publish(state.value.profile.copy(localRuntime = LocalContainerRuntime.CHROOT, chrootInstance = null))
+        ioDispatcher.runAll()
+        runCurrent()
+        ioDispatcher.runAll()
+        runCurrent()
+        assertEquals(0, scans)
+        assertTrue(RecordingFileObserver.started.isEmpty())
+        assertTrue(collector.isActive)
+        collector.cancelAndJoin()
+    }
+
+    @Test
+    fun watchWorkspaceBackpressuredOldBatchCannotCrossSameIdAbaEpoch() = runTest {
+        val root = temporary.newFolder("workspace")
+        val state = workspaceState(root)
+        val proot = state.value.profile
+        val hub = hub()
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val received = mutableListOf<FileChangeBatch>()
+        val collector = backgroundScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            hub.watchWorkspace(filter = LOCAL_FILTER, batchWindowMs = 0).collect { batch ->
+                received += batch
+                if (received.size == 1) { entered.complete(Unit); release.await() }
+            }
+        }
+        runCurrent()
+        val old = RecordingFileObserver.active.getValue(root.path)
+        old.onEvent(FileObserver.CLOSE_WRITE, "first.txt")
+        entered.await()
+        old.onEvent(FileObserver.CLOSE_WRITE, "queued-old.txt")
+        runCurrent()
+        state.publish(proot.copy(localRuntime = LocalContainerRuntime.CHROOT, chrootInstance = null))
+        state.publish(proot)
+        release.complete(Unit)
+        runCurrent()
+        val current = RecordingFileObserver.active.getValue(root.path)
+        assertNotSame(old, current)
+        current.onEvent(FileObserver.CLOSE_WRITE, "current.txt")
+        runCurrent()
+        assertEquals(listOf("~/workspace/first.txt", "~/workspace/current.txt"),
+            received.flatMap { it.changes }.map { it.containerPath })
+        assertTrue(collector.isActive)
+        collector.cancelAndJoin()
+    }
+
+    @Test
+    fun watchAllKeepsPrivateAicodeObserverAndPollingWhenGuestWorkspaceBecomesChroot() = runTest {
+        val root = temporary.newFolder("workspace")
+        val global = temporary.newFolder("aicode")
+        val state = workspaceState(root)
+        every { installer.aicodeDir } returns global
+        val executionFactory = mockk<WorkspaceExecutionContextFactory>()
+        val hub = hub(executionFactory = executionFactory)
+        val received = mutableListOf<FileChangeBatch>()
+        val collector = collect(hub.watchAll(filter = LOCAL_FILTER, batchWindowMs = 0), received)
+        runCurrent()
+        val configObserver = RecordingFileObserver.active.getValue(global.path)
+        assertEquals(2, scans)
+        state.publish(state.value.profile.copy(localRuntime = LocalContainerRuntime.CHROOT, chrootInstance = null))
+        runCurrent()
+        assertEquals(setOf(global.path), RecordingFileObserver.active.keys)
+        assertSame(configObserver, RecordingFileObserver.active.getValue(global.path))
+        val beforeScans = scans
+        configObserver.onEvent(FileObserver.CLOSE_WRITE, "mcp.json")
+        runCurrent()
+        advanceTimeBy(4000)
+        runCurrent()
+        assertEquals(beforeScans + 2, scans)
+        assertEquals(listOf("/root/.aicode/mcp.json"), received.flatMap { it.changes }.map { it.containerPath })
+        assertEquals(listOf(ChangeRoot.AICODE), received.flatMap { it.changes }.map { it.root })
+        assertTrue(collector.isActive)
+        verify(exactly = 1) { mapper.toHostFile(any()) }
+        coVerify(exactly = 0) { executionFactory.freeze(any(), any(), any()) }
+        collector.cancelAndJoin()
+        runCurrent()
+        assertTrue(RecordingFileObserver.active.isEmpty())
+    }
+
+    @Test
+    fun explicitHostWatchWithContainerRootIsIndependentOfChrootGuestReadiness() = runTest {
+        val root = temporary.newFolder("workspace")
+        val host = temporary.newFolder("authorized-host")
+        val profile = ContainerProfile.BUILTIN_ALPINE.copy(localRuntime = LocalContainerRuntime.CHROOT, chrootInstance = null)
+        val state = workspaceState(root, profile)
+        val executionFactory = mockk<WorkspaceExecutionContextFactory>()
+        val hub = hub(executionFactory = executionFactory)
+        val guest = collect(hub.watchWorkspace(filter = LOCAL_FILTER, batchWindowMs = 0))
+        val received = mutableListOf<FileChangeBatch>()
+        val collector = collect(hub.watchHostDir(host, containerRootPath = "/explicit-host", filter = LOCAL_FILTER,
+            fallbackPoll = true, batchWindowMs = 0), received)
+        runCurrent()
+        val observer = RecordingFileObserver.active.getValue(host.path)
+        assertEquals(listOf(host.path), RecordingFileObserver.started.map { it.first })
+        assertEquals(1, scans)
+        state.publish(profile, ready = false)
+        runCurrent()
+        state.publish(profile)
+        runCurrent()
+        assertSame(observer, RecordingFileObserver.active.getValue(host.path))
+        observer.onEvent(FileObserver.CLOSE_WRITE, "kept.txt")
+        runCurrent()
+        advanceTimeBy(2000)
+        runCurrent()
+        assertEquals(2, scans)
+        assertEquals(listOf("/explicit-host/kept.txt"), received.flatMap { it.changes }.map { it.containerPath })
+        assertEquals(listOf(ChangeRoot.OTHER), received.flatMap { it.changes }.map { it.root })
+        verify(exactly = 0) { mapper.toHostFile(any()) }
+        verify(exactly = 0) { mapper.toContainerPath(any()) }
+        coVerify(exactly = 0) { executionFactory.freeze(any(), any(), any()) }
+        assertTrue(guest.isActive)
+        assertTrue(collector.isActive)
+        guest.cancelAndJoin()
+        collector.cancelAndJoin()
+    }
+
+    @Test
+    fun watchWorkspaceSshUsesFrozenRemoteSamplesWithoutWaitingForLocalProfileOrHostMapping() = runTest {
+        val root = temporary.newFolder("workspace")
+        val state = workspaceState(root, ready = false)
+        val mode = ExecutionModeHolder().apply { setMode(ExecutionMode.REMOTE_SSH) }
+        val access = mockk<FileAccessProvider>()
+        val execution = WorkspaceExecutionContext(ExecutionMode.REMOTE_SSH, "frozen-ssh", access, null, null) {}
+        val executionFactory = mockk<WorkspaceExecutionContextFactory>()
+        val remoteHub = mockk<RemoteFileWatchHub>()
+        val samples = listOf(FileChangeBatch(listOf(FileChange(ChangeRoot.OTHER, "/ssh/workspace/remote.txt",
+            "/ssh/workspace/remote.txt", ChangeKind.MODIFIED))), FileChangeBatch(emptyList(), truncated = true))
+        coEvery { executionFactory.freeze(any(), any(), any()) } returns execution
+        every { access.resolvePath(WorkspacePathMapper.CONTAINER_ROOT, true) } answers {
+            assertSame(execution, WorkspaceExecutionContext.current())
+            "/ssh/workspace"
+        }
+        every { remoteHub.watch(execution, "/ssh/workspace", true, LOCAL_FILTER) } returns flow {
+            samples.forEach { emit(it) }
+            awaitCancellation()
+        }
+        val hub = hub(executionFactory = executionFactory, modeHolder = mode, remoteHub = remoteHub)
+        val received = mutableListOf<FileChangeBatch>()
+        val collector = collect(hub.watchWorkspace(recursive = true, filter = LOCAL_FILTER, batchWindowMs = 0), received)
+        runCurrent()
+        assertFalse(state.value.ready)
+        assertEquals(samples, received)
+        assertEquals(0, scans)
+        assertTrue(RecordingFileObserver.started.isEmpty())
+        verify(exactly = 0) { mapper.toHostFile(any()) }
+        coVerify(exactly = 1) { executionFactory.freeze(any(), any(), any()) }
+        verify(exactly = 1) { remoteHub.watch(execution, "/ssh/workspace", true, LOCAL_FILTER) }
+        assertTrue(collector.isActive)
+        collector.cancelAndJoin()
+    }
+
+    @Test
+    fun staleQueuedWorkspaceStartDoesNotBlockNewSharedHostSubscriberBeforeOldSubscribersLeave() = runTest {
+        val root = temporary.newFolder("workspace")
+        val state = workspaceState(root)
+        val observerDispatcher = QueuedObserverDispatcher()
+        val hub = hub(mainDispatcher = observerDispatcher, ioDispatcher = UnconfinedTestDispatcher(testScheduler))
+        val first = collect(hub.watchWorkspace(filter = LOCAL_FILTER, fallbackPoll = false, batchWindowMs = 0))
+        val second = collect(hub.watchWorkspace(filter = LOCAL_FILTER, fallbackPoll = false, batchWindowMs = 0))
+        runCurrent()
+        assertEquals(1, observerDispatcher.size)
+        state.publish(state.value.profile.copy(localRuntime = LocalContainerRuntime.CHROOT, chrootInstance = null))
+        observerDispatcher.runNext()
+        assertEquals(0, observerDispatcher.size)
+        assertTrue(RecordingFileObserver.started.isEmpty())
+        val received = mutableListOf<FileChangeBatch>()
+        val host = backgroundScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            hub.watchHostDir(root, containerRootPath = "/explicit-host", filter = LOCAL_FILTER,
+                fallbackPoll = false, batchWindowMs = 0).toList(received)
+        }
+        assertEquals(1, observerDispatcher.size)
+        runCurrent()
+        observerDispatcher.runAll()
+        runCurrent()
+        assertEquals(1, RecordingFileObserver.started.size)
+        assertEquals(0, scans)
+        assertTrue(RecordingFileObserver.stopped.isEmpty())
+        val observer = RecordingFileObserver.active.getValue(root.path)
+        observer.onEvent(FileObserver.CLOSE_WRITE, "shared-host.txt")
+        runCurrent()
+        assertEquals(listOf("/explicit-host/shared-host.txt"), received.flatMap { it.changes }.map { it.containerPath })
+        assertTrue(first.isActive)
+        assertTrue(second.isActive)
+        first.cancelAndJoin()
+        second.cancelAndJoin()
+        host.cancelAndJoin()
+        observerDispatcher.runAll()
+        assertEquals(1, RecordingFileObserver.stopped.size)
+        assertTrue(RecordingFileObserver.active.isEmpty())
+        assertEquals(0, observerDispatcher.size)
+    }
+
+    @Test
+    fun exitingWorkspaceStartCannotBeReusedBeforeChildCompletionOrClearTheReplacementStart() = runTest {
+        val root = temporary.newFolder("workspace")
+        val state = workspaceState(root)
+        val observerDispatcher = QueuedObserverDispatcher()
+        val hub = hub(mainDispatcher = observerDispatcher, ioDispatcher = UnconfinedTestDispatcher(testScheduler))
+        val first = collect(hub.watchWorkspace(filter = LOCAL_FILTER, fallbackPoll = false, batchWindowMs = 0))
+        val second = collect(hub.watchWorkspace(filter = LOCAL_FILTER, fallbackPoll = false, batchWindowMs = 0))
+        runCurrent()
+        assertEquals(1, observerDispatcher.size)
+        val observerScope = FileChangeHub::class.java.getDeclaredField("mainScope").apply { isAccessible = true }.get(hub) as CoroutineScope
+        val oldStart = observerScope.coroutineContext[Job]!!.children.single()
+        val completionBarrier = Job(oldStart)
+        val firstReceived = mutableListOf<FileChangeBatch>()
+        val secondReceived = mutableListOf<FileChangeBatch>()
+        var firstHost: Job? = null
+        var secondHost: Job? = null
+        try {
+            state.publish(state.value.profile.copy(localRuntime = LocalContainerRuntime.CHROOT, chrootInstance = null))
+            observerDispatcher.runNext()
+            assertFalse(oldStart.isCompleted)
+            assertTrue(completionBarrier.isActive)
+            assertTrue(RecordingFileObserver.started.isEmpty())
+            firstHost = backgroundScope.launch(start = CoroutineStart.UNDISPATCHED) {
+                hub.watchHostDir(root, containerRootPath = "/first-host", filter = LOCAL_FILTER,
+                    fallbackPoll = false, batchWindowMs = 0).toList(firstReceived)
+            }
+            assertEquals(1, observerDispatcher.size)
+            completionBarrier.complete()
+            assertTrue(oldStart.isCompleted)
+            secondHost = backgroundScope.launch(start = CoroutineStart.UNDISPATCHED) {
+                hub.watchHostDir(root, containerRootPath = "/second-host", filter = LOCAL_FILTER,
+                    fallbackPoll = false, batchWindowMs = 0).toList(secondReceived)
+            }
+            assertEquals(1, observerDispatcher.size)
+            runCurrent()
+            observerDispatcher.runAll()
+            runCurrent()
+            assertEquals(1, RecordingFileObserver.started.size)
+            assertEquals(0, scans)
+            assertTrue(RecordingFileObserver.stopped.isEmpty())
+            RecordingFileObserver.active.getValue(root.path).onEvent(FileObserver.CLOSE_WRITE, "tail-window.txt")
+            runCurrent()
+            assertEquals(listOf("/first-host/tail-window.txt"), firstReceived.flatMap { it.changes }.map { it.containerPath })
+            assertEquals(listOf("/second-host/tail-window.txt"), secondReceived.flatMap { it.changes }.map { it.containerPath })
+            assertTrue(first.isActive)
+            assertTrue(second.isActive)
+        } finally {
+            completionBarrier.cancel()
+            first.cancelAndJoin()
+            second.cancelAndJoin()
+            firstHost?.cancelAndJoin()
+            secondHost?.cancelAndJoin()
+            observerDispatcher.runAll()
+        }
+        assertEquals(1, RecordingFileObserver.stopped.size)
+        assertTrue(RecordingFileObserver.active.isEmpty())
+        assertEquals(0, observerDispatcher.size)
+    }
+
+    @Test
+    fun watchWorkspaceUsesActualMapperPublicationsForColdChrootAndDelayedProotRecovery() = runTest {
+        val root = temporary.newFolder("workspace")
+        val rootfs = temporary.newFolder("rootfs")
+        val settings = mockk<ContainerSettingsRepository>()
+        val home = mockk<PathHomeResolver>()
+        val executionFactory = mockk<WorkspaceExecutionContextFactory>()
+        val chroot = ContainerProfile.BUILTIN_ALPINE.copy(id = "cold-chroot", isBuiltin = false,
+            localRuntime = LocalContainerRuntime.CHROOT, chrootInstance = null)
+        val profiles = MutableStateFlow(listOf(chroot))
+        val selectionChanges = MutableStateFlow(0L)
+        val release = CompletableDeferred<Unit>()
+        every { workspace.current } returns MutableStateFlow<Workspace?>(Workspace("workspace", root.path))
+        every { workspace.currentPath() } returns root.path
+        every { settings.activeProfileIdFlow } returns flow { release.await(); emit(chroot.id) }
+        every { settings.customProfilesFlow } returns profiles
+        every { installer.rootfsDirFor(any()) } returns rootfs
+        every { home.home() } returns "/root"
+        every { home.expandHome(any()) } answers {
+            firstArg<String>().let { if (it == "~") "/root" else if (it.startsWith("~/")) "/root" + it.removePrefix("~") else it }
+        }
+        val actualMapper = WorkspacePathMapper(workspace, installer, settings, home)
+        suspend fun awaitProfile(profile: ContainerProfile) = withContext(Dispatchers.IO) {
+            withTimeout(5_000) { actualMapper.runtimeProfileState.first { it.ready && it.profile == profile } }
+        }
+        val hub = hub(executionFactory = executionFactory, profileChanges = selectionChanges, pathMapper = actualMapper)
+        val received = mutableListOf<FileChangeBatch>()
+        val collector = collect(hub.watchWorkspace(filter = LOCAL_FILTER, fallbackPoll = false, batchWindowMs = 0), received)
+        runCurrent()
+        advanceTimeBy(6000)
+        runCurrent()
+        assertFalse(actualMapper.runtimeProfileState.value.ready)
+        assertEquals(0, scans)
+        assertTrue(RecordingFileObserver.started.isEmpty())
+        release.complete(Unit)
+        val cold = awaitProfile(chroot)
+        runCurrent()
+        assertEquals(0, scans)
+        assertTrue(RecordingFileObserver.started.isEmpty())
+        assertThrows(LocalRuntimeAuthorizationRequired::class.java) { actualMapper.toHostFile("~/workspace") }
+        verify(exactly = 0) { installer.rootfsDirFor(any()) }
+        val proot = chroot.copy(localRuntime = LocalContainerRuntime.PROOT)
+        selectionChanges.value++
+        runCurrent()
+        assertTrue(RecordingFileObserver.active.isEmpty())
+        profiles.value = listOf(proot)
+        val firstProot = awaitProfile(proot)
+        runCurrent()
+        val old = RecordingFileObserver.active.getValue(root.path)
+        assertTrue(firstProot.epoch > cold.epoch)
+        assertEquals(1, RecordingFileObserver.started.size)
+        assertEquals(0, scans)
+        profiles.value = listOf(chroot)
+        val stopped = awaitProfile(chroot)
+        runCurrent()
+        assertTrue(RecordingFileObserver.active.isEmpty())
+        old.onEvent(FileObserver.CLOSE_WRITE, "stale.txt")
+        advanceTimeBy(6000)
+        runCurrent()
+        assertEquals(0, scans)
+        assertTrue(received.isEmpty())
+        profiles.value = listOf(proot)
+        val restored = awaitProfile(proot)
+        runCurrent()
+        assertTrue(restored.epoch > stopped.epoch)
+        val current = RecordingFileObserver.active.getValue(root.path)
+        assertNotSame(old, current)
+        current.onEvent(FileObserver.CLOSE_WRITE, "actual-cache-restored.txt")
+        runCurrent()
+        assertEquals(2, RecordingFileObserver.started.size)
+        assertEquals(0, scans)
+        assertEquals(listOf("~/workspace/actual-cache-restored.txt"), received.flatMap { it.changes }.map { it.containerPath })
+        assertTrue(collector.isActive)
+        coVerify(exactly = 0) { executionFactory.freeze(any(), any(), any()) }
+        collector.cancelAndJoin()
+    }
+
+    private fun workspaceState(root: File, profile: ContainerProfile = ContainerProfile.BUILTIN_ALPINE,
+        ready: Boolean = true): MutableStateFlow<WorkspacePathMapper.RuntimeProfileState> {
+        val state = MutableStateFlow(WorkspacePathMapper.RuntimeProfileState(profile, ready, if (ready) 1L else 0L))
+        every { workspace.current } returns MutableStateFlow<Workspace?>(Workspace("workspace", root.path))
+        every { workspace.currentPath() } returns root.path
+        every { mapper.runtimeProfileState } returns state
+        every { mapper.isChrootRuntime() } answers { state.value.profile.isChroot }
+        every { mapper.toHostFile(any()) } answers {
+            if (state.value.profile.isChroot) throw LocalRuntimeAuthorizationRequired()
+            root
+        }
+        return state
+    }
+
+    private fun MutableStateFlow<WorkspacePathMapper.RuntimeProfileState>.publish(profile: ContainerProfile, ready: Boolean = true) {
+        value = WorkspacePathMapper.RuntimeProfileState(profile, ready, value.epoch + 1)
+    }
 
     @Test
     fun uncollectedFlowDoesNoFilesystemOrObserverWork() = runTest {

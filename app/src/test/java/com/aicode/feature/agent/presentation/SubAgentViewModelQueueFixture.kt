@@ -2,6 +2,7 @@ package com.aicode.feature.agent.presentation
 
 import android.content.Context
 import androidx.lifecycle.ViewModelStore
+import com.aicode.core.watch.FileChangeHub
 import com.aicode.feature.agent.data.local.dao.AgentMessageDao
 import com.aicode.feature.agent.data.local.dao.ChatSessionDao
 import com.aicode.feature.agent.data.local.entity.ChatSessionEntity
@@ -10,6 +11,7 @@ import com.aicode.feature.agent.domain.command.SlashCommandRegistry
 import com.aicode.feature.agent.domain.container.ContainerInitState
 import com.aicode.feature.agent.domain.container.ContainerOsDetector
 import com.aicode.feature.agent.domain.container.LinuxContainerEngine
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwner
 import com.aicode.feature.agent.domain.memory.ProjectMemoryCapture
 import com.aicode.feature.agent.domain.memory.ProjectMemoryIdentity
 import com.aicode.feature.agent.domain.memory.ProjectMemoryIdentityResolver
@@ -51,6 +53,7 @@ import com.aicode.feature.settings.data.repository.RootAccessSettingsRepository
 import com.aicode.feature.settings.data.repository.StartupSessionMode
 import com.aicode.feature.terminal.domain.TerminalSessionProvider
 import com.aicode.feature.workspace.domain.FileAccessProvider
+import com.aicode.feature.workspace.domain.LocalFolderSnapshot
 import com.aicode.feature.workspace.domain.WorkspaceExecutionContext
 import com.aicode.feature.workspace.domain.WorkspaceExecutionContextFactory
 import io.mockk.coEvery
@@ -110,10 +113,14 @@ internal class SubAgentViewModelQueueFixture(
     val executionModeHolder = ExecutionModeHolder()
     val browseFileAccess = mockk<FileAccessProvider>(relaxed = true)
     val executionFactory = mockk<WorkspaceExecutionContextFactory>()
+    val fileChangeHub = mockk<FileChangeHub>(relaxed = true)
+    val localFolderSnapshots = MutableStateFlow(LocalFolderSnapshot.EMPTY)
+    private val localFolderRevisions = MutableStateFlow(0L)
     val permissions = permissionManager ?: mockk<ToolPermissionManager>(relaxed = true)
     val terminalEvents = MutableSharedFlow<com.aicode.feature.terminal.domain.TabFinishedEvent>()
     private val container = mockk<LinuxContainerEngine>(relaxed = true)
     private val containerSettings = mockk<ContainerSettingsRepository>(relaxed = true)
+    private val containerConfigurationRevisions = MutableStateFlow(0L)
     private val osDetector = mockk<ContainerOsDetector>(relaxed = true)
     private val rootSettings = mockk<RootAccessSettingsRepository>(relaxed = true)
     private val approvalSettings = mockk<ApprovalNotificationSettingsRepository>(relaxed = true)
@@ -214,14 +221,24 @@ internal class SubAgentViewModelQueueFixture(
         every { containerSettings.activeProfileIdFlow } returns flowOf("test")
         every { containerSettings.activeProfileSelectionRevision } returns 0L
         every { containerSettings.activeProfileSelectionRevisions } returns MutableStateFlow(0L)
-        every { localFolders.snapshots } returns MutableStateFlow(com.aicode.feature.workspace.domain.LocalFolderSnapshot.EMPTY)
-        every { localFolders.revision } returns MutableStateFlow(0L)
-        every { localFolders.snapshot() } returns com.aicode.feature.workspace.domain.LocalFolderSnapshot.EMPTY
+        every { containerSettings.profileConfigurationRevision } answers { containerConfigurationRevisions.value }
+        every { containerSettings.profileConfigurationRevisions } returns containerConfigurationRevisions
+        every { localFolders.snapshots } returns localFolderSnapshots
+        every { localFolders.revision } returns localFolderRevisions
+        every { localFolders.snapshot() } answers { localFolderSnapshots.value }
         every { browseFileAccess.cacheIdentity() } returns "queue-fixture"
-        coEvery { executionFactory.freeze(any()) } coAnswers {
+        coEvery { executionFactory.freeze(any(), any(), any()) } coAnswers {
+            firstArg<ProjectMemoryCapture?>()?.assertCurrent()
+            val owner = secondArg<RuntimeOwner?>()
+            val checkSource = thirdArg<(() -> Unit)?>()
             val mode = executionModeHolder.currentMode()
-            WorkspaceExecutionContext(mode, "queue-fixture", browseFileAccess, null, null) {
-                if (executionModeHolder.currentMode() != mode) throw kotlinx.coroutines.CancellationException("Fixture source changed")
+            val modeRevision = executionModeHolder.modeSelectionRevision
+            checkSource?.invoke()
+            WorkspaceExecutionContext(mode, "queue-fixture", browseFileAccess, null, null, runtimeOwner = owner) {
+                checkSource?.invoke()
+                if (executionModeHolder.currentMode() != mode || executionModeHolder.modeSelectionRevision != modeRevision) {
+                    throw kotlinx.coroutines.CancellationException("Fixture source changed")
+                }
             }
         }
         every { osDetector.osMap } returns MutableStateFlow(emptyMap())
@@ -345,7 +362,7 @@ internal class SubAgentViewModelQueueFixture(
         browserManager = mockk(relaxed = true),
         previewPathMapper = mockk(relaxed = true),
         toolPreviewFileAccessAdapter = previewFileAccess,
-        fileChangeHub = mockk(relaxed = true),
+        fileChangeHub = fileChangeHub,
         executionModeHolder = executionModeHolder,
         workspaceExecutionContextFactory = executionFactory,
         localFolderGrants = localFolders,
@@ -356,6 +373,11 @@ internal class SubAgentViewModelQueueFixture(
         context = context,
         agentRunManager = manager
     )
+
+    fun setLocalFolderSnapshot(snapshot: LocalFolderSnapshot) {
+        localFolderRevisions.value = snapshot.revision
+        localFolderSnapshots.value = snapshot
+    }
 
     fun createUiOwner(): UiOwner {
         check(processClose == null)

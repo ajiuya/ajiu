@@ -3,6 +3,7 @@ package com.aicode.feature.plugin.runtime
 import com.aicode.feature.agent.domain.container.ContainerInstaller
 import com.aicode.feature.agent.domain.container.ContainerProfile
 import com.aicode.feature.agent.domain.container.LinuxContainerEngine
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeCommands
 import com.aicode.feature.plugin.domain.PluginCapture
 import com.aicode.feature.plugin.domain.PluginManager
 import com.aicode.feature.plugin.domain.PluginRuntime
@@ -44,8 +45,9 @@ class PluginRuntimeManager internal constructor(
         pluginManager: PluginManager,
         installer: ContainerInstaller,
         engine: LinuxContainerEngine,
-        containerSettingsRepository: ContainerSettingsRepository
-    ) : this(pluginManager, LocalPluginProcessFactory(installer, engine, containerSettingsRepository))
+        containerSettingsRepository: ContainerSettingsRepository,
+        runtimeCommands: LocalRuntimeCommands
+    ) : this(pluginManager, LocalPluginProcessFactory(installer, engine, containerSettingsRepository, runtimeCommands))
 
     private data class Identity(val id: String, val revision: String, val hash: String, val epoch: Long)
     private class Lane(val mutex: Mutex = Mutex(), var users: Int = 0)
@@ -111,6 +113,10 @@ class PluginRuntimeManager internal constructor(
         withLane(capture.id) {
             capture.checkCurrent()
             context.checkCurrent()
+            if (context.runtimeOwner?.kind != com.aicode.feature.agent.domain.container.runtime.RuntimeOwnerKind.PLUGIN ||
+                context.sourceIdentity == null) {
+                throw PluginProcessException("PLUGIN_CONTEXT_REQUIRED", "A plugin execution source owner is required")
+            }
             if (runtime != capture.content.runtime || runtime.pluginId != capture.id || runtime.installDir != capture.installDir) {
                 throw PluginProcessException("PLUGIN_CAPTURE_MISMATCH", "Plugin runtime does not belong to the capture")
             }
@@ -130,7 +136,11 @@ class PluginRuntimeManager internal constructor(
                 entry = null
             }
             if (entry == null) {
-                val profile = processFactory.captureProfile()
+                val profile = context.runtimeProfile ?: processFactory.captureProfile()
+                if (profile.isChroot && (context.workspacePath.isBlank() || context.runtimeOwner?.kind != com.aicode.feature.agent.domain.container.runtime.RuntimeOwnerKind.PLUGIN ||
+                        context.sourceIdentity == null || context.localRuntimeCapture == null)) {
+                    throw PluginProcessException("PLUGIN_CONTEXT_REQUIRED", "A captured plugin workspace runtime authorization is required")
+                }
                 capture.checkCurrent()
                 context.checkCurrent()
                 val data = pluginManager.dataDirectory(capture.id)
@@ -144,7 +154,8 @@ class PluginRuntimeManager internal constructor(
                         if (it.tool == "pip") put("PYTHONPATH", processFactory.containerPath(File(dependencyDir, "python")))
                     }
                 }
-                val launch = PluginLocalLaunch(profile, processFactory.containerPath(executionDirectory), runtime.command.toList(), environment)
+                val launch = PluginLocalLaunch(profile, processFactory.containerPath(executionDirectory), runtime.command.toList(), environment,
+                    context.runtimeOwner, context.localRuntimeCapture, context.checkCurrent)
                 val created = reserve(identity, context.authorityIdentity, runtime.resident) {
                     capture.checkActive()
                     context.checkCurrent()
@@ -366,7 +377,8 @@ class PluginRuntimeManager internal constructor(
 internal class LocalPluginProcessFactory(
     private val installer: ContainerInstaller,
     private val engine: LinuxContainerEngine,
-    private val settings: ContainerSettingsRepository
+    private val settings: ContainerSettingsRepository,
+    private val runtimeCommands: LocalRuntimeCommands
 ) : PluginRuntimeProcessFactory {
     override suspend fun captureProfile(): ContainerProfile {
         val selected = settings.activeProfileFlow.first()
@@ -389,11 +401,23 @@ internal class LocalPluginProcessFactory(
         return "/root/.aicode" + if (relative.isEmpty()) "" else "/$relative"
     }
 
-    override fun start(launch: PluginLocalLaunch): Process = engine.startStdioProcess(
-        program = "/bin/sh",
-        programArgs = launch.launcherArguments(),
-        projectPath = null,
-        extraEnv = launch.environment,
-        profile = launch.profile
-    )
+    override suspend fun start(launch: PluginLocalLaunch): Process {
+        launch.checkSource()
+        if (launch.profile.isChroot) {
+            val capture = launch.localRuntimeCapture
+                ?: throw PluginProcessException("PLUGIN_CONTEXT_REQUIRED", "A captured plugin workspace runtime authorization is required")
+            if (capture.owner.kind != com.aicode.feature.agent.domain.container.runtime.RuntimeOwnerKind.PLUGIN ||
+                capture.owner != launch.runtimeOwner || capture.profileId != launch.profile.id) {
+                throw PluginProcessException("PLUGIN_CAPTURE_MISMATCH", "Plugin runtime capture belongs to another source")
+            }
+            return runtimeCommands.startStdio(capture, "/bin/sh", launch.launcherArguments(), extraEnv = launch.environment)
+        }
+        return engine.startStdioProcess(
+            program = "/bin/sh",
+            programArgs = launch.launcherArguments(),
+            projectPath = null,
+            extraEnv = launch.environment,
+            profile = launch.profile
+        )
+    }
 }

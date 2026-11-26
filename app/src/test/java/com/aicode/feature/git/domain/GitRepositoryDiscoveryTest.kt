@@ -44,7 +44,7 @@ class GitRepositoryDiscoveryTest {
         coEvery { engine.runCommandSyncUnbounded(any(), any(), any()) } answers {
             CommandResult(if (secondArg<String>() == nonRepo.absolutePath) "false\n" else "true\n", 0)
         }
-        repo = GitRepository(engine, workspace, holder)
+        repo = gitRepositoryForTest(engine, workspace, holder, root.absolutePath)
     }
 
     @Test

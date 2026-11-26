@@ -1,9 +1,11 @@
 package com.aicode.feature.workspace.domain
 
 import com.aicode.feature.settings.data.repository.ExecutionMode
+import com.aicode.feature.workspace.domain.chroot.ChrootFileAccess
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.InternalCoroutinesApi
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.runBlocking
 import java.io.File
@@ -34,9 +36,16 @@ internal class WorkspaceRootRead @Inject constructor(
             }
         } else when (execution.mode) {
             ExecutionMode.LOCAL_PROOT -> {
-                val root = pathMapper.resolveFile(rootPath).canonicalFile
-                if (root.parentFile == null || !root.isDirectory) throw IOException("Readable directory root required")
-                RootRead(rootPath, execution, ownerContext, pathMapper, remoteAccess, root, null)
+                val guest = execution.fileAccess as? ChrootFileAccess
+                if (guest != null) {
+                    RootRead(rootPath, execution, ownerContext, pathMapper, remoteAccess, null, null,
+                        guestRoot = guest.captureReadRoot(rootPath))
+                } else {
+                    if (execution.localRuntimeCapture != null) throw IOException("Captured chroot file backend required")
+                    val root = pathMapper.resolveFile(rootPath).canonicalFile
+                    if (root.parentFile == null || !root.isDirectory) throw IOException("Readable directory root required")
+                    RootRead(rootPath, execution, ownerContext, pathMapper, remoteAccess, root, null)
+                }
             }
             ExecutionMode.REMOTE_SSH -> RootRead(
                 rootPath, execution, ownerContext, pathMapper, remoteAccess, null,
@@ -56,10 +65,13 @@ internal class RootRead internal constructor(
     private val remoteRoot: RemoteSftpFileAccess.ReadRoot?,
     private val hostAccess: InternalLocalFolderAccess? = null,
     private val captureOwner: Job = requireNotNull(ownerContext[Job]),
+    private val guestRoot: ChrootFileAccess.BoundedReadRoot? = null,
 ) {
-    fun forOperation(context: CoroutineContext): RootRead = RootRead(
-        rootPath, execution, context, pathMapper, remoteAccess, localRoot, remoteRoot, hostAccess, captureOwner,
-    )
+    fun forOperation(context: CoroutineContext): RootRead = inContext {
+        requireNotNull(context[Job]).ensureActive()
+        RootRead(rootPath, execution, context, pathMapper, remoteAccess, localRoot, remoteRoot, hostAccess,
+            captureOwner, guestRoot)
+    }
 
     private fun <T> inContext(block: () -> T): T =
         runBlocking(ownerContext + execution.ownedBlockingContext(requireNotNull(ownerContext[Job])) + Dispatchers.IO) {
@@ -82,6 +94,8 @@ internal class RootRead internal constructor(
 
     fun checkCurrent() = inContext {
         if (localRoot != null) checkLocalRoot()
+        guestRoot?.checkCurrent()
+        Unit
     }
 
     private fun resolveLocal(path: String): File =
@@ -117,12 +131,36 @@ internal class RootRead internal constructor(
     }
 
     fun size(path: String): Long = inContext {
-        localRoot?.let { localTarget(path).length() }
+        guestRoot?.size(path) ?: localRoot?.let { localTarget(path).length() }
             ?: remoteAccess.rootReadSize(path, requireNotNull(remoteRoot))
     }
 
+    @OptIn(InternalCoroutinesApi::class)
+    private fun protectCaptureOwner(input: InputStream): InputStream {
+        val checked = identityCheckedRead(input) { captureOwner.ensureActive() }
+        val cancellation = captureOwner.invokeOnCompletion(onCancelling = true, invokeImmediately = true) { cause ->
+            if (cause is CancellationException) runCatching { checked.close() }
+        }
+        return object : InputStream() {
+            private fun readChecked(read: () -> Int): Int = try {
+                read().also { if (it < 0) close() }
+            } catch (failure: Throwable) {
+                runCatching { close() }.exceptionOrNull()?.let(failure::addSuppressed)
+                throw failure
+            }
+            override fun read(): Int = readChecked { checked.read() }
+            override fun read(b: ByteArray, off: Int, len: Int): Int = readChecked { checked.read(b, off, len) }
+            override fun close() {
+                cancellation.dispose()
+                checked.close()
+            }
+        }
+    }
+
     fun openRead(path: String, maxBytes: Long): InputStream = inContext {
-        if (localRoot == null) {
+        val result = if (guestRoot != null) {
+            execution.protectRead(identityCheckedRead(guestRoot.openRead(path, maxBytes)) { inContext {} })
+        } else if (localRoot == null) {
             remoteAccess.openRootRead(path, requireNotNull(remoteRoot), maxBytes)
         } else {
             val target = localTarget(path)
@@ -157,5 +195,6 @@ internal class RootRead internal constructor(
                 throw failure
             }
         }
+        protectCaptureOwner(result)
     }
 }

@@ -7,11 +7,13 @@ import com.aicode.feature.workspace.data.repository.WorkspaceRepository
 import com.aicode.feature.workspace.domain.LocalFileAccess
 import com.aicode.feature.workspace.domain.PathHomeResolver
 import com.aicode.feature.workspace.domain.WorkspacePathMapper
+import com.aicode.feature.workspace.domain.model.Workspace
 import io.mockk.every
 import io.mockk.mockk
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.runBlocking
@@ -32,14 +34,18 @@ class PlayerLocalFileAccessTest {
         val rootfs = temporary.newFolder("rootfs")
         val config = temporary.newFolder("config")
         val repository = mockk<WorkspaceRepository>()
+        val selection = MutableStateFlow(WorkspaceRepository.Selection(Workspace(workspace.name, workspace.absolutePath)))
         val installer = mockk<ContainerInstaller>()
         val settings = mockk<ContainerSettingsRepository>()
         val home = mockk<PathHomeResolver>()
         val initialized = CompletableDeferred<Job>()
-        every { repository.currentPath() } returns workspace.absolutePath
+        every { repository.currentPath() } answers { checkNotNull(selection.value.workspace).path }
+        every { repository.selection } returns selection
         every { installer.rootfsDirFor(any()) } returns rootfs
         every { installer.aicodeDir } returns config
         every { settings.customProfilesFlow } returns flowOf(listOf(ContainerProfile.BUILTIN_ALPINE))
+        every { settings.activeProfileSelectionRevision } returns 0L
+        every { settings.profileConfigurationRevision } returns 0L
         every { settings.activeProfileIdFlow } returns flow {
             emit(ContainerProfile.BUILTIN_ID)
             initialized.complete(currentCoroutineContext()[Job]!!)

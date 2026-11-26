@@ -55,6 +55,8 @@ class WorkspacePathMapperTest {
         every { containerInstaller.aicodeDir } returns File(aicodeDir)
         every { containerInstaller.rootfsDirFor(any()) } returns File(rootfsDir)
         val mapperInitialized = CompletableDeferred<Job>()
+        every { containerSettingsRepository.profileConfigurationRevision } returns 0L
+        every { containerSettingsRepository.activeProfileSelectionRevision } returns 0L
         every { containerSettingsRepository.customProfilesFlow } returns flowOf(listOf(ContainerProfile.BUILTIN_ALPINE))
         every { containerSettingsRepository.activeProfileIdFlow } returns flow {
             emit(ContainerProfile.BUILTIN_ID)

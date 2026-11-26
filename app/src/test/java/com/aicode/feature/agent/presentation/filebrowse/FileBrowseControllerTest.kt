@@ -6,6 +6,7 @@ import com.aicode.feature.agent.presentation.BrowseOperationNotice
 import com.aicode.feature.agent.presentation.FileBrowseState
 import com.aicode.feature.agent.presentation.FileTreeNode
 import com.aicode.feature.agent.presentation.FileTreeRoot
+import com.aicode.feature.settings.data.repository.ContainerProfileSnapshot
 import com.aicode.feature.settings.data.repository.ContainerSettingsRepository
 import com.aicode.feature.settings.data.repository.ExecutionMode
 import com.aicode.feature.settings.data.repository.ExecutionModeHolder
@@ -1028,6 +1029,8 @@ class FileBrowseControllerTest {
         val holder = ExecutionModeHolder()
         val profile = MutableStateFlow("profile-one")
         val selectionRevisions = MutableStateFlow(0L)
+        private val configurationRevisions = MutableStateFlow(0L)
+        private val settingsIdentity = Any()
         val localFolderSnapshots = MutableStateFlow(LocalFolderSnapshot.EMPTY)
         var profileName = "Linux"
         var extraBindings = emptyList<String>()
@@ -1078,12 +1081,31 @@ class FileBrowseControllerTest {
             every { settings.activeProfileIdFlow } returns profile
             every { settings.activeProfileSelectionRevision } answers { selectionRevisions.value }
             every { settings.activeProfileSelectionRevisions } returns selectionRevisions
+            every { settings.profileConfigurationRevision } answers { configurationRevisions.value }
+            every { settings.profileConfigurationRevisions } returns configurationRevisions
+            coEvery { settings.captureProfileSnapshot() } coAnswers {
+                ContainerProfileSnapshot(profile.value, profile.value, listOf(currentProfile()),
+                    selectionRevisions.value, configurationRevisions.value, settingsIdentity)
+            }
+            every { settings.checkProfileSnapshot(any()) } answers {
+                val snapshot = firstArg<ContainerProfileSnapshot>()
+                if (snapshot.repositoryIdentity !== settingsIdentity || snapshot.selectedProfileId != profile.value ||
+                    snapshot.selectionRevision != selectionRevisions.value || snapshot.configurationRevision != configurationRevisions.value ||
+                    snapshot.profiles != listOf(currentProfile())) {
+                    throw CancellationException("Container profile configuration changed")
+                }
+            }
             every { grants.snapshot() } answers { localFolderSnapshots.value }
             every { grants.snapshots } returns localFolderSnapshots
             coEvery { grants.awaitReady() } returns Unit
-            every { local.captureExecutionMapping() } answers {
+            every { local.captureExecutionMapping(any()) } answers {
                 onCapture()
-                mapping()
+                mapping(firstArg())
+            }
+            every { local.checkExecutionMapping(any()) } answers {
+                if (firstArg<WorkspacePathMapper.ExecutionMapping>() != mapping()) {
+                    throw CancellationException("Local workspace execution mapping changed")
+                }
             }
             every { local.cacheIdentity() } answers { "local:$workspace:${profile.value}" }
             every { remote.cacheIdentity() } answers { "remote:$workspace:${remoteIdentity.generation}" }
@@ -1230,9 +1252,14 @@ class FileBrowseControllerTest {
             val checkScope: () -> Unit,
             val onConfirm: () -> TransferResult
         )
-        private fun mapping() = WorkspacePathMapper.ExecutionMapping(
-            ContainerProfile.BUILTIN_ALPINE.copy(id = profile.value, name = profileName, extraBindings = extraBindings), File(workspace),
-            File("/rootfs/${profile.value}"), File("/config"), "/root"
+        private fun currentProfile() = ContainerProfile.BUILTIN_ALPINE.copy(
+            id = profile.value, name = profileName, extraBindings = extraBindings.toList()
+        )
+        private fun mapping(snapshot: ContainerProfileSnapshot? = null) = WorkspacePathMapper.ExecutionMapping(
+            snapshot?.activeProfile ?: currentProfile(), File(workspace),
+            File("/rootfs/${snapshot?.activeProfile?.id ?: profile.value}"), File("/config"), "/root",
+            configurationRevision = snapshot?.configurationRevision ?: configurationRevisions.value,
+            selectionRevision = snapshot?.selectionRevision ?: selectionRevisions.value
         )
         fun subscribe() {
             collection = test.backgroundScope.launch { controller.state.collect {} }

@@ -124,6 +124,60 @@ class FileUploadInputsTest {
     }
 
     @Test
+    fun contentDocumentReaderStreamsMultipleBoundedBlocksAndChecksEveryReadBeforeAndAfter() {
+        val uri = uri()
+        val bytes = ByteArray(TRANSFER_BUFFER_BYTES * 4 + 7) { (it % 97).toByte() }
+        metadata(uri, "file", bytes.size.toLong())
+        var checks = 0
+        var closed = 0
+        val requested = mutableListOf<Int>()
+        val checksAtRead = mutableListOf<Int>()
+        every { resolver.openInputStream(uri) } answers {
+            val input = bytes.inputStream()
+            object : InputStream() {
+                override fun read(): Int = throw AssertionError("Transfer must use bounded bulk reads")
+                override fun read(b: ByteArray, off: Int, len: Int): Int {
+                    requested += len
+                    checksAtRead += checks
+                    return input.read(b, off, len)
+                }
+                override fun close() { closed++; input.close() }
+            }
+        }
+        val reader = inputs.files(listOf(uri)) { checks++ }.single().reader
+        val version = transferVersion(reader) {}!!
+        assertEquals(bytes.size.toLong(), version.nodes.single().bytes)
+        assertEquals(6, requested.size)
+        assertTrue(requested.all { it == TRANSFER_BUFFER_BYTES })
+        assertTrue(checksAtRead.zipWithNext().all { (before, after) -> after - before >= 2 })
+        assertTrue(checks > checksAtRead.last())
+        assertEquals(1, closed)
+    }
+
+    @Test
+    fun documentSourceChangeDuringReadRejectsReturnedBytesAndClosesTheStream() {
+        val uri = uri()
+        metadata(uri, "file", 1)
+        var current = true
+        var closed = 0
+        every { resolver.openInputStream(uri) } answers {
+            object : InputStream() {
+                override fun read(): Int = throw AssertionError()
+                override fun read(b: ByteArray, off: Int, len: Int): Int {
+                    b[off] = 1
+                    current = false
+                    return 1
+                }
+                override fun close() { closed++ }
+            }
+        }
+        val reader = inputs.files(listOf(uri)) { if (!current) throw CancellationException("Original document token changed") }.single().reader
+        val failure = assertThrows(CancellationException::class.java) { transferVersion(reader) {} }
+        assertEquals("Original document token changed", failure.message)
+        assertEquals(1, closed)
+    }
+
+    @Test
     fun streamCancellationIsPropagatedAndTheInputIsClosed() {
         val uri = uri()
         metadata(uri, "file", null)

@@ -69,6 +69,19 @@ class AgentNotificationFormatterTest {
     )
 
     @Test
+    fun unknownBackgroundTaskDoesNotClaimCompletionFailureOrAnObservedExitCode() {
+        val item = backgroundTask.copy(outcome = NotificationOutcome.UNKNOWN, exitCode = null)
+        val text = AgentNotificationFormatter.buildMessage(listOf(item))
+        assertTrue(text.contains("<status>unknown</status>"))
+        assertTrue(text.contains("退出结果未知，需核验"))
+        assertFalse(text.contains("已结束"))
+        assertFalse(text.contains("<exit-code>-1</exit-code>"))
+        assertFalse(text.contains("<status>failed</status>"))
+        val payload = AgentNotificationFormatter.buildJsonArray(listOf(item)).single() as JsonObject
+        assertEquals(JsonPrimitive("unknown"), payload["status"])
+    }
+
+    @Test
     fun message_singleBackgroundTask_hasFenceAndFields() {
         val text = AgentNotificationFormatter.buildMessage(listOf(backgroundTask))
 

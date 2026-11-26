@@ -39,6 +39,36 @@ public interface SessionBackend {
      */
     int waitForExit();
 
+    default ExitOutcome waitForExitOutcome() {
+        return ExitOutcome.fromLegacyStatus(waitForExit());
+    }
+
+    final class ExitOutcome {
+        private final boolean mKnown;
+        private final int mStatus;
+
+        private ExitOutcome(boolean known, int status) {
+            mKnown = known;
+            mStatus = status;
+        }
+
+        public static ExitOutcome fromLegacyStatus(int status) {
+            return new ExitOutcome(true, status);
+        }
+
+        public static ExitOutcome unknown() {
+            return new ExitOutcome(false, -1);
+        }
+
+        public boolean isKnown() {
+            return mKnown;
+        }
+
+        public int getStatus() {
+            return mStatus;
+        }
+    }
+
     /** Release the backend's resources (close pty fd / remote shell channel). Safe to call multiple times. */
     void close();
 }

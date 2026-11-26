@@ -1,24 +1,35 @@
 package com.aicode.feature.settings.data.repository
 
 import android.content.Context
+import androidx.datastore.core.DataStore
+import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.aicode.core.datastore.preferencesCorruptionHandler
 import com.aicode.feature.agent.domain.container.ContainerProfile
+import com.aicode.feature.agent.domain.container.ChrootInstance
 import com.aicode.feature.agent.domain.container.versionFromDownloadFileName
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
+import java.util.Collections
+import java.util.concurrent.CancellationException
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -49,6 +60,26 @@ data class DownloadedImageRecord(
 fun DownloadedImageRecord.effectiveVersion(): String =
     version.takeIf { it.isNotBlank() } ?: versionFromDownloadFileName(entryId, fileUri)
 
+class ContainerProfileSnapshot internal constructor(
+    val selectedProfileId: String,
+    val defaultContainerId: String,
+    profiles: List<ContainerProfile>,
+    val selectionRevision: Long,
+    val configurationRevision: Long,
+    internal val repositoryIdentity: Any
+) {
+    val profiles: List<ContainerProfile> = Collections.unmodifiableList(profiles.map { profile ->
+        profile.copy(
+            extraBindings = Collections.unmodifiableList(profile.extraBindings.toList()),
+            extraArgs = Collections.unmodifiableList(profile.extraArgs.toList()),
+            env = Collections.unmodifiableMap(profile.env.toMap())
+        )
+    })
+    val activeProfile: ContainerProfile = this.profiles.firstOrNull { it.id == selectedProfileId }
+        ?: this.profiles.firstOrNull()
+        ?: ContainerProfile.BUILTIN_ALPINE
+}
+
 /**
  * 持久化当前选中的容器 profile 与用户自定义 profile 列表。
  *
@@ -56,9 +87,12 @@ fun DownloadedImageRecord.effectiveVersion(): String =
  * 无 [ACTIVE_PROFILE_ID_KEY] 时返回 [ContainerProfile.BUILTIN_ID]，等同改动前——默认内置 Alpine。
  */
 @Singleton
-class ContainerSettingsRepository @Inject constructor(
-    @param:ApplicationContext private val context: Context
+class ContainerSettingsRepository internal constructor(
+    private val dataStore: DataStore<Preferences>
 ) {
+    @Inject
+    constructor(@ApplicationContext context: Context) : this(context.containerDataStore)
+
     private companion object {
         val ACTIVE_PROFILE_ID_KEY = stringPreferencesKey("active_profile_id")
         val CUSTOM_PROFILES_KEY = stringPreferencesKey("custom_profiles_json")
@@ -77,23 +111,79 @@ class ContainerSettingsRepository @Inject constructor(
         val json = Json { ignoreUnknownKeys = true }
     }
 
+    private val profileMutation = Mutex()
+    private val profileChangePending = AtomicBoolean()
+    private val snapshotIdentity = Any()
+
+    private suspend fun mutateProfiles(block: suspend () -> Unit) = profileMutation.withLock {
+        try { block() } finally { profileChangePending.set(false) }
+    }
+    private val configurationRevocations = CopyOnWriteArrayList<() -> Unit>()
+
+    fun registerConfigurationRevocation(onRevoke: () -> Unit): AutoCloseable {
+        configurationRevocations.add(onRevoke)
+        return AutoCloseable { configurationRevocations.remove(onRevoke) }
+    }
+
+    private fun revokeConfiguration() {
+        configurationRevocations.forEach { runCatching(it) }
+    }
     private val profileSelectionRevision = AtomicLong()
     private val _profileSelectionRevisions = MutableStateFlow(0L)
     val activeProfileSelectionRevisions = _profileSelectionRevisions.asStateFlow()
     val activeProfileSelectionRevision: Long get() = profileSelectionRevision.get()
 
+    private val configurationRevision = AtomicLong()
+    private val _profileConfigurationRevisions = MutableStateFlow(0L)
+    val profileConfigurationRevisions: StateFlow<Long> = _profileConfigurationRevisions.asStateFlow()
+    val profileConfigurationRevision: Long get() = configurationRevision.get()
+
+    private fun publishProfileConfigurationChange() {
+        val revision = configurationRevision.incrementAndGet()
+        _profileConfigurationRevisions.update { maxOf(it, revision) }
+        revokeConfiguration()
+    }
+
+    suspend fun captureProfileSnapshot(): ContainerProfileSnapshot = profileMutation.withLock {
+        val prefs = dataStore.data.first()
+        ContainerProfileSnapshot(
+            prefs[ACTIVE_PROFILE_ID_KEY]?.takeIf { it.isNotBlank() } ?: ContainerProfile.BUILTIN_ID,
+            prefs[DEFAULT_CONTAINER_ID_KEY]?.takeIf { it.isNotBlank() } ?: ContainerProfile.BUILTIN_ID,
+            prefs[CUSTOM_PROFILES_KEY]?.let { raw ->
+                runCatching { json.decodeFromString(profileSerializer, raw) }.getOrNull()
+            } ?: emptyList(),
+            activeProfileSelectionRevision,
+            profileConfigurationRevision,
+            snapshotIdentity
+        )
+    }
+
+    fun checkProfileSnapshot(snapshot: ContainerProfileSnapshot) {
+        if (profileChangePending.get()) throw CancellationException("Container profile update is pending")
+        checkProfileSnapshotRevision(snapshot)
+        if (profileChangePending.get()) throw CancellationException("Container profile update is pending")
+    }
+
+    private fun checkProfileSnapshotRevision(snapshot: ContainerProfileSnapshot) {
+        if (snapshot.repositoryIdentity !== snapshotIdentity ||
+            snapshot.selectionRevision != activeProfileSelectionRevision ||
+            snapshot.configurationRevision != profileConfigurationRevision) {
+            throw CancellationException("Container profile configuration changed")
+        }
+    }
+
     /** 当前选中的 profile id；无值时默认内置 Alpine。 */
-    val activeProfileIdFlow: Flow<String> = context.containerDataStore.data.map { prefs ->
+    val activeProfileIdFlow: Flow<String> = dataStore.data.map { prefs ->
         prefs[ACTIVE_PROFILE_ID_KEY]?.takeIf { it.isNotBlank() } ?: ContainerProfile.BUILTIN_ID
     }
 
     /** 远程模式下的默认容器 id；无值时默认内置 Alpine。 */
-    val defaultContainerIdFlow: Flow<String> = context.containerDataStore.data.map { prefs ->
+    val defaultContainerIdFlow: Flow<String> = dataStore.data.map { prefs ->
         prefs[DEFAULT_CONTAINER_ID_KEY]?.takeIf { it.isNotBlank() } ?: ContainerProfile.BUILTIN_ID
     }
 
     /** 用户自定义 profile 列表（不含内置）。解析失败回退空列表。 */
-    val customProfilesFlow: Flow<List<ContainerProfile>> = context.containerDataStore.data.map { prefs ->
+    val customProfilesFlow: Flow<List<ContainerProfile>> = dataStore.data.map { prefs ->
         prefs[CUSTOM_PROFILES_KEY]?.let { raw ->
             runCatching { json.decodeFromString(profileSerializer, raw) }.getOrNull()
         } ?: emptyList()
@@ -109,17 +199,30 @@ class ContainerSettingsRepository @Inject constructor(
             ?: ContainerProfile.BUILTIN_ALPINE
     }
 
-    suspend fun setActiveProfile(id: String) {
-        context.containerDataStore.edit { prefs ->
+    suspend fun setActiveProfile(id: String): Unit = mutateProfiles {
+        var changed = false
+        dataStore.edit { prefs ->
             val previous = prefs[ACTIVE_PROFILE_ID_KEY]?.takeIf { it.isNotBlank() } ?: ContainerProfile.BUILTIN_ID
-            if (previous != id) profileSelectionRevision.incrementAndGet()
+            val next = id.takeIf { it.isNotBlank() } ?: ContainerProfile.BUILTIN_ID
+            changed = previous != next
+            if (changed) profileChangePending.set(true)
             prefs[ACTIVE_PROFILE_ID_KEY] = id
         }
+        if (changed) profileSelectionRevision.incrementAndGet()
         _profileSelectionRevisions.update { maxOf(it, profileSelectionRevision.get()) }
+        if (changed) revokeConfiguration()
     }
 
-    suspend fun setDefaultContainerId(id: String) {
-        context.containerDataStore.edit { it[DEFAULT_CONTAINER_ID_KEY] = id }
+    suspend fun setDefaultContainerId(id: String): Unit = mutateProfiles {
+        var changed = false
+        dataStore.edit { prefs ->
+            val previous = prefs[DEFAULT_CONTAINER_ID_KEY]?.takeIf { it.isNotBlank() } ?: ContainerProfile.BUILTIN_ID
+            val next = id.takeIf { it.isNotBlank() } ?: ContainerProfile.BUILTIN_ID
+            changed = previous != next
+            if (changed) profileChangePending.set(true)
+            prefs[DEFAULT_CONTAINER_ID_KEY] = id
+        }
+        if (changed) publishProfileConfigurationChange()
     }
 
     /**
@@ -127,19 +230,23 @@ class ContainerSettingsRepository @Inject constructor(
      * 置位初始化标记后不再自动补回——用户后续删光列表由空态手动恢复。
      * 存量设备已配自定义镜像时同样补入（旧版列表始终含内置项，升级不能让它消失）。
      */
-    suspend fun ensureBuiltinDefault() {
-        context.containerDataStore.edit { prefs ->
+    suspend fun ensureBuiltinDefault(): Unit = mutateProfiles {
+        var changed = false
+        dataStore.edit { prefs ->
             if (prefs[INITIALIZED_KEY] == true) return@edit
             prefs[INITIALIZED_KEY] = true
             val current = prefs[CUSTOM_PROFILES_KEY]?.let { raw ->
                 runCatching { json.decodeFromString(profileSerializer, raw) }.getOrNull()
             } ?: emptyList()
             if (current.none { it.id == ContainerProfile.BUILTIN_ID }) {
+                profileChangePending.set(true)
                 prefs[CUSTOM_PROFILES_KEY] = json.encodeToString(
                     profileSerializer, listOf(ContainerProfile.BUILTIN_ALPINE) + current
                 )
+                changed = true
             }
         }
+        if (changed) publishProfileConfigurationChange()
     }
 
     /**
@@ -147,8 +254,8 @@ class ContainerSettingsRepository @Inject constructor(
      * 存储顺序其实是插入序（旧在前）。改用显式拖拽顺序后不再实时排序，
      * 故首次升级把存储顺序按 createdAt 倒序重写一次，保证升级前后用户看到的一致。
      */
-    suspend fun ensureProfileDisplayOrder() {
-        context.containerDataStore.edit { prefs ->
+    suspend fun ensureProfileDisplayOrder(): Unit = profileMutation.withLock {
+        dataStore.edit { prefs ->
             if (prefs[ORDER_MIGRATED_KEY] == true) return@edit
             prefs[ORDER_MIGRATED_KEY] = true
             val current = prefs[CUSTOM_PROFILES_KEY]?.let { raw ->
@@ -164,8 +271,8 @@ class ContainerSettingsRepository @Inject constructor(
      * 按传入 id 顺序重排列表（只改顺序，不碰内容）。
      * 未出现在 [orderedIds] 里的项（并发新增）按原相对顺序追加到末尾，不会丢配置。
      */
-    suspend fun reorderCustomProfiles(orderedIds: List<String>) {
-        context.containerDataStore.edit { prefs ->
+    suspend fun reorderCustomProfiles(orderedIds: List<String>): Unit = profileMutation.withLock {
+        dataStore.edit { prefs ->
             val current = prefs[CUSTOM_PROFILES_KEY]?.let { raw ->
                 runCatching { json.decodeFromString(profileSerializer, raw) }.getOrNull()
             } ?: emptyList()
@@ -176,23 +283,23 @@ class ContainerSettingsRepository @Inject constructor(
     }
 
     /** 已展示公告内容的哈希；无值表示从未展示过。 */
-    val announcementShownHashFlow: Flow<String?> = context.containerDataStore.data.map { prefs ->
+    val announcementShownHashFlow: Flow<String?> = dataStore.data.map { prefs ->
         prefs[ANNOUNCEMENT_SHOWN_HASH_KEY]
     }
 
     suspend fun markAnnouncementShown(hash: String) {
-        context.containerDataStore.edit { it[ANNOUNCEMENT_SHOWN_HASH_KEY] = hash }
+        dataStore.edit { it[ANNOUNCEMENT_SHOWN_HASH_KEY] = hash }
     }
 
     /** 已下载镜像记录列表（按 entryId 去重，最新覆盖旧的）。 */
-    val downloadedImagesFlow: Flow<List<DownloadedImageRecord>> = context.containerDataStore.data.map { prefs ->
+    val downloadedImagesFlow: Flow<List<DownloadedImageRecord>> = dataStore.data.map { prefs ->
         prefs[DOWNLOADED_IMAGES_KEY]?.let { raw ->
             runCatching { json.decodeFromString(downloadedImageSerializer, raw) }.getOrNull()
         } ?: emptyList()
     }
 
     suspend fun upsertDownloadedImage(record: DownloadedImageRecord) {
-        context.containerDataStore.edit { prefs ->
+        dataStore.edit { prefs ->
             val current = prefs[DOWNLOADED_IMAGES_KEY]?.let { raw ->
                 runCatching { json.decodeFromString(downloadedImageSerializer, raw) }.getOrNull()
             } ?: emptyList()
@@ -202,7 +309,7 @@ class ContainerSettingsRepository @Inject constructor(
     }
 
     suspend fun removeDownloadedImage(entryId: String) {
-        context.containerDataStore.edit { prefs ->
+        dataStore.edit { prefs ->
             val current = prefs[DOWNLOADED_IMAGES_KEY]?.let { raw ->
                 runCatching { json.decodeFromString(downloadedImageSerializer, raw) }.getOrNull()
             } ?: emptyList()
@@ -217,12 +324,14 @@ class ContainerSettingsRepository @Inject constructor(
      * 位置规则：列表顺序由用户拖拽决定（存储顺序即显示顺序），故新增插到最前（沿用旧的「新建在前」观感），
      * 编辑原地替换、不动位置。
      */
-    suspend fun upsertCustomProfile(profile: ContainerProfile) {
-        context.containerDataStore.edit { prefs ->
+    suspend fun upsertCustomProfile(profile: ContainerProfile): Unit = mutateProfiles {
+        var changed = false
+        dataStore.edit { prefs ->
             val current = prefs[CUSTOM_PROFILES_KEY]?.let { raw ->
                 runCatching { json.decodeFromString(profileSerializer, raw) }.getOrNull()
             } ?: emptyList()
             val existing = current.firstOrNull { it.id == profile.id }
+            if (existing == profile) return@edit
             val final = when {
                 profile.createdAt != 0L -> profile
                 existing != null && existing.createdAt != 0L -> profile.copy(createdAt = existing.createdAt)
@@ -233,17 +342,71 @@ class ContainerSettingsRepository @Inject constructor(
             } else {
                 listOf(final) + current
             }
-            prefs[CUSTOM_PROFILES_KEY] = json.encodeToString(profileSerializer, merged)
+            if (current != merged) {
+                profileChangePending.set(true)
+                prefs[CUSTOM_PROFILES_KEY] = json.encodeToString(profileSerializer, merged)
+                changed = true
+            }
         }
+        if (changed) publishProfileConfigurationChange()
     }
 
-    suspend fun deleteCustomProfile(id: String) {
-        context.containerDataStore.edit { prefs ->
+    suspend fun publishChrootInstance(
+        snapshot: ContainerProfileSnapshot,
+        profile: ContainerProfile,
+        instance: ChrootInstance?
+    ): Unit = mutateProfiles {
+        checkProfileSnapshotRevision(snapshot)
+        if (!profile.isChroot || profile.isBuiltin ||
+            snapshot.profiles.singleOrNull { it.id == profile.id } != profile ||
+            (instance != null && profile.chrootInstance != null) ||
+            (instance == null && profile.chrootInstance == null)) {
+            throw CancellationException("CHROOT profile publication source changed")
+        }
+        var selectionChanged = false
+        dataStore.edit { prefs ->
             val current = prefs[CUSTOM_PROFILES_KEY]?.let { raw ->
                 runCatching { json.decodeFromString(profileSerializer, raw) }.getOrNull()
             } ?: emptyList()
-            prefs[CUSTOM_PROFILES_KEY] =
-                json.encodeToString(profileSerializer, current.filterNot { it.id == id })
+            if (current.singleOrNull { it.id == profile.id } != profile) {
+                throw CancellationException("CHROOT profile publication source changed")
+            }
+            val next = if (instance != null) {
+                current.map { if (it.id == profile.id) it.copy(chrootInstance = instance) else it }
+            } else {
+                current.filterNot { it.id == profile.id }
+            }
+            profileChangePending.set(true)
+            prefs[CUSTOM_PROFILES_KEY] = json.encodeToString(profileSerializer, next)
+            if (instance == null) {
+                val fallback = next.firstOrNull()?.id ?: ContainerProfile.BUILTIN_ID
+                if (prefs[ACTIVE_PROFILE_ID_KEY] == profile.id) {
+                    prefs[ACTIVE_PROFILE_ID_KEY] = fallback
+                    selectionChanged = true
+                }
+                if (prefs[DEFAULT_CONTAINER_ID_KEY] == profile.id) prefs[DEFAULT_CONTAINER_ID_KEY] = fallback
+            }
         }
+        if (selectionChanged) {
+            val revision = profileSelectionRevision.incrementAndGet()
+            _profileSelectionRevisions.update { maxOf(it, revision) }
+        }
+        publishProfileConfigurationChange()
+    }
+
+    suspend fun deleteCustomProfile(id: String): Unit = mutateProfiles {
+        var changed = false
+        dataStore.edit { prefs ->
+            val current = prefs[CUSTOM_PROFILES_KEY]?.let { raw ->
+                runCatching { json.decodeFromString(profileSerializer, raw) }.getOrNull()
+            } ?: emptyList()
+            val remaining = current.filterNot { it.id == id }
+            if (current != remaining) {
+                profileChangePending.set(true)
+                prefs[CUSTOM_PROFILES_KEY] = json.encodeToString(profileSerializer, remaining)
+                changed = true
+            }
+        }
+        if (changed) publishProfileConfigurationChange()
     }
 }

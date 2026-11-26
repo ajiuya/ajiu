@@ -11,7 +11,8 @@ import kotlinx.serialization.json.JsonPrimitive
 class ProjectProgressTerminalTracker @Inject constructor() {
     private data class Key(val sessionId: String, val tabId: String, val mode: String, val generation: String?)
     private val owners = linkedMapOf<Key, ProjectProgressCollector>()
-    private val earlyResults = linkedMapOf<Key, Int>()
+    private data class ExitObservation(val code: Int?)
+    private val earlyResults = linkedMapOf<Key, ExitObservation>()
     private val completed = linkedSetOf<Key>()
     private val active = mutableMapOf<String, MutableSet<ProjectProgressCollector>>()
     private val deletedSessions = mutableSetOf<String>()
@@ -49,14 +50,14 @@ class ProjectProgressTerminalTracker @Inject constructor() {
         val early = earlyResults.remove(key)
         if (early != null) {
             rememberCompleted(key)
-            collector.backgroundFinished(tabId, early)
+            collector.backgroundFinished(tabId, early.code)
         } else owners[key] = collector
     }
 
     @Synchronized fun finished(
         sourceSessionId: String?,
         tabId: String,
-        exitCode: Int,
+        exitCode: Int?,
         sourceMode: String? = null,
         channelGeneration: String? = null
     ) {
@@ -68,7 +69,7 @@ class ProjectProgressTerminalTracker @Inject constructor() {
             rememberCompleted(key)
             owner.backgroundFinished(tabId, exitCode)
         } else if (active[session].orEmpty().any { it.executionMode == key.mode && it.channelGeneration == key.generation }) {
-            earlyResults.putIfAbsent(key, exitCode)
+            earlyResults.putIfAbsent(key, ExitObservation(exitCode))
             while (earlyResults.size > 128) earlyResults.remove(earlyResults.keys.first())
         }
     }

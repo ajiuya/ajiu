@@ -100,6 +100,99 @@ class SessionPermissionGrantRepositoryTest {
     }
 
     @Test
+    fun readWritePolicyRegression_hostWriteScopeIsMemoryOnlyAndSessionScoped() = runTest {
+        val repository = SessionPermissionGrantRepository(context)
+        val sessionId = UUID.randomUUID().toString()
+        val otherSessionId = UUID.randomUUID().toString()
+        val grant = "host-write-session-v1:${UUID.randomUUID()}"
+        // Materialize the legacy store first, so any broad-grant disk write is observable.
+        repository.allow(sessionId, "root:sudo id")
+        val storeFile = context.preferencesDataStoreFile("session_permission_grants")
+        val before = storeFile.readBytes()
+
+        assertFalse(repository.isAllowed(sessionId, grant))
+        repository.allow(sessionId, grant)
+        repository.allow(sessionId, grant)
+
+        assertTrue(repository.isAllowed(sessionId, grant))
+        assertFalse(repository.isAllowed(otherSessionId, grant))
+        assertFalse(repository.isAllowed(sessionId, "$grant-different-source"))
+        assertArrayEquals("broad host-write grants must never reach preferences", before, storeFile.readBytes())
+    }
+
+    @Test
+    fun readWritePolicyRegression_freshRepositoryNeverRestoresBroadScopeButKeepsLegacyExactGrant() = runTest {
+        val repository = SessionPermissionGrantRepository(context)
+        val sessionId = UUID.randomUUID().toString()
+        val hostGrant = "host-write-session-v1:${UUID.randomUUID()}"
+        val legacyGrant = "elevate:rm -rf build-${UUID.randomUUID()}"
+        repository.allow(sessionId, hostGrant)
+        repository.allow(sessionId, legacyGrant)
+        assertTrue(repository.isAllowed(sessionId, hostGrant))
+
+        // The injected repository is a singleton in production. A fresh owner has no process-memory
+        // approvals and must not reconstruct this broad scope from the old preferences store.
+        val freshRepository = SessionPermissionGrantRepository(context)
+        assertFalse(freshRepository.isAllowed(sessionId, hostGrant))
+        assertTrue(freshRepository.isAllowed(sessionId, legacyGrant))
+    }
+
+    @Test
+    fun readWritePolicyRegression_nullAndBlankSessionsCannotRetainHostWriteScopes() = runTest {
+        val repository = SessionPermissionGrantRepository(context)
+        val hostGrant = "host-write-session-v1:${UUID.randomUUID()}"
+        repository.allow(UUID.randomUUID().toString(), "root:sudo id")
+        val storeFile = context.preferencesDataStoreFile("session_permission_grants")
+        val before = storeFile.readBytes()
+
+        for (sessionId in listOf(null, "", "  ")) {
+            repository.allow(sessionId, hostGrant)
+            assertFalse(repository.isAllowed(sessionId, hostGrant))
+        }
+
+        assertArrayEquals(before, storeFile.readBytes())
+    }
+
+    @Test
+    fun readWritePolicyRegression_hostWritePrefixRoutesWithoutOpeningDataStore() = runTest {
+        val noFileAccessContext = mockk<Context>()
+        val repository = SessionPermissionGrantRepository(noFileAccessContext)
+        val sessionId = UUID.randomUUID().toString()
+        val grant = SessionPermissionGrantRepository.HOST_WRITE_GRANT_PREFIX + "scope"
+
+        assertFalse(repository.isAllowed(sessionId, grant))
+        repository.allow(sessionId, grant)
+        assertTrue(repository.isAllowed(sessionId, grant))
+        assertFalse(SessionPermissionGrantRepository(noFileAccessContext).isAllowed(sessionId, grant))
+        for (session in listOf(null, "", "  ")) {
+            repository.allow(session, grant)
+            assertFalse(repository.isAllowed(session, grant))
+        }
+    }
+
+    @Test
+    fun readWritePolicyRegression_revokeSessionRemovesOnlyItsBroadAndLegacyApprovals() = runTest {
+        val repository = SessionPermissionGrantRepository(context)
+        val sessionId = UUID.randomUUID().toString()
+        val otherSessionId = UUID.randomUUID().toString()
+        val broad = SessionPermissionGrantRepository.HOST_WRITE_GRANT_PREFIX + UUID.randomUUID()
+        val legacy = "root:sudo id"
+        for (session in listOf(sessionId, otherSessionId)) {
+            repository.allow(session, broad)
+            repository.allow(session, legacy)
+        }
+
+        repository.revokeSession(sessionId)
+        assertFalse(repository.isAllowed(sessionId, broad))
+        assertFalse(repository.isAllowed(sessionId, legacy))
+        assertTrue(repository.isAllowed(otherSessionId, broad))
+        assertTrue(repository.isAllowed(otherSessionId, legacy))
+        assertFalse(SessionPermissionGrantRepository(context).isAllowed(sessionId, legacy))
+        for (session in listOf(null, "", "  ")) repository.revokeSession(session)
+        assertTrue(repository.isAllowed(otherSessionId, broad))
+    }
+
+    @Test
     fun storedGrant_containsSha256InsteadOfTheFullCommand() = runTest {
         val repository = SessionPermissionGrantRepository(context)
         val sessionId = UUID.randomUUID().toString()

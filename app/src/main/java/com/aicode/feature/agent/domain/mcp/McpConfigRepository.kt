@@ -39,6 +39,8 @@ import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.CancellationException
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -48,7 +50,13 @@ enum class McpScope { GLOBAL, PROJECT }
 /** 一个生效的 MCP 条目：配置 + 其来源作用域，供 UI 标注「全局/项目」。 */
 data class McpServerEntry(
     val server: McpServerConfig,
-    val scope: McpScope
+    val scope: McpScope,
+    val configurationRevision: Long = 0L,
+    val sourceIdentity: String = "",
+    val workspacePath: String? = null,
+    val overlaySourceIdentity: String? = null,
+    val overlayRevision: Long? = null,
+    val workspaceSelectionId: String = ""
 )
 
 /**
@@ -88,6 +96,24 @@ class McpConfigRepository @Inject constructor(
     private val globalState = MutableStateFlow<String?>(null)
     private val projectStates = ConcurrentHashMap<String, MutableStateFlow<String?>>()
     private val mutex = Mutex()
+    private val revisionCounter = AtomicLong()
+    private val revisions = ConcurrentHashMap<String, Long>()
+
+    private fun publish(state: MutableStateFlow<String?>, source: String, content: String) {
+        if (state.value != content) {
+            revisions[source] = revisionCounter.incrementAndGet()
+            state.value = content
+        }
+    }
+
+    fun checkEntryCurrent(entry: McpServerEntry) {
+        val selection = workspaceRepository.selection.value
+        if (entry.workspaceSelectionId.isBlank() || entry.workspaceSelectionId != selection.id ||
+            entry.workspacePath != selection.workspace?.takeIf { it.available }?.path || entry.sourceIdentity.isBlank() || revisions[entry.sourceIdentity] != entry.configurationRevision ||
+            entry.overlaySourceIdentity?.let { revisions[it] != entry.overlayRevision } == true) {
+            throw CancellationException("MCP server configuration source changed")
+        }
+    }
 
     // ── 外部修改监听：容器内/手工直接编辑配置文件后，刷新缓存并广播给 McpManager 重连 ──
 
@@ -112,11 +138,11 @@ class McpConfigRepository @Inject constructor(
      * 外部变更后按磁盘现状刷新缓存，内容确实变化时返回 true。项目级只处理当前工作区；
      * 其缓存尚未加载时不广播——首次加载由 [ensureProjectLoaded] 完成，工作区切换不算外部变更。
      */
-    private suspend fun reloadFromDisk(): Boolean {
+    private suspend fun reloadFromDisk(): Boolean = mutex.withLock {
         var changed = false
         val globalContent = load(globalFile)
         if (globalContent != (globalState.value ?: DEFAULT_JSON)) {
-            globalState.value = globalContent
+            publish(globalState, globalFile.absolutePath, globalContent)
             changed = true
             FileLogger.i(TAG, "检测到全局 MCP 配置变化，已刷新")
         }
@@ -125,12 +151,12 @@ class McpConfigRepository @Inject constructor(
         if (state.value != null) {
             val content = load(projectFileForPath(path))
             if (content != state.value) {
-                state.value = content
+                publish(state, projectFileForPath(path).absolutePath, content)
                 changed = true
                 FileLogger.i(TAG, "检测到项目 MCP 配置变化，已刷新")
             }
         }
-        return changed
+        changed
     }
 
     private fun getProjectState(workspacePath: String): MutableStateFlow<String?> =
@@ -140,7 +166,7 @@ class McpConfigRepository @Inject constructor(
         if (globalState.value != null) return
         mutex.withLock {
             if (globalState.value != null) return
-            globalState.value = load(globalFile)
+            publish(globalState, globalFile.absolutePath, load(globalFile))
         }
     }
 
@@ -149,7 +175,7 @@ class McpConfigRepository @Inject constructor(
         if (state.value != null) return
         mutex.withLock {
             if (state.value != null) return
-            state.value = load(projectFileForPath(workspacePath))
+            publish(state, projectFileForPath(workspacePath).absolutePath, load(projectFileForPath(workspacePath)))
         }
     }
 
@@ -181,12 +207,12 @@ class McpConfigRepository @Inject constructor(
      * 跟随当前工作区切换自动重载对应项目配置。
      */
     val effectiveEntriesFlow: Flow<List<McpServerEntry>> =
-        workspaceRepository.current.flatMapLatest {
-            val path = workspaceRepository.currentPath()
+        workspaceRepository.selection.flatMapLatest { selection ->
+            val path = selection.workspace?.path ?: workspaceRepository.currentPath()
             ensureGlobalLoaded()
             ensureProjectLoaded(path)
             combine(globalState, getProjectState(path)) { g, p ->
-                merge(parse(g ?: DEFAULT_JSON), parse(p ?: DEFAULT_JSON))
+                merge(parse(g ?: DEFAULT_JSON), parse(p ?: DEFAULT_JSON), path, selection)
             }
         }
 
@@ -205,7 +231,7 @@ class McpConfigRepository @Inject constructor(
         val json = serialize(servers)
         mutex.withLock {
             withContext(Dispatchers.IO) { writeFile(globalFile, json) }
-            globalState.value = json
+            publish(globalState, globalFile.absolutePath, json)
         }
     }
 
@@ -214,7 +240,7 @@ class McpConfigRepository @Inject constructor(
         val json = serialize(servers)
         mutex.withLock {
             withContext(Dispatchers.IO) { writeFile(projectFileForPath(path), json) }
-            getProjectState(path).value = json
+            publish(getProjectState(path), projectFileForPath(path).absolutePath, json)
         }
     }
 
@@ -224,13 +250,14 @@ class McpConfigRepository @Inject constructor(
 
     /** 当前项目生效的合并条目（含来源作用域），供设置页列表标注使用。 */
     suspend fun getEffectiveEntries(): List<McpServerEntry> {
-        val path = workspaceRepository.currentPath()
+        val selection = workspaceRepository.selection.value
+        val path = selection.workspace?.path ?: workspaceRepository.currentPath()
         ensureGlobalLoaded()
         ensureProjectLoaded(path)
-        return merge(
-            parse(globalState.value ?: DEFAULT_JSON),
-            parse(getProjectState(path).value ?: DEFAULT_JSON)
-        )
+        return mutex.withLock {
+            if (workspaceRepository.selection.value !== selection) throw CancellationException("MCP workspace changed")
+            merge(parse(globalState.value ?: DEFAULT_JSON), parse(getProjectState(path).value ?: DEFAULT_JSON), path, selection)
+        }
     }
 
     fun serialize(servers: List<McpServerConfig>): String {
@@ -281,11 +308,18 @@ class McpConfigRepository @Inject constructor(
     /** 合并全局与项目配置：全局按序在前，项目项覆盖同名，顺序 = 全局序 + 项目新增项。 */
     private fun merge(
         global: List<McpServerConfig>,
-        project: List<McpServerConfig>
+        project: List<McpServerConfig>,
+        workspacePath: String,
+        selection: WorkspaceRepository.Selection
     ): List<McpServerEntry> {
         val byName = LinkedHashMap<String, McpServerEntry>()
-        global.forEach { byName[it.name] = McpServerEntry(it, McpScope.GLOBAL) }
-        project.forEach { byName[it.name] = McpServerEntry(it, McpScope.PROJECT) }
+        val globalSource = globalFile.absolutePath
+        val projectSource = projectFileForPath(workspacePath).absolutePath
+        val selectedPath = selection.workspace?.takeIf { it.available }?.path
+        global.forEach { byName[it.name] = McpServerEntry(it, McpScope.GLOBAL, revisions[globalSource] ?: 0L, globalSource,
+            selectedPath, projectSource, revisions[projectSource] ?: 0L, selection.id) }
+        project.forEach { byName[it.name] = McpServerEntry(it, McpScope.PROJECT, revisions[projectSource] ?: 0L, projectSource,
+            selectedPath, workspaceSelectionId = selection.id) }
         return byName.values.toList()
     }
 }

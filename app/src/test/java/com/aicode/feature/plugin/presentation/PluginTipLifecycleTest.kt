@@ -143,6 +143,7 @@ class PluginTipLifecycleTest {
         val manifest = PluginManifest(1, id, LocalizedText.single("Sample"), SemVer(1, 0, 0), "test", "", LocalizedText.single(""), "MIT", "1.0.0")
         val process = if (withRuntime) PluginRuntime(id, "javascript", root, File(root, "index.js"), listOf("node", "index.js")) else null
         val capture = PluginCapture(record, manifest, PluginContent(runtime = process), root, {}, {})
-        return PluginInvocationContext(capture, null, "/work", "native-session", root, emptyFlow(), { it == "readFile" }, sourceIdentity = "fixed-source") {}
+        return PluginInvocationContext(capture, null, "/work", "native-session", root, emptyFlow(), { it == "readFile" }, sourceIdentity = "fixed-source", runtimeOwner = com.aicode.feature.agent.domain.container.runtime.RuntimeOwner(
+            com.aicode.feature.agent.domain.container.runtime.RuntimeOwnerKind.PLUGIN, "tip-test:$id")) {}
     }
 }

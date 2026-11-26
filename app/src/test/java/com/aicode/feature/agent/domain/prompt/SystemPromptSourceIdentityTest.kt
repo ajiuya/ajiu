@@ -1,6 +1,9 @@
 package com.aicode.feature.agent.domain.prompt
 
 import android.content.Context
+import androidx.datastore.core.DataStore
+import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.emptyPreferences
 import com.aicode.feature.agent.domain.container.ContainerInstaller
 import com.aicode.feature.agent.domain.memory.MemoryRepository
 import com.aicode.feature.agent.domain.model.AgentContext
@@ -10,11 +13,13 @@ import com.aicode.feature.agent.domain.subagent.AgentDefinition
 import com.aicode.feature.agent.domain.subagent.AgentDefinitionEntry
 import com.aicode.feature.agent.domain.subagent.AgentDefinitionRepository
 import com.aicode.feature.agent.domain.subagent.AgentDefinitionScope
+import com.aicode.feature.settings.data.repository.ContainerSettingsRepository
 import com.aicode.feature.settings.data.repository.ExecutionModeHolder
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.verify
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.flow.flowOf
 import org.junit.Assert.*
 import org.junit.Rule
 import org.junit.Test
@@ -64,7 +69,10 @@ class SystemPromptSourceIdentityTest {
             result
         }
         val context = AgentContext(null, null, temporary.newFolder("project").path, null, sessionId = "same-session")
-        return SystemPromptProvider(mockk<Context>(), skills, memory, catalog, installer, agents, ExecutionModeHolder()) to context
+        val settings = ContainerSettingsRepository(mockk<DataStore<Preferences>> {
+            every { data } returns flowOf(emptyPreferences())
+        })
+        return SystemPromptProvider(mockk<Context>(), skills, memory, catalog, installer, agents, ExecutionModeHolder(), settings) to context
     }
 
     @Test fun sameSessionAndProjectAreSeparatedByEndpointProfileUuidAndRevision() {

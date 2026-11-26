@@ -30,6 +30,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
+import org.junit.After
 import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
@@ -55,6 +56,7 @@ class PreviewSourceTest {
     private val remote = mockk<RemoteSftpFileAccess>()
     private val currentWorkspace = AtomicReference("initial")
     private val environment = AtomicReference("initial")
+    private val sourceOwner = Job()
     private lateinit var root: File
     private lateinit var cache: File
     private lateinit var factory: PreviewSourceFactory
@@ -69,6 +71,7 @@ class PreviewSourceTest {
         File(root, "site/style.css").writeText("body {}")
         every { context.cacheDir } returns cache
         every { workspace.currentPath() } answers { currentWorkspace.get() }
+        every { workspace.selection } returns kotlinx.coroutines.flow.MutableStateFlow(WorkspaceRepository.Selection(null))
         every { mapper.resolveFile(any(), any()) } answers {
             val path = firstArg<String>()
             if (path == "~/workspace") root else {
@@ -79,8 +82,66 @@ class PreviewSourceTest {
         execution = WorkspaceExecutionContext(ExecutionMode.LOCAL_PROOT, "frozen", mockk<FileAccessProvider>(), null, null) {
             if (environment.get() != "initial") throw CancellationException("Execution changed")
         }
-        coEvery { executionFactory.freeze(any()) } returns execution
+        coEvery { executionFactory.freezeForPaths(any(), any(), any(), any()) } returns execution
         factory = PreviewSourceFactory(context, workspace, executionFactory, WorkspaceRootRead(mapper, remote))
+    }
+
+    @After
+    fun finish() {
+        factory.close()
+        sourceOwner.cancel()
+    }
+
+    private suspend fun PreviewSourceFactory.open(request: PreviewRequest): PreviewSource = open(request, sourceOwner)
+
+    @Test
+    fun authorizationRetryUsesTheSameFileOwnerAndNeverReadsAnUnauthorizedBackend(): Unit = runBlocking {
+        val owners = mutableListOf<com.aicode.feature.agent.domain.container.runtime.RuntimeOwner>()
+        val checks = mutableListOf<() -> Unit>()
+        coEvery { executionFactory.freezeForPaths(any(), any(), any(), any()) } answers {
+            owners += requireNotNull(arg<com.aicode.feature.agent.domain.container.runtime.RuntimeOwner?>(2))
+            checks += requireNotNull(arg<(() -> Unit)?>(3))
+            if (owners.size == 1) throw com.aicode.feature.agent.domain.container.runtime.LocalRuntimeAuthorizationRequired()
+            execution
+        }
+        assertTrue(runCatching { factory.open(PreviewRequest("site/index.html")) }.exceptionOrNull() is IOException)
+        verify(exactly = 0) { mapper.resolveFile(any(), any()) }
+        factory.open(PreviewRequest("site/index.html")).use {
+            assertEquals(owners.first(), owners.last())
+            assertEquals(com.aicode.feature.agent.domain.container.runtime.RuntimeOwnerKind.FILE, owners.first().kind)
+            checks.first().invoke()
+        }
+        factory.close()
+        assertThrows(CancellationException::class.java) { checks.first().invoke() }
+    }
+
+    @Test
+    fun completedOpeningDoesNotOwnTheLeaseButTheVmScopeStillCancelsIt(): Unit = runBlocking {
+        var check: (() -> Unit)? = null
+        coEvery { executionFactory.freezeForPaths(any(), any(), any(), any()) } answers {
+            check = arg(3)
+            execution
+        }
+        val source = async { factory.open(PreviewRequest("site/index.html")) }.await()
+        try {
+            requireNotNull(check).invoke()
+            sourceOwner.cancel()
+            assertThrows(CancellationException::class.java) { requireNotNull(check).invoke() }
+            assertThrows(CancellationException::class.java) { source.openRead() }
+        } finally { source.close() }
+    }
+
+    @Test
+    fun equalWorkspacePathWithAnotherSelectionEpochRevokesTheOldPreview() = runBlocking {
+        val selection = kotlinx.coroutines.flow.MutableStateFlow(WorkspaceRepository.Selection(null))
+        every { workspace.selection } returns selection
+        val source = factory.open(PreviewRequest("site/index.html"))
+        try {
+            selection.value = WorkspaceRepository.Selection(null)
+            selection.value = WorkspaceRepository.Selection(null)
+            assertThrows(CancellationException::class.java) { source.checkCurrent() }
+            assertFalse(source.valid.value)
+        } finally { source.close() }
     }
 
     @Test
@@ -173,7 +234,7 @@ class PreviewSourceTest {
             assertEquals(entry.canonicalFile, source.localFile())
             assertEquals("<h1>entry</h1>", source.openRead().bufferedReader().use { it.readText() })
         }
-        coVerify(exactly = 1) { executionFactory.freeze(any()) }
+        coVerify(exactly = 1) { executionFactory.freezeForPaths(any(), any(), any(), any()) }
     }
 
     @Test
@@ -200,7 +261,7 @@ class PreviewSourceTest {
     fun recordedLocalPathCannotAuthorizeAnIncomparableRemoteSourceOrFallback() = runBlocking {
         val recorded = File(root, "site/index.html")
         val remoteExecution = WorkspaceExecutionContext(ExecutionMode.REMOTE_SSH, "remote", remote, null, null) {}
-        coEvery { executionFactory.freeze(any()) } returns remoteExecution
+        coEvery { executionFactory.freezeForPaths(any(), any(), any(), any()) } returns remoteExecution
         val reader = mockk<WorkspaceRootRead>()
         val read = mockk<RootRead>()
         every { reader.capture("~/workspace/site", remoteExecution, any()) } returns read
@@ -211,7 +272,7 @@ class PreviewSourceTest {
         }.exceptionOrNull()
         assertTrue(failure is IOException)
         assertEquals("Recorded local file does not match the current preview source", failure?.message)
-        coVerify(exactly = 1) { executionFactory.freeze(any()) }
+        coVerify(exactly = 1) { executionFactory.freezeForPaths(any(), any(), any(), any()) }
         verify(exactly = 1) { read.localFile("~/workspace/site/index.html") }
         verify(exactly = 0) { read.size(any()) }
         verify(exactly = 0) { read.openRead(any(), any()) }
@@ -229,7 +290,7 @@ class PreviewSourceTest {
             assertEquals("snapshot", source.openRead().bufferedReader().use { it.readText() })
             assertEquals(cached.canonicalFile, source.localFile())
         }
-        coVerify(exactly = 0) { executionFactory.freeze(any()) }
+        coVerify(exactly = 0) { executionFactory.freezeForPaths(any(), any(), any(), any()) }
         verify(exactly = 0) { workspace.currentPath() }
     }
 
@@ -249,7 +310,7 @@ class PreviewSourceTest {
         listOf(File(cache, "missing"), File(root, "site/index.html"), cache).forEach { file ->
             assertTrue(runCatching { factory.open(PreviewRequest("site/index.html", cachedPath = file.path)) }.exceptionOrNull() is IOException)
         }
-        coVerify(exactly = 0) { executionFactory.freeze(any()) }
+        coVerify(exactly = 0) { executionFactory.freezeForPaths(any(), any(), any(), any()) }
     }
 
     @Test
@@ -281,7 +342,7 @@ class PreviewSourceTest {
             assertThrows(IOException::class.java) { source.checkCurrent() }
             assertFalse(source.valid.value)
         }
-        coVerify(exactly = 0) { executionFactory.freeze(any()) }
+        coVerify(exactly = 0) { executionFactory.freezeForPaths(any(), any(), any(), any()) }
     }
 
     @Test

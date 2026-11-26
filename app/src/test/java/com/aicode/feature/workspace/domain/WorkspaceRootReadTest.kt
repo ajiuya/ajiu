@@ -11,10 +11,12 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
-import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.yield
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
@@ -35,6 +37,7 @@ class WorkspaceRootReadTest {
     private val home = mockk<PathHomeResolver>()
     private val remote = mockk<RemoteSftpFileAccess>()
     private val current = AtomicBoolean(true)
+    private val profiles = MutableStateFlow(emptyList<ContainerProfile>())
     private lateinit var workspaceRoot: File
     private lateinit var rootfs: File
     private lateinit var mounted: File
@@ -55,6 +58,7 @@ class WorkspaceRootReadTest {
         val config = temporary.newFolder("config")
         val profile = ContainerProfile.BUILTIN_ALPINE.copy(extraBindings = listOf("${mounted.absolutePath}:/mnt/external"))
         every { workspace.currentPath() } returns workspaceRoot.path
+        every { workspace.selection } returns MutableStateFlow(WorkspaceRepository.Selection(null))
         every { installer.rootfsDirFor(any()) } returns rootfs
         every { installer.aicodeDir } returns config
         every { home.home() } returns "/root"
@@ -62,16 +66,25 @@ class WorkspaceRootReadTest {
             firstArg<String>().let { if (it == "~") "/root" else if (it.startsWith("~/")) "/root" + it.removePrefix("~") else it }
         }
         val initialized = CompletableDeferred<Job>()
-        every { settings.customProfilesFlow } returns flowOf(listOf(profile))
+        every { settings.profileConfigurationRevision } returns 0L
+        every { settings.activeProfileSelectionRevision } returns 0L
+        profiles.value = listOf(profile)
+        every { settings.customProfilesFlow } returns profiles
         every { settings.activeProfileIdFlow } returns flow {
             emit(profile.id)
             initialized.complete(currentCoroutineContext()[Job]!!)
         }
         mapper = WorkspacePathMapper(workspace, installer, settings, home)
-        runBlocking { withTimeout(5_000) { initialized.await().join() } }
+        runBlocking {
+            withTimeout(5_000) {
+                initialized.await().join()
+                while (mapper.captureExecutionMapping().profile != profile) yield()
+            }
+        }
         val mapping = mapper.captureExecutionMapping()
         execution = WorkspaceExecutionContext(ExecutionMode.LOCAL_PROOT, "captured", mockk(), mapping, null) {
-            if (!current.get() || mapper.captureExecutionMapping() != mapping) throw CancellationException("Mapping changed")
+            if (!current.get()) throw CancellationException("Mapping changed")
+            mapper.checkExecutionMapping(mapping)
         }
         facade = WorkspaceRootRead(mapper, remote)
     }
@@ -166,7 +179,10 @@ class WorkspaceRootReadTest {
         try {
             val read = facade.capture("/mnt/external", execution, owner)
             val replacement = ContainerProfile.BUILTIN_ALPINE.copy(extraBindings = emptyList())
-            WorkspacePathMapper::class.java.getDeclaredField("currentProfile").apply { isAccessible = true }.set(mapper, replacement)
+            profiles.value = listOf(replacement)
+            runBlocking {
+                withTimeout(5_000) { mapper.runtimeProfileState.first { it.ready && it.profile == replacement } }
+            }
             assertThrows(CancellationException::class.java) { read.openRead("/mnt/external/report.txt", 100) }
         } finally { owner.cancel() }
     }

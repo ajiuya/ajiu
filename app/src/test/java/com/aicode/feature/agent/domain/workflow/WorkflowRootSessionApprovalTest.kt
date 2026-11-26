@@ -3,6 +3,7 @@ package com.aicode.feature.agent.domain.workflow
 import android.content.Context
 import android.os.SystemClock
 import com.aicode.core.util.FileLogger
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeAuthorizationRequired
 import com.aicode.feature.agent.domain.model.AgentContext
 import com.aicode.feature.agent.domain.model.AgentMessage
 import com.aicode.feature.agent.domain.notification.AgentEventInjector
@@ -44,6 +45,7 @@ import com.aicode.feature.settings.domain.model.ProviderType
 import com.aicode.feature.settings.domain.repository.AIProviderRepository
 import com.aicode.feature.workspace.domain.WorkspaceExecutionContext
 import io.mockk.coEvery
+import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.mockkConstructor
@@ -54,6 +56,7 @@ import io.mockk.unmockkObject
 import io.mockk.unmockkStatic
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
@@ -63,6 +66,7 @@ import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
@@ -71,6 +75,7 @@ import kotlinx.serialization.json.JsonPrimitive
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -97,6 +102,8 @@ class WorkflowRootSessionApprovalTest {
     private val grants = mockk<SessionPermissionGrantRepository>()
     private val permissions = ToolPermissionManager(grants)
     private val rules = mockk<PermissionRulesRepository>()
+    private val policy = mockk<ToolPermissionPolicyEngine>()
+    private lateinit var realPolicy: ToolPermissionPolicyEngine
     private val app = mockk<Context>()
     private val rootManager = mockk<RootCommandManager>()
     private val shizukuManager = mockk<ShizukuManager>()
@@ -135,6 +142,10 @@ class WorkflowRootSessionApprovalTest {
         every { app.getString(any()) } answers { "resource:${firstArg<Int>()}" }
         every { app.getString(any(), *anyVararg()) } answers { "resource:${firstArg<Int>()}" }
         coEvery { rules.loadEffectiveForCurrentProject() } returns emptyList<PermissionRule>()
+        realPolicy = ToolPermissionPolicyEngine(rules, grants, app, rootManager, shizukuManager)
+        coEvery { policy.evaluate(any(), any(), any(), any()) } coAnswers {
+            realPolicy.evaluate(firstArg(), secondArg(), arg(2), arg(3))
+        }
         coEvery { grants.isAllowed(any(), any()) } answers { (firstArg<String?>() to secondArg<String>()) in allowed }
         coEvery { grants.allow(any(), any()) } answers {
             allowed.add(firstArg<String?>() to secondArg<String>())
@@ -186,7 +197,7 @@ class WorkflowRootSessionApprovalTest {
             ),
             promptProvider = prompts,
             permissionManager = permissions,
-            policyEngine = ToolPermissionPolicyEngine(rules, grants, app, rootManager, shizukuManager),
+            policyEngine = policy,
             contextCompactor = compactor,
             toolOutputStore = outputStore,
             modelMetadataService = metadata,
@@ -206,7 +217,7 @@ class WorkflowRootSessionApprovalTest {
             shizukuManager = shizukuManager,
             recoveryRepository = mockk(relaxed = true),
             workspaceExecutionContextFactory = mockk {
-                coEvery { freeze(any()) } coAnswers {
+                coEvery { freeze(any(), any()) } coAnswers {
                     beforeFreeze()
                     WorkspaceExecutionContext(ExecutionMode.LOCAL_PROOT, "approval-test", mockk(), null, null) {}
                 }
@@ -261,7 +272,7 @@ class WorkflowRootSessionApprovalTest {
         return valid
     }
 
-    private fun call(tool: String, index: Int, command: String = "id", elevate: Boolean = false) = ToolCall(
+    private fun call(tool: String, index: Int, command: String = "touch /sys/ajiu-approval-test", elevate: Boolean = false) = ToolCall(
         "$tool-$index", tool, buildMap {
             put("command", JsonPrimitive(command))
             if (elevate) put("elevate", JsonPrimitive(true))
@@ -276,7 +287,7 @@ class WorkflowRootSessionApprovalTest {
         }
     }
 
-    private suspend fun collect(session: String = "session"): List<AgentEvent> = coroutineScope {
+    private suspend fun collect(session: String = "session", failOnFailure: Boolean = true): List<AgentEvent> = coroutineScope {
         val requests = launch(start = CoroutineStart.UNDISPATCHED) {
             permissions.pendingRequest.filterNotNull().collect { request ->
                 if (request.sessionId == session && seenRequests.none { it.id == request.id }) {
@@ -292,7 +303,7 @@ class WorkflowRootSessionApprovalTest {
                 when (event) {
                     is AgentEvent.AssistantText -> event.persisted?.complete(Unit)
                     is AgentEvent.ToolCallFinished -> event.persisted?.complete(Unit)
-                    is AgentEvent.Failed -> error(event.error)
+                    is AgentEvent.Failed -> if (failOnFailure) error(event.error)
                     else -> Unit
                 }
             }
@@ -304,61 +315,308 @@ class WorkflowRootSessionApprovalTest {
 
     private suspend fun awaitRequest(): PendingToolPermission = withTimeout(5_000) { pendingRequests.receive() }
 
-    private suspend fun assertAlwaysUsesFreshPermits(tool: String, expectedGrant: String) = coroutineScope {
-        responses(AIResponse("first", listOf(call(tool, 1))), AIResponse("second", listOf(call(tool, 2, "id -u"))), AIResponse("done"))
+    private suspend fun assertDefaultUsesFreshPermits(tool: String, commands: List<String> = listOf("id", "id -u")) {
+        responses(AIResponse("first", listOf(call(tool, 1, commands[0]))), AIResponse("second", listOf(call(tool, 2, commands[1]))), AIResponse("done"))
+        val events = collect()
+        assertTrue(seenRequests.isEmpty())
+        assertTrue(allowed.isEmpty())
+        assertEquals(commands, issued.map { it.command })
+        assertEquals(2, issued.map { it.id }.toSet().size)
+        assertTrue(issued.all { it.session == "session" && it.tool == tool })
+        issued.forEach { permit ->
+            if (tool == "Root") {
+                assertEquals(rootState.value, permit.root)
+                assertNull(permit.shizuku)
+            } else {
+                assertEquals(shizukuIdentity.value, permit.shizuku)
+                assertNull(permit.root)
+            }
+        }
+        assertEquals(issued.toList(), executed.toList())
+        assertTrue(rejected.isEmpty())
+        assertTrue(livePermits.isEmpty())
+        assertTrue(revoked.containsAll(issued.map { it.id }))
+        assertTrue(events.filterIsInstance<AgentEvent.ToolCallFinished>().all { !it.isError })
+        assertTrue(events.last() is AgentEvent.Completed)
+    }
+
+    @Test
+    fun rootDefault_mintsFreshPermitForEachCommandWithoutAnyPrompt() = runBlocking {
+        withTimeout(10_000) { assertDefaultUsesFreshPermits("Root") }
+    }
+
+    @Test
+    fun rootShizukuDefault_mintsFreshPermitForEachCommandWithoutAnyPrompt() = runBlocking {
+        withTimeout(10_000) { assertDefaultUsesFreshPermits("Shizuku") }
+    }
+
+    @Test
+    fun shellShizukuDefault_mintsFreshPermitForEachCommandWithoutAnyPrompt() = runBlocking {
+        withTimeout(10_000) {
+            shizukuIdentity.value = ShizukuIdentity(2000, "shell-connection")
+            assertDefaultUsesFreshPermits("Shizuku")
+        }
+    }
+
+    @Test
+    fun hostWriteSessionRegression_rootReadOnlySkipsPromptButStillNeedsFreshExactPermits() = runBlocking {
+        withTimeout(10_000) {
+            assertDefaultUsesFreshPermits("Root", listOf("cat /system/build.prop", "cat /system/etc/hosts"))
+        }
+    }
+
+    @Test
+    fun hostWriteSessionRegression_rootShizukuReadOnlySkipsPromptButStillNeedsFreshExactPermits() = runBlocking {
+        withTimeout(10_000) {
+            assertDefaultUsesFreshPermits("Shizuku", listOf("cat /system/build.prop", "cat /system/etc/hosts"))
+        }
+    }
+
+    @Test
+    fun hostWriteSessionRegression_shellShizukuReadOnlySkipsPromptButStillNeedsFreshExactPermits() = runBlocking {
+        withTimeout(10_000) {
+            shizukuIdentity.value = ShizukuIdentity(2000, "shell-connection")
+            assertDefaultUsesFreshPermits("Shizuku", listOf("cat /system/build.prop", "cat /system/etc/hosts"))
+        }
+    }
+
+    private suspend fun assertHostWriteSessionUsesFreshPermits(
+        tool: String,
+        denySecond: Boolean = false,
+        sameBatch: Boolean = false,
+        unknownSecond: Boolean = false
+    ) = coroutineScope {
+        val commands = listOf("touch /sys/ajiu-first-target",
+            if (unknownSecond) "/system/bin/ajiu-unknown-script --opaque" else "touch /system/etc/ajiu-second-target")
+        val grant = "host-write-session-v1:mock-$tool-scope"
+        val checks = CopyOnWriteArrayList<Pair<String, ToolPermissionPolicyEngine.Verdict>>()
+        coEvery { policy.evaluate(tool, any(), "session", any()) } answers {
+            val command = (secondArg<Map<String, JsonElement>>().getValue("command") as JsonPrimitive).content
+            val verdict = when {
+                denySecond && command == commands[1] -> ToolPermissionPolicyEngine.Verdict.DENY
+                ("session" to grant) in allowed -> ToolPermissionPolicyEngine.Verdict.ALLOW
+                else -> ToolPermissionPolicyEngine.Verdict.ASK
+            }
+            checks += command to verdict
+            ToolPermissionPolicyEngine.EvalResult(
+                verdict = verdict,
+                sessionGrant = grant.takeIf { verdict == ToolPermissionPolicyEngine.Verdict.ASK },
+                rootGeneration = rootState.value.generation.takeIf { tool == "Root" },
+                rootAuthorityId = rootState.value.authorityId.takeIf { tool == "Root" },
+                shizukuIdentity = shizukuIdentity.value.takeIf { tool == "Shizuku" },
+                permissionSource = ToolPermissionPolicyEngine.PermissionSource(ToolPermissionPolicyEngine.PermissionNamespace.HOST),
+                hostSystemTargets = if (command.startsWith("touch ")) setOf("WRITE:${command.removePrefix("touch ")}") else emptySet(),
+                hostSystemUncertainties = if (command.startsWith("touch ")) emptySet() else setOf("unknown-script")
+            )
+        }
+        if (sameBatch) responses(
+            AIResponse("two writes in the same batch", listOf(call(tool, 1, commands[0]), call(tool, 2, commands[1]))),
+            AIResponse("done")
+        ) else responses(
+            AIResponse("first write", listOf(call(tool, 1, commands[0]))),
+            AIResponse("different command and target", listOf(call(tool, 2, commands[1]))),
+            AIResponse("done")
+        )
         val run = async { collect() }
         try {
             val request = awaitRequest()
-            assertEquals(tool, request.toolName)
-            assertEquals(expectedGrant, request.sessionGrant)
             assertEquals("session", request.sessionId)
+            assertEquals(tool, request.toolName)
+            assertEquals(grant, request.sessionGrant)
+            assertEquals(JsonObject(mapOf("command" to JsonPrimitive(commands[0]))), Json.parseToJsonElement(request.argsPreview))
+            assertTrue(allowed.isEmpty())
+            assertTrue(issued.isEmpty())
             permissions.resolve(request.id, PermissionChoice.ALWAYS_SESSION)
             val events = run.await()
             assertEquals(1, seenRequests.size)
-            assertEquals(setOf("session" to expectedGrant), allowed)
-            assertEquals(listOf("id", "id -u"), issued.map { it.command })
-            assertEquals(2, issued.map { it.id }.toSet().size)
-            assertTrue(issued.all { it.session == "session" && it.tool == tool })
-            assertEquals(issued.toList(), executed.toList())
+            assertEquals(setOf("session" to grant), allowed)
+            coVerify(exactly = 1) { grants.allow("session", grant) }
+            assertEquals(
+                listOf(ToolPermissionPolicyEngine.Verdict.ASK, ToolPermissionPolicyEngine.Verdict.ASK, ToolPermissionPolicyEngine.Verdict.ALLOW),
+                checks.filter { it.first == commands[0] }.map { it.second }
+            )
+            assertEquals(
+                List(if (denySecond) 1 else 2) {
+                    if (denySecond) ToolPermissionPolicyEngine.Verdict.DENY else ToolPermissionPolicyEngine.Verdict.ALLOW
+                },
+                checks.filter { it.first == commands[1] }.map { it.second }
+            )
+            assertEquals(commands.take(if (denySecond) 1 else 2), issued.map { it.command })
+            assertEquals(issued.size, issued.map { it.id }.toSet().size)
+            issued.forEach { permit ->
+                assertEquals(tool, permit.tool)
+                assertEquals("session", permit.session)
+                if (tool == "Root") {
+                    assertEquals(rootState.value, permit.root)
+                    assertNull(permit.shizuku)
+                } else {
+                    assertEquals(shizukuIdentity.value, permit.shizuku)
+                    assertNull(permit.root)
+                }
+            }
+            assertEquals(issued.toSet(), executed.toSet())
             assertTrue(rejected.isEmpty())
             assertTrue(livePermits.isEmpty())
             assertTrue(revoked.containsAll(issued.map { it.id }))
-            assertTrue(events.filterIsInstance<AgentEvent.ToolCallFinished>().all { !it.isError })
+            val finished = events.filterIsInstance<AgentEvent.ToolCallFinished>()
+            assertEquals(2, finished.size)
+            assertFalse(finished.first { it.id == "$tool-1" }.isError)
+            if (denySecond) {
+                assertTrue(finished.last().isError)
+                assertTrue(finished.last().result.contains("SYSTEM_DENIED"))
+            } else assertTrue(finished.none { it.isError })
+            assertTrue(events.none { it is AgentEvent.Failed })
             assertTrue(events.last() is AgentEvent.Completed)
-        } finally {
-            run.cancelAndJoin()
-        }
+        } finally { run.cancelAndJoin() }
     }
 
     @Test
-    fun rootAlways_mintsFreshPermitForEachCommandWithoutAnotherPrompt() = runBlocking {
-        withTimeout(10_000) { assertAlwaysUsesFreshPermits("Root", "tool:Root:root-authority:42") }
+    fun hostWriteSessionRegression_rootAlwaysSessionAllowsDifferentCommandsAndTargetsWithExactPermits() = runBlocking {
+        withTimeout(10_000) { assertHostWriteSessionUsesFreshPermits("Root") }
     }
 
     @Test
-    fun rootShizukuAlways_mintsFreshPermitForEachCommandWithoutAnotherPrompt() = runBlocking {
-        withTimeout(10_000) { assertAlwaysUsesFreshPermits("Shizuku", "tool:Shizuku:0:root-connection") }
+    fun hostWriteSessionRegression_rootShizukuAlwaysSessionAllowsDifferentCommandsAndTargetsWithExactPermits() = runBlocking {
+        withTimeout(10_000) { assertHostWriteSessionUsesFreshPermits("Shizuku") }
     }
 
     @Test
-    fun shellShizukuAlways_mintsFreshPermitForEachCommandWithoutAnotherPrompt() = runBlocking {
+    fun hostWriteSessionRegression_shellShizukuAlwaysSessionAllowsDifferentCommandsAndTargetsWithExactPermits() = runBlocking {
         withTimeout(10_000) {
             shizukuIdentity.value = ShizukuIdentity(2000, "shell-connection")
-            assertAlwaysUsesFreshPermits("Shizuku", "tool:Shizuku:2000:shell-connection")
+            assertHostWriteSessionUsesFreshPermits("Shizuku")
         }
     }
 
     @Test
-    fun rootOnce_asksAgainForTheNextCommandAndIssuesDistinctPermits() = runBlocking {
+    fun hostWriteSessionRegression_rootSessionGrantCannotBypassExplicitDeny() = runBlocking {
+        withTimeout(10_000) { assertHostWriteSessionUsesFreshPermits("Root", denySecond = true) }
+    }
+
+    @Test
+    fun hostWriteSessionRegression_rootSameBatchDifferentWritesAskOnceAndUseDistinctPermits() = runBlocking {
+        withTimeout(10_000) { assertHostWriteSessionUsesFreshPermits("Root", sameBatch = true) }
+    }
+
+    @Test
+    fun hostWriteSessionRegression_shizukuSameBatchDifferentWritesAskOnceAndUseDistinctPermits() = runBlocking {
+        withTimeout(10_000) { assertHostWriteSessionUsesFreshPermits("Shizuku", sameBatch = true) }
+    }
+
+    @Test
+    fun hostWriteSessionRegression_rootSameBatchWriteThenUnknownAskOnceAndUseDistinctPermits() = runBlocking {
+        withTimeout(10_000) { assertHostWriteSessionUsesFreshPermits("Root", sameBatch = true, unknownSecond = true) }
+    }
+
+    private fun nativeIdentityChanges() = listOf<Triple<String, String, () -> Unit>>(
+        Triple("Root off", "Root") { rootState.value = RootAccessState(false, 43, "root-authority") },
+        Triple("Root epoch", "Root") { rootState.value = RootAccessState(true, 43, "root-authority") },
+        Triple("Root authority", "Root") { rootState.value = RootAccessState(true, 42, "replacement-authority") },
+        Triple("Shizuku uid", "Shizuku") { shizukuIdentity.value = ShizukuIdentity(2000, "root-connection") },
+        Triple("Shizuku connection", "Shizuku") { shizukuIdentity.value = ShizukuIdentity(0, "replacement-connection") },
+        Triple("Shizuku disconnected", "Shizuku") { shizukuIdentity.value = null }
+    )
+
+    @Test
+    fun hostWriteSessionRegression_nativeChangeDuringImmediateRecheckCannotSaveScopeOrIssuePermit() = runBlocking {
         withTimeout(10_000) {
-            responses(AIResponse("first", listOf(call("Root", 1))), AIResponse("second", listOf(call("Root", 2, "id -u"))), AIResponse("done"))
+            for ((scenario, tool, change) in nativeIdentityChanges()) {
+                rootState.value = RootAccessState(true, 42, "root-authority")
+                shizukuIdentity.value = ShizukuIdentity(0, "root-connection")
+                var checks = 0
+                coEvery { policy.evaluate(tool, any(), "session", null) } coAnswers {
+                    if (++checks == 2) change()
+                    realPolicy.evaluate(tool, secondArg(), "session", null)
+                }
+                responses(AIResponse("pending write", listOf(call(tool, 1))), AIResponse("must not be requested"))
+                val requestsBefore = modelRequests.size
+                val run = async { collect(failOnFailure = false) }
+                try {
+                    val request = awaitRequest()
+                    assertNotNull(request.sessionGrant)
+                    permissions.resolve(request.id, PermissionChoice.ALWAYS_SESSION)
+                    val events = run.await()
+                    assertEquals("$scenario must stop during the immediate recheck", 2, checks)
+                    assertEquals("EXECUTION_SOURCE_CHANGED", events.filterIsInstance<AgentEvent.Failed>().single().reasonCode)
+                    assertTrue(events.none { it is AgentEvent.ToolCallStarted || it is AgentEvent.ToolExecutionStarted || it is AgentEvent.ToolCallFinished })
+                    assertEquals(requestsBefore + 1, modelRequests.size)
+                    assertTrue(events.last() is AgentEvent.Completed)
+                    assertTrue(allowed.isEmpty())
+                    assertTrue(issued.isEmpty())
+                    assertTrue(executed.isEmpty())
+                    assertTrue(livePermits.isEmpty())
+                    assertNull(permissions.pendingForSession("session"))
+                } finally { run.cancelAndJoin() }
+            }
+            coVerify(exactly = 0) { grants.allow(any(), any()) }
+            coVerify(exactly = 0) { rootManager.authorize(any(), any(), any(), any()) }
+            io.mockk.verify(exactly = 0) { shizukuManager.authorize(any(), any(), any()) }
+        }
+    }
+
+    @Test
+    fun hostWriteSessionRegression_validatedOldScopeCannotAuthorizeChangedIdentityOrStartTool() = runBlocking {
+        withTimeout(10_000) {
+            val changes = nativeIdentityChanges()
+            for ((scenario, tool, change) in changes) {
+                allowed.clear()
+                rootState.value = RootAccessState(true, 42, "root-authority")
+                shizukuIdentity.value = ShizukuIdentity(0, "root-connection")
+                val frozen = CompletableDeferred<Unit>()
+                val release = CompletableDeferred<Unit>()
+                beforeFreeze = { frozen.complete(Unit); release.await() }
+                responses(AIResponse("write before revocation", listOf(call(tool, 1))), AIResponse("must not be requested"))
+                val requestsBefore = modelRequests.size
+                val issuedBefore = issued.size
+                val run = async { collect(failOnFailure = false) }
+                try {
+                    val request = awaitRequest()
+                    assertTrue(request.sessionGrant!!.startsWith(ToolPermissionManager.HOST_WRITE_GRANT_PREFIX))
+                    permissions.resolve(request.id, PermissionChoice.ALWAYS_SESSION)
+                    frozen.await()
+                    assertEquals(issuedBefore + 1, issued.size)
+                    val oldScope = setOf("session" to request.sessionGrant!!)
+                    assertEquals("$scenario saves only after the immediate matching-source review", oldScope, allowed)
+                    val permit = issued.last()
+                    change()
+                    release.complete(Unit)
+                    val events = run.await()
+                    assertEquals("EXECUTION_SOURCE_CHANGED", events.filterIsInstance<AgentEvent.Failed>().single().reasonCode)
+                    assertTrue(events.none { it is AgentEvent.ToolExecutionStarted || it is AgentEvent.ToolCallFinished })
+                    assertEquals(requestsBefore + 1, modelRequests.size)
+                    assertTrue(events.last() is AgentEvent.Completed)
+                    assertEquals(oldScope, allowed)
+                    val changed = policy.evaluate(tool, call(tool, 1).arguments, "session", null)
+                    assertTrue("The old scope must never ALLOW a new identity", changed.verdict != ToolPermissionPolicyEngine.Verdict.ALLOW)
+                    changed.sessionGrant?.let { assertFalse(it == request.sessionGrant) }
+                    assertTrue(executed.isEmpty())
+                    assertTrue(rejected.isEmpty())
+                    assertTrue(revoked.contains(permit.id))
+                    assertTrue(livePermits.isEmpty())
+                    assertNull(permissions.pendingForSession("session"))
+                } finally {
+                    release.complete(Unit)
+                    run.cancelAndJoin()
+                }
+            }
+            coVerify(exactly = changes.size) { grants.allow("session", any()) }
+            coVerify(exactly = 0) { rootManager.execute(any(), any(), any(), any()) }
+            coVerify(exactly = 0) { shizukuManager.runApprovedCommand(any(), any(), any(), any()) }
+        }
+    }
+
+    @Test
+    fun hostFileOnce_asksAgainForTheNextCommandAndIssuesDistinctPermits() = runBlocking {
+        withTimeout(10_000) {
+            responses(AIResponse("first", listOf(call("Root", 1))), AIResponse("second", listOf(call("Root", 2, "touch /system/etc/hosts"))), AIResponse("done"))
             val run = async { collect() }
             try {
                 val first = awaitRequest()
+                assertNotNull(first.sessionGrant)
                 permissions.resolve(first.id, PermissionChoice.ONCE)
                 val second = awaitRequest()
                 assertTrue(first.id != second.id)
-                assertEquals("tool:Root:root-authority:42", second.sessionGrant)
+                assertEquals(first.sessionGrant, second.sessionGrant)
                 permissions.resolve(second.id, PermissionChoice.ONCE)
                 val events = run.await()
                 assertEquals(2, seenRequests.size)
@@ -465,7 +723,7 @@ class WorkflowRootSessionApprovalTest {
     @Test
     fun batchRejection_revokesAlreadyApprovedPermitsForBothChannels() = runBlocking {
         withTimeout(10_000) {
-            responses(AIResponse("batch", listOf(call("Root", 1), call("Shizuku", 2), call("Root", 3, "id -u"))))
+            responses(AIResponse("batch", listOf(call("Root", 1), call("Shizuku", 2), call("Root", 3, "touch /system/etc/hosts"))))
             val run = async { collect() }
             try {
                 permissions.resolve(awaitRequest().id, PermissionChoice.ONCE)
@@ -507,14 +765,63 @@ class WorkflowRootSessionApprovalTest {
     }
 
     @Test
-    fun changedIdentityAfterApproval_cannotExecuteQueuedPermit() = runBlocking {
+    fun sourceAuthorizationAfterBothApprovals_revokesAllPermitsWithoutExecutingEitherChannel() = runBlocking {
+        withTimeout(10_000) {
+            val frozen = CompletableDeferred<Unit>()
+            val rejectSource = CompletableDeferred<Unit>()
+            beforeFreeze = {
+                withContext(Dispatchers.IO) {
+                    frozen.complete(Unit)
+                    rejectSource.await()
+                    throw LocalRuntimeAuthorizationRequired()
+                }
+            }
+            responses(AIResponse("batch", listOf(call("Root", 1), call("Shizuku", 2))), AIResponse("must not be requested"))
+            val run = async { runCatching { collect(failOnFailure = false) } }
+            try {
+                permissions.resolve(awaitRequest().id, PermissionChoice.ONCE)
+                permissions.resolve(awaitRequest().id, PermissionChoice.ONCE)
+                frozen.await()
+                assertEquals(2, issued.size)
+                assertEquals(setOf("Root", "Shizuku"), issued.map { it.tool }.toSet())
+                assertEquals(issued.map { it.id }.toSet(), livePermits.keys.toSet())
+                rejectSource.complete(Unit)
+                val outcome = run.await()
+                assertEquals(issued.map { it.id }.toSet(), revoked.toSet())
+                assertTrue(livePermits.isEmpty())
+                assertTrue(executed.isEmpty())
+                assertTrue(rejected.isEmpty())
+                assertTrue(allowed.isEmpty())
+                assertNull(permissions.pendingForSession("session"))
+                assertTrue(permissions.awaitingSessionIds.value.isEmpty())
+                coVerify(exactly = 0) { rootManager.execute(any(), any(), any(), any()) }
+                coVerify(exactly = 0) { shizukuManager.runApprovedCommand(any(), any(), any(), any()) }
+                assertNull("Source authorization must finish the Flow instead of escaping it", outcome.exceptionOrNull())
+                val events = outcome.getOrThrow()
+                assertEquals("LOCAL_RUNTIME_AUTHORIZATION_REQUIRED", events.filterIsInstance<AgentEvent.Failed>().single().reasonCode)
+                assertEquals(1, events.count { it is AgentEvent.Completed })
+                assertTrue(events.last() is AgentEvent.Completed)
+                assertTrue(events.indexOfFirst { it is AgentEvent.Failed } < events.indexOfFirst { it is AgentEvent.Completed })
+                assertTrue(events.none { it is AgentEvent.ToolExecutionStarted || it is AgentEvent.ToolCallFinished })
+                assertEquals(1, events.filterIsInstance<AgentEvent.AssistantText>().size)
+                assertEquals(1, modelRequests.size)
+            } finally {
+                rejectSource.complete(Unit)
+                run.cancelAndJoin()
+            }
+        }
+    }
+
+    @Test
+    fun changedIdentityAfterApproval_stopsBeforeExecutionAndRevokesQueuedPermit() = runBlocking {
         withTimeout(10_000) {
             for (tool in listOf("Root", "Shizuku")) {
                 val frozen = CompletableDeferred<Unit>()
                 val release = CompletableDeferred<Unit>()
                 beforeFreeze = { frozen.complete(Unit); release.await() }
-                responses(AIResponse("proposal", listOf(call(tool, 1))), AIResponse("done"))
-                val run = async { collect() }
+                responses(AIResponse("proposal", listOf(call(tool, 1))), AIResponse("must not be requested"))
+                val requestsBefore = modelRequests.size
+                val run = async { collect(failOnFailure = false) }
                 try {
                     permissions.resolve(awaitRequest().id, PermissionChoice.ONCE)
                     frozen.await()
@@ -524,14 +831,171 @@ class WorkflowRootSessionApprovalTest {
                     else shizukuIdentity.value = ShizukuIdentity(0, "new-connection")
                     release.complete(Unit)
                     val events = run.await()
-                    assertTrue(events.filterIsInstance<AgentEvent.ToolCallFinished>().single().isError)
+                    assertEquals("EXECUTION_SOURCE_CHANGED", events.filterIsInstance<AgentEvent.Failed>().single().reasonCode)
+                    assertTrue(events.none { it is AgentEvent.ToolExecutionStarted || it is AgentEvent.ToolCallFinished })
+                    assertTrue(events.last() is AgentEvent.Completed)
+                    assertEquals(requestsBefore + 1, modelRequests.size)
                     assertTrue(executed.isEmpty())
                     assertTrue(revoked.contains(permit.id))
                     assertTrue(livePermits.isEmpty())
-                    assertEquals(permit.id, rejected.last().permitId)
+                    assertTrue(rejected.isEmpty())
+                    coVerify(exactly = 0) { rootManager.execute(any(), any(), any(), any()) }
+                    coVerify(exactly = 0) { shizukuManager.runApprovedCommand(any(), any(), any(), any()) }
                 } finally { release.complete(Unit); run.cancelAndJoin() }
             }
         }
+    }
+
+    @Test
+    fun defaultAllowIdentityChangesStopBeforeExecutionWithoutPromptingOrReissuingPermits() = runBlocking {
+        withTimeout(10_000) {
+            val changes = listOf<Pair<String, () -> Unit>>(
+                "Root" to { rootState.value = rootState.value.copy(generation = rootState.value.generation + 1) },
+                "Root" to { rootState.value = rootState.value.copy(authorityId = "replacement-authority") },
+                "Shizuku" to { shizukuIdentity.value = ShizukuIdentity(2000, "root-connection") },
+                "Shizuku" to { shizukuIdentity.value = ShizukuIdentity(2000, "replacement-connection") }
+            )
+            for ((tool, change) in changes) {
+                val frozen = CompletableDeferred<Unit>()
+                val release = CompletableDeferred<Unit>()
+                beforeFreeze = { frozen.complete(Unit); release.await() }
+                responses(AIResponse("ordinary", listOf(call(tool, 1, "id"))), AIResponse("must not be requested"))
+                val issuedBefore = issued.size
+                val requestsBefore = modelRequests.size
+                val run = async { collect(failOnFailure = false) }
+                try {
+                    frozen.await()
+                    assertEquals(issuedBefore + 1, issued.size)
+                    val permit = issued.last()
+                    change()
+                    release.complete(Unit)
+                    val events = run.await()
+                    assertEquals("EXECUTION_SOURCE_CHANGED", events.filterIsInstance<AgentEvent.Failed>().single().reasonCode)
+                    assertEquals(issuedBefore + 1, issued.size)
+                    assertEquals(requestsBefore + 1, modelRequests.size)
+                    assertTrue(events.none { it is AgentEvent.ToolExecutionStarted || it is AgentEvent.ToolCallFinished })
+                    assertTrue(seenRequests.isEmpty())
+                    assertTrue(revoked.contains(permit.id))
+                    assertTrue(livePermits.isEmpty())
+                    assertTrue(executed.isEmpty())
+                    assertTrue(rejected.isEmpty())
+                    coVerify(exactly = 0) { rootManager.execute(any(), any(), any(), any()) }
+                    coVerify(exactly = 0) { shizukuManager.runApprovedCommand(any(), any(), any(), any()) }
+                } finally { release.complete(Unit); run.cancelAndJoin() }
+            }
+        }
+    }
+
+    @Test
+    fun changedIdentityAfterBothApprovalsRevokesBothPermitsAndStopsTheEntireBatch() = runBlocking {
+        withTimeout(10_000) {
+            val frozen = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            beforeFreeze = { frozen.complete(Unit); release.await() }
+            responses(AIResponse("batch", listOf(call("Root", 1), call("Shizuku", 2))), AIResponse("must not be requested"))
+            val run = async { collect(failOnFailure = false) }
+            try {
+                repeat(2) { permissions.resolve(awaitRequest().id, PermissionChoice.ONCE) }
+                frozen.await()
+                assertEquals(2, livePermits.size)
+                rootState.value = rootState.value.copy(generation = 43)
+                shizukuIdentity.value = ShizukuIdentity(0, "replacement-connection")
+                release.complete(Unit)
+                val events = run.await()
+                assertEquals("EXECUTION_SOURCE_CHANGED", events.filterIsInstance<AgentEvent.Failed>().single().reasonCode)
+                assertEquals(issued.map { it.id }.toSet(), revoked.toSet())
+                assertTrue(livePermits.isEmpty())
+                assertTrue(executed.isEmpty())
+                assertTrue(rejected.isEmpty())
+                assertTrue(events.none { it is AgentEvent.ToolExecutionStarted || it is AgentEvent.ToolCallFinished })
+                assertEquals(1, modelRequests.size)
+                assertEquals(1, events.count { it is AgentEvent.Completed })
+                coVerify(exactly = 0) { rootManager.execute(any(), any(), any(), any()) }
+                coVerify(exactly = 0) { shizukuManager.runApprovedCommand(any(), any(), any(), any()) }
+            } finally { release.complete(Unit); run.cancelAndJoin() }
+        }
+    }
+
+    private suspend fun assertIdentityLossAfterPermitStopsTurn(hostFileApproval: Boolean) = coroutineScope {
+        val losses = listOf<Triple<String, String, () -> Unit>>(
+            Triple("Root master off", "Root") {
+                rootState.value = RootAccessState(false, 43, "root-authority")
+            },
+            Triple("Root authority blank", "Root") {
+                rootState.value = RootAccessState(true, 42, "")
+            },
+            Triple("Shizuku disconnected", "Shizuku") {
+                shizukuIdentity.value = null
+            }
+        )
+        for ((scenario, tool, revokeIdentity) in losses) {
+            rootState.value = RootAccessState(true, 42, "root-authority")
+            shizukuIdentity.value = ShizukuIdentity(0, "root-connection")
+            val frozen = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            beforeFreeze = { frozen.complete(Unit); release.await() }
+            val command = if (hostFileApproval) "touch /system/etc/hosts" else "id"
+            responses(AIResponse("permit before identity loss", listOf(call(tool, 1, command))), AIResponse("must not be requested"))
+            val requestsBefore = modelRequests.size
+            val promptsBefore = seenRequests.size
+            val issuedBefore = issued.size
+            val run = async { collect(failOnFailure = false) }
+            try {
+                if (hostFileApproval) {
+                    val request = awaitRequest()
+                    assertEquals(tool, request.toolName)
+                    assertNotNull(request.sessionGrant)
+                    permissions.resolve(request.id, PermissionChoice.ONCE)
+                }
+                frozen.await()
+                assertEquals("$scenario must start with one valid command permit", issuedBefore + 1, issued.size)
+                val permit = issued.last()
+                assertEquals(tool, permit.tool)
+                assertEquals(command, permit.command)
+                assertEquals("session", permit.session)
+                if (tool == "Root") {
+                    assertEquals(rootState.value, permit.root)
+                    assertNull(permit.shizuku)
+                } else {
+                    assertEquals(shizukuIdentity.value, permit.shizuku)
+                    assertNull(permit.root)
+                }
+                assertEquals(setOf(permit.id), livePermits.keys.toSet())
+                revokeIdentity()
+                release.complete(Unit)
+                val events = run.await()
+                assertEquals("$scenario must stop the turn, not request another model step", requestsBefore + 1, modelRequests.size)
+                assertEquals("$scenario must be an explicit execution-source failure", "EXECUTION_SOURCE_CHANGED",
+                    events.filterIsInstance<AgentEvent.Failed>().single().reasonCode)
+                assertTrue(events.none { it is AgentEvent.ToolExecutionStarted || it is AgentEvent.ToolCallFinished })
+                assertEquals(1, events.count { it is AgentEvent.TurnFinished })
+                assertEquals(1, events.count { it is AgentEvent.Completed })
+                assertTrue(events.last() is AgentEvent.Completed)
+                assertEquals(promptsBefore + (if (hostFileApproval) 1 else 0), seenRequests.size)
+                assertEquals(issuedBefore + 1, issued.size)
+                assertTrue(revoked.contains(permit.id))
+                assertTrue(livePermits.isEmpty())
+                assertTrue(executed.isEmpty())
+                assertTrue(rejected.isEmpty())
+                assertTrue(allowed.isEmpty())
+                assertNull(permissions.pendingForSession("session"))
+                coVerify(exactly = 0) { rootManager.execute(any(), any(), any(), any()) }
+                coVerify(exactly = 0) { shizukuManager.runApprovedCommand(any(), any(), any(), any()) }
+            } finally {
+                release.complete(Unit)
+                run.cancelAndJoin()
+            }
+        }
+    }
+
+    @Test
+    fun reviewRegression_defaultAllowPermitIdentityLossStopsInsteadOfContinuingAfterSystemDenied() = runBlocking {
+        withTimeout(10_000) { assertIdentityLossAfterPermitStopsTurn(hostFileApproval = false) }
+    }
+
+    @Test
+    fun reviewRegression_hostFileOncePermitIdentityLossStopsInsteadOfContinuingAfterSystemDenied() = runBlocking {
+        withTimeout(10_000) { assertIdentityLossAfterPermitStopsTurn(hostFileApproval = true) }
     }
 
     @Test
@@ -540,19 +1004,19 @@ class WorkflowRootSessionApprovalTest {
             val originals = listOf(call("Root", 1), call("Shizuku", 2))
             coEvery { hooks.beforeTool(any(), any(), any()) } answers {
                 val toolCall = secondArg<ToolCall>()
-                PluginBeforeTool(JsonObject(mapOf("command" to JsonPrimitive(if (toolCall.name == "Root") "id -u" else "id -g"))))
+                PluginBeforeTool(JsonObject(mapOf("command" to JsonPrimitive(if (toolCall.name == "Root") "touch /system/etc/hosts" else "touch /system/etc/passwd"))))
             }
             responses(AIResponse("proposal", originals), AIResponse("done"))
             val run = async { collect() }
             try {
                 val rootRequest = awaitRequest()
-                assertEquals(JsonObject(mapOf("command" to JsonPrimitive("id -u"))), Json.parseToJsonElement(rootRequest.argsPreview))
+                assertEquals(JsonObject(mapOf("command" to JsonPrimitive("touch /system/etc/hosts"))), Json.parseToJsonElement(rootRequest.argsPreview))
                 permissions.resolve(rootRequest.id, PermissionChoice.ONCE)
                 val shizukuRequest = awaitRequest()
-                assertEquals(JsonObject(mapOf("command" to JsonPrimitive("id -g"))), Json.parseToJsonElement(shizukuRequest.argsPreview))
+                assertEquals(JsonObject(mapOf("command" to JsonPrimitive("touch /system/etc/passwd"))), Json.parseToJsonElement(shizukuRequest.argsPreview))
                 permissions.resolve(shizukuRequest.id, PermissionChoice.ONCE)
                 val events = run.await()
-                assertEquals(listOf("id -u", "id -g"), issued.map { it.command })
+                assertEquals(listOf("touch /system/etc/hosts", "touch /system/etc/passwd"), issued.map { it.command })
                 assertEquals(issued.toSet(), executed.toSet())
                 assertTrue(rejected.isEmpty())
                 assertTrue(events.filterIsInstance<AgentEvent.ToolCallFinished>().all { !it.isError })
@@ -562,10 +1026,20 @@ class WorkflowRootSessionApprovalTest {
     }
 
     @Test
-    fun dangerousElevation_rejectsForgedAlwaysChoiceWithoutIssuingPermit() = runBlocking {
+    fun hostFileAccess_rejectsForgedAlwaysChoiceWithoutIssuingPermit() = runBlocking {
         withTimeout(10_000) {
             for (tool in listOf("Root", "Shizuku")) {
-                responses(AIResponse("dangerous", listOf(call(tool, 1, "rm -rf /data", elevate = true))), AIResponse("done"))
+                // Preserve the invalid-choice control explicitly: unlike a valid host-write ASK,
+                // this evaluator intentionally offers no session scope at all.
+                coEvery { policy.evaluate(tool, any(), any(), any()) } returns ToolPermissionPolicyEngine.EvalResult(
+                    verdict = ToolPermissionPolicyEngine.Verdict.ASK,
+                    rootGeneration = rootState.value.generation.takeIf { tool == "Root" },
+                    rootAuthorityId = rootState.value.authorityId.takeIf { tool == "Root" },
+                    shizukuIdentity = shizukuIdentity.value.takeIf { tool == "Shizuku" },
+                    permissionSource = ToolPermissionPolicyEngine.PermissionSource(ToolPermissionPolicyEngine.PermissionNamespace.HOST),
+                    hostSystemTargets = setOf("WRITE:/system/etc/hosts")
+                )
+                responses(AIResponse("host file", listOf(call(tool, 1, "touch /system/etc/hosts"))), AIResponse("done"))
                 val run = async { collect() }
                 try {
                     val request = awaitRequest()
@@ -584,7 +1058,7 @@ class WorkflowRootSessionApprovalTest {
     }
 
     @Test
-    fun alwaysGrantCannotTransferBetweenWorkflowSessions() = runBlocking {
+    fun legacyAlwaysGrantCannotAuthorizeHostFileInAnotherWorkflowSession() = runBlocking {
         withTimeout(10_000) {
             allowed += "first-session" to "tool:Root:root-authority:42"
             allowed += "first-session" to "tool:Shizuku:0:root-connection"
@@ -597,7 +1071,7 @@ class WorkflowRootSessionApprovalTest {
                 permissions.resolve(rootRequest.id, PermissionChoice.ONCE)
                 val shizukuRequest = awaitRequest()
                 assertEquals("second-session", shizukuRequest.sessionId)
-                assertEquals("tool:Shizuku:0:root-connection", shizukuRequest.sessionGrant)
+                assertNotNull(shizukuRequest.sessionGrant)
                 permissions.resolve(shizukuRequest.id, PermissionChoice.REJECT)
                 run.await()
                 assertEquals(1, issued.size)
@@ -609,26 +1083,27 @@ class WorkflowRootSessionApprovalTest {
     }
 
     @Test
-    fun dangerousElevationStillAsksOnceAfterBothOrdinaryAlwaysGrants() = runBlocking {
+    fun hostFileAccessStillAsksOnceAfterBothDefaultAllowCommandsAndLegacyGrants() = runBlocking {
         withTimeout(10_000) {
+            val legacyGrants = setOf("session" to "tool:Root:root-authority:42", "session" to "tool:Shizuku:0:root-connection")
+            allowed.addAll(legacyGrants)
             responses(
-                AIResponse("root", listOf(call("Root", 1))),
-                AIResponse("shizuku", listOf(call("Shizuku", 2))),
-                AIResponse("root dangerous", listOf(call("Root", 3, "rm -rf /data", elevate = true))),
-                AIResponse("shizuku dangerous", listOf(call("Shizuku", 4, "rm -rf /system", elevate = true))),
+                AIResponse("root", listOf(call("Root", 1, "id"))),
+                AIResponse("shizuku", listOf(call("Shizuku", 2, "id"))),
+                AIResponse("root host file", listOf(call("Root", 3))),
+                AIResponse("shizuku host file", listOf(call("Shizuku", 4, "touch /system/etc/hosts"))),
                 AIResponse("done")
             )
             val run = async { collect() }
             try {
-                repeat(2) { permissions.resolve(awaitRequest().id, PermissionChoice.ALWAYS_SESSION) }
                 repeat(2) {
                     val request = awaitRequest()
-                    assertNull(request.sessionGrant)
+                    assertNotNull(request.sessionGrant)
                     permissions.resolve(request.id, PermissionChoice.ONCE)
                 }
                 val events = run.await()
-                assertEquals(setOf("session" to "tool:Root:root-authority:42", "session" to "tool:Shizuku:0:root-connection"), allowed)
-                assertEquals(4, seenRequests.size)
+                assertEquals(legacyGrants, allowed)
+                assertEquals(2, seenRequests.size)
                 assertEquals(4, issued.size)
                 assertEquals(4, executed.size)
                 assertEquals(4, issued.map { it.id }.toSet().size)

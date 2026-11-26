@@ -35,13 +35,14 @@ internal class FilePreviewViewModel @Inject constructor(private val sources: Pre
     private var generation = 0
 
     fun open(request: PreviewRequest) {
-        close()
+        releaseSource()
+        if (request.cachedPath.isNotBlank()) sources.close()
         val current = generation
         _load.value = PreviewLoad.Loading
         opening = viewModelScope.launch {
             var pending: PreviewSource? = null
             try {
-                val opened = withContext(Dispatchers.IO) { sources.open(request).also { pending = it } }
+                val opened = withContext(Dispatchers.IO) { sources.open(request, requireNotNull(viewModelScope.coroutineContext[Job])).also { pending = it } }
                 currentCoroutineContext().ensureActive()
                 if (generation != current) return@launch
                 source = opened
@@ -69,6 +70,11 @@ internal class FilePreviewViewModel @Inject constructor(private val sources: Pre
     }
 
     fun close() {
+        releaseSource()
+        sources.close()
+    }
+
+    private fun releaseSource() {
         generation++
         watching?.cancel()
         watching = null

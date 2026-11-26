@@ -174,6 +174,9 @@ fun CodeEditorScreen(
             leaveGuard?.isDirty = false
         }
     }
+    DisposableEffect(viewModel) {
+        onDispose { viewModel.release() }
+    }
 
     val context = LocalContext.current
     val savedText = stringResource(R.string.editor_save_success)
@@ -397,7 +400,12 @@ fun CodeEditorScreen(
                 HintText(stringResource(R.string.editor_binary_unsupported))
             }
             is EditorUiState.Error -> CenterBox(content) {
-                HintText(s.detail ?: stringResource(R.string.editor_load_failed))
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    HintText(s.detail ?: stringResource(R.string.editor_load_failed))
+                    TextButton(onClick = { viewModel.load(path) }) {
+                        Text(stringResource(R.string.common_retry))
+                    }
+                }
             }
         }
     }
