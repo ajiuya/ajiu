@@ -24,7 +24,7 @@ data class RuntimeOwner(val kind: RuntimeOwnerKind, val scopeId: String) {
 
 enum class LocalRuntimeCleanup { VERIFIED, UNKNOWN }
 
-enum class LocalRuntimeRemoval { REMOVED, REBOOT_REQUIRED }
+enum class LocalRuntimeRemoval { REMOVED, RETRY_REQUIRED }
 
 // The legacy type identifies a missing execution context, not a request for a user grant.
 class LocalRuntimeAuthorizationRequired : IOException("The current CHROOT workspace context is unavailable; retry from the current workspace")
@@ -108,7 +108,7 @@ data class LocalRuntimeState(
     val authorizedOwners: Int,
     val busy: Boolean,
     val journalRepairAvailable: Boolean = false,
-    val removalRebootRequired: Boolean = false
+    val removalPending: Boolean = false
 ) {
     val installed: Boolean get() = instance != null && !recoveryRequired && journalHealthy
 }

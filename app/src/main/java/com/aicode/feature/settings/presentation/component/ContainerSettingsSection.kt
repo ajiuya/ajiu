@@ -664,7 +664,7 @@ private fun ProfileEditSheet(
     val dismiss = { importJob?.cancel(); onDismiss() }
     val chrootState = initial?.takeIf { it.isChroot }?.let { chrootUiState.states[it.id] }
     val chrootEditable = initial?.isChroot != true || (chrootState != null && chrootState.journalHealthy &&
-        !chrootState.recoveryRequired && !chrootState.removalRebootRequired && !chrootState.busy && chrootUiState.workingProfileId == null)
+        !chrootState.recoveryRequired && !chrootState.removalPending && !chrootState.busy && chrootUiState.workingProfileId == null)
     // SFTP 通道才适合 SSH exec（FTP/LOCAL 不走 sshj）
     val sshConnections = remoteConnections.filter { it.protocol == RemoteProtocol.SFTP }
     // 编辑内置 Alpine 时保持 Asset 来源（可选导入覆盖）

@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <linux/capability.h>
 #include <linux/magic.h>
 #include <linux/openat2.h>
 #include <linux/stat.h>
@@ -16,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/vfs.h>
@@ -33,6 +35,9 @@
 #define REMOVE_RECEIPT "remove-after-reboot"
 #define REMOVE_MAGIC UINT64_C(0x414a525200000001)
 #define MAX_RECOVERY_VIEWS 4096U
+#define MAX_PROC_TASKS 65536U
+#define MAX_PROC_ENTRIES 1048576U
+#define RECOVERY_STOP_WAIT 7500
 
 struct removal_receipt {
     uint64_t magic, identity[8]; /* base, root, views, manifest: dev/ino pairs */
@@ -49,6 +54,7 @@ struct entry {
     ino_t ino;
     uint64_t mount_id;
 };
+struct proc_identity;
 struct install {
     struct entry *entries;
     uint32_t *index;
@@ -59,9 +65,11 @@ struct install {
     struct stat base_stat, root_stat, views_stat;
     uint64_t mount_id;
     bool base_created, root_created, views_created, base_known, root_known, views_known, validate, mutable_tree;
-    bool recover_remove, recovery_ready, reboot_required;
+    bool recover_remove, recovery_ready, removal_locked;
     struct removal_receipt receipt_data;
     struct stat receipt_stat;
+    struct proc_identity *proc_targets;
+    size_t proc_target_count;
 };
 static const char *stage = "arguments";
 static volatile sig_atomic_t timed_out;
@@ -413,6 +421,24 @@ static int rollback(struct install *s)
 
 struct mutable_entry { char *path; struct stat st; uint64_t mount_id; };
 struct mutable_tree { struct mutable_entry *entries; size_t count, capacity; uint64_t names; };
+struct proc_identity { dev_t dev; ino_t ino; mode_t type; };
+
+static int proc_identity_compare(const void *left, const void *right)
+{
+    const struct proc_identity *a = left, *b = right;
+    if (a->dev != b->dev) return a->dev < b->dev ? -1 : 1;
+    if (a->ino != b->ino) return a->ino < b->ino ? -1 : 1;
+    if (a->type != b->type) return a->type < b->type ? -1 : 1;
+    return 0;
+}
+
+static bool proc_identity_contains(const struct install *s, const struct stat *target)
+{
+    struct proc_identity key = { .dev = target->st_dev, .ino = target->st_ino,
+        .type = target->st_mode & S_IFMT };
+    return s->proc_target_count && bsearch(&key, s->proc_targets, s->proc_target_count,
+        sizeof(*s->proc_targets), proc_identity_compare) != NULL;
+}
 
 static int mutable_parent_current(struct install *s)
 {
@@ -543,6 +569,66 @@ static int mutable_scan(struct install *s, struct mutable_tree *tree, int parent
     return 0;
 }
 
+static int recovery_view(struct install *s, const char *name, const struct stat *expected, struct stat *out);
+static bool nonce_valid(const char *nonce);
+
+static int recovery_targets_prepare(struct install *s)
+{
+    struct mutable_tree tree = {0};
+    struct stat manifest, receipt;
+    int error = 0;
+    if (installed_anchors_current(s, false) < 0 || recovery_gate(s) < 0 ||
+        fstat(s->manifest, &manifest) < 0 || fstat(s->receipt, &receipt) < 0 ||
+        mutable_scan(s, &tree, s->root, "", 0) < 0) error = errno;
+    size_t capacity = tree.count + 5 + MAX_RECOVERY_VIEWS;
+    struct proc_identity *targets = NULL;
+    size_t count = 0;
+    if (!error) {
+        targets = calloc(capacity, sizeof(*targets));
+        if (!targets) error = errno;
+    }
+    if (!error) {
+        const struct stat *fixed[] = { &s->base_stat, &s->root_stat, &s->views_stat, &manifest, &receipt };
+        for (size_t i = 0; i < sizeof(fixed) / sizeof(*fixed); ++i)
+            targets[count++] = (struct proc_identity){ .dev = fixed[i]->st_dev, .ino = fixed[i]->st_ino,
+                .type = fixed[i]->st_mode & S_IFMT };
+        for (size_t i = 0; i < tree.count; ++i)
+            targets[count++] = (struct proc_identity){ .dev = tree.entries[i].st.st_dev,
+                .ino = tree.entries[i].st.st_ino, .type = tree.entries[i].st.st_mode & S_IFMT };
+        int fd = openat(s->views, ".", DIR_FLAGS), saved = errno;
+        DIR *directory = fd < 0 ? NULL : fdopendir(fd);
+        if (!directory) { error = fd < 0 ? saved : errno; if (fd >= 0) close(fd); }
+        while (directory && !error) {
+            if (time_remaining() < 0) { error = errno; break; }
+            errno = 0; struct dirent *entry = readdir(directory);
+            if (!entry) { error = errno; break; }
+            if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+            if (count == capacity) { error = EOVERFLOW; break; }
+            if (!nonce_valid(entry->d_name)) { error = EPROTO; break; }
+            struct stat view;
+            if (recovery_view(s, entry->d_name, NULL, &view) < 0) { error = errno; break; }
+            targets[count++] = (struct proc_identity){ .dev = view.st_dev, .ino = view.st_ino,
+                .type = view.st_mode & S_IFMT };
+        }
+        if (directory) {
+            int close_result = closedir(directory), saved = errno;
+            directory = NULL;
+            if (close_result < 0 && !error) error = saved;
+        }
+        if (!error) {
+            qsort(targets, count, sizeof(*targets), proc_identity_compare);
+            if (time_remaining() < 0 || installed_anchors_current(s, false) < 0 || recovery_gate(s) < 0)
+                error = errno;
+        }
+    }
+    for (size_t i = 0; i < tree.count; ++i) free(tree.entries[i].path);
+    free(tree.entries);
+    if (error) { free(targets); errno = error; return -1; }
+    s->proc_targets = targets;
+    s->proc_target_count = count;
+    return 0;
+}
+
 static const struct stat *mutable_parent_identity(const struct install *s, const struct mutable_tree *tree, const char *path)
 {
     const char *slash = strrchr(path, '/');
@@ -561,6 +647,9 @@ static int remove_mutable_tree(struct install *s)
     /* Pre-scan rejects submounts and exhausted budgets before the first unlink. The manifest is
      * historical provenance only: v2 never compares guest entries to their original package inode. */
     if (mutable_anchors_current(s) < 0 || mutable_scan(s, &tree, s->root, "", 0) < 0) error = errno;
+    for (size_t i = 0; s->recover_remove && !error && i < tree.count; ++i) {
+        if (!proc_identity_contains(s, &tree.entries[i].st)) error = ESTALE;
+    }
     for (size_t i = tree.count; !error && i > 0; --i) {
         if (time_remaining() < 0 || mutable_anchors_current(s) < 0) { error = errno; break; }
         const struct mutable_entry *entry = &tree.entries[i - 1];
@@ -791,9 +880,8 @@ static bool boot_id_valid(const char id[36])
     return nonzero;
 }
 
-static int read_boot_id(char id[36])
+static int protected_proc(uint64_t *proc_mount)
 {
-    stage = "recovery_boot_id";
     int slash = open("/", DIR_FLAGS);
     if (slash < 0) return -1;
     /* /proc is a mount boundary: pin it first, then forbid every further mount
@@ -804,11 +892,22 @@ static int read_boot_id(char id[36])
     if (proc < 0) { errno = saved; return -1; }
     struct stat st;
     struct statfs fs;
-    uint64_t proc_mount, boot_mount;
-    int error = 0, fd = -1;
     if (fstat(proc, &st) < 0 || !S_ISDIR(st.st_mode) || st.st_uid != 0 || st.st_gid != 0 ||
         (st.st_mode & 0022) || fstatfs(proc, &fs) < 0 || fs.f_type != PROC_SUPER_MAGIC ||
-        mount_identity(proc, &proc_mount) < 0 || !proc_mount) error = ESTALE;
+        mount_identity(proc, proc_mount) < 0 || !*proc_mount) {
+        close(proc); errno = ESTALE; return -1;
+    }
+    return proc;
+}
+
+static int read_boot_id(char id[36])
+{
+    stage = "recovery_boot_id";
+    uint64_t proc_mount, boot_mount;
+    int proc = protected_proc(&proc_mount);
+    if (proc < 0) return -1;
+    struct stat st;
+    int error = 0, fd = -1;
     if (!error) {
         struct open_how how = { .flags = O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW,
             .resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV };
@@ -875,9 +974,7 @@ static int receipt_current(struct install *s)
 
 static int recovery_gate(struct install *s)
 {
-    /* recovery_ready is set only after comparing the durable receipt to this boot.
-     * A running installer cannot itself survive that boot, so retain that proof. */
-    if (!s->recovery_ready) { errno = EBUSY; return -1; }
+    if (!s->recovery_ready || !s->removal_locked) { errno = EBUSY; return -1; }
     return receipt_current(s);
 }
 
@@ -946,9 +1043,11 @@ static int recovery_views(struct install *s, bool remove)
     if (dir && closedir(dir) < 0 && !error) error = errno;
     /* Preflight every child before the first rmdir. No cgroup name or membership is inferred. */
     for (size_t i = 0; remove && !error && i < count; ++i) {
+        struct stat current;
         if (installed_anchors_current(s, false) < 0 || recovery_gate(s) < 0 ||
-            recovery_view(s, entries[i].name, &entries[i].st, NULL) < 0 ||
-            unlinkat(s->views, entries[i].name, AT_REMOVEDIR) < 0) error = errno;
+            recovery_view(s, entries[i].name, &entries[i].st, &current) < 0) { error = errno; break; }
+        if (!proc_identity_contains(s, &current)) { error = ESTALE; break; }
+        if (unlinkat(s->views, entries[i].name, AT_REMOVEDIR) < 0) error = errno;
     }
     free(entries);
     if (remove && !error && (views_empty(s) < 0 || fsync(s->views) < 0)) error = errno;
@@ -982,11 +1081,347 @@ static int finish_base(struct install *s)
     return -1;
 }
 
+static int recovery_exclusive(struct install *s)
+{
+    int64_t until = monotonic_ms() + RECOVERY_STOP_WAIT;
+    for (;;) {
+        if (flock(s->base, LOCK_EX | LOCK_NB) == 0) { s->removal_locked = true; return 0; }
+        if (errno != EWOULDBLOCK && errno != EINTR) return -1;
+        if (time_remaining() < 0) return -1;
+        if (monotonic_ms() >= until) { errno = EBUSY; return -1; }
+        if (poll(NULL, 0, 20) < 0 && errno != EINTR) return -1;
+    }
+}
+
+static bool decimal(const char *text, uint64_t *value);
+
+static int proc_open(int parent, const char *name, int flags, uint64_t mount)
+{
+    struct open_how how = { .flags = (uint64_t)(flags | O_NOFOLLOW | O_CLOEXEC),
+        .resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV };
+    int fd = (int)syscall(SYS_openat2, parent, name, &how, sizeof(how));
+    if (fd < 0) return -1;
+    uint64_t actual;
+    if (mount_identity(fd, &actual) < 0 || actual != mount) { close(fd); errno = ESTALE; return -1; }
+    return fd;
+}
+
+static int proc_magic_target(struct install *s, int parent, const char *name)
+{
+    struct stat before, target, after, target_after;
+    if (fstatat(parent, name, &before, AT_SYMLINK_NOFOLLOW) < 0) return -1;
+    if (!S_ISLNK(before.st_mode)) { errno = ESTALE; return -1; }
+    if (fstatat(parent, name, &target, 0) < 0 || fstatat(parent, name, &after, AT_SYMLINK_NOFOLLOW) < 0 ||
+        fstatat(parent, name, &target_after, 0) < 0) return -1;
+    if (!same_object(&before, &after) || !same_object(&target, &target_after)) { errno = EBUSY; return -1; }
+    if ((S_ISDIR(target.st_mode) && (same_object(&target, &s->base_stat) ||
+        same_object(&target, &s->root_stat) || same_object(&target, &s->views_stat))) ||
+        proc_identity_contains(s, &target)) { errno = EBUSY; return -1; }
+    return 0;
+}
+
+static bool proc_number(const char *name)
+{
+    if (!*name) return false;
+    for (const char *p = name; *p; ++p) if (*p < '0' || *p > '9') return false;
+    return true;
+}
+
+static int proc_task_state(int task, uint64_t mount, uint64_t *start_time)
+{
+    int fd = proc_open(task, "stat", O_RDONLY | O_NONBLOCK, mount);
+    if (fd < 0) return -1;
+    char text[4096];
+    ssize_t n = pread(fd, text, sizeof(text) - 1, 0);
+    int saved = errno;
+    close(fd);
+    if (n < 0) { errno = saved; return -1; }
+    if (!n || n == (ssize_t)sizeof(text) - 1 || memchr(text, 0, (size_t)n)) { errno = EPROTO; return -1; }
+    text[n] = 0;
+    const char *tail = strrchr(text, ')');
+    if (!tail) { errno = EPROTO; return -1; }
+    char *cursor = (char *)tail + 1;
+    while (*cursor == ' ' || *cursor == '\t') ++cursor;
+    if (!*cursor || !cursor[1] || cursor[1] != ' ' || cursor[0] == 'Z' || cursor[0] == 'X') return 1;
+    cursor += 2;
+    uint64_t flags = 0;
+    for (unsigned int field = 4; field <= 9; ++field) {
+        while (*cursor == ' ' || *cursor == '\t') ++cursor;
+        bool signed_field = field == 7 || field == 8;
+        bool negative = signed_field && *cursor == '-';
+        if (negative) ++cursor;
+        if (*cursor < '0' || *cursor > '9') { errno = EPROTO; return -1; }
+        uint64_t number = 0;
+        while (*cursor >= '0' && *cursor <= '9') {
+            unsigned int digit = (unsigned int)(*cursor++ - '0');
+            if (number > (UINT64_MAX - digit) / 10) { errno = EOVERFLOW; return -1; }
+            number = number * 10 + digit;
+        }
+        if (*cursor != ' ' && *cursor != '\t' && *cursor != '\n') { errno = EPROTO; return -1; }
+        if (field <= 8 && number > (negative ? (uint64_t)INT32_MAX + 1 : INT32_MAX)) {
+            errno = ERANGE; return -1;
+        }
+        if (field == 9) flags = number;
+    }
+    if (flags & UINT64_C(0x00200000)) return 2;
+    for (unsigned int field = 10; field < 22; ++field) {
+        while (*cursor == ' ' || *cursor == '\t') ++cursor;
+        if (!*cursor) { errno = EPROTO; return -1; }
+        while (*cursor && *cursor != ' ' && *cursor != '\t' && *cursor != '\n') ++cursor;
+    }
+    while (*cursor == ' ' || *cursor == '\t') ++cursor;
+    if (!*cursor || *cursor < '0' || *cursor > '9') { errno = EPROTO; return -1; }
+    uint64_t value = 0;
+    while (*cursor >= '0' && *cursor <= '9') {
+        unsigned int digit = (unsigned int)(*cursor++ - '0');
+        if (value > (UINT64_MAX - digit) / 10) { errno = EOVERFLOW; return -1; }
+        value = value * 10 + digit;
+    }
+    *start_time = value;
+    return 0;
+}
+
+static int proc_reference(struct install *s, int parent, const char *name, uint64_t mount)
+{
+    struct stat directory;
+    uint64_t actual;
+    if (fstat(parent, &directory) < 0 || mount_identity(parent, &actual) < 0 || actual != mount) return -1;
+    return proc_magic_target(s, parent, name);
+}
+
+struct proc_scan { size_t tasks, entries; };
+
+static int proc_budget(struct proc_scan *scan)
+{
+    if (++scan->entries > MAX_PROC_ENTRIES) { errno = EOVERFLOW; return -1; }
+    return time_remaining() < 0 ? -1 : 0;
+}
+
+static int proc_task_disappeared(int task, uint64_t mount)
+{
+    uint64_t start;
+    int state = proc_task_state(task, mount, &start);
+    if (state == 1) return 1;
+    if (state < 0) return -1;
+    errno = EBUSY;
+    return -1;
+}
+
+static int proc_task(struct install *s, int task, uint64_t mount, struct proc_scan *scan)
+{
+    uint64_t start_time;
+    if (proc_budget(scan) < 0 || scan->tasks == MAX_PROC_TASKS) { if (scan->tasks == MAX_PROC_TASKS) errno = EOVERFLOW; return -1; }
+    ++scan->tasks;
+    int inactive = proc_task_state(task, mount, &start_time);
+    if (inactive == 1 || inactive == 2) return 0;
+    if (inactive < 0) return -1;
+    const char *const refs[] = { "root", "cwd" };
+    for (size_t i = 0; i < 2; ++i) {
+        if (proc_reference(s, task, refs[i], mount) < 0) {
+            int saved = errno;
+            if ((saved == ENOENT || saved == ESRCH) && proc_task_disappeared(task, mount) == 1) return 0;
+            errno = saved == ENOENT || saved == ESRCH ? EBUSY : saved; return -1;
+        }
+    }
+    int fd = proc_open(task, "fd", DIR_FLAGS, mount);
+    if (fd < 0) {
+        int saved = errno;
+        if ((saved == ENOENT || saved == ESRCH) && proc_task_disappeared(task, mount) == 1) return 0;
+        errno = saved == ENOENT || saved == ESRCH ? EBUSY : saved; return -1;
+    }
+    DIR *dir = fdopendir(fd);
+    if (!dir) { close(fd); return -1; }
+    int error = 0;
+    for (;;) {
+        if (proc_budget(scan) < 0) { error = errno; break; }
+        errno = 0; struct dirent *entry = readdir(dir);
+        if (!entry) { error = errno; break; }
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        if (!proc_number(entry->d_name)) { error = EPROTO; break; }
+        if (proc_reference(s, fd, entry->d_name, mount) < 0 && errno != ENOENT && errno != ESRCH) {
+            error = errno; break;
+        }
+    }
+    if (closedir(dir) < 0 && !error) error = errno;
+    if (!error) {
+        uint64_t current;
+        int state = proc_task_state(task, mount, &current);
+        if (state < 0) error = errno;
+        else if (!state && current != start_time) error = ESTALE;
+    }
+    return error ? (errno = error, -1) : 0;
+}
+
+static bool proc_mapfile_name(const char *name)
+{
+    bool dash = false, left = false, right = false;
+    for (const unsigned char *p = (const unsigned char *)name; *p; ++p) {
+        if ((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F')) {
+            if (dash) right = true; else left = true;
+        } else if (*p == '-' && !dash && left) dash = true;
+        else return false;
+    }
+    return dash && right;
+}
+
+static int proc_process_references(struct install *s, int process, uint64_t mount, struct proc_scan *scan)
+{
+    uint64_t start_time;
+    int state = proc_task_state(process, mount, &start_time);
+    if (state == 1 || state == 2) return 0;
+    if (state < 0) return -1;
+    if (proc_reference(s, process, "exe", mount) < 0) {
+        int saved = errno;
+        if ((saved == ENOENT || saved == ESRCH) && proc_task_disappeared(process, mount) == 1) return 0;
+        errno = saved == ENOENT || saved == ESRCH ? EBUSY : saved;
+        return -1;
+    }
+    int fd = proc_open(process, "map_files", DIR_FLAGS, mount);
+    if (fd < 0) {
+        int saved = errno;
+        if ((saved == ENOENT || saved == ESRCH) && proc_task_disappeared(process, mount) == 1) return 0;
+        errno = saved == ENOENT || saved == ESRCH ? EBUSY : saved;
+        return -1;
+    }
+    DIR *dir = fdopendir(fd);
+    if (!dir) { close(fd); return -1; }
+    int error = 0;
+    for (;;) {
+        if (proc_budget(scan) < 0) { error = errno; break; }
+        errno = 0; struct dirent *entry = readdir(dir);
+        if (!entry) { error = errno; break; }
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        if (!proc_mapfile_name(entry->d_name)) { error = EPROTO; break; }
+        if (proc_reference(s, fd, entry->d_name, mount) < 0 && errno != ENOENT && errno != ESRCH) {
+            error = errno; break;
+        }
+    }
+    if (closedir(dir) < 0 && !error) error = errno;
+    if (!error) {
+        uint64_t current;
+        state = proc_task_state(process, mount, &current);
+        if (state < 0) error = errno;
+        else if (!state && current != start_time) error = ESTALE;
+    }
+    return error ? (errno = error, -1) : 0;
+}
+
+static int proc_threads(struct install *s, int process, uint64_t mount, struct proc_scan *scan)
+{
+    uint64_t process_start;
+    int process_state = proc_task_state(process, mount, &process_start);
+    if (process_state == 1 || process_state == 2) return 0;
+    if (process_state < 0) return -1;
+    int fd = proc_open(process, "task", DIR_FLAGS, mount);
+    if (fd < 0) {
+        if (errno == ENOENT || errno == ESRCH) {
+            uint64_t start;
+            int state = proc_task_state(process, mount, &start);
+            if (state == 1 || state == 2) return 0;
+        }
+        return -1;
+    }
+    stage = "recovery_proc_process_references";
+    if (proc_process_references(s, process, mount, scan) < 0) { close(fd); return -1; }
+    DIR *dir = fdopendir(fd);
+    if (!dir) { close(fd); return -1; }
+    int error = 0;
+    for (;;) {
+        if (proc_budget(scan) < 0) { error = errno; break; }
+        errno = 0; struct dirent *entry = readdir(dir);
+        if (!entry) { error = errno; break; }
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        if (!proc_number(entry->d_name)) { error = EPROTO; break; }
+        int task = proc_open(fd, entry->d_name, DIR_FLAGS, mount);
+        if (task < 0) {
+            if (errno == ENOENT || errno == ESRCH) continue;
+            error = errno; break;
+        }
+        stage = "recovery_proc_task_references";
+        if (proc_task(s, task, mount, scan) < 0) error = errno;
+        close(task);
+        if (error) break;
+    }
+    if (closedir(dir) < 0 && !error) error = errno;
+    return error ? (errno = error, -1) : 0;
+}
+
+static int proc_snapshot(struct install *s, int proc, uint64_t mount, pid_t own, struct proc_scan *scan)
+{
+    int fd = proc_open(proc, ".", DIR_FLAGS, mount);
+    if (fd < 0) return -1;
+    DIR *dir = fdopendir(fd);
+    if (!dir) { close(fd); return -1; }
+    char own_name[32];
+    (void)snprintf(own_name, sizeof(own_name), "%ld", (long)own);
+    int error = 0;
+    for (;;) {
+        if (proc_budget(scan) < 0) { error = errno; break; }
+        errno = 0; struct dirent *entry = readdir(dir);
+        if (!entry) { error = errno; break; }
+        if (!proc_number(entry->d_name)) continue;
+        if (!strcmp(entry->d_name, own_name)) continue;
+        int process = proc_open(fd, entry->d_name, DIR_FLAGS, mount);
+        if (process < 0) {
+            if (errno == ENOENT || errno == ESRCH) continue;
+            error = errno; break;
+        }
+        stage = "recovery_proc_threads";
+        if (proc_threads(s, process, mount, scan) < 0) error = errno;
+        close(process);
+        if (error) break;
+    }
+    if (closedir(dir) < 0 && !error) error = errno;
+    return error ? (errno = error, -1) : 0;
+}
+
+static int proc_self_pid(int proc, pid_t *pid)
+{
+    char bytes[32];
+    ssize_t n = readlinkat(proc, "self", bytes, sizeof(bytes));
+    if (n <= 0 || (size_t)n == sizeof(bytes)) { errno = ESTALE; return -1; }
+    bytes[n] = 0;
+    uint64_t number;
+    if (!decimal(bytes, &number) || number > INT32_MAX) { errno = ESTALE; return -1; }
+    *pid = (pid_t)number;
+    return 0;
+}
+
+static int recovery_processes(struct install *s)
+{
+    struct __user_cap_header_struct header = { .version = _LINUX_CAPABILITY_VERSION_3 };
+    struct __user_cap_data_struct caps[2] = {{0}};
+    if (syscall(SYS_capget, &header, caps) < 0) return -1;
+    if (!(caps[0].effective & (UINT32_C(1) << CAP_SYS_PTRACE))) { errno = EPERM; return -1; }
+    uint64_t mount;
+    int proc = protected_proc(&mount);
+    if (proc < 0) return -1;
+    pid_t own;
+    if (proc_self_pid(proc, &own) < 0 || own != getpid()) { int saved = errno ? errno : ESTALE; close(proc); errno = saved; return -1; }
+    char own_name[32];
+    (void)snprintf(own_name, sizeof(own_name), "%ld", (long)own);
+    int own_process = proc_open(proc, own_name, DIR_FLAGS, mount), error = 0;
+    if (own_process < 0) error = errno;
+    uint64_t own_start;
+    int own_state = error ? -1 : proc_task_state(own_process, mount, &own_start);
+    if (!error && own_state != 0) error = own_state < 0 ? errno : ESTALE;
+    if (!error && (proc_reference(s, own_process, "root", mount) < 0 ||
+        proc_reference(s, own_process, "cwd", mount) < 0)) error = errno;
+    if (!error && (proc_task_state(own_process, mount, &own_start) != 0)) error = ESTALE;
+    if (own_process >= 0) close(own_process);
+    for (unsigned int pass = 0; pass < 2 && !error; ++pass) {
+        struct proc_scan scan = {0};
+        if (proc_snapshot(s, proc, mount, own, &scan) < 0) error = errno;
+        if (!error && pass == 0 && poll(NULL, 0, 25) < 0 && errno != EINTR) error = errno;
+    }
+    close(proc);
+    return error ? (errno = error, -1) : 0;
+}
+
 static int recover_remove(struct install *s)
 {
-    s->recovery_ready = s->reboot_required = false;
-    char boot[36];
-    if (read_boot_id(boot) < 0) return -1;
+    s->recovery_ready = false;
+    char boot[36] = {0};
     struct stat manifest;
     if (fstat(s->manifest, &manifest) < 0) return -1;
     struct removal_receipt expected = { .magic = REMOVE_MAGIC, .identity = {
@@ -998,12 +1433,11 @@ static int recover_remove(struct install *s)
     s->receipt = openat(s->base, REMOVE_RECEIPT, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
     if (s->receipt < 0) {
         if (errno != ENOENT || receipt_absent(s->base) < 0 || base_contents(s, 7U) < 0 ||
-            installed_anchors_current(s, false) < 0 || recovery_views(s, false) < 0) return -1;
+            installed_anchors_current(s, false) < 0 || read_boot_id(boot) < 0) return -1;
+        memcpy(expected.boot_id, boot, sizeof(expected.boot_id));
         s->receipt_data = expected;
         if (receipt_create(s) < 0) return -1;
-        s->reboot_required = true;
-        return 0;
-    }
+    } else {
     if (fstat(s->receipt, &s->receipt_stat) < 0 ||
         pread(s->receipt, &s->receipt_data, sizeof(s->receipt_data), 0) != (ssize_t)sizeof(s->receipt_data) ||
         !boot_id_valid(s->receipt_data.boot_id)) { errno = ESTALE; return -1; }
@@ -1012,8 +1446,16 @@ static int recover_remove(struct install *s)
         base_contents(s, 15U) < 0 || installed_anchors_current(s, false) < 0) { errno = ESTALE; return -1; }
     /* Re-sync also makes a valid receipt left by an interrupted first call durable. */
     if (fsync(s->receipt) < 0 || fsync(s->base) < 0) return -1;
-    if (!memcmp(boot, s->receipt_data.boot_id, sizeof(boot))) { s->reboot_required = true; return 0; }
+    }
+    stage = "recovery_lock";
+    if (recovery_exclusive(s) < 0) return -1;
+    stage = "recovery_processes";
+    if (receipt_current(s) < 0 || installed_anchors_current(s, false) < 0) return -1;
     s->recovery_ready = true;
+    stage = "recovery_targets";
+    if (recovery_targets_prepare(s) < 0) return -1;
+    stage = "recovery_processes";
+    if (recovery_processes(s) < 0 || receipt_current(s) < 0 || installed_anchors_current(s, false) < 0) return -1;
     stage = "recovery_views";
     if (recovery_gate(s) < 0 || recovery_views(s, true) < 0) return -1;
     stage = "recovery_rootfs";
@@ -1047,7 +1489,7 @@ int main(int argc, char **argv)
     if (flags < 0 || fcntl(STDOUT_FILENO, F_SETFL, flags | O_NONBLOCK) < 0) return 3;
     (void)signal(SIGPIPE, SIG_IGN);
     struct install s = { .local = -1, .base = -1, .root = -1, .views = -1, .manifest = -1, .receipt = -1,
-        .validate = validate, .recover_remove = recover };
+        .validate = validate, .recover_remove = remove };
     s.entries = calloc(MAX_ENTRIES, sizeof(*s.entries));
     s.index = calloc(HASH_SIZE, sizeof(*s.index));
     int rc = -1;
@@ -1064,7 +1506,8 @@ int main(int argc, char **argv)
     if (ready && s.entries && s.index) {
         if (install || remove) (void)snprintf(s.name, sizeof(s.name), "%s%s", PREFIX, argv[2]);
         if (remove) {
-            if (load_existing(&s, device, inode) == 0) rc = recover ? recover_remove(&s) : rollback(&s);
+            if (load_existing(&s, device, inode) == 0)
+                rc = recover_remove(&s);
         } else if (validate || setup(&s) == 0) rc = parse_stream(&s);
         if (rc == 0 && install) {
             rc = prepare_runtime_layout(&s);
@@ -1076,7 +1519,8 @@ int main(int argc, char **argv)
         }
     }
     int saved = errno;
-    const char *cleanup = remove ? (rc == 0 ? (s.reboot_required ? "reboot_required" : "removed") : "cleanup_unknown") :
+    if (remove && rc < 0 && saved == EBUSY) stage = "recovery_busy";
+    const char *cleanup = remove ? (rc == 0 ? "removed" : "cleanup_unknown") :
         (s.base_created ? "installed" : "not_created");
     if (rc < 0 && s.base_created && !remove) {
         timed_out = 0;
@@ -1088,7 +1532,7 @@ int main(int argc, char **argv)
            rc == 0 ? 0 : saved, s.count, s.bytes, cleanup, (uintmax_t)s.base_stat.st_dev, (uintmax_t)s.base_stat.st_ino);
     if (s.base_created) printf("\"/data/local/%s\"}\n", s.name); else puts("null}");
     if (s.entries) for (uint32_t i = 0; i < s.count; ++i) free(s.entries[i].path);
-    free(s.entries); free(s.index);
+    free(s.entries); free(s.index); free(s.proc_targets);
     if (s.receipt >= 0) close(s.receipt);
     if (s.views >= 0) close(s.views);
     if (s.manifest >= 0) close(s.manifest);

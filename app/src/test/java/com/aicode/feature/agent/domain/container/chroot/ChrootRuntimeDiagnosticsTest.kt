@@ -166,7 +166,7 @@ class ChrootRuntimeDiagnosticsTest {
         val journal = File(directory, "runtime.bin")
         ChrootRecoveryRepository(journal).recordIntent(instance, launch, ChrootFileIdentity(5, 19), "chat:fixture", 3)
         val recoveredJournal = ChrootRecoveryRepository(journal)
-        assertFalse(recoveredJournal.canStart(instance))
+        assertTrue(recoveredJournal.canStart(instance))
 
         val restored = ChrootRuntimeDiagnostics(file)
         assertFalse(restored.isHealthy)
@@ -207,7 +207,7 @@ class ChrootRuntimeDiagnosticsTest {
         assertFalse(store.isHealthy)
         assertEquals(first, store.latestUnknown(instance)!!.failure)
         assertTrue(journalBefore.contentEquals(journal.readBytes()))
-        assertFalse(ChrootRecoveryRepository(journal).canStart(instance))
+        assertTrue(ChrootRecoveryRepository(journal).canStart(instance))
         assertFalse(store.latestUnknown(instance)!!.summary().contains("private"))
     }
 

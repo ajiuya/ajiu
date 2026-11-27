@@ -6,6 +6,7 @@ import com.aicode.feature.agent.domain.container.ChrootInstance
 import com.aicode.feature.agent.domain.container.ContainerProfile
 import com.aicode.feature.agent.domain.container.LocalContainerRuntime
 import com.aicode.feature.agent.domain.container.RootfsSource
+import com.aicode.feature.agent.domain.container.chroot.ChrootRemovalBusyException
 import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeAuthorization
 import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeCleanup
 import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeMount
@@ -95,7 +96,7 @@ class ChrootSettingsViewModelTest {
         assertEquals(runtimeState, viewModel.uiState.value.states[profile.id])
         root.value = root.value.copy(generation = 8)
         runtimeState = runtimeState.copy(journalHealthy = false, recoveryRequired = true,
-            journalRepairAvailable = true, removalRebootRequired = true)
+            journalRepairAvailable = true, removalPending = true)
         changes.value++
         settle()
         assertEquals(root.value, viewModel.uiState.value.rootState)
@@ -261,26 +262,26 @@ class ChrootSettingsViewModelTest {
     }
 
     @Test
-    fun rebootRequiredIsDismissibleInformationAndOnlyAnExplicitRetryRemoves() {
+    fun legacyRemovalReceiptIsDismissibleInformationAndAnExplicitRetryCanRemoveImmediately() {
         runtimeState = runtimeState.copy(recoveryRequired = true)
         coEvery { runtime.recoverAndRemoveInstanceFromUser(profile, root.value) } returnsMany
-            listOf(LocalRuntimeRemoval.REBOOT_REQUIRED, LocalRuntimeRemoval.REMOVED)
+            listOf(LocalRuntimeRemoval.RETRY_REQUIRED, LocalRuntimeRemoval.REMOVED)
         viewModel.requestInstanceAction(profile.id, ChrootInstanceAction.REMOVE)
         settle()
         viewModel.confirm()
         viewModel.confirm()
         settle()
-        assertEquals(R.string.container_chroot_removal_reboot_required, viewModel.uiState.value.info)
+        assertEquals(R.string.container_chroot_removal_pending, viewModel.uiState.value.info)
         assertNull(viewModel.uiState.value.error)
         assertNull(viewModel.uiState.value.workingProfileId)
         assertEquals(listOf(profile), profiles.value)
-        runtimeState = runtimeState.copy(removalRebootRequired = true)
+        runtimeState = runtimeState.copy(removalPending = true)
         changes.value++
         settle()
         coVerify(exactly = 1) { runtime.recoverAndRemoveInstanceFromUser(profile, root.value) }
         viewModel.clearError()
         assertNull(viewModel.uiState.value.info)
-        assertTrue(viewModel.uiState.value.states.getValue(profile.id).removalRebootRequired)
+        assertTrue(viewModel.uiState.value.states.getValue(profile.id).removalPending)
         viewModel.requestInstanceAction(profile.id, ChrootInstanceAction.REMOVE)
         settle()
         assertEquals(ChrootInstanceAction.RECOVER_REMOVE,
@@ -291,6 +292,23 @@ class ChrootSettingsViewModelTest {
         assertNull(viewModel.uiState.value.error)
         assertNull(viewModel.uiState.value.info)
         coVerify(exactly = 0) { runtime.removeInstanceFromUser(any(), any()) }
+        coVerify(exactly = 0) { containers.deleteCustomProfile(any()) }
+    }
+
+    @Test
+    fun activeRemovalOccupancyIsActionableFailureAndDoesNotClaimDeletion() {
+        runtimeState = runtimeState.copy(recoveryRequired = true)
+        coEvery { runtime.recoverAndRemoveInstanceFromUser(profile, root.value) } throws ChrootRemovalBusyException()
+        viewModel.requestInstanceAction(profile.id, ChrootInstanceAction.REMOVE)
+        settle()
+        assertEquals(ChrootInstanceAction.RECOVER_REMOVE,
+            (viewModel.uiState.value.confirmation as ChrootConfirmation.Instance).action)
+        viewModel.confirm()
+        settle()
+        assertEquals(R.string.container_chroot_removal_busy, viewModel.uiState.value.error)
+        assertNull(viewModel.uiState.value.info)
+        assertEquals(listOf(profile), profiles.value)
+        coVerify(exactly = 1) { runtime.recoverAndRemoveInstanceFromUser(profile, root.value) }
         coVerify(exactly = 0) { containers.deleteCustomProfile(any()) }
     }
 

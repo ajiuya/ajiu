@@ -68,6 +68,8 @@ import javax.inject.Singleton
 
 private const val MAX_PRIVATE_ROOTFS_IMAGE_BYTES = 1024L * 1024 * 1024
 
+internal class ChrootRemovalBusyException : IOException("CHROOT instance is still in use; retry removal when its tasks have stopped")
+
 internal fun openChrootRootfsSource(
     value: String,
     filesDir: File,
@@ -254,7 +256,9 @@ class ChrootInstanceInstaller internal constructor(
         val device: Long,
         val inode: Long,
         val entries: Long,
-        val fileBytes: Long
+        val fileBytes: Long,
+        val stage: String,
+        val error: Int
     )
 
     private data class Exchange(
@@ -299,15 +303,14 @@ class ChrootInstanceInstaller internal constructor(
     private var pending = linkedMapOf<String, Pending>()
     private val activeIds = HashSet<String>()
     private val usedIds = HashSet<String>()
-    private val verifiedRecoveryReceipts = HashSet<String>()
     private var lastGeneration = 0L
     private val _failedInstances = MutableStateFlow<Set<String>>(emptySet())
     val failedInstances: StateFlow<Set<String>> = _failedInstances.asStateFlow()
     private val _unpublishedInstalls = MutableStateFlow<Set<String>>(emptySet())
     val unpublishedInstalls: StateFlow<Set<String>> = _unpublishedInstalls.asStateFlow()
-    private val _removalRebootRequired = MutableStateFlow<Set<String>>(emptySet())
-    // UI hint for receipts verified in this process; pending op=2 alone never proves a receipt or reboot.
-    val removalRebootRequired: StateFlow<Set<String>> = _removalRebootRequired.asStateFlow()
+    private val _removalPending = MutableStateFlow<Set<String>>(emptySet())
+    // Pending deletion survives an App restart; it is a retry hint, never proof of cleanup.
+    val removalPending: StateFlow<Set<String>> = _removalPending.asStateFlow()
     private val _isHealthy = MutableStateFlow(true)
     val isHealthy: StateFlow<Boolean> = _isHealthy.asStateFlow()
 
@@ -415,8 +418,13 @@ class ChrootInstanceInstaller internal constructor(
                 if (removal == LocalRuntimeRemoval.REMOVED) publishRemoved()
             }, checkRecoveryCurrent = checkCurrent) { exchange ->
                 when {
-                    verifiedRecoveryReceipt(intent, exchange) -> LocalRuntimeRemoval.REBOOT_REQUIRED
+                    verifiedRecoveryReceipt(intent, exchange) -> LocalRuntimeRemoval.RETRY_REQUIRED
                     exchange.sendFailure == null && verifiedCleanup(intent, exchange) -> LocalRuntimeRemoval.REMOVED
+                    exchange.sendFailure == null && exchange.exit != 0 && !exchange.result.passed &&
+                        exchange.result.stage == "recovery_busy" && exchange.result.error == 16 &&
+                        exchange.result.cleanup == "cleanup_unknown" && exchange.result.path == rootPath(instance.id) &&
+                        exchange.result.device == instance.device && exchange.result.inode == instance.inode ->
+                        throw ChrootRemovalBusyException()
                     else -> throw IOException("Native recovery removal did not provide verified identity-bound evidence")
                 }
             }
@@ -550,7 +558,7 @@ class ChrootInstanceInstaller internal constructor(
                     // branch, which never published a profile change, still checks the old source.
                     if (tx.recoveryReceiptVerified) checkRecoveryCurrent()
                 }
-                finishIntent(intent.id, retain = tx.recoveryReceiptVerified, receiptVerified = tx.recoveryReceiptVerified)
+                finishIntent(intent.id, retain = tx.recoveryReceiptVerified)
                 if (!tx.recoveryReceiptVerified) tx.cleanupVerified = true
                 settled = true
                 publicationPending = false
@@ -680,7 +688,7 @@ class ChrootInstanceInstaller internal constructor(
             fileBytes !in 0..512L * 1024 * 1024 || device < 0 || inode < 0 || error !in 0..Int.MAX_VALUE.toLong() ||
             passed && error != 0L
         ) throw IOException("Native result is outside protocol bounds")
-        return NativeResult(passed, string("cleanup_state"), path, device, inode, entries, fileBytes)
+        return NativeResult(passed, string("cleanup_state"), path, device, inode, entries, fileBytes, string("stage"), error.toInt())
     }
 
     private fun verifiedCleanup(intent: Pending, exchange: Exchange): Boolean {
@@ -697,6 +705,8 @@ class ChrootInstanceInstaller internal constructor(
     }
 
     private fun verifiedRecoveryReceipt(intent: Pending, exchange: Exchange): Boolean {
+        // Legacy installers may only acknowledge the durable deletion barrier. Keep the
+        // instance pending for a direct retry; this response never publishes a removal.
         val result = exchange.result
         return intent.recover && exchange.exit == 0 && exchange.sendFailure == null && result.passed &&
             result.cleanup == "reboot_required" && result.path == rootPath(intent.id) &&
@@ -720,11 +730,13 @@ class ChrootInstanceInstaller internal constructor(
         checkHealthy()
         require(intent.recover && intent.remove)
         val previous = pending[intent.id]
-        if (intent.id in activeIds || previous != null && previous != intent ||
+        val sameRemoval = previous != null && previous.remove &&
+            previous.id == intent.id && previous.generation == intent.generation &&
+            previous.device == intent.device && previous.inode == intent.inode
+        if (intent.id in activeIds || previous != null && !sameRemoval ||
             previous == null && pending.size >= MAX_PENDING
         ) throw IOException("Recovery removal requires the exact pending instance identity")
         usedIds.add(intent.id)
-        verifiedRecoveryReceipts.remove(intent.id)
         recordActiveIntent(intent)
     }
 
@@ -740,13 +752,11 @@ class ChrootInstanceInstaller internal constructor(
         }
     }
 
-    private fun finishIntent(id: String, retain: Boolean, receiptVerified: Boolean = false) = synchronized(journalGate) {
+    private fun finishIntent(id: String, retain: Boolean) = synchronized(journalGate) {
         activeIds.remove(id)
         val next = LinkedHashMap(pending)
         if (!retain) next.remove(id)
         persist(next)
-        if (!retain) verifiedRecoveryReceipts.remove(id)
-        else if (receiptVerified) verifiedRecoveryReceipts.add(id)
         publishFailures()
     }
 
@@ -767,7 +777,7 @@ class ChrootInstanceInstaller internal constructor(
     private fun publishFailures() {
         _failedInstances.value = pending.values.filter { it.recover || it.id !in activeIds }.mapTo(linkedSetOf()) { it.id }
         _unpublishedInstalls.value = pending.values.filter { !it.remove && it.id !in activeIds }.mapTo(linkedSetOf()) { it.id }
-        _removalRebootRequired.value = pending.values.filter { it.recover && it.id in verifiedRecoveryReceipts }.mapTo(linkedSetOf()) { it.id }
+        _removalPending.value = pending.values.filter { it.recover && it.id !in activeIds }.mapTo(linkedSetOf()) { it.id }
     }
 
     private fun checkHealthy() {

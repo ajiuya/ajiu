@@ -113,11 +113,8 @@ internal class ChrootRecoveryRepository internal constructor(
 
     fun snapshot(): List<ChrootRecoveryEntry> = synchronized(gate) { entries.values.toList() }
 
-    fun canStart(instanceId: String): Boolean = synchronized(gate) {
-        _isHealthy.value && entries.values.none {
-            it.instanceId == instanceId && it.phase == ChrootRecoveryPhase.UNKNOWN
-        }
-    }
+    @Suppress("UNUSED_PARAMETER")
+    fun canStart(instanceId: String): Boolean = synchronized(gate) { _isHealthy.value }
 
     /**
      * The caller must explicitly authorize recovery, revoke bindings and exclude active execution.

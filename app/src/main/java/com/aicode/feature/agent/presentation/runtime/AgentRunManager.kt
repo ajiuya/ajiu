@@ -1227,16 +1227,16 @@ class AgentRunManager internal constructor(
             var delegated: Job? = null
             var commandCompaction: Job? = null
             var compactionOutcome: RecoveryStatus? = null
-            fun checkCommandOwner() {
+            fun checkCommandOwner(allowStopping: Boolean = false) {
                 if (epoch != acceptanceEpoch || commandOwners[sessionId] !== owner || !owner.isActive ||
-                    sessionId in deletedSessionIds || sessionId in stoppingSessions) {
+                    sessionId in deletedSessionIds || (!allowStopping && sessionId in stoppingSessions)) {
                     throw CancellationException("Command owner changed")
                 }
             }
             try {
                 if (!awaitReady(sessionId)) return@launch
                 stopAllSettled.first { it }
-                checkCommandOwner()
+                checkCommandOwner(allowStopping = true)
                 val source = acceptedSource.getOrThrow()
                 checkSource(source)
                 val capture = (acceptedCapture ?: projectMemoryIdentityResolver.capture(workspacePath))
@@ -1251,14 +1251,14 @@ class AgentRunManager internal constructor(
                         accepted.environment != recoveryCodec.encodeToString(capture.identity)) {
                         throw CancellationException("Recovery command environment changed")
                     }
-                    checkCommandOwner()
+                    checkCommandOwner(allowStopping = true)
                     capture.assertCurrent()
                     recoveryRun = recoveryRun ?: recoveryRepository.claim(accepted.id, accepted.environment)
                     val run = recoveryRun ?: return@launch
                     if (run.requestId != accepted.id || run.sessionId != sessionId || run.generation != accepted.generation ||
                         !recoveryRepository.isCurrent(run.id)) return@launch
                 }
-                checkCommandOwner()
+                checkCommandOwner(allowStopping = true)
                 capture.assertCurrent()
                 val inputId = accepted?.inputMessageId ?: UUID.randomUUID().toString()
                 messagePersistenceUseCase.persist(sessionId, MessageRole.USER, input, id = inputId,
@@ -1266,7 +1266,7 @@ class AgentRunManager internal constructor(
                 sessionUseCase.touch(sessionId, messagePersistenceUseCase.nextTimestamp())
                 if (compress && (compressionCommandOwners[sessionId] !== owner || !owner.isActive ||
                         sessionId in deletedSessionIds || sessionId in stoppingSessions)) return@launch
-                checkCommandOwner()
+                checkCommandOwner(allowStopping = true)
                 capture.assertCurrent()
                 kotlinx.coroutines.coroutineScope {
                     val invocationScope = this
@@ -1282,6 +1282,7 @@ class AgentRunManager internal constructor(
                     }
                     val invocation = object : SlashCommandContext {
                         override fun compactCurrentSession() {
+                            if (sessionId in stoppingSessions) return
                             val compaction = startContextCompaction(sessionId, true, workspacePath, currentFile, selectedCode, capture,
                                 onFinished = { compactionOutcome = it })
                             if (recoveryRun != null) {
@@ -1300,6 +1301,7 @@ class AgentRunManager internal constructor(
                             invocationScope.launch { delegate(SlashCommandRegistry.buildSkillPrompt(fixedSkill, args)) }
                         }
                         override fun setSessionGoal(rawArgs: String) {
+                            if (sessionId in stoppingSessions) return
                             invocationScope.launch { setSessionGoalNow(sessionId, rawArgs, source) }
                         }
                     }
@@ -1308,7 +1310,7 @@ class AgentRunManager internal constructor(
                         is ResolvedCommand.SkillCommand -> invocation.runSkill(resolved.skill, resolved.args)
                     }
                 }
-                checkCommandOwner()
+                checkCommandOwner(allowStopping = true)
                 capture.assertCurrent()
                 if (delegated == null) {
                     outcome = if (compress && recoveryRun != null) compactionOutcome ?: RecoveryStatus.INTERRUPTED

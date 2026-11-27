@@ -150,7 +150,7 @@ internal class ChrootRuntimeFacade internal constructor(
         }
         scope.launch {
             combine(installer.failedInstances, installer.isHealthy, installer.unpublishedInstalls,
-                installer.removalRebootRequired, recovery.canRepairInterruptedWrite) { _, _, _, _, _ -> Unit }.collect { changed() }
+                installer.removalPending, recovery.canRepairInterruptedWrite) { _, _, _, _, _ -> Unit }.collect { changed() }
         }
         scope.launch {
             while (true) {
@@ -306,7 +306,7 @@ internal class ChrootRuntimeFacade internal constructor(
         return LocalRuntimeState(instance, authority.accessState.value.enabled, healthy, blocked,
             active?.activeLaunches ?: 0, owners, journalRepairBusy.get() || profile.id in busyProfiles || (instance != null && instance.id in busyInstances),
             journalRepairAvailable = recovery.canRepairInterruptedWrite.value && installer.isHealthy.value,
-            removalRebootRequired = instance?.id?.let { it in installer.removalRebootRequired.value } == true)
+            removalPending = instance?.id?.let { it in installer.removalPending.value } == true)
     }
 
     override suspend fun createInstanceFromUser(profile: ContainerProfile, expectedRoot: RootAccessState): ChrootInstance {
@@ -344,36 +344,12 @@ internal class ChrootRuntimeFacade internal constructor(
     }
 
     override suspend fun removeInstanceFromUser(profile: ContainerProfile, expectedRoot: RootAccessState) {
-        val instance = profile.chrootInstance
-        if (instance == null) {
+        if (profile.chrootInstance == null) {
             removeUninstalledProfile(profile, expectedRoot)
             return
         }
-        if (!profile.isChroot || !busyInstances.add(instance.id)) throw IOException("CHROOT instance operation is unavailable")
-        changed()
-        try {
-            val snapshot = settings.captureProfileSnapshot()
-            if (snapshot.profiles.singleOrNull { it.id == profile.id } != profile) {
-                throw CancellationException("CHROOT removal profile changed")
-            }
-            val session = sessionFactory.ensureFromUser(expectedRoot)
-            settings.checkProfileSnapshot(snapshot)
-            sessionFactory.checkSession(session)
-            if (stopAndVerify(instance) != LocalRuntimeCleanup.VERIFIED) throw IOException("CHROOT cleanup is not verified")
-            ensureAvailable(instance, allowBusy = true)
-            if (manager.instanceState(instance.id).activeLaunches != 0) throw IOException("CHROOT instance is still active")
-            settings.checkProfileSnapshot(snapshot)
-            sessionFactory.checkSession(session)
-            installer.removeFromUser(instance, expectedRoot, expectedSession = session) {
-                sessionFactory.checkSession(session)
-                settings.publishChrootInstance(snapshot, profile, null) {
-                    sessionFactory.checkSession(session)
-                    if (authority.accessState.value != expectedRoot) throw CancellationException("Root authority changed before removal publication")
-                }
-            }
-        } finally {
-            busyInstances.remove(instance.id)
-            changed()
+        if (recoverAndRemoveInstanceFromUser(profile, expectedRoot) != LocalRuntimeRemoval.REMOVED) {
+            throw IOException("CHROOT removal is pending; retry removal from Containers & Images")
         }
     }
 
@@ -451,7 +427,8 @@ internal class ChrootRuntimeFacade internal constructor(
                 throw CancellationException("CHROOT recovery removal profile changed")
             }
             val session = sessionFactory.ensureFromUser(expectedRoot)
-            // UNKNOWN stays recorded. Only the native reboot receipt may authorize this deletion.
+            // UNKNOWN stays recorded. Native removal verifies that this instance has no
+            // remaining users before deleting it during the current boot.
             authority.withLock {
                 invalidateIssuances { it.instanceId == instance.id }
                 bindings.values.toList().filter { it.request.sources.profile.chrootInstance?.id == instance.id }.forEach(::revokeBinding)
@@ -486,7 +463,7 @@ internal class ChrootRuntimeFacade internal constructor(
         val results = manager.stopAndAwaitInstance(instance.id)
         changed()
         if (results.all { it == ChrootCleanupResult.VERIFIED } && recovery.isHealthy.value && installer.isHealthy.value &&
-            !manager.instanceState(instance.id).blocked && instance.id !in recovery.blockedInstances.value &&
+            !manager.instanceState(instance.id).blocked && !manager.hasUnverifiedCleanup(instance.id) &&
             instance.id !in installer.failedInstances.value && manager.instanceState(instance.id).activeLaunches == 0
         ) LocalRuntimeCleanup.VERIFIED else LocalRuntimeCleanup.UNKNOWN
     }
@@ -832,11 +809,14 @@ internal class ChrootRuntimeFacade internal constructor(
         if (!recovery.isHealthy.value) {
             throw IOException("CHROOT runtime journal is incomplete; open Containers & Images to repair runtime records or remove the affected instance")
         }
-        if (!installer.isHealthy.value || instance.id in recovery.blockedInstances.value ||
-            manager.instanceState(instance.id).blocked || instance.id in installer.failedInstances.value ||
-            !allowBusy && instance.id in busyInstances) {
-            val detail = manager.failureSummary(instance.id)?.let { " ($it)" }.orEmpty()
-            throw IOException("CHROOT instance requires verified cleanup or recovery$detail")
+        if (!installer.isHealthy.value) {
+            throw IOException("CHROOT installation records are incomplete; open Containers & Images to inspect the instance")
+        }
+        if (instance.id in installer.failedInstances.value) {
+            throw IOException("CHROOT instance installation or removal is incomplete; retry removal from Containers & Images")
+        }
+        if (manager.instanceState(instance.id).blocked || !allowBusy && instance.id in busyInstances) {
+            throw IOException("CHROOT instance operation is in progress; retry when it completes")
         }
     }
 

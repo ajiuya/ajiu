@@ -31,7 +31,7 @@ class ChrootRecoveryRepositoryTest {
     private fun file(): File = File(temporary.newFolder(), "journal.bin")
 
     @Test
-    fun unfinishedIntentBecomesUnknownOnRestartAndCannotBeResetByLateSuccess() {
+    fun unfinishedIntentBecomesUnknownOnRestartAndAllowsNewNonceWithoutRewritingHistory() {
         val file = file()
         val first = ChrootRecoveryRepository(file)
         first.recordIntent(instance, launch, rootfs, "chat:private-owner", 9L)
@@ -42,9 +42,23 @@ class ChrootRecoveryRepositoryTest {
         assertEquals(setOf(instance), recovered.blockedInstances.value)
         assertEquals(ChrootRecoveryPhase.UNKNOWN, recovered.snapshot().single().phase)
         assertEquals(ChrootCleanupResult.UNKNOWN, recovered.snapshot().single().cleanup)
+        val unknown = recovered.snapshot().single()
+        recovered.recordPhase(launch, ChrootRecoveryPhase.RUNNING)
         recovered.recordCleanup(launch, ChrootCleanupResult.VERIFIED)
-        assertFalse(recovered.canStart(instance))
-        assertEquals(ChrootCleanupResult.UNKNOWN, recovered.snapshot().single().cleanup)
+        assertTrue(recovered.canStart(instance))
+        assertEquals(unknown, recovered.snapshot().single())
+        expectIo { recovered.recordIntent(instance, launch, rootfs, "chat:private-owner", 10L) }
+        val nextLaunch = "abcdef0123456789abcdef01"
+        recovered.recordIntent(instance, nextLaunch, rootfs, "chat:new-owner", 10L)
+        recovered.recordPhase(nextLaunch, ChrootRecoveryPhase.RUNNING)
+        recovered.recordCleanup(nextLaunch, ChrootCleanupResult.VERIFIED)
+        assertEquals(unknown, recovered.snapshot().single { it.launchId == launch })
+        assertEquals(ChrootRecoveryPhase.CLOSED, recovered.snapshot().single { it.launchId == nextLaunch }.phase)
+        assertEquals(ChrootCleanupResult.VERIFIED, recovered.snapshot().single { it.launchId == nextLaunch }.cleanup)
+        assertEquals(setOf(launch), recovered.unknownLaunchIds(instance))
+        assertEquals(setOf(launch, nextLaunch), recovered.recordedLaunchIds.value)
+        assertEquals(setOf(instance), recovered.blockedInstances.value)
+        assertEquals(recovered.snapshot(), ChrootRecoveryRepository(file).snapshot())
     }
 
     @Test
@@ -69,7 +83,7 @@ class ChrootRecoveryRepositoryTest {
     }
 
     @Test
-    fun concurrentLaunchesShareAnInstanceUntilAnyCleanupBecomesUnknown() {
+    fun concurrentLaunchesKeepIndependentCleanupAndAllowNewNonceAfterUnknown() {
         val repository = ChrootRecoveryRepository(file())
         val second = "abcdef0123456789abcdef01"
         repository.recordIntent(instance, launch, rootfs, "terminal:first", 3L)
@@ -78,9 +92,21 @@ class ChrootRecoveryRepositoryTest {
         assertEquals(setOf(launch, second), repository.recordedLaunchIds.value)
         assertTrue(repository.canStart(instance))
         repository.recordCleanup(second, ChrootCleanupResult.UNKNOWN)
+        assertTrue(repository.canStart(instance))
+        assertEquals(ChrootRecoveryPhase.RUNNING, repository.snapshot().single { it.launchId == launch }.phase)
+        val third = "abcdefabcdefabcdefabcdef"
+        repository.recordIntent(instance, third, rootfs, "chat:third", 3L)
+        repository.recordPhase(third, ChrootRecoveryPhase.RUNNING)
         repository.recordCleanup(launch, ChrootCleanupResult.VERIFIED)
-        assertFalse(repository.canStart(instance))
+        assertEquals(ChrootRecoveryPhase.CLOSED, repository.snapshot().single { it.launchId == launch }.phase)
+        assertEquals(ChrootCleanupResult.VERIFIED, repository.snapshot().single { it.launchId == launch }.cleanup)
+        assertEquals(ChrootRecoveryPhase.UNKNOWN, repository.snapshot().single { it.launchId == second }.phase)
+        assertEquals(ChrootCleanupResult.UNKNOWN, repository.snapshot().single { it.launchId == second }.cleanup)
+        assertEquals(ChrootRecoveryPhase.RUNNING, repository.snapshot().single { it.launchId == third }.phase)
+        assertEquals(setOf(launch, second, third), repository.recordedLaunchIds.value)
+        assertEquals(setOf(second), repository.unknownLaunchIds(instance))
         assertEquals(setOf(instance), repository.blockedInstances.value)
+        expectIo { repository.recordIntent(instance, second, rootfs, "chat:second", 3L) }
     }
 
     @Test
@@ -126,6 +152,8 @@ class ChrootRecoveryRepositoryTest {
         } catch (_: IOException) {
         }
         assertFalse(repository.isHealthy.value)
+        assertFalse(repository.canStart(instance))
+        expectIo { repository.recordIntent(instance, "abcdef0123456789abcdef01", rootfs, "user:next", 1L) }
         assertTrue(file.exists())
         val recovered = ChrootRecoveryRepository(file)
         assertFalse(recovered.canStart(instance))
@@ -156,12 +184,14 @@ class ChrootRecoveryRepositoryTest {
         val repository = ChrootRecoveryRepository(corrupt)
         assertFalse(repository.isHealthy.value)
         assertFalse(repository.canStart(instance))
+        expectIo { repository.recordIntent(instance, launch, rootfs, "user:owner", 1L) }
         assertEquals(3L, corrupt.length())
         val unfinished = file()
         File(unfinished.path + ".pending").writeBytes(byteArrayOf(9))
         val pending = ChrootRecoveryRepository(unfinished)
         assertFalse(pending.isHealthy.value)
         assertFalse(pending.canStart(instance))
+        expectIo { pending.recordIntent(instance, launch, rootfs, "user:owner", 1L) }
         assertTrue(File(unfinished.path + ".pending").exists())
     }
 
@@ -206,7 +236,7 @@ class ChrootRecoveryRepositoryTest {
         assertEquals(conservativeEntries(original), repository.snapshot())
         assertTrue(repository.canStart(original.first().instanceId))
         original.filter { it.phase != ChrootRecoveryPhase.CLOSED }.forEach {
-            assertFalse(repository.canStart(it.instanceId))
+            assertTrue(repository.canStart(it.instanceId))
             assertTrue(repository.unknownLaunchIds(it.instanceId).contains(it.launchId))
         }
         assertArrayEquals(legacyBytes(conservativeEntries(original)), journal.readBytes())
@@ -408,7 +438,7 @@ class ChrootRecoveryRepositoryTest {
         fail.set(false)
         repository.repairInterruptedWriteFromUser()
         assertTrue(repository.isHealthy.value)
-        assertFalse(repository.canStart(instance))
+        assertTrue(repository.canStart(instance))
         assertEquals(ChrootCleanupResult.UNKNOWN, repository.snapshot().single().cleanup)
         repository.recordCleanup(launch, ChrootCleanupResult.VERIFIED)
         assertEquals(ChrootCleanupResult.UNKNOWN, repository.snapshot().single().cleanup)
@@ -427,7 +457,7 @@ class ChrootRecoveryRepositoryTest {
         assertEquals(ChrootRecoveryPhase.UNKNOWN, repository.snapshot().single().phase)
         repository.repairInterruptedWriteFromUser()
         assertTrue(repository.isHealthy.value)
-        assertFalse(repository.canStart(instance))
+        assertTrue(repository.canStart(instance))
         assertEquals(setOf(launch), repository.unknownLaunchIds(instance))
     }
 

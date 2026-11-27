@@ -185,8 +185,10 @@ class ChrootInstanceInstallerTest {
         device: Long = identity.device,
         inode: Long = identity.inode,
         entries: Int = 2,
-        bytes: Int = 2
-    ): String = """{"passed":$passed,"stage":"root_mode","errno":${if (passed) 0 else 22},"entries":$entries,"file_bytes":$bytes,"cleanup_state":"$cleanup","device":$device,"inode":$inode,"created_directory":${path?.let { "\"$it\"" } ?: "null"}}"""
+        bytes: Int = 2,
+        stage: String = "root_mode",
+        errno: Int = if (passed) 0 else 22
+    ): String = """{"passed":$passed,"stage":"$stage","errno":$errno,"entries":$entries,"file_bytes":$bytes,"cleanup_state":"$cleanup","device":$device,"inode":$inode,"created_directory":${path?.let { "\"$it\"" } ?: "null"}}"""
 
     private fun writeInstallerJournal(journal: File, version: Int, operation: Int, target: ChrootInstance = instance) {
         DataOutputStream(journal.outputStream()).use { output ->
@@ -732,7 +734,7 @@ class ChrootInstanceInstallerTest {
                 assertEquals(1, f.starts.get())
                 assertEquals(12L, f.journal.length())
                 assertTrue(f.installer.failedInstances.value.isEmpty())
-                assertTrue(f.installer.removalRebootRequired.value.isEmpty())
+                assertTrue(f.installer.removalPending.value.isEmpty())
             } finally {
                 releaseFirst.complete(Unit)
             }
@@ -760,7 +762,7 @@ class ChrootInstanceInstallerTest {
             assertEquals(1, publications.get())
             assertEquals(12L, f.journal.length())
             assertTrue(f.installer.failedInstances.value.isEmpty())
-            assertTrue(f.installer.removalRebootRequired.value.isEmpty())
+            assertTrue(f.installer.removalPending.value.isEmpty())
         }
     }
 
@@ -781,7 +783,7 @@ class ChrootInstanceInstallerTest {
                 assertEquals(0, publications.get())
                 assertRecoveryIntent(f.journal)
                 assertEquals(setOf(id), f.installer.failedInstances.value)
-                assertTrue(f.installer.removalRebootRequired.value.isEmpty())
+                assertEquals(setOf(id), f.installer.removalPending.value)
             }
         }
     }
@@ -808,10 +810,10 @@ class ChrootInstanceInstallerTest {
             session = ChrootRuntimeSession("receipt-session", f.root)
             val home = installer.prepareHome(instance)
             File(home, "user-data").writeText("keep")
-            assertEquals(LocalRuntimeRemoval.REBOOT_REQUIRED,
+            assertEquals(LocalRuntimeRemoval.RETRY_REQUIRED,
                 installer.recoverAndRemoveFromUser(instance, f.root, session) { publications.incrementAndGet() })
             assertRecoveryIntent(journal)
-            assertEquals(setOf(id), installer.removalRebootRequired.value)
+            assertEquals(setOf(id), installer.removalPending.value)
             assertEquals(setOf(id), installer.failedInstances.value)
             assertTrue(installer.unpublishedInstalls.value.isEmpty())
             assertTrue(installer.isHealthy.value)
@@ -838,7 +840,7 @@ class ChrootInstanceInstallerTest {
         }).use { f ->
             installer = f.installer
             session = ChrootRuntimeSession("after-restart-session", f.root)
-            assertTrue(installer.removalRebootRequired.value.isEmpty())
+            assertEquals(setOf(id), installer.removalPending.value)
             assertEquals(setOf(id), installer.failedInstances.value)
             assertArrayEquals(retained, journal.readBytes())
             for (changed in listOf(instance.copy(device = identity.device + 1), instance.copy(inode = identity.inode + 1),
@@ -858,7 +860,7 @@ class ChrootInstanceInstallerTest {
             assertEquals(1, publications.get())
             assertEquals(12L, journal.length())
             assertTrue(installer.failedInstances.value.isEmpty())
-            assertTrue(installer.removalRebootRequired.value.isEmpty())
+            assertTrue(installer.removalPending.value.isEmpty())
             assertEquals("keep", File(files, "chroot-home/$id/user-data").readText())
             assertEquals(0, f.starts.get())
             assertEquals(0, f.inputs.get())
@@ -866,9 +868,9 @@ class ChrootInstanceInstallerTest {
     }
 
     @Test
-    fun recoveryNeverAdoptsOrdinaryPendingAndJournalV1CannotSmuggleRecoveryOperations() = runTest {
+    fun recoveryNeverAdoptsPendingInstallAndJournalV1CannotSmuggleRecoveryOperations() = runTest {
         val recoveryStarts = AtomicInteger()
-        for (version in listOf(1, 2)) for (operation in listOf(0, 1)) {
+        for (version in listOf(1, 2)) for (operation in listOf(0)) {
             val journal = File(temporary.newFolder(), "ordinary-pending.bin")
             writeInstallerJournal(journal, version, operation)
             val retained = journal.readBytes()
@@ -878,7 +880,7 @@ class ChrootInstanceInstallerTest {
             }).use { f ->
                 assertTrue(f.installer.isHealthy.value)
                 assertEquals(setOf(id), f.installer.failedInstances.value)
-                assertTrue(f.installer.removalRebootRequired.value.isEmpty())
+                assertTrue(f.installer.removalPending.value.isEmpty())
                 val session = ChrootRuntimeSession("recovery-session", f.root)
                 fails { f.installer.recoverAndRemoveFromUser(instance, f.root, session) }
                 fails { f.installer.removeFromUser(instance, f.root, session) }
@@ -901,6 +903,94 @@ class ChrootInstanceInstallerTest {
             }
         }
         assertEquals(0, recoveryStarts.get())
+    }
+
+    @Test
+    fun sameIdentityRecoveryUpgradesLegacyOrdinaryRemovalAndPublishesNativeRemovedInOneRound() = runTest {
+        for (version in listOf(1, 2)) {
+            val journal = File(temporary.newFolder(), "ordinary-remove-v$version.bin")
+            writeInstallerJournal(journal, version, operation = 1)
+            val starts = AtomicInteger()
+            val publications = AtomicInteger()
+            val process = FakeProcess({ native(cleanup = "removed") })
+            fixture(process, journal = journal, startRecoveryBound = { target, targetIdentity, _, _ ->
+                assertEquals(id, target)
+                assertEquals(identity, targetIdentity)
+                assertRecoveryIntent(journal)
+                starts.incrementAndGet()
+                process
+            }).use { f ->
+                val session = ChrootRuntimeSession("same-identity-retry", f.root)
+                assertEquals(setOf(id), f.installer.failedInstances.value)
+                assertTrue(f.installer.removalPending.value.isEmpty())
+                assertEquals(LocalRuntimeRemoval.REMOVED,
+                    f.installer.recoverAndRemoveFromUser(instance, f.root, session) { publications.incrementAndGet() })
+                assertEquals(1, starts.get())
+                assertEquals(1, publications.get())
+                assertEquals(12L, journal.length())
+                assertTrue(f.installer.failedInstances.value.isEmpty())
+                assertTrue(f.installer.removalPending.value.isEmpty())
+                assertEquals(0, f.starts.get())
+            }
+        }
+    }
+
+    @Test
+    fun recoveryRejectsOrdinaryRemovalWithDifferentIdentityWithoutChangingItsJournal() = runTest {
+        val stored = instance.copy(device = identity.device + 1)
+        for (version in listOf(1, 2)) {
+            val journal = File(temporary.newFolder(), "mismatched-remove-v$version.bin")
+            writeInstallerJournal(journal, version, operation = 1, target = stored)
+            val retained = journal.readBytes()
+            val recoveryStarts = AtomicInteger()
+            fixture(journal = journal, startRecoveryBound = { _, _, _, _ ->
+                recoveryStarts.incrementAndGet()
+                FakeProcess({ native(cleanup = "removed") })
+            }).use { f ->
+                val failure = fails {
+                    f.installer.recoverAndRemoveFromUser(instance, f.root, ChrootRuntimeSession("mismatch", f.root))
+                }
+                assertTrue(failure is IOException)
+                assertArrayEquals(retained, journal.readBytes())
+                assertEquals(0, recoveryStarts.get())
+                assertEquals(0, f.starts.get())
+                assertEquals(setOf(id), f.installer.failedInstances.value)
+                assertTrue(f.installer.removalPending.value.isEmpty())
+            }
+        }
+    }
+
+    @Test
+    fun recoveryBusyHintRequiresExactIdentityAndNeverMasksIdentityMismatch() = runTest {
+        val exact = native(passed = false, cleanup = "cleanup_unknown", stage = "recovery_busy", errno = 16)
+        val mismatches = listOf(
+            native(passed = false, cleanup = "cleanup_unknown", path = "/data/local/other", stage = "recovery_busy", errno = 16),
+            native(passed = false, cleanup = "cleanup_unknown", device = identity.device + 1, stage = "recovery_busy", errno = 16),
+            native(passed = false, cleanup = "cleanup_unknown", inode = identity.inode + 1, stage = "recovery_busy", errno = 16),
+            native(passed = false, cleanup = "cleanup_unknown", stage = "root_mode", errno = 16),
+            native(passed = false, cleanup = "cleanup_unknown", stage = "recovery_busy", errno = 22)
+        )
+        val results = listOf(exact to true) + mismatches.map { it to false }
+        for ((result, isExactBusy) in results) {
+            val process = FakeProcess({ result }, exit = 16)
+            fixture(process, startRecoveryBound = { _, _, _, _ -> process }).use { f ->
+                val publications = AtomicInteger()
+                val failure = fails {
+                    f.installer.recoverAndRemoveFromUser(instance, f.root, ChrootRuntimeSession("busy", f.root)) {
+                        publications.incrementAndGet()
+                    }
+                }
+                assertTrue(failure is IOException)
+                assertEquals(isExactBusy, failure is ChrootRemovalBusyException)
+                if (isExactBusy) assertTrue(failure.message.orEmpty().contains("still in use"))
+                else assertFalse(failure.message.orEmpty().contains("still in use"))
+                assertEquals(0, publications.get())
+                assertRecoveryIntent(f.journal)
+                assertEquals(setOf(id), f.installer.failedInstances.value)
+                assertEquals(setOf(id), f.installer.removalPending.value)
+                assertEquals(0, f.starts.get())
+            }
+        }
     }
 
     @Test
@@ -933,7 +1023,7 @@ class ChrootInstanceInstallerTest {
                 assertEquals(0, publications.get())
                 assertRecoveryIntent(f.journal)
                 assertEquals(setOf(id), f.installer.failedInstances.value)
-                assertTrue(f.installer.removalRebootRequired.value.isEmpty())
+                assertEquals(setOf(id), f.installer.removalPending.value)
                 assertEquals(0, f.starts.get())
                 assertEquals(0, f.inputs.get())
                 assertEquals(0, process.destroyed.get())
@@ -961,12 +1051,38 @@ class ChrootInstanceInstallerTest {
             assertEquals(1, publications.get())
             assertEquals(2, recoveryStarts.get())
             assertTrue(f.installer.failedInstances.value.isEmpty())
-            assertTrue(f.installer.removalRebootRequired.value.isEmpty())
+            assertTrue(f.installer.removalPending.value.isEmpty())
         }
     }
 
     @Test
-    fun failedRecoveryRetryClearsTheReceiptHintWhileRetainingTheDurableRequest() = runTest {
+    fun legacyRecoveryReceiptCanBeRetriedInTheSameBootUntilNativeRemovalCompletes() = runTest {
+        val receipt = FakeProcess({ native(cleanup = "reboot_required") })
+        val removed = FakeProcess({ native(cleanup = "removed") })
+        val starts = AtomicInteger()
+        val publications = AtomicInteger()
+        fixture(receipt, startRecoveryBound = { _, _, _, _ ->
+            if (starts.getAndIncrement() == 0) receipt else removed
+        }).use { f ->
+            val session = ChrootRuntimeSession("same-boot-retry", f.root)
+            assertEquals(LocalRuntimeRemoval.RETRY_REQUIRED,
+                f.installer.recoverAndRemoveFromUser(instance, f.root, session) { publications.incrementAndGet() })
+            assertEquals(setOf(id), f.installer.removalPending.value)
+            assertEquals(0, publications.get())
+            assertRecoveryIntent(f.journal)
+
+            assertEquals(LocalRuntimeRemoval.REMOVED,
+                f.installer.recoverAndRemoveFromUser(instance, f.root, session) { publications.incrementAndGet() })
+            assertEquals(2, starts.get())
+            assertEquals(1, publications.get())
+            assertEquals(12L, f.journal.length())
+            assertTrue(f.installer.failedInstances.value.isEmpty())
+            assertTrue(f.installer.removalPending.value.isEmpty())
+        }
+    }
+
+    @Test
+    fun failedRecoveryRetryKeepsTheDurableRequestVisibleAsPending() = runTest {
         val receipt = FakeProcess({ native(cleanup = "reboot_required") })
         val failed = FakeProcess({ native(cleanup = "cleanup_unknown", passed = false) }, 5)
         val starts = AtomicInteger()
@@ -974,10 +1090,10 @@ class ChrootInstanceInstallerTest {
             if (starts.getAndIncrement() == 0) receipt else failed
         }).use { f ->
             val session = ChrootRuntimeSession("reviewed", f.root)
-            assertEquals(LocalRuntimeRemoval.REBOOT_REQUIRED, f.installer.recoverAndRemoveFromUser(instance, f.root, session))
-            assertEquals(setOf(id), f.installer.removalRebootRequired.value)
+            assertEquals(LocalRuntimeRemoval.RETRY_REQUIRED, f.installer.recoverAndRemoveFromUser(instance, f.root, session))
+            assertEquals(setOf(id), f.installer.removalPending.value)
             fails { f.installer.recoverAndRemoveFromUser(instance, f.root, session) }
-            assertTrue(f.installer.removalRebootRequired.value.isEmpty())
+            assertEquals(setOf(id), f.installer.removalPending.value)
             assertEquals(setOf(id), f.installer.failedInstances.value)
             assertRecoveryIntent(f.journal)
             assertEquals(2, starts.get())
@@ -1007,6 +1123,7 @@ class ChrootInstanceInstallerTest {
                 assertEquals(0, publications.get())
                 assertRecoveryIntent(f.journal)
                 assertEquals(setOf(id), f.installer.failedInstances.value)
+                assertEquals(setOf(id), f.installer.removalPending.value)
                 assertEquals(f.root, f.authority.accessSnapshot())
             }
         }
@@ -1031,7 +1148,7 @@ class ChrootInstanceInstallerTest {
             assertEquals(0, f.starts.get())
             assertFalse(f.journal.exists())
             assertTrue(f.installer.failedInstances.value.isEmpty())
-            assertTrue(f.installer.removalRebootRequired.value.isEmpty())
+            assertTrue(f.installer.removalPending.value.isEmpty())
         }
     }
 
@@ -1066,7 +1183,7 @@ class ChrootInstanceInstallerTest {
                 assertEquals(0, publications.get())
                 assertRecoveryIntent(f.journal)
                 assertEquals(setOf(id), f.installer.failedInstances.value)
-                assertTrue(f.installer.removalRebootRequired.value.isEmpty())
+                assertEquals(setOf(id), f.installer.removalPending.value)
                 // The receipt only proves this installer helper settled. The instance stays blocked,
                 // while revocation does not incorrectly leave the entire Root authority unusable.
                 assertTrue(f.authority.accessSnapshot().enabled)
@@ -1092,7 +1209,7 @@ class ChrootInstanceInstallerTest {
             assertEquals(1, publications.get())
             assertRecoveryIntent(f.journal)
             assertEquals(setOf(id), f.installer.failedInstances.value)
-            assertTrue(f.installer.removalRebootRequired.value.isEmpty())
+            assertEquals(setOf(id), f.installer.removalPending.value)
             assertTrue(f.installer.isHealthy.value)
         }
     }
@@ -1117,8 +1234,7 @@ class ChrootInstanceInstallerTest {
             assertEquals(0, publications.get())
             assertRecoveryIntent(f.journal)
             assertEquals(setOf(id), f.installer.failedInstances.value)
-            // A recorded recovery request cannot claim that the native receipt exists.
-            assertTrue(f.installer.removalRebootRequired.value.isEmpty())
+            assertEquals(setOf(id), f.installer.removalPending.value)
         }
     }
 

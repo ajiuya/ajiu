@@ -21,6 +21,7 @@ static int namespace_close(int fd);
 static int namespace_fstat(int fd, struct stat *st);
 static int namespace_fstatat(int fd, const char *name, struct stat *st, int flags);
 static int namespace_fcntl(int fd, int command, ...);
+static int namespace_flock(int fd, int operation);
 static ssize_t namespace_pread(int fd, void *data, size_t size, off_t offset);
 static ssize_t namespace_readlink(const char *path, char *data, size_t size);
 static long namespace_syscall(long number, ...);
@@ -30,6 +31,7 @@ static long namespace_syscall(long number, ...);
 #define fstat namespace_fstat
 #define fstatat namespace_fstatat
 #define fcntl namespace_fcntl
+#define flock namespace_flock
 #define pread namespace_pread
 #define readlink namespace_readlink
 #define syscall namespace_syscall
@@ -37,6 +39,7 @@ static long namespace_syscall(long number, ...);
 #undef syscall
 #undef readlink
 #undef pread
+#undef flock
 #undef fcntl
 #undef fstatat
 #undef fstat
@@ -60,8 +63,8 @@ static struct mount_attr last_attributes;
 static char executable_path[256];
 static int receipt_error;
 static mode_t receipt_mode;
-static unsigned int receipt_checks, rootfs_opens;
-static bool recovery_fixture;
+static unsigned int receipt_checks, rootfs_opens, lock_checks;
+static bool recovery_fixture, lock_held;
 
 static unsigned int live_fds(void)
 {
@@ -108,7 +111,8 @@ static void reset_world(void)
     fail_duplicate = invalid_worker_elf = invalid_runtime_elf = false;
     fail_attributes = fail_move = false;
     cloned = moved = last_tree = 0;
-    receipt_error = ENOENT; receipt_mode = 0; receipt_checks = rootfs_opens = 0; recovery_fixture = false;
+    receipt_error = ENOENT; receipt_mode = 0; receipt_checks = rootfs_opens = lock_checks = 0;
+    recovery_fixture = false; lock_held = false;
     memset(&last_attributes, 0, sizeof(last_attributes));
     (void)snprintf(executable_path, sizeof(executable_path),
         "/data/app/~~session/com.ajiu.debug-install/lib/arm64/libajiu_chroot_runtime.so");
@@ -157,6 +161,14 @@ static int namespace_fstatat(int fd, const char *name, struct stat *st, int flag
     if (receipt_error) { errno = receipt_error; return -1; }
     /* Content, owner, size and type are deliberately untrusted: existence is enough. */
     *st = (struct stat){ .st_mode = receipt_mode, .st_size = 0, .st_uid = 10000, .st_gid = 10000 };
+    return 0;
+}
+
+static int namespace_flock(int fd, int operation)
+{
+    CHECK(recovery_fixture && descriptor(fd)->node == N_BASE);
+    CHECK(operation == (LOCK_SH | LOCK_NB) && !lock_held);
+    ++lock_checks; lock_held = true;
     return 0;
 }
 
@@ -302,7 +314,7 @@ static long namespace_syscall(long number, ...)
 static void empty_runtime(struct runtime *r)
 {
     memset(r, 0, sizeof(*r));
-    r->native_dir = r->worker_fd = r->app_fd = -1;
+    r->native_dir = r->worker_fd = r->app_fd = r->instance_lock = -1;
     for (int i = 0; i < ANCHORS; ++i) r->a[i].fd = -1;
     for (size_t i = 0; i < AJIU_LAUNCH_MAX_MOUNTS; ++i) r->source[i] = -1;
     (void)snprintf(r->package, sizeof(r->package), "com.ajiu.debug");
@@ -484,7 +496,7 @@ static void check_static_order(const char *path)
     ordered(main_body, main_order, sizeof(main_order) / sizeof(*main_order));
     struct source_body mount_body = function_body(text, "static int mount_namespace(");
     static const char *const mount_order[] = { "unshare(CLONE_NEWNS)", "MS_REC | MS_PRIVATE",
-        "new_mount_namespace", "instance(r, true)", "namespace_rootfs_identity", "close(old[i].fd)",
+        "new_mount_namespace", "instance(r, true, false)", "namespace_rootfs_identity", "close(old[i].fd)",
         "protected_walk(true)", "namespace_cgroup_identity", "close(old[i].fd)", "r->namespace = ns", "group_guard(r)",
         "attach_tree(r->a[ROOT].fd, r->a[VIEW].fd, false, true, true)", "*view = resolve_target(", "fstatfs(*view, &fs)", "writable_executable_os",
         "(ST_NOSUID | ST_NODEV));", "open_sources(r)", "reopen_worker(r)",
@@ -504,9 +516,28 @@ static void check_static_order(const char *path)
     ordered(guest_body, guest_order, sizeof(guest_order) / sizeof(*guest_order));
     absent(guest_body, "drop_identity(");
     struct source_body instance_body = function_body(text, "static int instance(");
-    static const char *const instance_order[] = { "installed_layout", "pread(r->a[MANIFEST].fd", "guest_manifest_version(header[0])" };
+    static const char *const instance_order[] = { "instance_lock(r, cleanup)", "installed_layout", "pread(r->a[MANIFEST].fd", "guest_manifest_version(header[0])" };
     ordered(instance_body, instance_order, sizeof(instance_order) / sizeof(*instance_order));
+    struct source_body restore_body = function_body(text, "static int restore_namespace(");
+    static const char *const restore_order[] = { "cleanup_instance_lock", "close_runtime(r)", "instance(r, true, true)" };
+    ordered(restore_body, restore_order, sizeof(restore_order) / sizeof(*restore_order));
     free(text);
+}
+
+static void check_lock_lifetime(void)
+{
+    reset_world(); recovery_fixture = true;
+    struct runtime r; empty_runtime(&r);
+    int base = allocate_fd(N_BASE, current_namespace);
+    r.instance_lock = namespace_fcntl(base, F_DUPFD_CLOEXEC, 3);
+    r.instance_locked = true;
+    CHECK(namespace_flock(r.instance_lock, LOCK_SH | LOCK_NB) == 0 && lock_held);
+    CHECK(namespace_close(base) == 0 && live_fds() == 1);
+    close_runtime(&r);
+    CHECK(r.instance_locked && descriptor(r.instance_lock)->node == N_BASE && live_fds() == 1);
+    CHECK(namespace_close(r.instance_lock) == 0);
+    r.instance_locked = false;
+    CHECK(live_fds() == 0);
 }
 
 static void check_removal_receipt_startup(void)
@@ -530,6 +561,9 @@ static void check_removal_receipt_startup(void)
             CHECK(rootfs_opens == 0);
         }
         for (int n = 0; n < ANCHORS; ++n) if (r.a[n].fd >= 0) CHECK(namespace_close(r.a[n].fd) == 0);
+        CHECK(r.instance_locked && descriptor(r.instance_lock)->node == N_BASE && lock_held);
+        CHECK(namespace_close(r.instance_lock) == 0);
+        r.instance_locked = false;
         CHECK(live_fds() == 0);
     }
 }
@@ -538,6 +572,7 @@ int main(int argc, char **argv)
 {
     CHECK(argc == 1 || argc == 2);
     check_removal_receipt_startup();
+    check_lock_lifetime();
     check_sources();
     check_worker();
     check_static_order(argc == 2 ? argv[1] : "native/chroot/runtime_helper.c");

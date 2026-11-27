@@ -35,7 +35,7 @@ internal fun chrootStatusResource(state: LocalRuntimeState?, action: ChrootInsta
     action == ChrootInstanceAction.REPAIR_JOURNAL -> R.string.container_chroot_status_repairing
     action == ChrootInstanceAction.STOP || action == ChrootInstanceAction.REMOVE ||
         action == ChrootInstanceAction.RECOVER_REMOVE -> R.string.container_chroot_status_cleanup
-    state?.removalRebootRequired == true -> R.string.container_chroot_status_removal_reboot_required
+    state?.removalPending == true -> R.string.container_chroot_status_removal_pending
     state == null || state.recoveryRequired || !state.journalHealthy -> R.string.container_chroot_status_unknown
     state.busy -> R.string.container_chroot_status_busy
     state.instance == null -> R.string.container_chroot_status_not_installed
@@ -69,9 +69,9 @@ internal fun ChrootProfileSettings(
             SettingsDivider()
             SettingsRow(title = stringResource(R.string.container_chroot_root_disabled))
         }
-        if (state?.removalRebootRequired == true) {
+        if (state?.removalPending == true) {
             SettingsDivider()
-            SettingsRow(title = stringResource(R.string.container_chroot_removal_reboot_required))
+            SettingsRow(title = stringResource(R.string.container_chroot_removal_pending))
         }
         SettingsDivider()
         SettingsRow(

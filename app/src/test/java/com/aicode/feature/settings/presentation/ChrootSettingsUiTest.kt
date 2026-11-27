@@ -203,9 +203,9 @@ class ChrootSettingsUiTest {
             clickText(text(R.string.common_delete))
             pump()
             assertEquals(listOf(ChrootInstanceAction.RECOVER_REMOVE, ChrootInstanceAction.REMOVE), actions)
-            state = state.copy(removalRebootRequired = true)
+            state = state.copy(removalPending = true)
             pump()
-            assertTrue(allText().contains(text(R.string.container_chroot_status_removal_reboot_required)))
+            assertTrue(allText().contains(text(R.string.container_chroot_status_removal_pending)))
             assertTrue(textEnabled(R.string.common_delete))
             clickText(text(R.string.common_delete))
             pump()
@@ -403,11 +403,11 @@ class ChrootSettingsUiTest {
     }
 
     @Test(timeout = 30_000)
-    fun rebootRequiredIsInformationAndPendingRemovalKeepsAnExplicitRetryEntry() {
+    fun pendingRemovalIsInformationAndKeepsAnExplicitRetryEntry() {
         val installed = profile.copy(chrootInstance = instance)
-        val pending = LocalRuntimeState(instance, true, true, true, 0, 0, false, removalRebootRequired = true)
+        val pending = LocalRuntimeState(instance, true, true, true, 0, 0, false, removalPending = true)
         var uiState by mutableStateOf(ChrootSettingsUiState(states = mapOf(profile.id to pending), rootState = root,
-            info = R.string.container_chroot_removal_reboot_required))
+            info = R.string.container_chroot_removal_pending))
         var dismissals = 0
         val actions = mutableListOf<ChrootInstanceAction>()
         render(content = {
@@ -417,15 +417,15 @@ class ChrootSettingsUiTest {
             }
         }) {
             assertTrue(allText().contains(text(R.string.container_chroot_info_title)))
-            assertTrue(allText().contains(text(R.string.container_chroot_removal_reboot_required)))
-            assertTrue(allText().contains(text(R.string.container_chroot_status_removal_reboot_required)))
+            assertTrue(allText().contains(text(R.string.container_chroot_removal_pending)))
+            assertTrue(allText().contains(text(R.string.container_chroot_status_removal_pending)))
             assertTrue(!allText().contains(text(R.string.container_chroot_error_title)))
             assertTrue(actions.isEmpty())
             clickText(text(R.string.common_confirm))
             pump()
             assertEquals(1, dismissals)
             assertTrue(!allText().contains(text(R.string.container_chroot_info_title)))
-            assertTrue(allText().contains(text(R.string.container_chroot_removal_reboot_required)))
+            assertTrue(allText().contains(text(R.string.container_chroot_removal_pending)))
             assertTrue(!textEnabled(R.string.container_chroot_remove))
             assertTrue(textEnabled(R.string.container_chroot_recover_remove))
             clickText(text(R.string.container_chroot_recover_remove))
@@ -435,10 +435,20 @@ class ChrootSettingsUiTest {
     }
 
     @Test(timeout = 30_000)
-    fun recoveryWorkShowsProgressInsteadOfAnIdleUnknownOrRebootStatus() {
+    fun activeRemovalOccupancyShowsRetryGuidanceWithoutClaimingRemoval() {
+        val uiState = ChrootSettingsUiState(error = R.string.container_chroot_removal_busy)
+        render(content = { ChrootSettingsDialogs(uiState, {}, {}, {}) }) {
+            assertTrue(allText().contains(text(R.string.container_chroot_error_title)))
+            assertTrue(allText().contains(text(R.string.container_chroot_removal_busy)))
+            assertTrue(!allText().contains(text(R.string.container_chroot_info_title)))
+        }
+    }
+
+    @Test(timeout = 30_000)
+    fun recoveryWorkShowsProgressInsteadOfAnIdleUnknownOrPendingRemovalStatus() {
         val installed = profile.copy(chrootInstance = instance)
         val state = LocalRuntimeState(instance, true, false, true, 0, 0, true,
-            journalRepairAvailable = true, removalRebootRequired = true)
+            journalRepairAvailable = true, removalPending = true)
         var action by mutableStateOf(ChrootInstanceAction.REPAIR_JOURNAL)
         render(content = {
             ChrootProfileSettings(installed, ChrootSettingsUiState(states = mapOf(profile.id to state), rootState = root,
@@ -446,7 +456,7 @@ class ChrootSettingsUiTest {
         }) {
             assertTrue(allText().contains(text(R.string.container_chroot_status_repairing)))
             assertTrue(!allText().contains(text(R.string.container_chroot_status_unknown)))
-            assertTrue(!allText().contains(text(R.string.container_chroot_status_removal_reboot_required)))
+            assertTrue(!allText().contains(text(R.string.container_chroot_status_removal_pending)))
             assertTrue(nodes().none { it.config.contains(SemanticsActions.OnClick) })
             action = ChrootInstanceAction.RECOVER_REMOVE
             pump()

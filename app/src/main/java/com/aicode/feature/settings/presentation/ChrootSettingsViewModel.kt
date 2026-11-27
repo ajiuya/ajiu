@@ -4,6 +4,7 @@ import androidx.lifecycle.ViewModel
 import com.aicode.R
 import androidx.lifecycle.viewModelScope
 import com.aicode.feature.agent.domain.container.ContainerProfile
+import com.aicode.feature.agent.domain.container.chroot.ChrootRemovalBusyException
 import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeAuthorization
 import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeCleanup
 import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeRemoval
@@ -36,7 +37,7 @@ internal fun ChrootInstanceAction.isAvailable(
 ): Boolean {
     if (!profile.isChroot || state == null || state.busy || state.instance != profile.chrootInstance) return false
     val rootAvailable = root.enabled && state.rootEnabled
-    val healthy = state.journalHealthy && !state.recoveryRequired && !state.removalRebootRequired
+    val healthy = state.journalHealthy && !state.recoveryRequired && !state.removalPending
     return when (this) {
         ChrootInstanceAction.CREATE -> rootAvailable && healthy && state.instance == null
         ChrootInstanceAction.STOP -> healthy && state.instance != null
@@ -48,7 +49,7 @@ internal fun ChrootInstanceAction.isAvailable(
 }
 
 internal fun chrootRemovalAction(state: LocalRuntimeState?): ChrootInstanceAction =
-    if (state?.instance != null && (state.recoveryRequired || !state.journalHealthy || state.removalRebootRequired)) {
+    if (state?.instance != null && (state.recoveryRequired || !state.journalHealthy || state.removalPending)) {
         ChrootInstanceAction.RECOVER_REMOVE
     } else ChrootInstanceAction.REMOVE
 
@@ -227,8 +228,8 @@ internal class ChrootSettingsViewModel @Inject constructor(
                 ChrootInstanceAction.RECOVER_REMOVE -> {
                     when (runtime.recoverAndRemoveInstanceFromUser(profile, confirmation.rootState)) {
                         LocalRuntimeRemoval.REMOVED -> Unit
-                        LocalRuntimeRemoval.REBOOT_REQUIRED -> _uiState.update {
-                            it.copy(info = R.string.container_chroot_removal_reboot_required)
+                        LocalRuntimeRemoval.RETRY_REQUIRED -> _uiState.update {
+                            it.copy(info = R.string.container_chroot_removal_pending)
                         }
                     }
                 }
@@ -261,7 +262,11 @@ internal class ChrootSettingsViewModel @Inject constructor(
                 }
                 fail(R.string.container_chroot_summary_stale)
             } catch (failure: Exception) {
-                fail(if (failure is AddRootDisabled) R.string.container_chroot_root_disabled else R.string.container_chroot_operation_failed)
+                fail(when (failure) {
+                    is AddRootDisabled -> R.string.container_chroot_root_disabled
+                    is ChrootRemovalBusyException -> R.string.container_chroot_removal_busy
+                    else -> R.string.container_chroot_operation_failed
+                })
             } finally {
                 _uiState.update { state -> state.copy(
                     workingProfileId = null,

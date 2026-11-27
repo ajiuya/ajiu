@@ -2585,7 +2585,7 @@
     <string name="container_chroot_bundled_selected">Bundled minimal Alpine selected. This does not mean development tools are ready.</string>
     <string name="container_chroot_downloaded_images">Use a previously downloaded private image</string>
     <string name="container_chroot_import_failed">The private image copy could not be saved. Select the file again. No instance was created and Root was not requested.</string>
-    <string name="container_chroot_selection_notice">Explicitly select this container before use. Actual sources for a healthy instance are allowed by default, without individual grants. The Root switch and system Root permission must remain valid. Unknown state is never force-recovered.</string>
+    <string name="container_chroot_selection_notice">Explicitly select this container before use. Actual sources for a healthy instance are allowed by default, without individual grants. The Root switch and system Root permission must remain valid. Unknown results from past tasks do not block new tasks; the current source, instance identity, and runtime records must still pass validation.</string>
     <string name="container_chroot_add_and_create">Add and create instance</string>
     <string name="container_chroot_add_create_notice">Add and create instance saves this configuration and uses Root to write a new, separate writable rootfs and home from the selected image. Existing system Root permission and an enabled Root switch are required. This does not select or activate the configuration. After a failure, review the instance state. If verification is needed, open Edit to review Repair runtime records and Remove abnormal instance.</string>
     <string name="container_chroot_add_create_failed">The configuration was saved, but instance creation could not be confirmed complete. Review the instance state in Edit. If verification is needed, use Repair runtime records or Remove abnormal instance when available.</string>
@@ -2601,9 +2601,9 @@
     <string name="container_chroot_status_busy">Instance operation in progress</string>
     <string name="container_chroot_status_stopped">Stopped; a new actual operation may start by policy</string>
     <string name="container_chroot_status_cleanup">Stop or removal cleanup awaiting verification</string>
-    <string name="container_chroot_status_unknown">UNKNOWN: verification needed. Open Edit to review runtime record repair, or use Delete to handle the abnormal instance.</string>
+    <string name="container_chroot_status_unknown">Instance or runtime records need verification. Open Edit to review runtime record repair, or use Delete to handle the abnormal instance.</string>
     <string name="container_chroot_status_repairing">Repairing runtime records</string>
-    <string name="container_chroot_status_removal_reboot_required">Removal pending: restart your phone, then tap Delete again</string>
+    <string name="container_chroot_status_removal_pending">Removal incomplete: tap Delete again; no phone restart needed</string>
     <string name="container_chroot_root_disabled">The Root switch is off. This page will not enable it automatically or request permission in the background.</string>
     <string name="container_chroot_create">Create CHROOT instance</string>
     <string name="container_chroot_stop">Stop all sources and verify cleanup</string>
@@ -2613,12 +2613,13 @@
     <string name="container_chroot_recover_remove">Remove abnormal instance</string>
     <string name="container_chroot_create_notice">Create a new writable Root instance and separate home from this image, without converting an existing PRoot tree. Creation and later actual operations require existing system Root permission. Cancelling creates and activates nothing.</string>
     <string name="container_chroot_stop_notice">Stop every execution source for this instance. Task exit is not proof of completed cleanup; the instance is stopped only after cleanup is verified.</string>
-    <string name="container_chroot_remove_notice">Stop all execution sources for this instance and verify process and mount cleanup, then remove the container system and configuration. Files inside the container system will not be kept. If its state becomes unverified, review the abnormal instance removal details again.</string>
+    <string name="container_chroot_remove_notice">Stop all tasks for this instance, verify its identity, processes, and mounts, then remove the container system and configuration. No phone restart is needed. Files and installed software inside the container system will not be kept. If validation fails, the configuration is kept. Review the state before retrying.</string>
     <string name="container_chroot_remove_configuration_notice">No instance is registered for this configuration. Runtime records must be verified and incomplete installations ruled out before the configuration can be removed.</string>
     <string name="container_chroot_repair_journal_notice">Preserve fault records first, then repair recoverable runtime records. This does not delete the instance or files inside the container system. The instance state must still be checked again after repair.</string>
-    <string name="container_chroot_recover_remove_notice">Preserve fault records and repair recoverable runtime records first, then attempt to stop and remove this instance and configuration. Files inside the container system will not be kept. If old processes cannot be confirmed to have exited, a removal request will be recorded. Restart your phone, then tap Delete again. Removal will not be forced before restarting.</string>
+    <string name="container_chroot_recover_remove_notice">Preserve fault records, repair recoverable runtime records, and stop all tasks for this instance. Once its identity, processes, and mounts are verified, remove the container system and configuration without restarting your phone. Files and installed software inside the container system will not be kept. Remaining processes, changed identity, damaged records, or unexpected mounts cause failure and keep the configuration. Review the state before retrying.</string>
     <string name="container_chroot_info_title">CHROOT operation notice</string>
-    <string name="container_chroot_removal_reboot_required">The removal request was recorded. The instance has not been deleted because old processes cannot yet be confirmed to have exited. Restart your phone, then tap Delete again. Removal will not be forced before restarting.</string>
+    <string name="container_chroot_removal_pending">Removal has not completed. No phone restart is needed. Tap Delete again to stop tasks, repeat validation, and clean up files inside the container system. The configuration is removed only after deletion is confirmed complete. Remaining processes, changed identity, or damaged records keep the failure state. Review it before retrying.</string>
+    <string name="container_chroot_removal_busy">This instance is still in use by running tasks. Wait for them to stop, then tap Delete again. No phone restart is needed.</string>
     <string name="container_chroot_authorization_requests">Pending requests from actual sources</string>
     <string name="container_chroot_no_requests">No actual sources are awaiting authorization</string>
     <string name="container_chroot_authorize_owner">Review and authorize: %1$s · %2$s</string>
@@ -2643,7 +2644,7 @@
     <string name="container_chroot_mount_read_write">%1$s → %2$s (writable)</string>
     <string name="container_chroot_summary_stale">The configuration, image source, or Root state changed. Review the current details before retrying.</string>
     <string name="container_chroot_error_title">CHROOT operation did not complete</string>
-    <string name="container_chroot_operation_failed">The current source, authority, or cleanup state could not be verified. Check the instance state before trying again.</string>
+    <string name="container_chroot_operation_failed">Validation of the current source, Root permission, instance identity, runtime records, processes, or mounts failed. Review the state before retrying. The configuration is kept until deletion is confirmed complete.</string>
     <string name="container_chroot_error_message">%1$s\nReview the state in Edit and check Repair runtime records or Remove abnormal instance.</string>
     <string name="container_chroot_owner_agent">AI session</string>
     <string name="container_chroot_owner_terminal">Terminal</string>

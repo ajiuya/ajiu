@@ -112,8 +112,12 @@ internal class ChrootRuntimeManager internal constructor(
             active.values.count { it.spec.instanceId == instanceId },
             leases.values.filter { it.configuration.instanceId == instanceId && validLeaseLocked(it, current) }
                 .map { it.owner }.distinct().size,
-            !availableLocked(instanceId)
+            !availableLocked()
         )
+    }
+
+    fun hasUnverifiedCleanup(instanceId: String): Boolean = authority.withLock {
+        instanceId in uncertainInstances || instanceId in recovery.blockedInstances.value
     }
 
     fun failureSummary(instanceId: String): String? = diagnostics?.let { store ->
@@ -201,7 +205,7 @@ internal class ChrootRuntimeManager internal constructor(
         authority.accessSnapshot()
         return authority.withCurrent(expectedRootState.authorityId, expectedRootState.generation) {
             checkCurrent()
-            if (!availableLocked(instanceId) || exhausted) return@withCurrent null
+            if (!availableLocked() || exhausted) return@withCurrent null
             val next = Configuration(configurationRevision, instanceId, rootfsIdentity)
             val previous = configurations[profileId]
             if (previous != null && (configurationRevision < previous.revision ||
@@ -220,7 +224,7 @@ internal class ChrootRuntimeManager internal constructor(
         return authority.withLock { current ->
             val lease = leases[leaseId] ?: return@withLock null
             if (!validLeaseLocked(lease, current) || !matches(lease, launch, profileRevision) ||
-                !availableLocked(launch.instanceId) || launch.launchId in active ||
+                !availableLocked() || launch.launchId in active ||
                 launch.launchId in recovery.recordedLaunchIds.value) return@withLock null
             UUID.randomUUID().toString().also { permits[it] = Permit(lease, launch.digest, profileRevision) }
         }
@@ -237,7 +241,7 @@ internal class ChrootRuntimeManager internal constructor(
             val permit = permits.remove(permitId) ?: return@withLock null
             val lease = leases[leaseId] ?: return@withLock null
             if (permit.lease != lease || permit.digest != spec.digest || !validLeaseLocked(lease, current) ||
-                !matches(lease, spec, permit.revision) || !availableLocked(spec.instanceId) ||
+                !matches(lease, spec, permit.revision) || !availableLocked() ||
                 spec.launchId in active || spec.launchId in recovery.recordedLaunchIds.value ||
                 !sourceValid(checkSource)) return@withLock null
             Execution(lease, spec, checkSource).also { execution ->
@@ -258,7 +262,7 @@ internal class ChrootRuntimeManager internal constructor(
     }
 
     fun isLeaseCurrent(leaseId: String): Boolean = authority.withLock { current ->
-        leases[leaseId]?.let { validLeaseLocked(it, current) && availableLocked(it.configuration.instanceId) } == true
+        leases[leaseId]?.let { validLeaseLocked(it, current) && availableLocked() } == true
     }
 
     fun revokeLease(leaseId: String) = authority.withLock { revokeMatchingLocked { it.id == leaseId } }
@@ -276,8 +280,7 @@ internal class ChrootRuntimeManager internal constructor(
         Unit
     }
 
-    private fun availableLocked(instanceId: String): Boolean = !journalMaintenance && recovery.isHealthy.value &&
-        instanceId !in recovery.blockedInstances.value && instanceId !in uncertainInstances
+    private fun availableLocked(): Boolean = !journalMaintenance && recovery.isHealthy.value
 
     private fun validLeaseLocked(lease: Lease, current: RootAccessState): Boolean = !exhausted && current.enabled &&
         current.authorityId == lease.root.authorityId && current.generation == lease.root.generation &&
@@ -440,7 +443,6 @@ internal class ChrootRuntimeManager internal constructor(
     private fun canRunLocked(execution: Execution): Boolean {
         val valid = !execution.stopOnly && !execution.finished && active[execution.spec.launchId] === execution &&
             validLeaseLocked(execution.lease, authority.accessState.value) && recovery.isHealthy.value &&
-            execution.spec.instanceId !in uncertainInstances && execution.spec.instanceId !in recovery.blockedInstances.value &&
             sourceValid(execution.checkSource)
         if (!valid && !execution.stopOnly && !execution.finished) {
             markStopOnlyLocked(execution)

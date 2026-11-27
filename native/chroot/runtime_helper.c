@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
@@ -76,7 +77,8 @@ struct runtime {
     struct registry registry;
     char base_name[48], group_name[40], package[24];
     int cap_last, source[AJIU_LAUNCH_MAX_MOUNTS], native_dir, worker_fd, app_fd;
-    bool view_made, group_made;
+    bool view_made, group_made, instance_locked;
+    int instance_lock;
 };
 struct packet { uint32_t magic, type, length; unsigned char body[AJIU_MAX_DATA_BYTES]; };
 struct enrollment { pid_t pid; uint64_t start; };
@@ -707,22 +709,35 @@ static int guest_manifest_version(uint64_t magic)
 
 static int removal_receipt_absent(int base)
 {
-    /* Match rootfs_install.c: even a damaged receipt is a permanent startup
-     * barrier until recovery has removed the entire instance after reboot. */
     stage = "removal_receipt";
     struct stat st;
     if (fstatat(base, "remove-after-reboot", &st, AT_SYMLINK_NOFOLLOW) == 0) { errno = EBUSY; return -1; }
     return errno == ENOENT ? 0 : -1;
 }
 
-static int instance(struct runtime *r, bool view)
+static int instance_lock(struct runtime *r, bool cleanup)
+{
+    if (r->instance_locked) {
+        struct stat held;
+        TRY("instance_lock_identity", fstat(r->instance_lock, &held));
+        NEED("instance_lock_identity", same(&held, &r->a[BASE].st));
+    } else {
+        NEED("instance_cleanup_lock", !cleanup);
+        TRY("instance_lock", flock(r->a[BASE].fd, LOCK_SH | LOCK_NB));
+        TRY("instance_lock_copy", r->instance_lock = fcntl(r->a[BASE].fd, F_DUPFD_CLOEXEC, 3));
+        r->instance_locked = true;
+    }
+    return cleanup ? 0 : removal_receipt_absent(r->a[BASE].fd);
+}
+
+static int instance(struct runtime *r, bool view, bool cleanup)
 {
     TRY("rootfs_parent", r->a[LOCAL].fd = protected_walk(false));
     if (snapshot(&r->a[LOCAL]) < 0 || anchored(&r->a[BASE], r->a[LOCAL].fd, r->base_name, DF) < 0) return -1;
     const struct stat *b = &r->a[BASE].st;
     NEED("rootfs_instance", b->st_uid == 0 && b->st_gid == 0 && (b->st_mode & 07777) == 0700 &&
         (uint64_t)b->st_dev == r->launch->rootfs_dev && (uint64_t)b->st_ino == r->launch->rootfs_ino);
-    if (removal_receipt_absent(r->a[BASE].fd) < 0) return -1;
+    if (instance_lock(r, cleanup) < 0) return -1;
     if (anchored(&r->a[ROOT], r->a[BASE].fd, "root", DF) < 0 ||
         anchored(&r->a[MANIFEST], r->a[BASE].fd, "manifest", O_RDONLY) < 0 ||
         anchored(&r->a[VIEWS], r->a[BASE].fd, "views", DF) < 0) return -1;
@@ -810,7 +825,7 @@ static int populated(struct runtime *r)
 
 static int prepare(struct runtime *r)
 {
-    if (instance(r, false) < 0) return -1;
+    if (instance(r, false, false) < 0) return -1;
     TRY("cgroup_parent", r->a[CGROOT].fd = protected_walk(true));
     if (snapshot(&r->a[CGROOT]) < 0) return -1;
     struct statfs fs;
@@ -1311,7 +1326,7 @@ static int mount_namespace(struct runtime *r, int *view)
     NEED("new_mount_namespace", ns.st_dev != r->namespace.st_dev || ns.st_ino != r->namespace.st_ino);
     struct anchor old[ANCHORS]; memcpy(old, r->a, sizeof(old));
     for (int i = 0; i < ANCHORS; ++i) r->a[i] = (struct anchor){ .fd = -1 };
-    if (instance(r, true) < 0) return -1;
+    if (instance(r, true, false) < 0) return -1;
     for (int i = LOCAL; i <= VIEW; ++i) {
         NEED("namespace_rootfs_identity", same(&old[i].st, &r->a[i].st));
         if (old[i].fd >= 0) close(old[i].fd);
@@ -1531,9 +1546,11 @@ static int restore_namespace(struct runtime *r, const struct runtime *original, 
     int n = snprintf(path, sizeof(path), "/data/local/%s/views/%s", r->base_name, r->launch->launch_id);
     NEED("view_unmount_name", n > 0 && (size_t)n < sizeof(path));
     TRY("unmount_private_view", umount2(path, MNT_DETACH));
+    NEED("cleanup_instance_lock", r->instance_locked && original->instance_locked &&
+        r->instance_lock == original->instance_lock);
     close_runtime(r);
     for (int i = 0; i < ANCHORS; ++i) r->a[i] = (struct anchor){ .fd = -1 };
-    if (instance(r, true) < 0) return -1;
+    if (instance(r, true, true) < 0) return -1;
     for (int i = LOCAL; i <= VIEW; ++i)
         NEED("unmounted_view_identity", same(&r->a[i].st, &original->a[i].st));
     TRY("cleanup_cgroup_parent", r->a[CGROOT].fd = protected_walk(true));
@@ -1658,7 +1675,8 @@ static void controller(struct runtime *r, int socket, pid_t parent, int parentfd
         int64_t now = now_ms();
         if (now < 0) { now = start + r->launch->lease_ms + CLEANUP_WAIT; error = EIO; }
         int parent_state = protected_role(r, parent, parentfd, parent_start);
-        if (parent_state != 0 || interrupted || now - last_parent >= r->launch->lease_ms ||
+        if ((r->instance_locked && !stopped && removal_receipt_absent(r->instance_lock) < 0) ||
+            parent_state != 0 || interrupted || now - last_parent >= r->launch->lease_ms ||
             (!prepared && now - start >= 15000) || (running && r->launch->command_timeout_ms &&
             now - start >= r->launch->command_timeout_ms)) {
             if (!stopped) { stopped = true; stop_at = now; }
@@ -1937,6 +1955,10 @@ static bool read_control(int control, struct ajiu_launch_session *session, bool 
 static int supervision_stop_reason(const struct runtime *r, bool ready, int64_t start,
     int64_t lease_at, int64_t command_at, int64_t now, bool *stopped, int64_t *stop_at)
 {
+    if (r->instance_locked && !*stopped && removal_receipt_absent(r->instance_lock) < 0) {
+        *stopped = true; *stop_at = now;
+        return errno == EBUSY ? ECANCELED : errno;
+    }
     if (interrupted || pidfd_dead(r->app_fd) != 0 || (!*stopped &&
         (now - lease_at >= r->launch->lease_ms || (!ready && now - start >= 15000) ||
         (command_at && r->launch->command_timeout_ms && now - command_at >= r->launch->command_timeout_ms)))) {
@@ -2197,6 +2219,7 @@ int main(int argc, char **argv)
     unsigned char cleanup = unknown ? 1 : 0;
     (void)output_frame(&output_ok, AJIU_CLEANUP, &cleanup, 1);
     close_runtime(&r);
+    if (r.instance_locked) { close(r.instance_lock); r.instance_lock = -1; r.instance_locked = false; }
     (void)munmap(r.shared, sizeof(*r.shared));
     ajiu_launch_free(&launch); free(body);
     return unknown ? 5 : result < 0 ? 3 : 0;

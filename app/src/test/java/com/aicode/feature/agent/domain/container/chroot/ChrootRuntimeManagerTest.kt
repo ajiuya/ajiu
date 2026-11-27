@@ -512,9 +512,9 @@ class ChrootRuntimeManagerTest {
 
             assertEquals(recorded, fixture.recovery.snapshot())
             assertTrue(fixture.recovery.isHealthy.value)
-            assertFalse(fixture.recovery.canStart(instance))
-            assertTrue(fixture.manager.instanceState(instance).blocked)
-            assertNull(fixture.manager.allowBinding(owner, "profile", 1, instance, rootfs, fixture.root))
+            assertTrue(fixture.recovery.canStart(instance))
+            assertFalse(fixture.manager.instanceState(instance).blocked)
+            assertNotNull(fixture.manager.allowBinding(owner, "profile", 1, instance, rootfs, fixture.root))
             assertFalse(fixture.manager.isLeaseCurrent(cleanLease))
             assertNull(fixture.manager.launch(cleanLease, permit, cleanLaunch) {})
             val replacement = checkNotNull(fixture.manager.allowBinding(owner, "clean-profile", 1, cleanInstance, rootfs, fixture.root))
@@ -959,10 +959,12 @@ class ChrootRuntimeManagerTest {
                     "repeat" -> ChrootRuntimeFailureStage.FRAME_SEQUENCE
                     else -> ChrootRuntimeFailureStage.FRAME_READ
                 }, handle.failure.value?.stage)
-                assertFalse(fixture.recovery.canStart(instance))
+                assertTrue(fixture.recovery.canStart(instance))
                 fixture.authority.setEnabled(false)
                 fixture.authority.setEnabled(true)
-                assertNull(fixture.manager.activateFromUser(owner, "profile", 1L, instance, rootfs, fixture.authority.accessSnapshot()))
+                val lease = checkNotNull(fixture.manager.activateFromUser(owner, "profile", 1L, instance, rootfs, fixture.authority.accessSnapshot()))
+                assertNull(fixture.manager.authorize(lease, spec(), 1L))
+                assertEquals(ChrootRecoveryPhase.UNKNOWN, fixture.recovery.snapshot().single().phase)
                 assertEquals(0, fixture.factory.process.destroys.get())
             }
         }
@@ -978,7 +980,7 @@ class ChrootRuntimeManagerTest {
             assertEquals(ChrootCleanupResult.UNKNOWN, handle.awaitCleanup())
             assertTrue(handle.inputStream.available() <= ChrootLaunchHandle.MAX_BUFFER_BYTES)
             assertEquals(ChrootRuntimeFailureStage.OUTPUT_BUFFER, handle.failure.value?.stage)
-            assertFalse(fixture.recovery.canStart(instance))
+            assertTrue(fixture.recovery.canStart(instance))
             assertEquals(0, fixture.factory.process.destroys.get())
         }
     }
@@ -994,7 +996,7 @@ class ChrootRuntimeManagerTest {
             assertEquals(ChrootTaskResult.Exited(ChrootProcessExit(0, null)), handle.awaitTaskExit())
             assertEquals(ChrootCleanupResult.UNKNOWN, handle.awaitCleanup())
             assertEquals(ChrootRuntimeFailureStage.HELPER_STDOUT_EOF, handle.failure.value?.stage)
-            assertFalse(fixture.recovery.canStart(instance))
+            assertTrue(fixture.recovery.canStart(instance))
         }
     }
 
@@ -1029,6 +1031,7 @@ class ChrootRuntimeManagerTest {
             assertTrue(first.isAlive)
             assertTrue(second.isAlive)
             assertTrue(fixture.recovery.blockedInstances.value.isEmpty())
+            assertFalse(fixture.manager.hasUnverifiedCleanup(instance))
             fixture.manager.stopInstance(instance)
             eventually { fixture.controls.values.all { it.sent.contains(ChrootFrameType.STOP) } }
             pairs.values.forEach {
@@ -1041,6 +1044,104 @@ class ChrootRuntimeManagerTest {
             assertEquals(ChrootCleanupResult.VERIFIED, second.awaitCleanup())
             assertNull(fixture.manager.authorize(firstLease, spec(launch = "abcdefabcdefabcdefabcdef"), 1L))
             assertTrue(processes.all { it.destroys.get() == 0 })
+        }
+    }
+
+    @Test
+    fun unknownCleanupKeepsSiblingAndNewLaunchesIndependentWithinTheSameInstance() = runTest {
+        for (siblingReadyBeforeFailure in listOf(false, true)) {
+            fixture().use { fixture ->
+                val firstSpec = spec()
+                val firstLease = fixture.lease()
+                val firstPermit = checkNotNull(fixture.manager.authorize(firstLease, firstSpec, 1L))
+                val first = checkNotNull(fixture.manager.launch(firstLease, firstPermit, firstSpec) {})
+                awaitSignal(fixture.control.awaiting)
+                fixture.ready()
+                assertTrue(readyResult(first))
+
+                val secondSpec = spec(owner = "terminal:second", launch = "abcdef0123456789abcdef01", token = ByteArray(32) { 2 })
+                val secondLease = fixture.lease(owner = secondSpec.ownerIdentity)
+                val secondPermit = checkNotNull(fixture.manager.authorize(secondLease, secondSpec, 1L))
+                val second = checkNotNull(fixture.manager.launch(secondLease, secondPermit, secondSpec) {})
+                eventually { fixture.controls.containsKey(secondSpec.launchId) }
+                val secondControl = fixture.controls.getValue(secondSpec.launchId)
+                awaitSignal(secondControl.awaiting)
+                val secondProcess = fixture.factory.processes[1]
+                if (siblingReadyBeforeFailure) {
+                    secondProcess.frame(ChrootFrameType.READY, secondSpec.token())
+                    secondControl.authenticated.complete(Unit)
+                    assertTrue(readyResult(second))
+                }
+
+                fixture.factory.process.exit(37)
+                fixture.factory.process.frame(ChrootFrameType.CLEANUP, byteArrayOf(1))
+                fixture.factory.process.finish()
+                assertEquals(ChrootCleanupResult.UNKNOWN, cleanupResult(first))
+                assertEquals(ChrootTaskResult.Exited(ChrootProcessExit(37, null)), first.awaitTaskExit())
+                assertEquals(ChrootRuntimeFailureStage.CLEANUP_EVIDENCE, first.failure.value?.stage)
+                assertFalse(first.resize(80, 24))
+                assertTrue(runCatching { first.outputStream.write(1) }.exceptionOrNull() is IOException)
+                assertTrue(fixture.manager.isLeaseCurrent(firstLease))
+                assertTrue(fixture.manager.isLeaseCurrent(secondLease))
+                assertEquals(2, fixture.manager.instanceState(instance).authorizedOwners)
+                assertEquals(1, fixture.manager.instanceState(instance).activeLaunches)
+                assertFalse(fixture.manager.instanceState(instance).blocked)
+                assertTrue(fixture.manager.hasUnverifiedCleanup(instance))
+                assertNull(fixture.manager.authorize(firstLease, firstSpec, 1L))
+                eventually { fixture.manager.blockedInstances.value == setOf(instance) }
+                eventually { fixture.manager.failureSummary(instance)?.contains("failure=CLEANUP/CLEANUP_EVIDENCE") == true }
+
+                if (!siblingReadyBeforeFailure) {
+                    secondProcess.frame(ChrootFrameType.READY, secondSpec.token())
+                    secondControl.authenticated.complete(Unit)
+                    assertTrue(readyResult(second))
+                }
+                second.outputStream.write(byteArrayOf(7, 8))
+                assertTrue(second.resize(80, 24))
+                assertTrue(second.isAlive)
+                assertNull(second.failure.value)
+                assertNull(second.cleanupState.value)
+                assertFalse(secondControl.closed.get())
+                assertFalse(secondControl.sent.contains(ChrootFrameType.STOP))
+                assertEquals(listOf(ChrootFrameType.LAUNCH, ChrootFrameType.STDIN), secondProcess.inputFrames())
+
+                val nextSpec = spec(owner = "file:next", launch = "abcdefabcdefabcdefabcdef", token = ByteArray(32) { 3 })
+                val nextLease = fixture.lease(owner = nextSpec.ownerIdentity)
+                val nextPermit = checkNotNull(fixture.manager.authorize(nextLease, nextSpec, 1L))
+                val next = checkNotNull(fixture.manager.launch(nextLease, nextPermit, nextSpec) {})
+                assertNull(fixture.manager.launch(nextLease, nextPermit, nextSpec) {})
+                eventually { fixture.controls.containsKey(nextSpec.launchId) }
+                val nextControl = fixture.controls.getValue(nextSpec.launchId)
+                awaitSignal(nextControl.awaiting)
+                val nextProcess = fixture.factory.processes[2]
+                nextProcess.frame(ChrootFrameType.READY, nextSpec.token())
+                nextControl.authenticated.complete(Unit)
+                assertTrue(readyResult(next))
+                assertEquals(3, fixture.factory.starts.get())
+
+                for (process in listOf(secondProcess, nextProcess)) {
+                    process.exit(0)
+                    process.frame(ChrootFrameType.CLEANUP, byteArrayOf(0))
+                    process.finish()
+                }
+                assertEquals(ChrootCleanupResult.VERIFIED, cleanupResult(second))
+                assertEquals(ChrootCleanupResult.VERIFIED, cleanupResult(next))
+                assertFalse(secondControl.sent.contains(ChrootFrameType.STOP))
+                fixture.recovery.recordPhase(firstSpec.launchId, ChrootRecoveryPhase.RUNNING)
+                fixture.recovery.recordCleanup(firstSpec.launchId, ChrootCleanupResult.VERIFIED)
+                assertEquals(ChrootCleanupResult.UNKNOWN, first.awaitCleanup())
+                val unknown = fixture.recovery.snapshot().single { it.launchId == firstSpec.launchId }
+                assertEquals(ChrootRecoveryPhase.UNKNOWN, unknown.phase)
+                assertEquals(ChrootCleanupResult.UNKNOWN, unknown.cleanup)
+                for (launchSpec in listOf(secondSpec, nextSpec)) {
+                    val closed = fixture.recovery.snapshot().single { it.launchId == launchSpec.launchId }
+                    assertEquals(ChrootRecoveryPhase.CLOSED, closed.phase)
+                    assertEquals(ChrootCleanupResult.VERIFIED, closed.cleanup)
+                }
+                assertEquals(setOf(firstSpec.launchId), fixture.recovery.unknownLaunchIds(instance))
+                assertEquals(0, fixture.manager.instanceState(instance).activeLaunches)
+                assertTrue(fixture.recovery.canStart(instance))
+            }
         }
     }
 
@@ -1163,8 +1264,8 @@ class ChrootRuntimeManagerTest {
             val evidence = fixture.diagnostics.latestUnknown(instance)!!.completionEvidence!!
             assertEquals(ChrootStopTrigger.TASK_EXIT, evidence.trigger)
             assertEquals(7, evidence.flags)
-            assertTrue(fixture.manager.instanceState(instance).blocked)
-            assertFalse(fixture.recovery.canStart(instance))
+            assertFalse(fixture.manager.instanceState(instance).blocked)
+            assertTrue(fixture.recovery.canStart(instance))
             assertEquals(0, fixture.factory.process.destroys.get())
         }
     }
@@ -1198,7 +1299,7 @@ class ChrootRuntimeManagerTest {
             assertEquals(ChrootTaskResult.Unknown, handle.awaitTaskExit())
             eventually { fixture.diagnostics.latestUnknown(instance)?.completionEvidence != null }
             assertEquals(ChrootStopTrigger.STOP, fixture.diagnostics.latestUnknown(instance)!!.completionEvidence!!.trigger)
-            assertTrue(fixture.manager.instanceState(instance).blocked)
+            assertFalse(fixture.manager.instanceState(instance).blocked)
             assertEquals(0, fixture.factory.process.destroys.get())
         }
     }
@@ -1230,8 +1331,8 @@ class ChrootRuntimeManagerTest {
                 dispatcher.advanceBy(budget)
                 assertEquals(ChrootCleanupResult.UNKNOWN, cleanupResult(handle))
                 assertEquals(ChrootRuntimeFailureStage.STOP_DEADLINE, handle.failure.value?.stage)
-                assertTrue(manager.instanceState(instance).blocked)
-                assertFalse(fixture.recovery.canStart(instance))
+                assertFalse(manager.instanceState(instance).blocked)
+                assertTrue(fixture.recovery.canStart(instance))
                 releaseListener.countDown()
                 awaitSignal(startupReturned)
                 assertEquals(ChrootCleanupResult.UNKNOWN, handle.cleanupState.value)
@@ -1266,7 +1367,7 @@ class ChrootRuntimeManagerTest {
             assertEquals("settled", withContext(Dispatchers.IO) { withTimeout(5_000L) { maintenance.await() } })
             assertEquals(12_000L, outerBudget)
             assertEquals(0, fixture.manager.instanceState(instance).activeLaunches)
-            assertTrue(fixture.manager.instanceState(instance).blocked)
+            assertFalse(fixture.manager.instanceState(instance).blocked)
         }
     }
 
@@ -1391,7 +1492,7 @@ class ChrootRuntimeManagerTest {
                 assertEquals(ChrootTaskResult.Unknown, handle.awaitTaskExit())
                 assertTrue(control.closed.get())
                 assertTrue(control.sent.isEmpty())
-                assertTrue(manager.instanceState(instance).blocked)
+                assertFalse(manager.instanceState(instance).blocked)
                 assertEquals(setOf(spec().launchId), fixture.recovery.unknownLaunchIds(instance))
                 assertEquals(0, fixture.factory.process.destroys.get())
                 eventually { fixture.diagnostics.latestUnknown(instance)?.completionEvidence != null }
@@ -1426,7 +1527,7 @@ class ChrootRuntimeManagerTest {
                 assertEquals(ChrootTaskResult.Unknown, handle.awaitTaskExit())
                 assertTrue(control.closed.get())
                 assertTrue(control.sent.isEmpty())
-                assertTrue(manager.instanceState(instance).blocked)
+                assertFalse(manager.instanceState(instance).blocked)
                 assertEquals(setOf(spec().launchId), fixture.recovery.unknownLaunchIds(instance))
                 assertEquals(0, fixture.factory.process.destroys.get())
                 eventually { fixture.diagnostics.latestUnknown(instance)?.completionEvidence != null }
@@ -1506,7 +1607,7 @@ class ChrootRuntimeManagerTest {
                     assertEquals(ChrootRuntimeFailureKind.PROTOCOL, handle.failure.value?.kind)
                     assertEquals(ChrootRuntimeFailureStage.FRAME_SEQUENCE, handle.failure.value?.stage)
                     assertTrue(control.sent.isEmpty())
-                    assertTrue(manager.instanceState(instance).blocked)
+                    assertFalse(manager.instanceState(instance).blocked)
                     assertEquals(setOf(spec().launchId), fixture.recovery.unknownLaunchIds(instance))
                     assertEquals(ChrootRecoveryPhase.UNKNOWN, fixture.recovery.snapshot().single().phase)
                 } finally { control.close() }
@@ -1612,7 +1713,7 @@ class ChrootRuntimeManagerTest {
             assertEquals(ChrootCleanupResult.UNKNOWN, cleanupResult(handle))
             assertEquals(ChrootTaskResult.Unknown, handle.awaitTaskExit())
             assertFalse(proxy.tryDispatch())
-            assertTrue(manager.instanceState(instance).blocked)
+            assertFalse(manager.instanceState(instance).blocked)
             assertEquals(setOf(spec().launchId), fixture.recovery.unknownLaunchIds(instance))
             assertEquals(ChrootRecoveryPhase.UNKNOWN, fixture.recovery.snapshot().single().phase)
         }
@@ -1632,8 +1733,8 @@ class ChrootRuntimeManagerTest {
                 assertEquals(ChrootTaskResult.Exited(ChrootProcessExit(37, null)), handle.awaitTaskExit())
                 assertEquals(ChrootCleanupResult.UNKNOWN, cleanupResult(handle))
                 assertEquals(ChrootRuntimeFailureStage.HELPER_EXIT_STATUS, handle.failure.value?.stage)
-                assertTrue(fixture.manager.instanceState(instance).blocked)
-                assertFalse(fixture.recovery.canStart(instance))
+                assertFalse(fixture.manager.instanceState(instance).blocked)
+                assertTrue(fixture.recovery.canStart(instance))
             }
         }
     }
@@ -1928,11 +2029,11 @@ class ChrootRuntimeManagerTest {
                 assertEquals(ChrootStopTrigger.TASK_EXIT, frozen.trigger)
                 assertEquals("HELPER_EXIT", frozen.pending())
                 assertEquals(127, frozen.flags)
-                assertTrue(fixture.manager.instanceState(instance).blocked)
+                assertFalse(fixture.manager.instanceState(instance).blocked)
                 releaseWrapper.countDown()
                 awaitSignal(wrapperPublished)
                 assertEquals(ChrootCleanupResult.UNKNOWN, handle.awaitCleanup())
-                assertFalse(fixture.recovery.canStart(instance))
+                assertTrue(fixture.recovery.canStart(instance))
                 eventually {
                     val reloaded = ChrootRuntimeDiagnostics(fixture.diagnosticFile)
                     reloaded.isHealthy && reloaded.latestUnknown(instance)?.completionEvidence == frozen
@@ -1981,7 +2082,7 @@ class ChrootRuntimeManagerTest {
             assertEquals(ChrootCompletionEvidence.ALL_FLAGS xor ChrootCompletionEvidence.STDOUT_ENDED, frozen.flags)
             assertEquals(ChrootCleanupResult.UNKNOWN, handle.cleanupState.value)
             assertEquals(ChrootRuntimeFailureStage.STOP_DEADLINE, handle.failure.value?.stage)
-            assertFalse(fixture.recovery.canStart(instance))
+            assertTrue(fixture.recovery.canStart(instance))
             assertEquals(0, fixture.factory.process.destroys.get())
         }
     }
@@ -2000,7 +2101,7 @@ class ChrootRuntimeManagerTest {
             assertEquals(ChrootRuntimeFailureKind.TIMEOUT, handle.failure.value?.kind)
             assertEquals(ChrootRuntimeFailureStage.STOP_DEADLINE, handle.failure.value?.stage)
             assertEquals(0, fixture.factory.process.destroys.get())
-            assertFalse(fixture.recovery.canStart(instance))
+            assertTrue(fixture.recovery.canStart(instance))
         }
     }
 
@@ -2053,6 +2154,9 @@ class ChrootRuntimeManagerTest {
             assertEquals(ChrootCleanupResult.VERIFIED, cleanupResult(handle))
             assertEquals(0, fixture.factory.starts.get())
             assertFalse(fixture.recovery.isHealthy.value)
+            assertFalse(fixture.recovery.canStart(instance))
+            assertTrue(fixture.manager.instanceState(instance).blocked)
+            assertNull(fixture.manager.allowBinding(owner, "profile", 1L, instance, rootfs, fixture.root))
         }
     }
 
@@ -2070,7 +2174,50 @@ class ChrootRuntimeManagerTest {
             assertFalse(readyResult(handle))
             assertEquals(ChrootCleanupResult.UNKNOWN, cleanupResult(handle))
             assertEquals(failure, handle.failure.value)
-            assertFalse(fixture.recovery.canStart(instance))
+            assertTrue(fixture.recovery.canStart(instance))
+        }
+    }
+
+    @Test
+    fun unverifiedCleanupAuditSeesLocalUnknownBeforeTheJournalPublishesIt() = runTest {
+        val pauseSync = AtomicBoolean()
+        val writeEntered = CompletableDeferred<Unit>()
+        val releaseWrite = CountDownLatch(1)
+        val recovery = ChrootRecoveryRepository(File(temporary.newFolder(), "runtime.bin")) {
+            if (pauseSync.get()) {
+                writeEntered.complete(Unit)
+                check(releaseWrite.await(5L, TimeUnit.SECONDS))
+            }
+        }
+        fixture().use { fixture ->
+            val manager = ChrootRuntimeManager(fixture.authority, fixture.factory, recovery, fixture.scope,
+                Dispatchers.IO, { fixture.control }, { System.nanoTime() / 1_000_000L }, cleanupTimeoutMs = 4_000L)
+            val lease = checkNotNull(manager.allowBinding(owner, "profile", 1L, instance, rootfs, fixture.root))
+            val permit = checkNotNull(manager.authorize(lease, spec(), 1L))
+            val handle = checkNotNull(manager.launch(lease, permit, spec()) {})
+            awaitSignal(fixture.control.awaiting)
+            fixture.ready()
+            assertTrue(readyResult(handle))
+            eventually { recovery.snapshot().single().phase == ChrootRecoveryPhase.RUNNING }
+            assertFalse(manager.hasUnverifiedCleanup(instance))
+            pauseSync.set(true)
+            try {
+                fixture.factory.process.stdout.close()
+                awaitSignal(writeEntered)
+                assertTrue(recovery.isHealthy.value)
+                assertTrue(recovery.blockedInstances.value.isEmpty())
+                assertTrue(manager.hasUnverifiedCleanup(instance))
+                assertFalse(manager.hasUnverifiedCleanup("abcdef0123456789abcdef01"))
+                assertFalse(manager.instanceState(instance).blocked)
+                assertTrue(manager.isLeaseCurrent(lease))
+                assertNull(handle.cleanupState.value)
+            } finally {
+                releaseWrite.countDown()
+            }
+            assertEquals(ChrootCleanupResult.UNKNOWN, cleanupResult(handle))
+            assertEquals(setOf(instance), recovery.blockedInstances.value)
+            assertEquals(ChrootRecoveryPhase.UNKNOWN, recovery.snapshot().single().phase)
+            assertTrue(manager.hasUnverifiedCleanup(instance))
         }
     }
 
@@ -2097,9 +2244,9 @@ class ChrootRuntimeManagerTest {
                 assertTrue(withContext(Dispatchers.IO) { writeEntered.await(5, TimeUnit.SECONDS) })
                 assertEquals(ChrootCleanupResult.UNKNOWN, cleanupResult(handle))
                 assertTrue(fixture.authority.withCurrent(fixture.root.authorityId, fixture.root.generation) { true } == true)
-                assertTrue(manager.instanceState(instance).blocked)
+                assertFalse(manager.instanceState(instance).blocked)
                 assertFalse(fixture.control.sent.contains(ChrootFrameType.GO))
-                assertNull(manager.allowBinding(owner, "profile", 1, instance, rootfs, fixture.root))
+                assertNotNull(manager.allowBinding(owner, "profile", 1, instance, rootfs, fixture.root))
             } finally {
                 releaseWrite.countDown()
             }
@@ -2113,10 +2260,15 @@ class ChrootRuntimeManagerTest {
     fun cleanupJournalWriteFailurePreservesTheUnknownEntryAndDiagnostic() = runTest {
         val journal = File(temporary.newFolder(), "runtime.bin")
         fixture(journal).use { fixture ->
-            val handle = fixture.start()
+            val lease = fixture.lease()
+            val permit = checkNotNull(fixture.manager.authorize(lease, spec(), 1L))
+            val handle = checkNotNull(fixture.manager.launch(lease, permit, spec()) {})
+            awaitSignal(fixture.control.awaiting)
             fixture.ready()
             assertTrue(readyResult(handle))
             eventually { fixture.recovery.snapshot().single().phase == ChrootRecoveryPhase.RUNNING }
+            val nextSpec = spec(launch = "abcdef0123456789abcdef01")
+            val nextPermit = checkNotNull(fixture.manager.authorize(lease, nextSpec, 1L))
             File(journal.path + ".pending").writeBytes(byteArrayOf(1))
             fixture.factory.process.exit(0)
             fixture.factory.process.frame(ChrootFrameType.CLEANUP, byteArrayOf(0))
@@ -2133,6 +2285,11 @@ class ChrootRuntimeManagerTest {
             }
             assertTrue(fixture.manager.instanceState(instance).blocked)
             assertFalse(fixture.recovery.canStart(instance))
+            assertFalse(fixture.manager.isLeaseCurrent(lease))
+            assertNull(fixture.manager.allowBinding(owner, "profile", 1L, instance, rootfs, fixture.root))
+            assertNull(fixture.manager.authorize(lease, nextSpec, 1L))
+            assertNull(fixture.manager.launch(lease, nextPermit, nextSpec) {})
+            assertEquals(1, fixture.factory.starts.get())
             assertEquals(0, fixture.factory.process.destroys.get())
         }
     }
@@ -2152,7 +2309,7 @@ class ChrootRuntimeManagerTest {
             assertTrue(failure.nativeFailureObserved)
             assertEquals(failure, handle.nativeFailure.value)
             assertEquals(ChrootCleanupResult.UNKNOWN, cleanupResult(handle))
-            assertFalse(fixture.recovery.canStart(instance))
+            assertTrue(fixture.recovery.canStart(instance))
             assertEquals(failure, handle.failure.value)
             assertFalse(fixture.control.sent.contains(ChrootFrameType.GO))
             eventually { fixture.diagnostics.latestUnknown(instance)?.nativeFailure == failure }
@@ -2263,7 +2420,7 @@ class ChrootRuntimeManagerTest {
             assertEquals("ajiu_runtime: $body\n".toByteArray().size - 1, stderr.requestedBytes.get())
             assertFalse(readyResult(handle))
             assertFalse(fixture.control.sent.contains(ChrootFrameType.GO))
-            assertFalse(fixture.recovery.canStart(instance))
+            assertTrue(fixture.recovery.canStart(instance))
             assertEquals(0, fixture.factory.process.destroys.get())
         }
     }
@@ -2285,7 +2442,7 @@ class ChrootRuntimeManagerTest {
             assertEquals(native, handle.nativeFailure.value)
             assertEquals(native, handle.failure.value)
             assertFalse(fixture.control.sent.contains(ChrootFrameType.GO))
-            assertFalse(fixture.recovery.canStart(instance))
+            assertTrue(fixture.recovery.canStart(instance))
             assertEquals(0, fixture.factory.process.destroys.get())
         }
     }
@@ -2365,14 +2522,75 @@ class ChrootRuntimeManagerTest {
     }
 
     @Test
-    fun recoveredPendingIntentBlocksActivationWithoutCreatingRootProcess() = runTest {
-        val journal = File(temporary.newFolder(), "journal.bin")
-        ChrootRecoveryRepository(journal).recordIntent(instance, "89abcdef0123456789abcdef", rootfs, owner, 1L)
-        fixture(journal).use { fixture ->
-            assertEquals(setOf(instance), fixture.manager.blockedInstances.value)
-            assertNull(fixture.manager.activateFromUser(owner, "profile", 1L, instance, rootfs, fixture.root))
-            assertEquals(ChrootRecoveryPhase.UNKNOWN, fixture.recovery.snapshot().single().phase)
-            assertEquals(0, fixture.factory.starts.get())
+    fun recoveredUnknownAllowsNewNonceWithoutReplayingOrClearingTheOldLaunch() = runTest {
+        for (completedUnknown in listOf(false, true)) {
+            val journal = File(temporary.newFolder(), "journal.bin")
+            val oldSpec = spec()
+            ChrootRecoveryRepository(journal).apply {
+                recordIntent(instance, oldSpec.launchId, rootfs, owner, 1L)
+                if (completedUnknown) recordCleanup(oldSpec.launchId, ChrootCleanupResult.UNKNOWN)
+            }
+            fixture(journal).use { fixture ->
+                assertEquals(setOf(instance), fixture.manager.blockedInstances.value)
+                assertFalse(fixture.manager.instanceState(instance).blocked)
+                assertTrue(fixture.manager.hasUnverifiedCleanup(instance))
+                val unknown = fixture.recovery.snapshot().single()
+                assertEquals(ChrootRecoveryPhase.UNKNOWN, unknown.phase)
+                assertEquals(ChrootCleanupResult.UNKNOWN, unknown.cleanup)
+                val lease = checkNotNull(fixture.manager.activateFromUser(owner, "profile", 1L, instance, rootfs, fixture.root))
+                assertTrue(fixture.manager.isLeaseCurrent(lease))
+                assertNull(fixture.manager.authorize(lease, oldSpec, 1L))
+                assertEquals(0, fixture.factory.starts.get())
+
+                val nextSpec = spec(launch = "abcdef0123456789abcdef01", token = ByteArray(32) { 2 })
+                val permit = checkNotNull(fixture.manager.authorize(lease, nextSpec, 1L))
+                val handle = checkNotNull(fixture.manager.launch(lease, permit, nextSpec) {})
+                assertNull(fixture.manager.launch(lease, permit, nextSpec) {})
+                eventually { fixture.controls.containsKey(nextSpec.launchId) }
+                val control = fixture.controls.getValue(nextSpec.launchId)
+                awaitSignal(control.awaiting)
+                fixture.factory.process.frame(ChrootFrameType.READY, nextSpec.token())
+                control.authenticated.complete(Unit)
+                assertTrue(readyResult(handle))
+                fixture.factory.process.exit(0)
+                fixture.factory.process.frame(ChrootFrameType.CLEANUP, byteArrayOf(0))
+                fixture.factory.process.finish()
+                assertEquals(ChrootTaskResult.Exited(ChrootProcessExit(0, null)), handle.awaitTaskExit())
+                assertEquals(ChrootCleanupResult.VERIFIED, cleanupResult(handle))
+                assertEquals(1, fixture.factory.starts.get())
+                assertNull(fixture.manager.authorize(lease, oldSpec, 1L))
+                assertNull(fixture.manager.authorize(lease, nextSpec, 1L))
+                assertEquals(unknown, fixture.recovery.snapshot().single { it.launchId == oldSpec.launchId })
+                val closed = fixture.recovery.snapshot().single { it.launchId == nextSpec.launchId }
+                assertEquals(ChrootRecoveryPhase.CLOSED, closed.phase)
+                assertEquals(ChrootCleanupResult.VERIFIED, closed.cleanup)
+                assertEquals(setOf(oldSpec.launchId), fixture.recovery.unknownLaunchIds(instance))
+                assertEquals(setOf(oldSpec.launchId, nextSpec.launchId), fixture.recovery.recordedLaunchIds.value)
+                assertEquals(setOf(instance), fixture.manager.blockedInstances.value)
+                assertFalse(fixture.manager.instanceState(instance).blocked)
+                assertTrue(fixture.manager.hasUnverifiedCleanup(instance))
+                assertTrue(fixture.manager.isLeaseCurrent(lease))
+                assertEquals(fixture.recovery.snapshot(), ChrootRecoveryRepository(journal).snapshot())
+            }
+        }
+    }
+
+    @Test
+    fun corruptedOrInterruptedJournalStillRejectsBindingWithoutCreatingAHelper() = runTest {
+        for (interrupted in listOf(false, true)) {
+            val journal = File(temporary.newFolder(), "journal.bin")
+            if (interrupted) {
+                ChrootRecoveryRepository(journal).recordIntent(instance, spec().launchId, rootfs, owner, 1L)
+                File(journal.path + ".pending").writeBytes(byteArrayOf(1))
+            } else journal.writeBytes(byteArrayOf(1, 2, 3))
+            fixture(journal).use { fixture ->
+                assertFalse(fixture.recovery.isHealthy.value)
+                assertFalse(fixture.recovery.canStart(instance))
+                assertTrue(fixture.manager.instanceState(instance).blocked)
+                assertNull(fixture.manager.allowBinding(owner, "profile", 1L, instance, rootfs, fixture.root))
+                assertEquals(0, fixture.factory.captures.get())
+                assertEquals(0, fixture.factory.starts.get())
+            }
         }
     }
 }

@@ -1,9 +1,33 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <errno.h>
+#include <fcntl.h>
+#include <stdbool.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+static int supervision_fstatat(int fd, const char *path, struct stat *st, int flags);
+static int receipt_base_fd = -1;
+static bool receipt_present;
 #define main chroot_runtime_production_main_not_called
+#define fstatat supervision_fstatat
 #ifndef AJIU_RUNTIME_HELPER_SOURCE
 #define AJIU_RUNTIME_HELPER_SOURCE "runtime_helper.c"
 #endif
 #include AJIU_RUNTIME_HELPER_SOURCE
+#undef fstatat
 #undef main
+
+static int supervision_fstatat(int fd, const char *path, struct stat *st, int flags)
+{
+    if (fd == receipt_base_fd && !strcmp(path, "remove-after-reboot") && flags == AT_SYMLINK_NOFOLLOW) {
+        if (receipt_present) { *st = (struct stat){ .st_mode = S_IFREG | 0600, .st_nlink = 1 }; return 0; }
+        errno = ENOENT; return -1;
+    }
+    return fstatat(fd, path, st, flags);
+}
 
 #define CHECK(value) do { if (!(value)) { fprintf(stderr, "Native supervision check line %d: %s (errno=%d)\n", __LINE__, #value, errno); exit(1); } ++checks; } while (0)
 static unsigned int checks;
@@ -71,6 +95,24 @@ static void check_exit_lease_boundary(void)
     c.stopped = true; c.stop_at = 5999;
     CHECK(deadline_step(&c, true, 6000, 1000, 0) == 0 && c.stop_at == 5999);
     CHECK(deadline_step(&c, false, 16000, 1000, 1000) == 0 && c.stopped && c.stop_at == 5999);
+    close_deadline(&c);
+}
+
+static void check_removal_receipt_stops_runtime(void)
+{
+    struct deadline_case c;
+    open_deadline(&c);
+    int lock = fcntl(STDIN_FILENO, F_DUPFD_CLOEXEC, 3);
+    CHECK(lock >= 0);
+    c.runtime.instance_locked = true;
+    c.runtime.instance_lock = lock;
+    receipt_base_fd = lock;
+    receipt_present = true;
+    CHECK(deadline_step(&c, true, 1200, 1000, 1000) == ECANCELED && c.stopped && c.stop_at == 1200);
+    receipt_present = false;
+    CHECK(deadline_step(&c, true, 1300, 1000, 1000) == 0 && c.stopped && c.stop_at == 1200);
+    receipt_base_fd = -1;
+    CHECK(close(lock) == 0);
     close_deadline(&c);
 }
 
@@ -236,6 +278,7 @@ int main(int argc, char **argv)
         { "exit-command-boundary", check_exit_command_boundary },
         { "exit-lease-boundary", check_exit_lease_boundary },
         { "stop-safety", check_stop_safety },
+        { "removal-receipt-stops-runtime", check_removal_receipt_stops_runtime },
         { "live-input", check_live_input },
         { "late-input", check_late_input },
         { "invalid-input", check_invalid_input },
