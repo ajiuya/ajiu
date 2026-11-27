@@ -199,7 +199,7 @@
     <string name="plugin_page_failed">插件页面加载失败，已关闭页面能力。</string>
     <string name="plugin_approval_title">插件请求宿主操作</string>
     <string name="plugin_approval_identity">插件：%1$s\nID：%2$s</string>
-    <string name="plugin_approval_warning">以下按钮属于宿主原生审批。可选择仅允许本次；提供“始终允许”时，它仅适用于下方明确列出的插件、目标与同类操作。拒绝、返回或关闭均视为拒绝，页面脚本不能代替你审批。</string>
+    <string name="plugin_approval_warning">以下按钮属于宿主原生审批。会话允许仅记住当前插件、来源与相同操作及参数；无聊天上下文时仅限本次插件运行，重启 App 后清除。“始终允许”另行持久保存下方明确的操作范围。拒绝、返回或关闭均视为拒绝，页面脚本不能代替你审批。</string>
     <string name="plugin_approval_allow_once">仅允许本次</string>
     <string name="plugin_approval_deny">拒绝</string>
     <string name="plugin_approval_execute_tool">调用宿主工具</string>
@@ -1134,6 +1134,8 @@
     <string name="chat_send">发送</string>
     <string name="chat_perm_deny">拒绝</string>
     <string name="chat_perm_session_allow">本会话始终允许</string>
+    <string name="permission_session_unavailable">当前会话或执行来源无法确认，暂不能记住授权。请重新发起请求，或仅允许本次。</string>
+    <string name="plugin_approval_run_session">本次插件运行始终允许</string>
     <string name="chat_perm_allow_once">仅本次允许</string>
     <string name="chat_perm_session_label">会话「%1$s」</string>
 

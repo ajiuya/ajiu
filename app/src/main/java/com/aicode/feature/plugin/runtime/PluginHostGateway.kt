@@ -199,7 +199,7 @@ class PluginHostGateway @Inject constructor(
                 "fs.read", "fs.readBinary", "fs.list", "fs.stat", "fs.write", "fs.writeBinary",
                 "fs.append", "fs.mkdir", "fs.delete", "fs.rename", "fs.copy" -> fileBridge.call(context, api, params) { name, args, op, details ->
                     val copySource = args["from"]?.takeIf { api == "fs.copy" }
-                    authorize(context, name, args, op, details) {
+                    authorizeWithSessionIdentity(context, name, args, op, details, params) {
                         if (copySource != null) checkPolicy(context, "readFile", buildJsonObject { put("path", copySource) })
                     }
                 }
@@ -272,7 +272,7 @@ class PluginHostGateway @Inject constructor(
         }
     }
 
-    internal suspend fun checkPolicy(context: PluginInvocationContext, name: String, args: JsonObject) {
+    internal suspend fun checkPolicy(context: PluginInvocationContext, name: String, args: JsonObject): ToolPermissionPolicyEngine.EvalResult {
         context.checkCurrent()
         if (!context.allowsTool(name)) forbidden()
         val decision = policy.evaluate(name, args, context.sessionId)
@@ -280,10 +280,16 @@ class PluginHostGateway @Inject constructor(
         if (decision.verdict == ToolPermissionPolicyEngine.Verdict.DENY || decision.rootGeneration != null) {
             throw PluginHostException("SYSTEM_DENIED", "The host policy denied this operation")
         }
+        return decision
     }
 
     suspend fun authorize(context: PluginInvocationContext, name: String, args: JsonObject,
-        operation: PluginApprovalOperation, details: String, additionalPolicy: suspend () -> Unit = {}) {
+        operation: PluginApprovalOperation, details: String, additionalPolicy: suspend () -> Unit = {}) =
+        authorizeWithSessionIdentity(context, name, args, operation, details, args, additionalPolicy)
+
+    internal suspend fun authorizeWithSessionIdentity(context: PluginInvocationContext, name: String, args: JsonObject,
+        operation: PluginApprovalOperation, details: String, sessionArguments: JsonElement,
+        additionalPolicy: suspend () -> Unit = {}) {
         if (context.capture.cleanup) {
             context.checkIntegrity()
             if (name !in setOf("readFile", "writeFile", "list") ||
@@ -292,7 +298,16 @@ class PluginHostGateway @Inject constructor(
             }
             return
         }
-        checkPolicy(context, name, args); additionalPolicy()
+        val reviewed = checkPolicy(context, name, args)
+        additionalPolicy()
+        val sessionScope = context.sessionApprovalScope(name, args, reviewed, sessionArguments)
+        val validateSession: suspend () -> Unit = {
+            val current = checkPolicy(context, name, args)
+            additionalPolicy()
+            if (context.sessionApprovalScope(name, args, current, sessionArguments) != sessionScope) {
+                throw PluginHostException("CONTEXT_CHANGED", "The approval source or identity changed")
+            }
+        }
         if (operationGrants.isAllowed(context, name, args)) {
             checkPolicy(context, name, args); additionalPolicy()
             return
@@ -300,7 +315,8 @@ class PluginHostGateway @Inject constructor(
         val canRemember = operationGrants.canRemember(context, name)
         val allowed = approvals.awaitApproval(context.capture.id, context.capture.manifest.name.resolve(Locale.getDefault().toLanguageTag()),
             operation, context.approvalDetails(details), context.changes, context::checkCurrent,
-            canAlwaysAllow = canRemember, scopeSummary = name, sourceIdentity = context.sourceIdentity) {
+            canAlwaysAllow = canRemember, scopeSummary = name, sourceIdentity = context.sourceIdentity,
+            sessionScope = sessionScope, validateSession = validateSession) {
                 checkPolicy(context, name, args); additionalPolicy()
                 operationGrants.remember(context, name, args)
             }

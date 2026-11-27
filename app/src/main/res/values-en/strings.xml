@@ -199,7 +199,7 @@
     <string name="plugin_page_failed">The plugin page failed to load. Its capabilities have been closed.</string>
     <string name="plugin_approval_title">Plugin requests a host operation</string>
     <string name="plugin_approval_identity">Plugin: %1$s\nID: %2$s</string>
-    <string name="plugin_approval_warning">These are native host approval controls. Allow once applies to this request. When offered, Always allow applies only to the specified plugin, target, and operation scope below. Rejecting, going back, or closing means denial. Page scripts cannot approve for you.</string>
+    <string name="plugin_approval_warning">These are native host approval controls. Session approval remembers only this plugin, source, operation, and exact arguments. Without a chat context, it applies only to this plugin run. It clears when the app restarts. Always allow separately persists the specified operation scope below. Rejecting, going back, or closing means denial. Page scripts cannot approve for you.</string>
     <string name="plugin_approval_allow_once">Allow once</string>
     <string name="plugin_approval_deny">Deny</string>
     <string name="plugin_approval_execute_tool">Invoke host tool</string>
@@ -1134,6 +1134,8 @@
     <string name="chat_send">Send</string>
     <string name="chat_perm_deny">Deny</string>
     <string name="chat_perm_session_allow">Always Allow This Session</string>
+    <string name="permission_session_unavailable">The current session or execution source cannot be verified, so approval cannot be remembered. Start a new request or allow once.</string>
+    <string name="plugin_approval_run_session">Always allow for this plugin run</string>
     <string name="chat_perm_allow_once">Allow Once</string>
     <string name="chat_perm_session_label">Session "%1$s"</string>
 

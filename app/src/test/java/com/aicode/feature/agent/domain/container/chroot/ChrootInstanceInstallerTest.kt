@@ -261,6 +261,7 @@ class ChrootInstanceInstallerTest {
             assertEquals(0, f.process.destroyed.get())
             assertTrue(File(f.files, "chroot-home/$id/workspace").isDirectory)
             assertTrue(File(f.files, "chroot-home/$id/.aicode/skills").isDirectory)
+            assertTrue(File(f.files, "chroot-home/$id/.aicode/tool-output").isDirectory)
             assertEquals("nameserver 223.5.5.5\nnameserver 223.6.6.6\n", File(f.files, "chroot-dns/$id/resolv.conf").readText())
             assertFalse(File(f.files, "rootfs").exists())
             assertFalse(File(f.files, "aicode").exists())

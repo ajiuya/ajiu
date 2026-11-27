@@ -19,6 +19,8 @@ import com.aicode.feature.agent.domain.command.SlashCommandRegistry
 import com.aicode.feature.agent.domain.command.SlashCommandRegistry.ResolvedCommand
 import com.aicode.feature.agent.domain.context.CompactionPhase
 import com.aicode.feature.agent.domain.container.RemoteConnectionIdentity
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwner
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwnerKind
 import com.aicode.feature.agent.domain.memory.ProjectMemoryCapture
 import com.aicode.feature.agent.domain.memory.ProjectProgressCollector
 import com.aicode.feature.agent.domain.model.AgentContext
@@ -2258,24 +2260,21 @@ class AgentRunManager internal constructor(
                 val entity = sessionUseCase.getSessionById(sessionId) ?: return@async null
                 val capture = projectMemoryIdentityResolver.capture(entity.workspacePath)?.let { freezeCapture(it, fixedSource) } ?: return@async null
                 capture.assertCurrent()
-                val execution = workspaceExecutionContextFactory.freeze(capture)
-                capture.assertCurrent()
-                withContext(execution) {
-                    when (option) {
-                        RewindOption.RESTORE_CODE_AND_CONVERSATION -> {
-                            if (checkpoint != null) conflicts = checkpointManager.restoreCodeToCheckpoint(sessionId, checkpoint.id).skipped.toList()
-                            capture.assertCurrent()
-                            messagePersistenceUseCase.rewindConversation(sessionId, targetMsgEntity.timestamp)
-                            fillPrompt = targetMsgEntity.content
-                        }
-                        RewindOption.RESTORE_CONVERSATION -> {
-                            messagePersistenceUseCase.rewindConversation(sessionId, targetMsgEntity.timestamp)
-                            fillPrompt = targetMsgEntity.content
-                        }
-                        RewindOption.RESTORE_CODE -> {
-                            if (checkpoint != null) conflicts = checkpointManager.restoreCodeToCheckpoint(sessionId, checkpoint.id).skipped.toList()
-                        }
+                if (option != RewindOption.RESTORE_CONVERSATION && checkpoint != null) {
+                    val execution = workspaceExecutionContextFactory.freeze(
+                        capture,
+                        RuntimeOwner(RuntimeOwnerKind.AGENT, sessionId),
+                        checkSource = { checkSource(fixedSource) }
+                    )
+                    capture.assertCurrent()
+                    withContext(execution) {
+                        conflicts = checkpointManager.restoreCodeToCheckpoint(sessionId, checkpoint.id).skipped.toList()
                     }
+                }
+                capture.assertCurrent()
+                if (option != RewindOption.RESTORE_CODE) {
+                    messagePersistenceUseCase.rewindConversation(sessionId, targetMsgEntity.timestamp)
+                    fillPrompt = targetMsgEntity.content
                 }
                 RewindResult(fillPrompt, attachments, conflicts)
             } finally {

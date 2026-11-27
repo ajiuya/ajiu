@@ -1,6 +1,10 @@
 package com.aicode.feature.plugin.runtime
 
 import com.aicode.feature.plugin.data.PluginOperationGrantRepository
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeCapture
+import com.aicode.feature.workspace.domain.WorkspaceExecutionContext
+import io.mockk.every
+import io.mockk.mockk
 import com.aicode.feature.plugin.domain.PluginCapture
 import com.aicode.feature.plugin.domain.PluginCoreFixtures
 import com.aicode.feature.plugin.domain.PluginManager
@@ -35,6 +39,44 @@ class PluginAlwaysApprovalTest {
         PluginInvocationContext(capture, null, "", "session-A", manager.dataDirectory(capture.id), emptyFlow(), persistentIdentity = target) {}
     private fun command(value: String) = buildJsonObject { put("command", value) }
     private fun path(value: String, body: String) = buildJsonObject { put("method", "fs.write"); put("path", value); put("bytes", body.length) }
+
+    @Test fun sessionScopeBindsRealChatRunAndCanonicalOperationArguments() = runBlocking<Unit> {
+        val manager = manager(); val capture = source(manager)
+        fun invocation(session: String? = "chat-A") = PluginInvocationContext(capture, null, "", session,
+            manager.dataDirectory(capture.id), emptyFlow(), sourceIdentity = "source-A") {}
+        val first = invocation()
+        val args = buildJsonObject { put("provider", "A"); put("model", "B") }
+        val reordered = buildJsonObject { put("model", "B"); put("provider", "A") }
+        val expected = first.sessionApprovalScope("model.start", args, "identity-A")
+        assertNotNull(expected)
+        assertEquals(expected, invocation().sessionApprovalScope("model.start", reordered, "identity-A"))
+        assertNotEquals(expected, invocation("chat-B").sessionApprovalScope("model.start", args, "identity-A"))
+        assertNotEquals(expected, first.sessionApprovalScope("model.start", command("different"), "identity-A"))
+        assertNotEquals(expected, first.sessionApprovalScope("model.start", args, "identity-B"))
+        val run = invocation(null)
+        val runScope = run.sessionApprovalScope("Bash", command("pwd"), "identity-A")
+        assertEquals(runScope, run.child().sessionApprovalScope("Bash", command("pwd"), "identity-A"))
+        assertEquals(runScope, run.retainSource().sessionApprovalScope("Bash", command("pwd"), "identity-A"))
+        assertNotEquals(runScope, invocation(null).sessionApprovalScope("Bash", command("pwd"), "identity-A"))
+        assertNull(context(manager, capture).sessionApprovalScope("Bash", command("pwd"), "identity-A"))
+        for (tool in listOf("Root", "submitPlan", "planMode", "askUserQuestion")) {
+            assertNull(first.sessionApprovalScope(tool, empty, "identity-A"))
+        }
+    }
+
+    @Test fun sessionScopeChangesWithChrootRuntimeAuthorityDigest() = runBlocking<Unit> {
+        val manager = manager(); val capture = source(manager)
+        fun invocation(runtimeDigest: String): PluginInvocationContext {
+            val runtime = mockk<LocalRuntimeCapture> { every { digest } returns runtimeDigest }
+            val execution = mockk<WorkspaceExecutionContext>(relaxed = true) { every { localRuntimeCapture } returns runtime }
+            return PluginInvocationContext(capture, execution, "", "chat-A",
+                manager.dataDirectory(capture.id), emptyFlow(), sourceIdentity = "source-A") {}
+        }
+        val args = command("pwd")
+        val original = invocation("root-epoch-A").sessionApprovalScope("Bash", args, "identity-A")
+        assertEquals(original, invocation("root-epoch-A").sessionApprovalScope("Bash", args, "identity-A"))
+        assertNotEquals(original, invocation("root-epoch-B").sessionApprovalScope("Bash", args, "identity-A"))
+    }
 
     @Test fun nativeAlwaysDecisionPersistsAndChecksItsSourceAgain() = runBlocking<Unit> {
         val coordinator = PluginApprovalCoordinator()

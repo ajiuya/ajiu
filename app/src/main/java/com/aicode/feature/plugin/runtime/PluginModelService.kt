@@ -206,6 +206,8 @@ class PluginModelService internal constructor(
             put("providerId", config.id); put("model", model); put("handleId", handle.id)
             put("estimatedInputTokens", estimated); put("maxOutputTokens", options.output ?: metadata.outputTokens)
             put("request", params)
+            put("executionSha256", com.aicode.feature.plugin.data.PluginFiles.sha256(
+                Gson().toJson(listOf(config, system, messages, definitions, options)).toByteArray(Charsets.UTF_8)))
         }
         // The capability permits access to models; each paid request still needs the user's native decision.
         gateway.get().authorize(context, "model.start", approvalArgs, PluginApprovalOperation.EXECUTE_TOOL,

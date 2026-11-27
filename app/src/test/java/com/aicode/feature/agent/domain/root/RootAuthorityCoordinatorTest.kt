@@ -11,6 +11,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.runBlocking
@@ -192,7 +193,7 @@ class RootAuthorityCoordinatorTest {
     }
 
     @Test
-    fun cleanupHasOneFiveSecondBudgetAndTimeoutStillPersistsClosing() = runTest {
+    fun cleanupHasOneTwelveSecondBudgetAndTimeoutStillPersistsClosing() = runTest {
         val fixture = fixture()
         val coordinator = fixture.coordinator
         coordinator.setEnabled(true)
@@ -216,7 +217,7 @@ class RootAuthorityCoordinatorTest {
         val closing = async { coordinator.setEnabled(false) }
         runCurrent()
         assertEquals(2, waiting)
-        advanceTimeBy(4_999L)
+        advanceTimeBy(11_999L)
         runCurrent()
         assertFalse(closing.isCompleted)
         assertEquals(0, unknown)
@@ -224,10 +225,33 @@ class RootAuthorityCoordinatorTest {
         advanceTimeBy(1L)
         runCurrent()
         closing.await()
-        assertEquals(5_000L, testScheduler.currentTime - startedAt)
+        assertEquals(12_000L, testScheduler.currentTime - startedAt)
         assertEquals(2, unknown)
         assertFalse(coordinator.accessSnapshot().enabled)
         assertEquals(before.generation + 1L, coordinator.accessSnapshot().generation)
+    }
+
+    @Test
+    fun cleanupBeyondTheManagerDeadlineHasPublicationMarginBeforeRevocationFails() = runTest {
+        val fixture = fixture()
+        val coordinator = fixture.coordinator
+        coordinator.setEnabled(true)
+        val before = coordinator.accessSnapshot()
+        coordinator.registerRevocation(onRevoke = {}, awaitStopped = { delay(10_500L) })
+        val enabling = async { coordinator.setEnabled(true) }
+        runCurrent()
+        advanceTimeBy(6_500L)
+        runCurrent()
+        assertFalse(enabling.isCompleted)
+        assertFalse(coordinator.accessState.value.enabled)
+        advanceTimeBy(3_500L)
+        runCurrent()
+        assertFalse(enabling.isCompleted)
+        advanceTimeBy(500L)
+        runCurrent()
+        enabling.await()
+        assertEquals(before, coordinator.accessSnapshot())
+        assertNotNull(coordinator.withCurrent(before.authorityId, before.generation) { Unit })
     }
 
     @Test

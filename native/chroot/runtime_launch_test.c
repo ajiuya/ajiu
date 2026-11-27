@@ -171,6 +171,24 @@ int main(int argc, char **argv)
     fixture(f, "/root/.aicode/skills", "/data/user/0/com.ajiu/files/aicode/skills", "A=B");
     CHECK(parse(f) == -1); put32(f->bytes + f->ro, 1); CHECK(parse(f) == 0);
     fixture(f, "/root/.aicode/plugins", "/data/user/0/com.ajiu/files/aicode/plugins", "A=B"); CHECK(parse(f) == 0);
+    fixture(f, "/root/.aicode/tool-output", "/data/user/0/com.ajiu/files/aicode/tool-output", "A=B"); CHECK(parse(f) == 0);
+    static const char *const private_sources[] = { "/data/user/0/com.ajiu/files/aicode",
+        "/data/user/0/com.ajiu/files/aicode/mcp-oauth", "/data/user/0/com.ajiu/files/credentials",
+        "/data/user/0/com.other/files/aicode/tool-output", "/data/user/1/com.ajiu/files/aicode/tool-output" };
+    static const char *const config_targets[] = { "/root", "/root/.aicode", "/root/.aicode/tool-output",
+        "/root/.aicode/mcp-oauth", "/root/.aicode/credentials" };
+    for (size_t i = 0; i < sizeof(private_sources) / sizeof(*private_sources); ++i)
+        for (size_t j = 0; j < sizeof(config_targets) / sizeof(*config_targets); ++j) {
+            fixture(f, config_targets[j], private_sources[i], "A=B"); CHECK(parse(f) == -1);
+        }
+    static const char *const readonly_config[] = { "skills", "agents", "docs", "bin", "lib", "prompts.custom" };
+    for (size_t i = 0; i < sizeof(readonly_config) / sizeof(*readonly_config); ++i) {
+        char source[128], target[128];
+        CHECK(snprintf(source, sizeof(source), "/data/user/0/com.ajiu/files/aicode/%s", readonly_config[i]) > 0);
+        CHECK(snprintf(target, sizeof(target), "/root/.aicode/%s", readonly_config[i]) > 0);
+        fixture(f, target, source, "A=B"); CHECK(parse(f) == -1);
+        put32(f->bytes + f->ro, 1); CHECK(parse(f) == 0);
+    }
     fixture(f, "/etc/resolv.conf", "/data/user/0/com.ajiu/files/chroot-dns/0123456789abcdef01234567/resolv.conf", "A=B");
     put32(f->bytes + f->kind, 2); CHECK(parse(f) == -1); put32(f->bytes + f->ro, 1); CHECK(parse(f) == 0);
     valid(f); put32(f->bytes + f->mountc, 0); f->used = f->mountc + 4; CHECK(parse(f) == 0);

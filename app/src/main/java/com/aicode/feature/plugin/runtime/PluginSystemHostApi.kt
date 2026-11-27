@@ -72,7 +72,7 @@ class PluginSystemHostApi @Inject constructor(
             }
             "clipboard.write" -> {
                 val text = string(params, "text", 128 * 1024, true)
-                approve(context, method, buildJsonObject { put("characters", text.length) }, "Write clipboard (${text.length} characters)")
+                approve(context, method, buildJsonObject { put("characters", text.length) }, "Write clipboard (${text.length} characters)", params)
                 withContext(Dispatchers.Main.immediate) {
                     context.checkCurrent()
                     app.getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText(app.getString(R.string.app_name), text))
@@ -82,7 +82,7 @@ class PluginSystemHostApi @Inject constructor(
             "share.text" -> {
                 val text = string(params, "text", 256 * 1024, true)
                 val title = optional(params, "title", 200)
-                approve(context, method, buildJsonObject { put("characters", text.length); put("title", title) }, "Share text (${text.length} characters)")
+                approve(context, method, buildJsonObject { put("characters", text.length); put("title", title) }, "Share text (${text.length} characters)", params)
                 withContext(Dispatchers.Main.immediate) {
                     context.checkCurrent()
                     val send = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text)
@@ -120,14 +120,14 @@ class PluginSystemHostApi @Inject constructor(
                 val summary = buildJsonObject { put("url", request.url.toString()); put("method", request.method)
                     put("bytes", request.body?.toByteArray(Charsets.UTF_8)?.size ?: 0)
                     put("headers", JsonArray(request.headers.keys.map(::JsonPrimitive))) }
-                approve(context, method, summary, summary.toString())
+                approve(context, method, summary, summary.toString(), params)
                 http.execute(context, request)
             }
             "notify" -> {
                 val title = string(params, "title", 100)
                 val body = string(params, "body", 1000, true)
                 val key = optional(params, "key", 64)
-                approve(context, method, buildJsonObject { put("title", title); put("body", body) }, "$title\n$body")
+                approve(context, method, buildJsonObject { put("title", title); put("body", body) }, "$title\n$body", params)
                 withContext(Dispatchers.Main.immediate) {
                     context.checkCurrent()
                     val manager = NotificationManagerCompat.from(app)
@@ -178,8 +178,9 @@ class PluginSystemHostApi @Inject constructor(
         }.also { context.checkIntegrity() }
     }
 
-    private suspend fun approve(context: PluginInvocationContext, method: String, params: JsonObject, details: String) =
-        gateway.get().authorize(context, method, params, PluginApprovalOperation.EXECUTE_TOOL, details)
+    private suspend fun approve(context: PluginInvocationContext, method: String, params: JsonObject, details: String,
+        sessionArguments: JsonObject = params) =
+        gateway.get().authorizeWithSessionIdentity(context, method, params, PluginApprovalOperation.EXECUTE_TOOL, details, sessionArguments)
     private fun string(params: JsonObject, name: String, max: Int, empty: Boolean = false): String =
         (params[name] as? JsonPrimitive)?.takeIf { it.isString && (empty || it.content.isNotBlank()) && it.content.length <= max && '\u0000' !in it.content }?.content ?: invalid()
     private fun optional(params: JsonObject, name: String, max: Int): String? = if (params[name] == null || params[name] == kotlinx.serialization.json.JsonNull) null else string(params, name, max)

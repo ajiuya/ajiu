@@ -73,7 +73,7 @@ internal fun PluginApprovalDialog(request: PluginHostApproval, onDecision: (Stri
                 Text(stringResource(R.string.plugin_approval_identity, request.pluginName, request.pluginId))
                 Text(stringResource(request.operation.labelRes()), style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(vertical = Spacing.sm))
                 Text(request.details)
-                if (request.canAlwaysAllow) {
+                if (request.canAlwaysAllow || request.canAllowSession) {
                     Text(stringResource(R.string.plugin_approval_scope), style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = Spacing.md))
                     Text(request.scopeSummary)
                 }
@@ -83,6 +83,10 @@ internal fun PluginApprovalDialog(request: PluginHostApproval, onDecision: (Stri
         confirmButton = {
             Column {
                 Button(onClick = { decide(PluginApprovalChoice.ONCE) }, enabled = !decided) { Text(stringResource(R.string.plugin_approval_allow_once)) }
+                TextButton(onClick = { decide(PluginApprovalChoice.ALWAYS_SESSION) }, enabled = !decided && request.canAllowSession) {
+                    Text(stringResource(if (request.pluginRunSession) R.string.plugin_approval_run_session else R.string.chat_perm_session_allow))
+                }
+                if (!request.canAllowSession) Text(stringResource(R.string.permission_session_unavailable), style = MaterialTheme.typography.bodySmall)
                 if (request.canAlwaysAllow) TextButton(onClick = { decide(PluginApprovalChoice.ALWAYS) }, enabled = !decided) { Text(stringResource(R.string.plugin_approval_always)) }
             }
         },

@@ -12,6 +12,8 @@ import java.nio.file.attribute.BasicFileAttributes
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
@@ -84,6 +86,17 @@ class PluginInvocationContext internal constructor(
         }
         if (currentIdentity != dataIdentity) throw CancellationException("Plugin data directory changed")
         checkCurrent()
+    }
+
+    internal fun sessionApprovalScope(tool: String, arguments: JsonObject, policyIdentity: Any,
+        sessionArguments: JsonElement = arguments): PluginSessionApprovalScope? {
+        checkIntegrity()
+        if (sourceIdentity === MISSING_SOURCE || capture.cleanup || tool in setOf("Root", "submitPlan", "planMode", "askUserQuestion")) return null
+        val target = pluginSessionOperationFingerprint(tool, arguments, sessionArguments)
+        val chatSession = sessionId?.takeIf { it.isNotBlank() }
+        return PluginSessionApprovalScope(capture.id, capture.installRevision, capture.contentHash, capture.activationEpoch,
+            chatSession, invocationAuthority.takeIf { chatSession == null },
+            listOf(sourceIdentity, dataIdentity, execution?.localRuntimeCapture?.digest), target, policyIdentity)
     }
 
     internal fun approvalDetails(action: String): String {

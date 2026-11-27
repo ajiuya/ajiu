@@ -81,7 +81,7 @@ class ChrootLaunch private constructor(
         private val nonce = Regex("[0-9a-f]{24}")
         private val environmentKey = Regex("[A-Za-z_][A-Za-z0-9_]*")
         private val configDirectories = setOf(
-            "skills", "agents", "memory", "docs", "bin", "lib", "plugins", "scripts", "prompts.custom"
+            "skills", "agents", "memory", "docs", "bin", "lib", "plugins", "scripts", "prompts.custom", "tool-output"
         )
         private val readOnlyConfigDirectories = setOf("skills", "agents", "docs", "bin", "lib", "prompts.custom")
         const val MAX_PAYLOAD_BYTES = 1024 * 1024

@@ -25,11 +25,22 @@ import io.mockk.every
 import io.mockk.mockk
 import io.mockk.verify
 import java.io.File
+import java.io.ByteArrayInputStream
+import java.io.InputStream
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption.REPLACE_EXISTING
 import java.util.Base64
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
@@ -221,6 +232,52 @@ class PluginFileBridgeTest {
         failWith("USER_REJECTED") { call("fs.stat", path("missing")) { _, _, _, _ -> throw PluginHostException("USER_REJECTED", "Declined") } }
         assertEquals("false", call("fs.stat", path("missing")).value("exists"))
         assertEquals("original", workspace.resolve("file").readText())
+    }
+
+    @Test fun appendAfterSuspendingApprovalRetainsItsLiveCallerJob() = runBlocking<Unit> {
+        val target = data.resolve("append.txt").apply { writeText("start") }
+        val approvals = PluginApprovalCoordinator()
+        val operation = async {
+            val caller = requireNotNull(currentCoroutineContext()[Job])
+            call("fs.append", text("data://append.txt", "alpha")) { _, _, _, _ ->
+                assertTrue(approvals.awaitApproval("fixture.files", "Files", PluginApprovalOperation.WRITE_FILES,
+                    "append", emptyFlow(), context::checkCurrent))
+                assertTrue(caller.isActive)
+                assertSame(caller, WorkspaceExecutionContext.blockingContext()[Job])
+            }
+        }
+        val request = withTimeout(5000) { approvals.pending.filterNotNull().first() }
+        approvals.resolve(request.id, PluginApprovalChoice.ONCE)
+        withTimeout(5000) { operation.await() }
+        assertEquals("startalpha", target.readText())
+        assertNull(approvals.pending.value)
+    }
+
+    @Test fun callerCancellationAfterApprovalClosesReadStreamAndPreventsAppend() = runBlocking<Unit> {
+        val target = data.resolve("append.txt").apply { writeText("start") }
+        val approvals = PluginApprovalCoordinator()
+        val opened = CompletableDeferred<InputStream>()
+        val closed = AtomicBoolean(false)
+        val operation = async {
+            call("fs.append", text("data://append.txt", "alpha")) { _, _, _, _ ->
+                assertTrue(approvals.awaitApproval("fixture.files", "Files", PluginApprovalOperation.WRITE_FILES,
+                    "append", emptyFlow(), context::checkCurrent))
+                val input = frozen.protectRead(object : ByteArrayInputStream(byteArrayOf(1, 2)) {
+                    override fun close() { closed.set(true); super.close() }
+                })
+                opened.complete(input)
+                awaitCancellation()
+            }
+        }
+        val request = withTimeout(5000) { approvals.pending.filterNotNull().first() }
+        approvals.resolve(request.id, PluginApprovalChoice.ONCE)
+        val input = withTimeout(5000) { opened.await() }
+        assertEquals(1, input.read())
+        operation.cancelAndJoin()
+        assertTrue(closed.get())
+        cancelled { input.read() }
+        assertEquals("start", target.readText())
+        assertNull(approvals.pending.value)
     }
 
     @Test fun approvalDescribesRealDestinationAndByteCountsButNeverTheContent() = runBlocking<Unit> {

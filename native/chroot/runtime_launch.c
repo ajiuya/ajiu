@@ -116,7 +116,7 @@ int ajiu_launch_group_allowed(uint32_t uid, uint32_t group)
 static int aicode_name(const char *name, int *readonly)
 {
     static const char *const ro[] = { "skills", "agents", "docs", "bin", "lib", "prompts.custom" };
-    static const char *const rw[] = { "memory", "scripts", "plugins" };
+    static const char *const rw[] = { "memory", "scripts", "plugins", "tool-output" };
     for (size_t i = 0; i < sizeof(ro) / sizeof(*ro); ++i)
         if (!strcmp(name, ro[i])) { *readonly = 1; return 1; }
     for (size_t i = 0; i < sizeof(rw) / sizeof(*rw); ++i)

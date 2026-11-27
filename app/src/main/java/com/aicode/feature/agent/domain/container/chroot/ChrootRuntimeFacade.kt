@@ -456,7 +456,7 @@ internal class ChrootRuntimeFacade internal constructor(
                 invalidateIssuances { it.instanceId == instance.id }
                 bindings.values.toList().filter { it.request.sources.profile.chrootInstance?.id == instance.id }.forEach(::revokeBinding)
             }
-            withTimeoutOrNull(10_000L) { manager.stopAndAwaitInstance(instance.id) }
+            withTimeoutOrNull(ChrootRuntimeTimeouts.CLEANUP_AWAIT_TIMEOUT_MS) { manager.stopAndAwaitInstance(instance.id) }
                 ?: throw IOException("CHROOT launches have not settled for recovery removal")
             if (manager.instanceState(instance.id).activeLaunches != 0) throw IOException("CHROOT instance is still active")
             settings.checkProfileSnapshot(snapshot)
@@ -717,7 +717,7 @@ internal class ChrootRuntimeFacade internal constructor(
                         runCatching { process.outputStream.close() }
                         val task = withTimeoutOrNull(5_000L) { process.awaitTaskExit() }
                         if (task == null) process.stop()
-                        val cleanup = withTimeoutOrNull(6_000L) { process.awaitCleanup() } ?: LocalRuntimeCleanup.UNKNOWN
+                        val cleanup = withTimeoutOrNull(ChrootRuntimeTimeouts.CLEANUP_AWAIT_TIMEOUT_MS) { process.awaitCleanup() } ?: LocalRuntimeCleanup.UNKNOWN
                         val errors = withTimeoutOrNull(1_000L) { errorDrain.await() } ?: -1
                         if (cleanup != LocalRuntimeCleanup.VERIFIED || task !is LocalRuntimeTaskResult.Exited ||
                             task.code != 0 || errors != 0) throw IOException("CHROOT file worker cleanup is not verified")

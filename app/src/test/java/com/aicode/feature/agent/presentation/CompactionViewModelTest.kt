@@ -5,8 +5,12 @@ import android.content.Context
 import androidx.test.core.app.ApplicationProvider
 import com.aicode.R
 import com.aicode.feature.agent.data.local.entity.AgentMessageEntity
+import com.aicode.feature.agent.data.local.entity.CheckpointEntity
 import com.aicode.feature.agent.domain.command.CompressCommandHandler
 import com.aicode.feature.agent.domain.command.SlashCommandRegistry
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeAuthorizationRequired
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwner
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwnerKind
 import com.aicode.feature.agent.domain.context.CompactionPhase
 import com.aicode.feature.agent.domain.context.CompactionProgress
 import com.aicode.feature.agent.domain.model.AgentContext
@@ -404,6 +408,12 @@ class CompactionViewModelTest {
             id = "rewind-target", sessionId = PARENT, role = MessageRole.USER.name,
             content = "original prompt", timestamp = 42L
         )
+        coEvery { fixture.dependencies.checkpointDao.getCheckpointBySessionAndMessage(PARENT, "rewind-target") } returns CheckpointEntity(
+            id = "rewind-checkpoint", sessionId = PARENT, userMessageId = "rewind-target",
+            promptSnippet = "original prompt", createdAt = 42L
+        )
+        val rewindOwner = RuntimeOwner(RuntimeOwnerKind.AGENT, PARENT)
+        coEvery { fixture.executionFactory.freeze(any(), rewindOwner, any()) } throws LocalRuntimeAuthorizationRequired()
         var filledPrompt: String? = null
         vm.executeRewindOption("rewind-target", RewindOption.RESTORE_CONVERSATION) { prompt, attachments ->
             filledPrompt = prompt
@@ -414,6 +424,8 @@ class CompactionViewModelTest {
         assertFalse(PARENT in vm.contextUsages.value)
         assertEquals("original prompt", filledPrompt)
         coVerify(exactly = 1) { fixture.persistence.rewindConversation(PARENT, 42L) }
+        coVerify(exactly = 0) { fixture.executionFactory.freeze(any(), rewindOwner, any()) }
+        coVerify(exactly = 0) { fixture.dependencies.checkpointManager.restoreCodeToCheckpoint(any(), any()) }
         target.send(AgentEvent.CompactionStarted(18_000, "late-after-rewind"))
         target.send(progress(100, "late-after-rewind", CompactionPhase.COMPLETED))
         assertHidden(PARENT)

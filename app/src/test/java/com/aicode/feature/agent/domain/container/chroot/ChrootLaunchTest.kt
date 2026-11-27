@@ -159,6 +159,26 @@ class ChrootLaunchTest {
     }
 
     @Test
+    fun toolOutputIsWritableWithoutExposingHostPrivateConfiguration() {
+        fun mount(source: String, target: String, readOnly: Boolean = false) =
+            ChrootMount(ChrootMountKind.DIRECTORY, readOnly, source, target, ChrootFileIdentity(65098, 123))
+        val output = mount("/data/user/0/com.ajiu/files/aicode/tool-output", "/root/.aicode/tool-output")
+        assertEquals(listOf(output), freeze(mounts = listOf(output)).mounts)
+        for (source in listOf("/data/user/0/com.ajiu/files/aicode", "/data/user/0/com.ajiu/files/aicode/mcp-oauth",
+            "/data/user/0/com.ajiu/files/credentials", "/data/user/0/com.other/files/aicode/tool-output",
+            "/data/user/1/com.ajiu/files/aicode/tool-output")) {
+            for (target in listOf("/root", "/root/.aicode", "/root/.aicode/tool-output", "/root/.aicode/mcp-oauth")) {
+                rejects { freeze(mounts = listOf(mount(source, target))) }
+            }
+        }
+        for (name in listOf("skills", "agents", "docs", "bin", "lib", "prompts.custom")) {
+            val binding = mount("/data/user/0/com.ajiu/files/aicode/$name", "/root/.aicode/$name")
+            rejects { freeze(mounts = listOf(binding)) }
+            assertEquals(listOf(binding.copy(readOnly = true)), freeze(mounts = listOf(binding.copy(readOnly = true))).mounts)
+        }
+    }
+
+    @Test
     fun diagnosticStringDoesNotExposeArgumentsEnvironmentOrOwner() {
         val launch = freeze(owner = "private-owner", argv = listOf("/bin/echo", "private-argument"), env = listOf("TOKEN=private-value"))
         assertFalse(launch.toString().contains("private-"))

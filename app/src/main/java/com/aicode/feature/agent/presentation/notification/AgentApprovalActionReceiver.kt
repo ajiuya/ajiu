@@ -21,18 +21,8 @@ class AgentApprovalActionReceiver : BroadcastReceiver() {
     lateinit var toolPermissionManager: ToolPermissionManager
 
     override fun onReceive(context: Context, intent: Intent) {
-        if (intent.action != ACTION) return
-        val kind = intent.getStringExtra(EXTRA_KIND)?.let { value -> ApprovalKind.entries.find { it.name == value } } ?: return
-        val choice = intent.getStringExtra(EXTRA_CHOICE) ?: return
-        val requestId = intent.getStringExtra(EXTRA_REQUEST_ID) ?: return
-        when (kind) {
-            ApprovalKind.PERMISSION -> {
-                val permissionChoice = PermissionChoice.entries.find { it.name == choice } ?: return
-                if (permissionChoice != PermissionChoice.ONCE && permissionChoice != PermissionChoice.REJECT) return
-                toolPermissionManager.resolve(requestId, permissionChoice)
-            }
-            ApprovalKind.QUESTION, ApprovalKind.PLAN -> Unit
-        }
+        resolveApprovalAction(intent.action, intent.getStringExtra(EXTRA_KIND),
+            intent.getStringExtra(EXTRA_CHOICE), intent.getStringExtra(EXTRA_REQUEST_ID), toolPermissionManager)
     }
 
     companion object {
@@ -41,4 +31,14 @@ class AgentApprovalActionReceiver : BroadcastReceiver() {
         const val EXTRA_KIND = "extra_kind"
         const val EXTRA_CHOICE = "extra_choice"
     }
+}
+
+internal fun resolveApprovalAction(action: String?, kind: String?, choice: String?, requestId: String?,
+    toolPermissionManager: ToolPermissionManager) {
+    if (action != AgentApprovalActionReceiver.ACTION || requestId.isNullOrBlank()) return
+    if (kind != ApprovalKind.PERMISSION.name) return
+    val permissionChoice = PermissionChoice.entries.find { it.name == choice } ?: return
+    val request = toolPermissionManager.pendingById(requestId) ?: return
+    if (permissionChoice == PermissionChoice.ALWAYS_SESSION && !request.canAllowSession) return
+    toolPermissionManager.resolve(requestId, permissionChoice)
 }

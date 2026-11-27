@@ -58,6 +58,21 @@ struct test_faults {
 };
 static struct test_faults faults;
 static int synthetic_root = -1;
+static struct { char path[FW_PATH + 1]; uint64_t id; } config_mounts[4];
+static size_t config_mount_count;
+
+static uint64_t test_config_mount_id(int fd)
+{
+    if (!config_mount_count) return 0;
+    char number[64], path[FW_PATH + 1];
+    CHECK(snprintf(number, sizeof(number), "/proc/self/fd/%d", fd) > 0);
+    ssize_t size = readlink(number, path, FW_PATH);
+    CHECK(size > 0 && size < FW_PATH); path[size] = 0;
+    for (size_t i = config_mount_count; i > 0; --i)
+        if (fw_below(path, config_mounts[i - 1].path)) return config_mounts[i - 1].id;
+    return 0;
+}
+
 static struct {
     bool active, all_chowns_mocked, metadata_fault;
     uid_t uid[3]; gid_t gid[3];
@@ -246,6 +261,10 @@ static long test_syscall(long number, ...)
         long result = syscall(number, fd, name, flags, mask, identity);
         if (!result && fd == faults.special_fd && faults.special)
             identity->stx_mode = S_IFIFO | 0600;
+        if (!result && config_mount_count) {
+            uint64_t mount = test_config_mount_id(fd);
+            if (mount) identity->stx_mnt_id = mount;
+        }
         if (!result && root_mock.active) {
             if (identity->stx_ino == (uint64_t)root_mock.original_ino &&
                 makedev(identity->stx_dev_major, identity->stx_dev_minor) == root_mock.original_dev) {
@@ -256,6 +275,9 @@ static long test_syscall(long number, ...)
                 identity->stx_uid = root_mock.virtual_uid; identity->stx_gid = root_mock.virtual_gid;
                 identity->stx_mode = (identity->stx_mode & S_IFMT) | (uint16_t)root_mock.virtual_mode;
             } else { identity->stx_uid = 0; identity->stx_gid = 0; }
+        }
+        if (!result && config_mount_count) {
+            identity->stx_uid = identity->stx_gid = 10445;
         }
         if (!result && mkdir_race.active) {
             dev_t dev = makedev(identity->stx_dev_major, identity->stx_dev_minor);
@@ -300,6 +322,8 @@ static long test_syscall(long number, ...)
                 size_t at = mkdir_race.issued++;
                 mkdir_race.issued_dev[at] = link.st_dev; mkdir_race.issued_ino[at] = link.st_ino;
             }
+        } else if (config_mount_count) {
+            CHECK(test_config_mount_id(source) != 0 && test_config_mount_id(source) == test_config_mount_id(target));
         } else CHECK(root.st_dev == src.st_dev && root.st_ino == src.st_ino && root.st_dev == dst.st_dev && root.st_ino == dst.st_ino);
         CHECK(fw_entry_name(source_name) == 0 && fw_entry_name(target_name) == 0 && (flags == 0 || flags == RENAME_NOREPLACE));
         return syscall(number, source, source_name, target, target_name, flags);
@@ -500,7 +524,7 @@ static int test_mount_parser_policy(void)
     CHECK(fw_mount_class("/root/workspace", &ro) == 1 && !ro);
     CHECK(fw_mount_class("/etc/resolv.conf", &ro) == 2 && ro);
     static const char *const readonly[] = { "skills", "agents", "docs", "bin", "lib", "prompts.custom" };
-    static const char *const writable[] = { "memory", "scripts", "plugins" };
+    static const char *const writable[] = { "memory", "scripts", "plugins", "tool-output" };
     for (size_t i = 0; i < sizeof(readonly) / sizeof(*readonly); ++i) {
         CHECK(snprintf(path, sizeof(path), "/root/.aicode/%s", readonly[i]) > 0);
         CHECK(fw_mount_class(path, &ro) == 1 && ro);
@@ -530,7 +554,8 @@ static int test_mount_parser_policy(void)
     struct fw_identity identity = {0}; identity.st.stx_mode = S_IFREG | 0600; identity.st.stx_mnt_id = 2;
     CHECK(fw_authorize(ctx, -1, &identity, "/root/normal", false) == 0);
     CHECK(fw_authorize(ctx, -1, &identity, "/etc/not-home", false) == -1 && errno == EXDEV);
-    CHECK(fw_authorize(ctx, -1, &identity, "/root/.aicode/credentials/key", false) == -1 && errno == EACCES);
+    CHECK(fw_authorize(ctx, -1, &identity, "/root/.aicode/settings.json", false) == 0);
+    CHECK(fw_authorize(ctx, -1, &identity, "/root/.aicode/credentials/key", false) == 0);
     CHECK(fw_authorize(ctx, -1, &identity, "/root/.aicode/plugins/file", false) == -1 && errno == EXDEV);
     CHECK(fw_authorize(ctx, -1, &identity, "/root/workspace/file", false) == -1 && errno == EXDEV);
     identity.st.stx_mnt_id = 55;
@@ -575,7 +600,7 @@ static int test_default_allow_root_guest_rootfs_rw_keeps_host_ro(void)
     /* The installed guest OS is writable; changing that must not weaken host read-only binds. */
     CHECK(fw_mount_class("/", &ro) == 1 && !ro);
     static const char *const writable[] = { "/root", "/root/workspace", "/root/.aicode/memory",
-        "/root/.aicode/scripts", "/root/.aicode/plugins" };
+        "/root/.aicode/scripts", "/root/.aicode/plugins", "/root/.aicode/tool-output" };
     static const char *const readonly[] = { "/root/.aicode/skills", "/root/.aicode/agents",
         "/root/.aicode/docs", "/root/.aicode/bin", "/root/.aicode/lib", "/root/.aicode/prompts.custom" };
     for (size_t i = 0; i < sizeof(writable) / sizeof(*writable); ++i)
@@ -1374,6 +1399,101 @@ static int test_review_regression_mkdir_race(int temporary)
     return 0;
 }
 
+static void test_config_mount(struct fw_context *ctx, int fd, const char *target, bool writable, bool allowed)
+{
+    CHECK(config_mount_count < sizeof(config_mounts) / sizeof(*config_mounts));
+    size_t index = config_mount_count++;
+    char number[64]; CHECK(snprintf(number, sizeof(number), "/proc/self/fd/%d", fd) > 0);
+    ssize_t size = readlink(number, config_mounts[index].path, FW_PATH);
+    CHECK(size > 0 && size < FW_PATH); config_mounts[index].path[size] = 0;
+    uint64_t id = ctx->mounts[0].id + 100 + index; config_mounts[index].id = id;
+    CHECK(fw_add_boundary(ctx, id, target) == 0);
+    if (!allowed) return;
+    struct fw_mount *mount = &ctx->mounts[ctx->mount_count++];
+    mount->fd = fw_dup(fd); mount->id = id; mount->writable = writable; strcpy(mount->path, target);
+    CHECK(mount->fd >= 0 && fw_identify(fd, &mount->identity) == 0);
+}
+
+static void test_config_write(struct fw_context *ctx, const char *path, bool overwrite)
+{
+    unsigned char bytes[64], request[64];
+    CHECK(test_path_response(ctx, FW_BEGIN_WRITE, path, true, overwrite ? 1U : 0U, bytes) == 8 && fw_be32(bytes) == 0);
+    uint32_t handle = fw_be32(bytes + 4);
+    struct fw_output payload = { .bytes = request };
+    CHECK(fw_out32(&payload, handle) == 0 && fw_out32(&payload, 17) == 0 && fw_append(&payload, "foreign-preserved", 17) == 0);
+    struct fw_input input = { .bytes = request, .size = payload.size };
+    CHECK(fw_write_chunk_request(ctx, &input) == 0);
+    fw_put32(request, handle); input = (struct fw_input){ .bytes = request, .size = 4 };
+    struct fw_output output = { .bytes = bytes, .size = 4 };
+    CHECK(fw_commit_write_request(ctx, &input, &output) == 0 && output.size == 12 && fw_be32(bytes + 8) == 17);
+}
+
+static int test_private_home_config(int temporary)
+{
+    int directory = test_directory(temporary, "private-home-config");
+    int home = test_directory(directory, "root"), config = test_directory(home, ".aicode");
+    int docs = test_directory(config, "docs"), output = test_directory(config, "tool-output");
+    int foreign = test_directory(config, "unapproved");
+    test_file(config, "settings.json"); test_file(docs, "guide.md"); test_file(foreign, "private");
+    struct fw_context *ctx = test_context(directory); test_reset_faults();
+    ctx->proc_fds = open("/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC); CHECK(ctx->proc_fds >= 0);
+    memset(&root_mock, 0, sizeof(root_mock)); root_mock.active = root_mock.all_chowns_mocked = true;
+    for (size_t i = 0; i < 3; ++i) root_mock.uid[i] = root_mock.gid[i] = 10445;
+    test_config_mount(ctx, home, "/root", true, true);
+    test_config_mount(ctx, docs, "/root/.aicode/docs", false, true);
+    test_config_mount(ctx, output, "/root/.aicode/tool-output", true, true);
+    test_config_mount(ctx, foreign, "/root/.aicode/unapproved", true, false);
+    test_path_stat(ctx, "/root/.aicode/settings.json", true, config, "settings.json");
+    test_path_error(ctx, FW_STAT, "/root/.aicode/missing.json", true, 1, ENOENT);
+    test_path_resolved(ctx, "/root/.aicode/new/child", true, "/root/.aicode/new/child");
+    unsigned char bytes[4096];
+    CHECK(test_path_response(ctx, FW_LIST, "/root/.aicode", false, 0, bytes) > 8 && fw_be32(bytes) == 0 && fw_be32(bytes + 4) == 3);
+    CHECK(test_path_response(ctx, FW_MKDIRS, "/root/.aicode/local", false, 0, bytes) == 4 && fw_be32(bytes) == 0);
+    test_config_write(ctx, "/root/.aicode/local/new.json", false);
+    test_config_write(ctx, "/root/.aicode/settings.json", true);
+    test_config_write(ctx, "/root/.aicode/tool-output/result.log", false);
+    test_foreign_preserved(config, "settings.json"); test_foreign_preserved(output, "result.log");
+    CHECK(test_path_response(ctx, FW_OPEN_READ, "/root/.aicode/settings.json", false, 0, bytes) == 8 && fw_be32(bytes) == 0);
+    unsigned char request[8]; fw_put32(request, fw_be32(bytes + 4)); fw_put32(request + 4, 32);
+    struct fw_input input = { .bytes = request, .size = sizeof(request) };
+    struct fw_output response = { .bytes = bytes, .size = 4 };
+    CHECK(fw_read_chunk_request(ctx, &input, &response) == 0 && response.size == 25 && fw_be32(bytes + 4) == 17 &&
+        !memcmp(bytes + 8, "foreign-preserved", 17));
+    input = (struct fw_input){ .bytes = request, .size = 4 }; CHECK(fw_close_request(ctx, &input, false) == 0);
+    test_rename_response(ctx, "/root/.aicode/local/new.json", "/root/.aicode/local/renamed.json", 0, 0);
+    CHECK(test_path_response(ctx, FW_DELETE, "/root/.aicode/local", true, 1, bytes) == 4 && fw_be32(bytes) == 0);
+    test_path_stat(ctx, "/root/.aicode/docs/guide.md", true, docs, "guide.md");
+    test_path_error(ctx, FW_BEGIN_WRITE, "/root/.aicode/docs/guide.md", true, 1, EROFS);
+    test_path_error(ctx, FW_BEGIN_WRITE, "/root/.aicode/docs/new.md", true, 0, EROFS);
+    test_path_error(ctx, FW_MKDIRS, "/root/.aicode/docs/new", false, 0, EROFS);
+    test_path_error(ctx, FW_DELETE, "/root/.aicode/docs/guide.md", true, 0, EROFS);
+    test_rename_response(ctx, "/root/.aicode/docs/guide.md", "/root/.aicode/docs/renamed.md", 0, EROFS);
+    test_foreign_preserved(docs, "guide.md"); test_missing_entry(docs, "new.md"); test_missing_entry(docs, "new");
+    test_path_error(ctx, FW_STAT, "/root/.aicode/unapproved/private", true, 1, EXDEV);
+    test_path_error(ctx, FW_BEGIN_WRITE, "/root/.aicode/unapproved/private", true, 1, EXDEV);
+    test_foreign_preserved(foreign, "private");
+    const char *const protected[] = { "/root", "/root/.aicode", "/root/.aicode/docs", "/root/.aicode/tool-output" };
+    for (size_t i = 0; i < sizeof(protected) / sizeof(*protected); ++i) {
+        test_path_error(ctx, FW_DELETE, protected[i], true, 1, EBUSY);
+        test_rename_response(ctx, protected[i], "/root/moved", 0, EBUSY);
+    }
+    CHECK(symlinkat("/root/.aicode/docs/guide.md", config, "readonly-link") == 0);
+    test_path_error(ctx, FW_BEGIN_WRITE, "/root/.aicode/readonly-link", true, 1, EROFS);
+    test_foreign_preserved(docs, "guide.md");
+    CHECK(symlinkat("/proc/self", config, "escape") == 0);
+    test_path_error(ctx, FW_STAT, "/root/.aicode/escape/status", true, 1, EACCES);
+    CHECK(fw_cleanup(ctx) == 0 && !ctx->cleanup_failed); synthetic_root = -1; free(ctx); config_mount_count = 0;
+    memset(&root_mock, 0, sizeof(root_mock));
+    CHECK(unlinkat(config, "readonly-link", 0) == 0 && unlinkat(config, "escape", 0) == 0 && unlinkat(config, "settings.json", 0) == 0);
+    CHECK(unlinkat(docs, "guide.md", 0) == 0 && unlinkat(output, "result.log", 0) == 0 && unlinkat(foreign, "private", 0) == 0);
+    CHECK(close(docs) == 0 && close(output) == 0 && close(foreign) == 0);
+    CHECK(unlinkat(config, "docs", AT_REMOVEDIR) == 0 && unlinkat(config, "tool-output", AT_REMOVEDIR) == 0 &&
+        unlinkat(config, "unapproved", AT_REMOVEDIR) == 0 && close(config) == 0);
+    CHECK(unlinkat(home, ".aicode", AT_REMOVEDIR) == 0 && close(home) == 0 && unlinkat(directory, "root", AT_REMOVEDIR) == 0);
+    CHECK(close(directory) == 0 && unlinkat(temporary, "private-home-config", AT_REMOVEDIR) == 0);
+    return 0;
+}
+
 static unsigned int test_real_in_root(int directory)
 {
     struct fw_identity expected, actual;
@@ -1405,7 +1525,8 @@ int main(int argc, char **argv)
     test_reset_faults();
     if (argc == 3) {
         int focused;
-        if (!strcmp(argv[2], "nonrootCredentialsControl")) focused = test_nonroot_credentials_control();
+        if (!strcmp(argv[2], "privateHomeConfig")) focused = test_private_home_config(dir);
+        else if (!strcmp(argv[2], "nonrootCredentialsControl")) focused = test_nonroot_credentials_control();
         else if (!strcmp(argv[2], "reviewRegressionMkdirRace")) focused = test_review_regression_mkdir_race(dir);
         else if (!strcmp(argv[2], "rootGuestGuard")) focused = test_root_guard_and_app_control();
         else if (!strcmp(argv[2], "rootGuestMetadataFailures")) focused = test_root_creation_owner_and_metadata_failure(dir);
@@ -1431,7 +1552,7 @@ int main(int argc, char **argv)
     unsigned long real_probe_checks = checks - pure_checks - ordinary_checks;
     if (test_list_handler(dir) || test_cleanup_handlers(dir) || test_path_handlers(dir) || test_nofollow_mutations(dir) ||
         test_default_allow_root_guest_atomic_overwrite_metadata(dir) || test_root_creation_owner_and_metadata_failure(dir) ||
-        test_review_regression_mkdir_race(dir)) {
+        test_review_regression_mkdir_race(dir) || test_private_home_config(dir)) {
         close(dir); return 1;
     }
     unsigned long mocked_checks = checks - pure_checks - ordinary_checks - real_probe_checks;

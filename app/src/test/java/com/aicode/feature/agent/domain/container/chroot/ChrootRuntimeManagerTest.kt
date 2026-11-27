@@ -8,12 +8,16 @@ import com.aicode.testing.ChrootVerificationForeground
 import io.mockk.every
 import io.mockk.spyk
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CancellableContinuation
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Delay
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.DisposableHandle
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.InternalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
@@ -51,6 +55,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.CoroutineContext
+import kotlin.coroutines.resume
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ChrootRuntimeManagerTest {
@@ -246,7 +251,7 @@ class ChrootRuntimeManagerTest {
     }
 
     /** Observes a real IO runnable returning, rather than assuming a submitted STOP already ran. */
-    private class StartupIoDispatcher : CoroutineDispatcher() {
+    private open class StartupIoDispatcher : CoroutineDispatcher() {
         private val submitted = ThreadLocal<CompletableDeferred<Unit>?>()
         private val returning = ThreadLocal<CompletableDeferred<Unit>?>()
 
@@ -273,6 +278,46 @@ class ChrootRuntimeManagerTest {
                     completion?.complete(Unit)
                 }
             })
+        }
+    }
+
+    @OptIn(InternalCoroutinesApi::class)
+    private class CleanupClockDispatcher : StartupIoDispatcher(), Delay {
+        private class Timer(val at: Long, val action: Runnable) : DisposableHandle {
+            val cancelled = AtomicBoolean()
+            override fun dispose() { cancelled.set(true) }
+        }
+
+        private val gate = Any()
+        private var time = 0L
+        private val timers = mutableListOf<Timer>()
+        val cleanupScheduled = CompletableDeferred<Long>()
+        val timeoutScheduled = CompletableDeferred<Long>()
+        val cleanupSchedules = AtomicInteger()
+        val now: Long get() = synchronized(gate) { time }
+
+        override fun scheduleResumeAfterDelay(timeMillis: Long, continuation: CancellableContinuation<Unit>) {
+            val timer = schedule(timeMillis, Runnable { continuation.resume(Unit) })
+            continuation.invokeOnCancellation { timer.dispose() }
+            if (timeMillis == 4_000L || timeMillis == 10_000L) {
+                cleanupSchedules.incrementAndGet()
+                cleanupScheduled.complete(timeMillis)
+            }
+        }
+
+        override fun invokeOnTimeout(timeMillis: Long, block: Runnable, context: CoroutineContext): DisposableHandle =
+            schedule(timeMillis, block).also { timeoutScheduled.complete(timeMillis) }
+
+        private fun schedule(duration: Long, block: Runnable): Timer = synchronized(gate) {
+            Timer(time + duration, block).also(timers::add)
+        }
+
+        fun advanceBy(duration: Long) {
+            val due = synchronized(gate) {
+                time += duration
+                timers.filter { it.at <= time }.also { timers.removeAll(it.toSet()) }
+            }
+            due.forEach { if (!it.cancelled.get()) it.action.run() }
         }
     }
 
@@ -351,7 +396,7 @@ class ChrootRuntimeManagerTest {
         val diagnostics = ChrootRuntimeDiagnostics(diagnosticFile)
         val manager = ChrootRuntimeManager(authority, factory, recovery, scope, Dispatchers.IO, {
             controls.getOrPut(it.launchId) { FakeControl() }.also { channel -> channel.listenerFailure?.let { throw it } }
-        }, { System.nanoTime() / 1_000_000L }, diagnostics)
+        }, { System.nanoTime() / 1_000_000L }, diagnostics, cleanupTimeoutMs = 4_000L)
         return Fixture(authority, root, recovery, factory, control, controls, scope, manager, diagnostics, diagnosticFile)
     }
 
@@ -573,6 +618,75 @@ class ChrootRuntimeManagerTest {
         factory.process.frame(ChrootFrameType.READY, launchSpec.token())
         control.authenticated.complete(Unit)
         eventually { control.sent.contains(ChrootFrameType.GO) }
+    }
+
+    @Test
+    fun fastSuccessfulExitAfterGoRemainsReadyWhenStartupResumes() = runTest {
+        assertFastExitAfterGoRemainsReady(0)
+    }
+
+    @Test
+    fun fastNonzeroExitAfterGoRemainsReadyWhenStartupResumes() = runTest {
+        assertFastExitAfterGoRemainsReady(37)
+    }
+
+    private suspend fun TestScope.assertFastExitAfterGoRemainsReady(exitCode: Int) {
+        val goThread = ThreadLocal<Boolean>()
+        val startupPaused = CompletableDeferred<Unit>()
+        val startupReleased = CompletableDeferred<Unit>()
+        val releaseStartup = CountDownLatch(1)
+        fixture(
+            authorityDecorate = { coordinator ->
+                spyk(coordinator).also { decorated ->
+                    every { decorated.withCurrent(any(), any(), any<() -> Any?>()) } answers {
+                        val result = callOriginal()
+                        if (goThread.get() == true) {
+                            goThread.remove()
+                            startupPaused.complete(Unit)
+                            try {
+                                check(releaseStartup.await(10L, TimeUnit.SECONDS)) {
+                                    "Startup was not released after the GO authority gate"
+                                }
+                            } finally {
+                                startupReleased.complete(Unit)
+                            }
+                        }
+                        result
+                    }
+                }
+            },
+            configure = { _, control ->
+                control.onSend = { type ->
+                    if (type == ChrootFrameType.GO) goThread.set(true)
+                }
+            }
+        ).use { fixture ->
+            val handle = fixture.pendingLaunch()
+            try {
+                awaitSignal(fixture.control.awaiting)
+                fixture.factory.process.frame(ChrootFrameType.READY, spec().token())
+                fixture.control.authenticated.complete(Unit)
+                awaitSignal(startupPaused)
+                assertEquals(listOf(ChrootFrameType.GO), fixture.control.sent.toList())
+                assertNull(handle.taskState.value)
+                assertNull(handle.cleanupState.value)
+
+                fixture.factory.process.exit(exitCode)
+                fixture.factory.process.frame(ChrootFrameType.CLEANUP, byteArrayOf(0))
+                fixture.factory.process.finish()
+                assertEquals(ChrootCleanupResult.VERIFIED, cleanupResult(handle))
+                assertEquals(ChrootTaskResult.Exited(ChrootProcessExit(exitCode, null)), handle.awaitTaskExit())
+                assertEquals(1L, releaseStartup.count)
+                assertFalse(startupReleased.isCompleted)
+            } finally {
+                releaseStartup.countDown()
+                if (startupPaused.isCompleted) awaitSignal(startupReleased)
+            }
+            assertTrue(readyResult(handle))
+            assertEquals(ChrootTaskResult.Exited(ChrootProcessExit(exitCode, null)), handle.taskState.value)
+            assertEquals(ChrootCleanupResult.VERIFIED, handle.cleanupState.value)
+            assertNull(handle.failure.value)
+        }
     }
 
     @Test
@@ -931,6 +1045,232 @@ class ChrootRuntimeManagerTest {
     }
 
     @Test
+    fun stoppingBlockedHelperCaptureFinishesWithoutIntentOrLateStartupAndAllowsANewLease() = runTest {
+        val dispatcher = StartupIoDispatcher()
+        val captureEntered = CompletableDeferred<Unit>()
+        val startupReturned = CompletableDeferred<Unit>()
+        val releaseCapture = CountDownLatch(1)
+        val listenerCalls = AtomicInteger()
+        fixture(configure = { factory, _ ->
+            factory.onCapture = {
+                dispatcher.observeCurrentReturn(startupReturned)
+                captureEntered.complete(Unit)
+                check(releaseCapture.await(10L, TimeUnit.SECONDS))
+            }
+        }).use { fixture ->
+            val manager = ChrootRuntimeManager(fixture.authority, fixture.factory, fixture.recovery, fixture.scope,
+                dispatcher, { listenerCalls.incrementAndGet(); fixture.control }, { System.nanoTime() / 1_000_000L },
+                fixture.diagnostics, cleanupTimeoutMs = 4_000L)
+            val lease = manager.allowBinding(owner, "profile", 1, instance, rootfs, fixture.root)!!
+            val permit = manager.authorize(lease, spec(), 1)!!
+            val handle = manager.launch(lease, permit, spec()) {}!!
+            try {
+                awaitSignal(captureEntered)
+                awaitSignal(dispatcher.observeSubmission { handle.stop() })
+                assertEquals(ChrootCleanupResult.VERIFIED, cleanupResult(handle))
+                assertEquals(1L, releaseCapture.count)
+                assertFalse(startupReturned.isCompleted)
+                assertFalse(readyResult(handle))
+                assertEquals(ChrootTaskResult.Unknown, handle.awaitTaskExit())
+                assertTrue(fixture.recovery.snapshot().isEmpty())
+                assertTrue(fixture.recovery.recordedLaunchIds.value.isEmpty())
+                assertEquals(0, listenerCalls.get())
+                assertEquals(0, fixture.factory.starts.get())
+                assertEquals(0, manager.instanceState(instance).activeLaunches)
+                assertFalse(manager.instanceState(instance).blocked)
+                assertNull(handle.failure.value)
+
+                releaseCapture.countDown()
+                awaitSignal(startupReturned)
+                assertEquals(ChrootCleanupResult.VERIFIED, handle.cleanupState.value)
+                assertNull(handle.failure.value)
+                assertTrue(fixture.recovery.snapshot().isEmpty())
+                assertTrue(fixture.recovery.recordedLaunchIds.value.isEmpty())
+                assertEquals(0, listenerCalls.get())
+                assertEquals(0, fixture.factory.starts.get())
+                assertTrue(fixture.control.sent.isEmpty())
+                val replacement = manager.allowBinding(owner, "profile", 1, instance, rootfs, fixture.root)!!
+                assertNotEquals(lease, replacement)
+                assertTrue(manager.isLeaseCurrent(replacement))
+                assertNotNull(manager.authorize(replacement, spec(), 1))
+            } finally {
+                releaseCapture.countDown()
+                if (captureEntered.isCompleted) awaitSignal(startupReturned)
+            }
+        }
+    }
+
+    private fun Fixture.withProductionCleanupBudget(dispatcher: CleanupClockDispatcher): Fixture = copy(
+        manager = ChrootRuntimeManager(authority, factory, recovery, scope, dispatcher,
+            { control }, { dispatcher.now }, diagnostics)
+    )
+
+    @Test
+    fun productionCleanupBudgetAcceptsCompleteProofAfterNativeSupervisorGrace() = runTest {
+        val dispatcher = CleanupClockDispatcher()
+        fixture().withProductionCleanupBudget(dispatcher).use { fixture ->
+            val stderr = BytesPipe()
+            fixture.factory.process.helperErrorStream = stderr
+            val handle = fixture.start()
+            fixture.ready()
+            assertTrue(readyResult(handle))
+            fixture.factory.process.exit(0)
+            val budget = awaitSignal(dispatcher.cleanupScheduled)
+            assertEquals(ChrootTaskResult.Exited(ChrootProcessExit(0, null)), handle.awaitTaskExit())
+
+            dispatcher.advanceBy(4_100L)
+            if (budget <= dispatcher.now) cleanupResult(handle)
+            assertNull(handle.cleanupState.value)
+            assertNull(handle.failure.value)
+            dispatcher.advanceBy(2_400L)
+            assertEquals(6_500L, dispatcher.now)
+            assertNull(handle.cleanupState.value)
+            fixture.factory.process.frame(ChrootFrameType.CLEANUP, byteArrayOf(0))
+            fixture.factory.process.finish()
+            dispatcher.advanceBy(20L)
+
+            assertEquals(ChrootCleanupResult.VERIFIED, cleanupResult(handle))
+            assertEquals(10_000L, budget)
+            assertEquals(1, dispatcher.cleanupSchedules.get())
+            assertNull(handle.failure.value)
+            assertFalse(fixture.manager.instanceState(instance).blocked)
+            assertEquals(ChrootRecoveryPhase.CLOSED, fixture.recovery.snapshot().single().phase)
+            assertEquals(0, fixture.factory.process.destroys.get())
+        }
+    }
+
+    @Test
+    fun productionCleanupBudgetExpiresUnknownAtTenSecondsWithoutProof() = runTest {
+        val dispatcher = CleanupClockDispatcher()
+        fixture().withProductionCleanupBudget(dispatcher).use { fixture ->
+            fixture.factory.process.helperErrorStream = BytesPipe()
+            val handle = fixture.start()
+            fixture.ready()
+            assertTrue(readyResult(handle))
+            fixture.factory.process.exit(0)
+            val budget = awaitSignal(dispatcher.cleanupScheduled)
+
+            dispatcher.advanceBy(9_999L)
+            if (budget <= dispatcher.now) cleanupResult(handle)
+            assertNull(handle.cleanupState.value)
+            dispatcher.advanceBy(1L)
+            assertEquals(ChrootCleanupResult.UNKNOWN, cleanupResult(handle))
+            assertEquals(10_000L, dispatcher.now)
+            assertEquals(10_000L, budget)
+            assertEquals(ChrootRuntimeFailureStage.STOP_DEADLINE, handle.failure.value?.stage)
+            assertEquals(ChrootTaskResult.Exited(ChrootProcessExit(0, null)), handle.awaitTaskExit())
+            eventually { fixture.diagnostics.latestUnknown(instance)?.completionEvidence != null }
+            val evidence = fixture.diagnostics.latestUnknown(instance)!!.completionEvidence!!
+            assertEquals(ChrootStopTrigger.TASK_EXIT, evidence.trigger)
+            assertEquals(7, evidence.flags)
+            assertTrue(fixture.manager.instanceState(instance).blocked)
+            assertFalse(fixture.recovery.canStart(instance))
+            assertEquals(0, fixture.factory.process.destroys.get())
+        }
+    }
+
+    @Test
+    fun repeatedStopDoesNotRestartTheProductionCleanupBudget() = runTest {
+        val dispatcher = CleanupClockDispatcher()
+        fixture().withProductionCleanupBudget(dispatcher).use { fixture ->
+            fixture.factory.process.helperErrorStream = BytesPipe()
+            val handle = fixture.start()
+            fixture.ready()
+            assertTrue(readyResult(handle))
+            handle.stop()
+            val budget = awaitSignal(dispatcher.cleanupScheduled)
+            dispatcher.advanceBy(6_500L)
+            if (budget <= dispatcher.now) cleanupResult(handle)
+            assertNull(handle.cleanupState.value)
+            handle.stop()
+            handle.stop()
+            awaitSignal(dispatcher.observeSubmission { fixture.manager.stopInstance(instance) })
+            awaitSignal(dispatcher.observeSubmission { fixture.manager.stopInstance(instance) })
+            dispatcher.advanceBy(3_499L)
+            assertNull(handle.cleanupState.value)
+            dispatcher.advanceBy(1L)
+
+            assertEquals(ChrootCleanupResult.UNKNOWN, cleanupResult(handle))
+            assertEquals(10_000L, dispatcher.now)
+            assertEquals(1, dispatcher.cleanupSchedules.get())
+            assertEquals(1, fixture.control.sent.count { it == ChrootFrameType.STOP })
+            assertEquals(ChrootRuntimeFailureStage.STOP_DEADLINE, handle.failure.value?.stage)
+            assertEquals(ChrootTaskResult.Unknown, handle.awaitTaskExit())
+            eventually { fixture.diagnostics.latestUnknown(instance)?.completionEvidence != null }
+            assertEquals(ChrootStopTrigger.STOP, fixture.diagnostics.latestUnknown(instance)!!.completionEvidence!!.trigger)
+            assertTrue(fixture.manager.instanceState(instance).blocked)
+            assertEquals(0, fixture.factory.process.destroys.get())
+        }
+    }
+
+    @Test
+    fun stopAfterIntentReservationWithoutBirthStillRequiresCleanupEvidence() = runTest {
+        val dispatcher = CleanupClockDispatcher()
+        val listenerEntered = CompletableDeferred<Unit>()
+        val startupReturned = CompletableDeferred<Unit>()
+        val releaseListener = CountDownLatch(1)
+        fixture().use { fixture ->
+            val manager = ChrootRuntimeManager(fixture.authority, fixture.factory, fixture.recovery, fixture.scope,
+                dispatcher, {
+                    dispatcher.observeCurrentReturn(startupReturned)
+                    listenerEntered.complete(Unit)
+                    check(releaseListener.await(10L, TimeUnit.SECONDS))
+                    fixture.control
+                }, { dispatcher.now }, fixture.diagnostics)
+            val lease = manager.allowBinding(owner, "profile", 1, instance, rootfs, fixture.root)!!
+            val permit = manager.authorize(lease, spec(), 1)!!
+            val handle = manager.launch(lease, permit, spec()) {}!!
+            try {
+                awaitSignal(listenerEntered)
+                assertEquals(ChrootRecoveryPhase.INTENT, fixture.recovery.snapshot().single().phase)
+                assertEquals(0, fixture.factory.starts.get())
+                awaitSignal(dispatcher.observeSubmission { handle.stop() })
+                val budget = awaitSignal(dispatcher.cleanupScheduled)
+                assertNull(handle.cleanupState.value)
+                dispatcher.advanceBy(budget)
+                assertEquals(ChrootCleanupResult.UNKNOWN, cleanupResult(handle))
+                assertEquals(ChrootRuntimeFailureStage.STOP_DEADLINE, handle.failure.value?.stage)
+                assertTrue(manager.instanceState(instance).blocked)
+                assertFalse(fixture.recovery.canStart(instance))
+                releaseListener.countDown()
+                awaitSignal(startupReturned)
+                assertEquals(ChrootCleanupResult.UNKNOWN, handle.cleanupState.value)
+                assertEquals(ChrootRecoveryPhase.UNKNOWN, fixture.recovery.snapshot().single().phase)
+                assertEquals(0, fixture.factory.starts.get())
+                assertTrue(fixture.control.sent.isEmpty())
+            } finally {
+                releaseListener.countDown()
+                if (listenerEntered.isCompleted) awaitSignal(startupReturned)
+            }
+        }
+    }
+
+    @Test
+    fun journalMaintenanceWaitsBeyondTheProductionCleanupDeadline() = runTest {
+        val dispatcher = CleanupClockDispatcher()
+        val maintenanceDispatcher = CleanupClockDispatcher()
+        fixture().withProductionCleanupBudget(dispatcher).use { fixture ->
+            val handle = fixture.start()
+            fixture.ready()
+            assertTrue(readyResult(handle))
+            val maintenance = fixture.scope.async(maintenanceDispatcher) {
+                fixture.manager.withJournalMaintenance { "settled" }
+            }
+            val outerBudget = awaitSignal(maintenanceDispatcher.timeoutScheduled)
+            awaitSignal(dispatcher.cleanupScheduled)
+            maintenanceDispatcher.advanceBy(10_001L)
+            if (outerBudget <= maintenanceDispatcher.now) runCatching { maintenance.await() }
+            assertFalse(maintenance.isCompleted)
+            dispatcher.advanceBy(10_000L)
+            assertEquals(ChrootCleanupResult.UNKNOWN, cleanupResult(handle))
+            assertEquals("settled", withContext(Dispatchers.IO) { withTimeout(5_000L) { maintenance.await() } })
+            assertEquals(12_000L, outerBudget)
+            assertEquals(0, fixture.manager.instanceState(instance).activeLaunches)
+            assertTrue(fixture.manager.instanceState(instance).blocked)
+        }
+    }
+
+    @Test
     fun ownerRevocationProvesUndispatchedBrokerLaunchAndClosesItsIntentWithoutInventingTaskExit() = runTest {
         fixture().use { fixture ->
             val created = CompletableDeferred<ChrootBrokerProcess>()
@@ -940,7 +1280,7 @@ class ChrootRuntimeManagerTest {
                 override fun start(helper: ChrootHelperIdentity): Process = proxy.also { created.complete(it) }
             }
             val manager = ChrootRuntimeManager(fixture.authority, factory, fixture.recovery, fixture.scope,
-                Dispatchers.IO, { fixture.control }, { System.nanoTime() / 1_000_000L })
+                Dispatchers.IO, { fixture.control }, { System.nanoTime() / 1_000_000L }, cleanupTimeoutMs = 4_000L)
             val lease = manager.activateFromUser(owner, "profile", 1, instance, rootfs, fixture.root)!!
             val permit = manager.authorize(lease, spec(), 1)!!
             val handle = manager.launch(lease, permit, spec()) {}!!
@@ -986,7 +1326,7 @@ class ChrootRuntimeManagerTest {
                 process.finish()
             }
             val manager = ChrootRuntimeManager(fixture.authority, fixture.factory, fixture.recovery, fixture.scope,
-                dispatcher, { control }, { System.nanoTime() / 1_000_000L })
+                dispatcher, { control }, { System.nanoTime() / 1_000_000L }, cleanupTimeoutMs = 4_000L)
             val lease = manager.activateFromUser(owner, "profile", 1, instance, rootfs, fixture.root)!!
             val permit = manager.authorize(lease, spec(), 1)!!
             val handle = manager.launch(lease, permit, spec()) {}!!
@@ -1034,7 +1374,7 @@ class ChrootRuntimeManagerTest {
             val dispatcher = StartupIoDispatcher()
             val control = StartupControl(dispatcher)
             val manager = ChrootRuntimeManager(fixture.authority, fixture.factory, fixture.recovery, fixture.scope,
-                dispatcher, { control }, { System.nanoTime() / 1_000_000L }, fixture.diagnostics)
+                dispatcher, { control }, { System.nanoTime() / 1_000_000L }, fixture.diagnostics, cleanupTimeoutMs = 4_000L)
             val lease = manager.activateFromUser(owner, "profile", 1, instance, rootfs, fixture.root)!!
             val permit = manager.authorize(lease, spec(), 1)!!
             val handle = manager.launch(lease, permit, spec()) {}!!
@@ -1066,7 +1406,7 @@ class ChrootRuntimeManagerTest {
             val dispatcher = StartupIoDispatcher()
             val control = StartupControl(dispatcher)
             val manager = ChrootRuntimeManager(fixture.authority, fixture.factory, fixture.recovery, fixture.scope,
-                dispatcher, { control }, { System.nanoTime() / 1_000_000L }, fixture.diagnostics)
+                dispatcher, { control }, { System.nanoTime() / 1_000_000L }, fixture.diagnostics, cleanupTimeoutMs = 4_000L)
             val lease = manager.activateFromUser(owner, "profile", 1, instance, rootfs, fixture.root)!!
             val permit = manager.authorize(lease, spec(), 1)!!
             val handle = manager.launch(lease, permit, spec()) {}!!
@@ -1110,7 +1450,7 @@ class ChrootRuntimeManagerTest {
                 process.finish()
             }
             val manager = ChrootRuntimeManager(fixture.authority, fixture.factory, fixture.recovery, fixture.scope,
-                dispatcher, { control }, { System.nanoTime() / 1_000_000L })
+                dispatcher, { control }, { System.nanoTime() / 1_000_000L }, cleanupTimeoutMs = 4_000L)
             val lease = manager.activateFromUser(owner, "profile", 1, instance, rootfs, fixture.root)!!
             val permit = manager.authorize(lease, spec(), 1)!!
             val handle = manager.launch(lease, permit, spec()) {}!!
@@ -1148,7 +1488,7 @@ class ChrootRuntimeManagerTest {
                 val dispatcher = StartupIoDispatcher()
                 val control = StartupControl(dispatcher)
                 val manager = ChrootRuntimeManager(fixture.authority, fixture.factory, fixture.recovery, fixture.scope,
-                    dispatcher, { control }, { System.nanoTime() / 1_000_000L })
+                    dispatcher, { control }, { System.nanoTime() / 1_000_000L }, cleanupTimeoutMs = 4_000L)
                 val lease = manager.activateFromUser(owner, "profile", 1, instance, rootfs, fixture.root)!!
                 val permit = manager.authorize(lease, spec(), 1)!!
                 val handle = manager.launch(lease, permit, spec()) {}!!
@@ -1197,7 +1537,7 @@ class ChrootRuntimeManagerTest {
             // Keep the stderr collector blocked until final cleanup, so it cannot consume the observation gate.
             process.helperErrorStream = BytesPipe()
             val manager = ChrootRuntimeManager(fixture.authority, fixture.factory, fixture.recovery, fixture.scope,
-                dispatcher, { control }, { System.nanoTime() / 1_000_000L })
+                dispatcher, { control }, { System.nanoTime() / 1_000_000L }, cleanupTimeoutMs = 4_000L)
             val lease = manager.activateFromUser(owner, "profile", 1, instance, rootfs, fixture.root)!!
             val permit = manager.authorize(lease, spec(), 1)!!
             val handle = manager.launch(lease, permit, spec()) {}!!
@@ -1265,7 +1605,7 @@ class ChrootRuntimeManagerTest {
                 override fun start(helper: ChrootHelperIdentity): Process = proxy
             }
             val manager = ChrootRuntimeManager(fixture.authority, factory, fixture.recovery, fixture.scope,
-                Dispatchers.IO, { fixture.control }, { System.nanoTime() / 1_000_000L })
+                Dispatchers.IO, { fixture.control }, { System.nanoTime() / 1_000_000L }, cleanupTimeoutMs = 4_000L)
             val lease = manager.activateFromUser(owner, "profile", 1, instance, rootfs, fixture.root)!!
             val permit = manager.authorize(lease, spec(), 1)!!
             val handle = manager.launch(lease, permit, spec()) {}!!
@@ -1746,7 +2086,7 @@ class ChrootRuntimeManagerTest {
                 throw IOException("private disk failure")
             }
             val manager = ChrootRuntimeManager(fixture.authority, fixture.factory, fixture.recovery, fixture.scope,
-                Dispatchers.IO, { fixture.control }, { System.nanoTime() / 1_000_000L }, diagnostics)
+                Dispatchers.IO, { fixture.control }, { System.nanoTime() / 1_000_000L }, diagnostics, cleanupTimeoutMs = 4_000L)
             val lease = manager.allowBinding(owner, "profile", 1, instance, rootfs, fixture.root)!!
             val permit = manager.authorize(lease, spec(), 1)!!
             val handle = manager.launch(lease, permit, spec()) {}!!

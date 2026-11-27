@@ -8,8 +8,10 @@ import com.aicode.feature.agent.domain.container.ContainerProfile
 import dagger.hilt.android.qualifiers.ApplicationContext
 import java.io.File
 import java.io.IOException
+import java.nio.file.FileAlreadyExistsException
 import java.nio.file.Files
 import java.nio.file.LinkOption.NOFOLLOW_LINKS
+import java.nio.file.attribute.PosixFilePermissions
 import java.util.Collections
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -52,9 +54,10 @@ internal class ChrootAppSourceCapture @Inject constructor(@ApplicationContext co
             mount(workspace, "/root/workspace", false, true, identity.uid, owned = false),
             mount(dnsFile, "/etc/resolv.conf", true, false, identity.uid)
         )
+        prepareChrootToolOutputDirectory(filesDir, identity.uid)
         CONFIG_DIRECTORIES.forEach { name ->
             val source = File(filesDir, "aicode/$name")
-            if (Files.exists(source.toPath(), NOFOLLOW_LINKS)) {
+            if (name == "tool-output" || Files.exists(source.toPath(), NOFOLLOW_LINKS)) {
                 mounts += mount(source, "/root/.aicode/$name", name in READ_ONLY_CONFIG, true, identity.uid)
             }
         }
@@ -136,7 +139,41 @@ internal class ChrootAppSourceCapture @Inject constructor(@ApplicationContext co
     }
 
     private companion object {
-        val CONFIG_DIRECTORIES = listOf("skills", "agents", "memory", "docs", "bin", "lib", "plugins", "scripts", "prompts.custom")
+        val CONFIG_DIRECTORIES = listOf("skills", "agents", "memory", "docs", "bin", "lib", "plugins", "scripts", "prompts.custom", "tool-output")
         val READ_ONLY_CONFIG = setOf("skills", "agents", "docs", "bin", "lib", "prompts.custom")
     }
+}
+
+internal fun prepareChrootToolOutputDirectory(root: File, uid: Int): File {
+    fun identity(directory: File): ChrootFileIdentity {
+        var ancestor: File? = directory
+        while (ancestor != null) {
+            if (!Files.isDirectory(ancestor.toPath(), NOFOLLOW_LINKS)) {
+                throw IOException("CHROOT output directory has an unsupported ancestor")
+            }
+            ancestor = ancestor.parentFile
+        }
+        val attributes = Files.readAttributes(directory.toPath(), "unix:uid,dev,ino,isDirectory", NOFOLLOW_LINKS)
+        if (attributes["isDirectory"] != true || (attributes["uid"] as Number).toInt() != uid) {
+            throw IOException("CHROOT output directory is not owned by the application")
+        }
+        return ChrootFileIdentity((attributes["dev"] as Number).toLong(), (attributes["ino"] as Number).toLong())
+    }
+
+    var parent = root
+    val rootIdentity = identity(root)
+    for (name in listOf("aicode", "tool-output")) {
+        val parentIdentity = identity(parent)
+        val directory = File(parent, name)
+        try {
+            Files.createDirectory(directory.toPath(), PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rwx------")))
+        } catch (_: FileAlreadyExistsException) {
+        }
+        identity(directory)
+        if (identity(parent) != parentIdentity || identity(root) != rootIdentity) {
+            throw IOException("CHROOT output directory source changed")
+        }
+        parent = directory
+    }
+    return parent
 }

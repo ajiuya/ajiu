@@ -336,7 +336,7 @@ static int fw_mount_class(const char *path, bool *must_ro)
     if (!strcmp(path, "/root") || !strcmp(path, "/root/workspace")) return 1;
     if (!strcmp(path, "/etc/resolv.conf")) { *must_ro = true; return 2; }
     static const char *const ro[] = { "skills", "agents", "docs", "bin", "lib", "prompts.custom" };
-    static const char *const rw[] = { "memory", "scripts", "plugins" };
+    static const char *const rw[] = { "memory", "scripts", "plugins", "tool-output" };
     const char *prefix = "/root/.aicode/";
     if (strncmp(path, prefix, strlen(prefix))) return 0;
     const char *name = path + strlen(prefix);
@@ -418,9 +418,8 @@ static int fw_authorize(const struct fw_context *ctx, int fd, const struct fw_id
     for (size_t i = 0; i < ctx->boundary_count; ++i)
         if (strlen(ctx->boundaries[i].path) > mount_path_length &&
             fw_below(path, ctx->boundaries[i].path) && ctx->boundaries[i].id != m->id) return fw_fail(EXDEV);
-    if (fw_below(path, "/root/.aicode") && strcmp(path, "/root/.aicode") &&
+    if (fw_below(path, "/root/.aicode") && strcmp(m->path, "/root") &&
         strncmp(m->path, "/root/.aicode/", 14)) return fw_fail(EACCES);
-    if (writing && !strcmp(path, "/root/.aicode")) return fw_fail(EACCES);
     if (fw_kind(id) < 0) return -1;
     if (writing) {
         struct statvfs fs;

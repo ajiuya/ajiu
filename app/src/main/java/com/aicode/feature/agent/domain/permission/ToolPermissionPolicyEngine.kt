@@ -4,6 +4,7 @@ import android.content.Context
 import com.aicode.R
 import com.aicode.feature.agent.domain.container.ChrootInstance
 import com.aicode.feature.agent.domain.container.LocalContainerRuntime
+import com.aicode.feature.agent.domain.container.RemoteSshConnection
 import com.aicode.feature.agent.domain.permission.ShellCommandParser.BlockerKind
 import com.aicode.feature.agent.domain.root.RootAccessState
 import com.aicode.feature.agent.domain.root.RootCommandManager
@@ -35,7 +36,8 @@ class ToolPermissionPolicyEngine @Inject constructor(
     // Defaults preserve legacy explicit constructors; Hilt injects the real singleton dependencies.
     private val modeHolder: ExecutionModeHolder? = null,
     private val containerSettings: ContainerSettingsRepository? = null,
-    private val workspaceRepository: WorkspaceRepository? = null
+    private val workspaceRepository: WorkspaceRepository? = null,
+    private val remoteConnection: RemoteSshConnection? = null
 ) {
     private companion object {
         const val SHIZUKU_TOOL = "Shizuku"
@@ -72,7 +74,8 @@ class ToolPermissionPolicyEngine @Inject constructor(
         val localRuntime: LocalContainerRuntime? = null,
         val chrootInstance: ChrootInstance? = null,
         val workspaceSelectionId: String? = null,
-        val workspacePath: String? = null
+        val workspacePath: String? = null,
+        val remoteConnectionGeneration: String? = null
     )
 
     data class EvalResult(
@@ -190,7 +193,7 @@ class ToolPermissionPolicyEngine @Inject constructor(
         }
         if (command == null) return EvalResult(Verdict.ALLOW, permissionSource = source)
 
-        // Legacy PRoot/SSH policy deliberately remains unchanged.
+        sourceCapture.checkCurrent()
         val analysis = ShellCommandParser.analyze(command)
         val safetyReason = checkCatastrophicRm(executableSegments) ?: if (!analysis.analyzable && looksDestructive(command, analysis, executableSegments)) {
             val constructs = analysis.blockers.joinToString("\n") { blocker ->
@@ -224,7 +227,7 @@ class ToolPermissionPolicyEngine @Inject constructor(
             }
             return approval(
                 sessionId,
-                "elevate:$command",
+                commandGrant(toolName, "elevate", command, source),
                 appContext.getString(R.string.tool_elevation_confirmation_title),
                 appContext.getString(R.string.tool_elevation_confirmation_reason)
             ).copy(permissionSource = source)
@@ -233,7 +236,7 @@ class ToolPermissionPolicyEngine @Inject constructor(
         return when {
             ShellCommandParser.requiresRootApproval(command) -> approval(
                 sessionId,
-                "root:$command",
+                commandGrant(toolName, "root", command, source),
                 appContext.getString(R.string.tool_root_confirmation_title),
                 appContext.getString(R.string.tool_root_confirmation_reason)
             )
@@ -253,7 +256,8 @@ class ToolPermissionPolicyEngine @Inject constructor(
         val mode = execution?.mode ?: modeHolder?.currentMode() ?: ExecutionMode.LOCAL_PROOT
         if (modeHolder != null && modeHolder.currentMode() != mode) throw CancellationException("Workspace execution mode changed")
         // Capture before the suspending profile read: A -> B -> A must not repair a torn snapshot.
-        val workspaceBefore = if (mode == ExecutionMode.LOCAL_PROOT) workspaceRepository?.selection?.value else null
+        val workspaceBefore = workspaceRepository?.selection?.value
+        val remote = if (mode == ExecutionMode.REMOTE_SSH) remoteConnection?.identityState?.value else null
         val profile = if (execution != null) execution.profileSnapshot else containerSettings?.captureProfileSnapshot()
         if (execution != null && profile == null && containerSettings != null) {
             throw CancellationException("Captured workspace profile is unavailable")
@@ -268,11 +272,12 @@ class ToolPermissionPolicyEngine @Inject constructor(
             else -> PermissionNamespace.PROOT_GUEST
         }
         val frozenWorkspace = execution?.runtimeWorkspaceSource
-        val workspaceSelection = if (namespace == PermissionNamespace.CHROOT_GUEST && workspaceRepository != null) {
-            if (execution == null) workspaceBefore else frozenWorkspace?.selection
-        } else null
+        val workspaceSelection = if (namespace == PermissionNamespace.CHROOT_GUEST && workspaceRepository != null && execution != null) {
+            frozenWorkspace?.selection
+        } else workspaceBefore
         val workspacePath = if (workspaceSelection == null) null else {
-            if (execution == null) workspaceSelection.workspace?.path else frozenWorkspace?.sourcePath
+            if (namespace == PermissionNamespace.CHROOT_GUEST && execution != null) frozenWorkspace?.sourcePath
+            else workspaceSelection.workspace?.path
         }
         val checkCurrent = {
             execution?.checkCurrent()
@@ -280,7 +285,10 @@ class ToolPermissionPolicyEngine @Inject constructor(
                 throw CancellationException("Workspace execution mode changed")
             }
             profile?.let { containerSettings?.checkProfileSnapshot(it) }
-            if (namespace == PermissionNamespace.CHROOT_GUEST && workspaceRepository != null) {
+            if (mode == ExecutionMode.REMOTE_SSH && remoteConnection != null && remoteConnection.identityState.value !== remote) {
+                throw CancellationException("Remote permission source changed")
+            }
+            if (workspaceRepository != null) {
                 if (workspaceRepository.selection.value !== workspaceBefore ||
                     (workspaceSelection != null && workspaceSelection !== workspaceBefore) ||
                     (workspaceSelection != null && workspacePath != workspaceBefore?.workspace?.path)) {
@@ -294,9 +302,25 @@ class ToolPermissionPolicyEngine @Inject constructor(
             PermissionSource(
                 namespace, mode, revision, profile?.selectedProfileId, profile?.selectionRevision,
                 profile?.configurationRevision, active?.id, active?.localRuntime, active?.chrootInstance,
-                workspaceSelection?.id, workspacePath
+                workspaceSelection?.id, workspacePath, remote?.generation?.toString()
             ), checkCurrent
         )
+    }
+
+    private fun commandGrant(toolName: String, kind: String, command: String, source: PermissionSource): String? {
+        if (modeHolder == null || containerSettings == null || workspaceRepository == null ||
+            source.mode == null || source.modeSelectionRevision == null || source.selectedProfileId.isNullOrBlank() ||
+            source.profileSelectionRevision == null || source.profileConfigurationRevision == null ||
+            source.activeProfileId != source.selectedProfileId || source.workspaceSelectionId.isNullOrBlank() ||
+            source.workspacePath.isNullOrBlank() || workspaceRepository.selection.value.workspace?.available != true ||
+            source.namespace == PermissionNamespace.REMOTE && (remoteConnection == null || source.remoteConnectionGeneration.isNullOrBlank())) return null
+        return "command-session-v1:" + hashFields(listOf(
+            toolName, kind, command, source.namespace.name, source.mode?.name, source.modeSelectionRevision?.toString(),
+            source.selectedProfileId, source.profileSelectionRevision?.toString(), source.profileConfigurationRevision?.toString(),
+            source.activeProfileId, source.localRuntime?.name, source.chrootInstance?.id,
+            source.chrootInstance?.device?.toString(), source.chrootInstance?.inode?.toString(), source.chrootInstance?.installGeneration?.toString(),
+            source.workspaceSelectionId, source.workspacePath, source.remoteConnectionGeneration
+        ))
     }
 
     /** A missing source component permits one-shot review only, never an unbound broad grant. */
@@ -333,20 +357,23 @@ class ToolPermissionPolicyEngine @Inject constructor(
             source.workspaceSelectionId, source.workspacePath, root?.authorityId, root?.generation?.toString(),
             shizuku?.uid?.toString(), shizuku?.connectionId
         )
+        return SessionPermissionGrantRepository.HOST_WRITE_GRANT_PREFIX + hashFields(material)
+    }
+
+    private fun hashFields(material: List<String?>): String {
         val digest = MessageDigest.getInstance("SHA-256")
         for (field in material) {
             val bytes = field?.toByteArray(Charsets.UTF_8)
             digest.update(ByteBuffer.allocate(Int.SIZE_BYTES).putInt(bytes?.size ?: -1).array())
             if (bytes != null) digest.update(bytes)
         }
-        val hash = digest.digest().joinToString("") { (it.toInt() and 0xff).toString(16).padStart(2, '0') }
-        return SessionPermissionGrantRepository.HOST_WRITE_GRANT_PREFIX + hash
+        return digest.digest().joinToString("") { (it.toInt() and 0xff).toString(16).padStart(2, '0') }
     }
 
     private fun immutable(values: Collection<String>): Set<String> = Collections.unmodifiableSet(LinkedHashSet(values))
 
-    private suspend fun approval(sessionId: String?, grant: String, title: String?, note: String): EvalResult {
-        if (!sessionId.isNullOrBlank() && sessionPermissionGrants.isAllowed(sessionId, grant)) {
+    private suspend fun approval(sessionId: String?, grant: String?, title: String?, note: String): EvalResult {
+        if (!sessionId.isNullOrBlank() && grant != null && sessionPermissionGrants.isAllowed(sessionId, grant)) {
             return EvalResult(Verdict.ALLOW)
         }
         return EvalResult(

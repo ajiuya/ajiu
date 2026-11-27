@@ -29,6 +29,7 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 
@@ -94,7 +95,10 @@ class PluginRemoteRunManager @Inject constructor(
         val model = session.model?.takeIf { it.isNotBlank() } ?: config.effectiveModel
         val args = buildJsonObject { put("sourceKey", session.sourceKey); put("sessionId", session.sessionId); put("providerId", providerId)
             put("model", model); put("subscribeOnly", prompt == null); prompt?.let { put("text", it) } }
-        gateway.get().authorize(context, "sessionSource.remoteRun", args, PluginApprovalOperation.EXECUTE_TOOL, "Connect to external provider\n$args")
+        val providerIdentity = com.aicode.feature.plugin.data.PluginFiles.sha256(
+            com.google.gson.Gson().toJson(config).toByteArray(Charsets.UTF_8))
+        gateway.get().authorizeWithSessionIdentity(context, "sessionSource.remoteRun", args, PluginApprovalOperation.EXECUTE_TOOL,
+            "Connect to external provider\n$args", JsonPrimitive(providerIdentity))
         registry.requireSession(context, session.sourceKey, session.sessionId)
         if (providers.getProviderById(providerId) != config) throw PluginHostException("CONTEXT_CHANGED", "External provider changed during approval")
         val provider = factory.create(config.copy(selectedModel = model), session.id)

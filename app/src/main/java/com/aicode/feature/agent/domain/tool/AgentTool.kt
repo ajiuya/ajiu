@@ -84,7 +84,12 @@ data class PendingToolPermission(
     val sessionGrant: String? = null,
     /** 发起该授权请求的会话 id。多会话并行时用于在 UI 上区分弹窗归属、点亮侧边栏等待授权指示。 */
     val sessionId: String = ""
-)
+) {
+    val canAllowSession: Boolean
+        get() = sessionId.isNotBlank() && !sessionGrant.isNullOrBlank() &&
+            (!sessionGrant.startsWith(ToolPermissionManager.HOST_WRITE_GRANT_PREFIX) ||
+                sessionGrant.removePrefix(ToolPermissionManager.HOST_WRITE_GRANT_PREFIX).isNotBlank())
+}
 
 abstract class AgentTool {
     abstract val name: String

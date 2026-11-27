@@ -114,7 +114,10 @@ class PluginSessionSourceService @Inject constructor(
         val source = requireDefinition(context, sourceKey)
         registry.checkSource(context, source.key)
         val handler = source.handlers.createSession ?: throw PluginHostException("SESSION_CREATE_UNSUPPORTED", "Session source cannot create sessions")
-        gateway.get().authorize(context, "sessionSource.createSession", args, PluginApprovalOperation.EXECUTE_TOOL, "Create external session\nsource=$sourceKey\n$args")
+        val approvalArgs = buildJsonObject {
+            put("sourceKey", source.key); put("sourceId", source.localId); put("handler", handler); put("arguments", args)
+        }
+        gateway.get().authorize(context, "sessionSource.createSession", approvalArgs, PluginApprovalOperation.EXECUTE_TOOL, "Create external session\nsource=$sourceKey\n$args")
         return invoke(context, source, handler, JsonObject(args + ("sourceId" to kotlinx.serialization.json.JsonPrimitive(source.localId))))
     }
 

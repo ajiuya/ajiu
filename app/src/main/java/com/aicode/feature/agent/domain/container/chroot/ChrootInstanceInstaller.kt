@@ -878,7 +878,7 @@ class ChrootInstanceInstaller internal constructor(
         const val DNS = "nameserver 223.5.5.5\nnameserver 223.6.6.6\n"
         val NONCE = Regex("[0-9a-f]{24}")
         val PROFILE_ID = Regex("[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
-        val CONFIG_DIRECTORIES = listOf("skills", "agents", "memory", "docs", "bin", "lib", "plugins", "scripts", "prompts.custom")
+        val CONFIG_DIRECTORIES = listOf("skills", "agents", "memory", "docs", "bin", "lib", "plugins", "scripts", "prompts.custom", "tool-output")
         val RESULT_KEYS = setOf("passed", "stage", "errno", "entries", "file_bytes", "cleanup_state", "device", "inode", "created_directory")
         val random = SecureRandom()
         fun randomId(): String = ByteArray(12).also(random::nextBytes).joinToString("") { "%02x".format(it.toInt() and 0xff) }

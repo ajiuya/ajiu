@@ -14,7 +14,21 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
-internal class ChrootFileOperationException(val errno: Int) : IOException("Chroot file operation rejected: $errno")
+internal class ChrootFileOperationException(
+    val errno: Int,
+    val guestPath: String? = null,
+    val operation: String? = null,
+    val targetGuestPath: String? = null,
+    cause: Throwable? = null
+) : IOException(buildString {
+    append("Chroot file operation rejected: $errno")
+    operation?.let { append("; operation=$it") }
+    guestPath?.let { append("; path=${it.replace("\n", "\\n").replace("\r", "\\r")}") }
+    targetGuestPath?.let { append("; target=${it.replace("\n", "\\n").replace("\r", "\\r")}") }
+}, cause) {
+    fun withGuestPath(path: String): ChrootFileOperationException = if (guestPath != null) this else
+        ChrootFileOperationException(errno, path, operation ?: "request", targetGuestPath, this)
+}
 
 internal data class ChrootFileStat(
     val kind: Int,
@@ -35,12 +49,12 @@ internal class ChrootFileWorkerClient(
     private val lane = Any()
     private var nextRequestId = 1
 
-    fun stat(path: String, followFinal: Boolean = true): ChrootFileStat = request(1, {
+    fun stat(path: String, followFinal: Boolean = true): ChrootFileStat = request(1, path, {
         string(path)
         writeInt(if (followFinal) 1 else 0)
     }) { stat() }
 
-    fun list(path: String): List<Pair<String, ChrootFileStat>> = request(2, { string(path) }) {
+    fun list(path: String): List<Pair<String, ChrootFileStat>> = request(2, path, { string(path) }) {
         val count = readInt()
         if (count !in 0..10000) throw ProtocolException("Invalid chroot directory count")
         List(count) {
@@ -52,13 +66,13 @@ internal class ChrootFileWorkerClient(
         }
     }
 
-    fun resolve(path: String, followFinal: Boolean): String = request(3, {
+    fun resolve(path: String, followFinal: Boolean): String = request(3, path, {
         string(path)
         writeInt(if (followFinal) 1 else 0)
     }) { string().also { if (!it.startsWith('/')) throw ProtocolException("Invalid resolved chroot path") } }
 
     fun openRead(path: String): InputStream {
-        val handle = request(4, { string(path) }) { handle() }
+        val handle = request(4, path, { string(path) }) { handle() }
         return object : InputStream() {
             private var released = false
             private var exhausted = false
@@ -72,7 +86,7 @@ internal class ChrootFileWorkerClient(
                 if (exhausted) return -1
                 if (released) throw IOException("Chroot read stream closed")
                 try {
-                    val bytes = request(5, { writeInt(handle); writeInt(minOf(length, MAX_CHUNK)) }) {
+                    val bytes = request(5, path, { writeInt(handle); writeInt(minOf(length, MAX_CHUNK)) }) {
                         val count = readInt()
                         if (count !in 0..minOf(length, MAX_CHUNK)) throw ProtocolException("Invalid chroot read length")
                         ByteArray(count).also(::readFully)
@@ -93,14 +107,14 @@ internal class ChrootFileWorkerClient(
             override fun close() {
                 if (!released) {
                     released = true
-                    request(6, { writeInt(handle) }) { Unit }
+                    request(6, path, { writeInt(handle) }) { Unit }
                 }
             }
         }
     }
 
     fun write(path: String, source: InputStream, overwrite: Boolean): Long {
-        val handle = request(7, { string(path); writeInt(if (overwrite) 1 else 0) }) { handle() }
+        val handle = request(7, path, { string(path); writeInt(if (overwrite) 1 else 0) }) { handle() }
         var committed = false
         try {
             val buffer = ByteArray(MAX_CHUNK)
@@ -112,19 +126,19 @@ internal class ChrootFileWorkerClient(
                 if (count == 0) throw IOException("File upload made no progress")
                 total += count
                 if (total > MAX_WRITE_BYTES) throw IOException("Chroot file upload exceeds the stream limit")
-                request(8, { writeInt(handle); writeInt(count); write(buffer, 0, count) }) { Unit }
+                request(8, path, { writeInt(handle); writeInt(count); write(buffer, 0, count) }) { Unit }
             }
-            val result = request(9, { writeInt(handle) }) { readLong() }
+            val result = request(9, path, { writeInt(handle) }) { readLong() }
             if (result != total) throw ProtocolException("Chroot file commit size mismatch")
             committed = true
             return result
         } finally {
-            if (!committed) runCatching { request(10, { writeInt(handle) }) { Unit } }
+            if (!committed) runCatching { request(10, path, { writeInt(handle) }) { Unit } }
         }
     }
 
     fun write(path: String, overwrite: Boolean, writer: (OutputStream) -> Unit): Long {
-        val handle = request(7, { string(path); writeInt(if (overwrite) 1 else 0) }) { handle() }
+        val handle = request(7, path, { string(path); writeInt(if (overwrite) 1 else 0) }) { handle() }
         var committed = false
         var accepting = true
         var total = 0L
@@ -138,7 +152,7 @@ internal class ChrootFileWorkerClient(
                     checkCurrent()
                     val count = minOf(MAX_CHUNK, offset + length - at)
                     if (total > MAX_WRITE_BYTES - count) throw IOException("Chroot file upload exceeds the stream limit")
-                    request(8, { writeInt(handle); writeInt(count); write(buffer, at, count) }) { Unit }
+                    request(8, path, { writeInt(handle); writeInt(count); write(buffer, at, count) }) { Unit }
                     total += count
                     at += count
                 }
@@ -149,30 +163,36 @@ internal class ChrootFileWorkerClient(
             writer(sink)
             accepting = false
             checkCurrent()
-            val result = request(9, { writeInt(handle) }) { readLong() }
+            val result = request(9, path, { writeInt(handle) }) { readLong() }
             if (result != total) throw ProtocolException("Chroot file commit size mismatch")
             committed = true
             return result
         } finally {
             accepting = false
-            if (!committed) runCatching { request(10, { writeInt(handle) }) { Unit } }
+            if (!committed) runCatching { request(10, path, { writeInt(handle) }) { Unit } }
         }
     }
 
-    fun mkdirs(path: String) = request(11, { string(path) }) { Unit }
+    fun mkdirs(path: String) = request(11, path, { string(path) }) { Unit }
 
-    fun delete(path: String, recursive: Boolean) = request(12, {
+    fun delete(path: String, recursive: Boolean) = request(12, path, {
         string(path)
         writeInt(if (recursive) 1 else 0)
     }) { Unit }
 
-    fun rename(source: String, target: String, overwrite: Boolean) = request(13, {
+    fun rename(source: String, target: String, overwrite: Boolean) = request(13, source, {
         string(source)
         string(target)
         writeInt(if (overwrite) 1 else 0)
-    }) { Unit }
+    }, targetPath = target) { Unit }
 
-    private fun <T> request(opcode: Int, encode: DataOutputStream.() -> Unit, decode: DataInputStream.() -> T): T = synchronized(lane) {
+    private fun <T> request(
+        opcode: Int,
+        path: String,
+        encode: DataOutputStream.() -> Unit,
+        targetPath: String? = null,
+        decode: DataInputStream.() -> T
+    ): T = synchronized(lane) {
         if (closed.get()) throw IOException("Chroot file transport closed")
         checkCurrent()
         val buffer = ByteArrayOutputStream()
@@ -209,7 +229,7 @@ internal class ChrootFileWorkerClient(
             if (errno !in 0..4095) throw ProtocolException("Invalid chroot file errno")
             if (errno != 0) {
                 if (result.available() != 0) throw ProtocolException("Unexpected chroot file error body")
-                throw ChrootFileOperationException(errno)
+                throw ChrootFileOperationException(errno, path, OPERATIONS[opcode], targetPath)
             }
             val value = result.decode()
             if (result.available() != 0) throw ProtocolException("Trailing chroot file response bytes")
@@ -262,6 +282,8 @@ internal class ChrootFileWorkerClient(
     }
 
     companion object {
+        private val OPERATIONS = listOf("", "stat", "list", "resolve", "open-read", "read", "close",
+            "begin-write", "write", "commit-write", "abort", "mkdirs", "delete", "rename")
         private const val MAGIC = 0x414a4657
         private const val MAX_FRAME = 1024 * 1024
         private const val MAX_CHUNK = 64 * 1024

@@ -1,5 +1,6 @@
 package com.aicode.feature.agent.domain.root
 
+import com.aicode.feature.agent.domain.container.chroot.ChrootRuntimeTimeouts
 import com.aicode.feature.settings.data.repository.RootAccessSettingsRepository
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -31,10 +32,6 @@ class RootAuthorityCoordinator internal constructor(
         repository,
         CoroutineScope(SupervisorJob() + Dispatchers.IO)
     )
-
-    private companion object {
-        const val REVOCATION_TIMEOUT_MS = 5_000L
-    }
 
     private class Revocation(
         val onRevoke: () -> Unit,
@@ -97,7 +94,7 @@ class RootAuthorityCoordinator internal constructor(
                 revocations.toList().also { revokeLocked(it) }
             }
             withContext(NonCancellable) {
-                val stopped = withTimeoutOrNull(REVOCATION_TIMEOUT_MS) {
+                val stopped = withTimeoutOrNull(ChrootRuntimeTimeouts.CLEANUP_AWAIT_TIMEOUT_MS) {
                     supervisorScope {
                         pending.forEach { registration ->
                             launch(start = CoroutineStart.UNDISPATCHED) {

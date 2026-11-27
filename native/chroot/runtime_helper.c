@@ -1185,6 +1185,62 @@ static int kill_group(struct runtime *r)
     return 0;
 }
 
+static int home_target_identity(struct anchor *directory, const struct anchor *home, uid_t uid, gid_t gid)
+{
+    if (snapshot(directory) < 0) return -1;
+    NEED("source_fd_identity", S_ISDIR(directory->st.st_mode) && directory->st.st_uid == uid &&
+        directory->st.st_gid == gid && directory->st.st_dev == home->st.st_dev &&
+        directory->mount_id == home->mount_id);
+    return 0;
+}
+
+static int prepare_home_tool_output(int home_fd, const struct ajiu_launch *launch)
+{
+    bool requested = false;
+    for (uint32_t i = 0; i < launch->mountc; ++i)
+        if (!strcmp(launch->mounts[i].target_path, "/root/.aicode/tool-output")) requested = true;
+    if (!requested) return 0;
+    uid_t uid = launch->uid;
+    gid_t gid = launch->gid;
+    struct anchor home = { .fd = home_fd }, config = { .fd = -1 }, output = { .fd = -1 };
+    if (snapshot(&home) < 0) return -1;
+    NEED("source_fd_identity", S_ISDIR(home.st.st_mode) && home.st.st_uid == uid && home.st.st_gid == gid);
+    int rc = -1;
+    bool created = false;
+    stage = "anchor_open";
+    config.fd = open_at(home.fd, ".aicode", DF, RESOLVE_BENEATH | RESOLVE_NO_XDEV);
+    if (config.fd < 0 || home_target_identity(&config, &home, uid, gid) < 0) goto done;
+    stage = "anchor_open";
+    output.fd = open_at(config.fd, "tool-output", DF, RESOLVE_BENEATH | RESOLVE_NO_XDEV);
+    if (output.fd < 0) {
+        if (errno != ENOENT) goto done;
+        if (mkdirat(config.fd, "tool-output", 0700) == 0) created = true;
+        else if (errno != EEXIST) goto done;
+        output.fd = open_at(config.fd, "tool-output", DF, RESOLVE_BENEATH | RESOLVE_NO_XDEV);
+        if (output.fd < 0) goto done;
+    }
+    if (created) {
+        if (snapshot(&output) < 0) goto done;
+        stage = "source_fd_identity";
+        if (!S_ISDIR(output.st.st_mode) || output.st.st_uid != 0 ||
+            output.st.st_dev != home.st.st_dev || output.mount_id != home.mount_id) {
+            errno = ESTALE; goto done;
+        }
+        if (fchown(output.fd, uid, gid) < 0 || fchmod(output.fd, 0700) < 0) goto done;
+    }
+    if (home_target_identity(&output, &home, uid, gid) < 0 ||
+        current(&config, home.fd, ".aicode") < 0 || current(&output, config.fd, "tool-output") < 0) goto done;
+    if (created && (output.st.st_mode & 07777) != 0700) { errno = ESTALE; goto done; }
+    rc = 0;
+done: {
+        int saved = errno;
+        if (output.fd >= 0 && close(output.fd) < 0 && rc == 0) { saved = errno; rc = -1; }
+        if (config.fd >= 0 && close(config.fd) < 0 && rc == 0) { saved = errno; rc = -1; }
+        errno = saved;
+    }
+    return rc;
+}
+
 static int resolve_target(int root, const char *path, bool directory)
 {
     return open_at(root, path, directory ? DF : O_PATH, RESOLVE_IN_ROOT);
@@ -1286,6 +1342,7 @@ static int mount_namespace(struct runtime *r, int *view)
         TRY("source_fd_identity", fstat(r->source[i], &source));
         NEED("frozen_source", (uint64_t)source.st_dev == m->source_dev && (uint64_t)source.st_ino == m->source_ino &&
             (m->kind == AJIU_MOUNT_DIRECTORY ? S_ISDIR(source.st_mode) : S_ISREG(source.st_mode)));
+        if (home && prepare_home_tool_output(r->source[i], r->launch) < 0) return -1;
         int target = resolve_target(*view, m->target_path, m->kind == AJIU_MOUNT_DIRECTORY);
         if (target < 0) return -1;
         struct stat target_st;
@@ -1490,6 +1547,35 @@ static int restore_namespace(struct runtime *r, const struct runtime *original, 
     return 0;
 }
 
+static bool controller_input_ready(struct controller_io *io, unsigned char *pending, size_t *used, size_t *offset, bool stopped)
+{
+    if (stopped && io->input >= 0) {
+        if (io->input != io->master) close(io->input);
+        io->input = -1;
+    }
+    if (io->input < 0) *used = *offset = 0;
+    if (*offset && *used) {
+        memmove(pending, pending + *offset, *used - *offset);
+        *used -= *offset; *offset = 0;
+    }
+    return *used <= AJIU_MAX_FRAME_BYTES - AJIU_MAX_DATA_BYTES;
+}
+
+static int controller_queue_input(const struct packet *packet, const struct controller_io *io,
+    unsigned char *pending, size_t *used, bool running, bool stopped, bool *eof, bool pty)
+{
+    if (!running || (!stopped && *eof) || (packet->type != AJIU_STDIN && packet->type != AJIU_STDIN_EOF) ||
+        (packet->type == AJIU_STDIN_EOF && packet->length)) { errno = EPROTO; return -1; }
+    bool discard = stopped || io->input < 0;
+    if (packet->type == AJIU_STDIN) {
+        if (!discard) { memcpy(pending + *used, packet->body, packet->length); *used += packet->length; }
+    } else {
+        *eof = true;
+        if (pty && !discard) pending[(*used)++] = 4;
+    }
+    return 0;
+}
+
 static int flush_input(struct controller_io *io, unsigned char *pending, size_t *used, size_t *offset, bool eof, bool pty)
 {
     if (*offset < *used && io->input >= 0) {
@@ -1578,11 +1664,7 @@ static void controller(struct runtime *r, int socket, pid_t parent, int parentfd
             if (!stopped) { stopped = true; stop_at = now; }
             if (parent_state != 0) peer_dead = true;
         }
-        if (pending_offset && pending_used) {
-            memmove(pending, pending + pending_offset, pending_used - pending_offset);
-            pending_used -= pending_offset; pending_offset = 0;
-        }
-        bool can_receive = pending_used <= sizeof(pending) - AJIU_MAX_DATA_BYTES;
+        bool can_receive = controller_input_ready(&io, pending, &pending_used, &pending_offset, stopped);
         if (!peer_dead && can_receive) {
             int rc = receive_packet(socket, &packet);
             if (rc < 0) { peer_dead = true; if (!stopped) { stopped = true; stop_at = now; } }
@@ -1598,11 +1680,9 @@ static void controller(struct runtime *r, int socket, pid_t parent, int parentfd
                 } else if (packet.type == AJIU_GO && !packet.length && prepared && !running && !stopped) {
                     if (exact_write(gate[1], "G", 1) < 0) error = errno;
                     else { running = true; start = now; store(&r->shared->executing, 1); close(gate[1]); gate[1] = -1; }
-                } else if (packet.type == AJIU_STDIN && running && !stopped && !input_eof) {
-                    memcpy(pending + pending_used, packet.body, packet.length); pending_used += packet.length;
-                } else if (packet.type == AJIU_STDIN_EOF && !packet.length && running && !stopped && !input_eof) {
-                    input_eof = true;
-                    if (r->launch->io_mode == AJIU_IO_PTY) pending[pending_used++] = 4;
+                } else if (packet.type == AJIU_STDIN || packet.type == AJIU_STDIN_EOF) {
+                    if (controller_queue_input(&packet, &io, pending, &pending_used, running, stopped,
+                        &input_eof, r->launch->io_mode == AJIU_IO_PTY) < 0) error = errno;
                 } else if (packet.type == AJIU_RESIZE && packet.length == 4 && running && !stopped && io.master >= 0) {
                     struct winsize size = { .ws_col = (unsigned short)(((unsigned int)packet.body[0] << 8) | packet.body[1]),
                         .ws_row = (unsigned short)(((unsigned int)packet.body[2] << 8) | packet.body[3]) };
@@ -1636,6 +1716,7 @@ static void controller(struct runtime *r, int socket, pid_t parent, int parentfd
             (void)send_packet(socket, MSG_FAILURE, &code, sizeof(code), FRAME_WAIT);
             stopped = true; stop_at = now;
         }
+        if (stopped) can_receive = controller_input_ready(&io, pending, &pending_used, &pending_offset, true);
         if (flush_input(&io, pending, &pending_used, &pending_offset, input_eof, r->launch->io_mode == AJIU_IO_PTY) < 0) error = errno;
         bool discard = peer_dead || (stopped && error);
         if (output_step(socket, &io.output, AJIU_STDOUT, r->launch->io_mode == AJIU_IO_PTY, discard) < 0 ||
@@ -1853,6 +1934,18 @@ static bool read_control(int control, struct ajiu_launch_session *session, bool 
     return true;
 }
 
+static int supervision_stop_reason(const struct runtime *r, bool ready, int64_t start,
+    int64_t lease_at, int64_t command_at, int64_t now, bool *stopped, int64_t *stop_at)
+{
+    if (interrupted || pidfd_dead(r->app_fd) != 0 || (!*stopped &&
+        (now - lease_at >= r->launch->lease_ms || (!ready && now - start >= 15000) ||
+        (command_at && r->launch->command_timeout_ms && now - command_at >= r->launch->command_timeout_ms)))) {
+        if (!*stopped) { *stopped = true; *stop_at = now; }
+        return interrupted ? ECANCELED : ETIMEDOUT;
+    }
+    return 0;
+}
+
 static int supervisor(struct runtime *r, struct ajiu_launch_session *session, bool *output_ok, unsigned char *body, int control)
 {
     int sockets[2] = {-1, -1}, controllerfd = -1, parentfd = -1;
@@ -1883,11 +1976,8 @@ static int supervisor(struct runtime *r, struct ajiu_launch_session *session, bo
     for (;;) {
         int64_t now = now_ms();
         if (now < 0) { now = start + r->launch->lease_ms + CLEANUP_WAIT; if (!error) error = EIO; }
-        if (interrupted || pidfd_dead(r->app_fd) != 0 || now - lease_at >= r->launch->lease_ms || (!ready && now - start >= 15000) ||
-            (command_at && r->launch->command_timeout_ms && now - command_at >= r->launch->command_timeout_ms)) {
-            if (!stopped) { stopped = true; stop_at = now; }
-            if (!error) error = interrupted ? ECANCELED : ETIMEDOUT;
-        }
+        int stop_error = supervision_stop_reason(r, ready, start, lease_at, command_at, now, &stopped, &stop_at);
+        if (!error) error = stop_error;
         if (controller_ok && !controller_exited) {
             int state = protected_role(r, controller_pid, controllerfd, controller_start);
             if (state < 0) {

@@ -13,6 +13,7 @@ import androidx.lifecycle.ProcessLifecycleOwner
 import com.aicode.MainActivity
 import com.aicode.R
 import com.aicode.feature.agent.domain.permission.PermissionChoice
+import com.aicode.feature.agent.domain.tool.ToolPermissionManager
 import com.aicode.feature.settings.data.repository.ApprovalNotificationSettingsRepository
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CoroutineScope
@@ -33,7 +34,8 @@ import javax.inject.Singleton
 @Singleton
 class AgentApprovalNotificationManager @Inject constructor(
     @param:ApplicationContext private val context: Context,
-    private val settings: ApprovalNotificationSettingsRepository
+    private val settings: ApprovalNotificationSettingsRepository,
+    private val toolPermissions: ToolPermissionManager
 ) {
     /** 待审批项的类型，决定通知上挂哪组按钮。 */
     enum class ApprovalKind { PERMISSION, QUESTION, PLAN }
@@ -117,6 +119,12 @@ class AgentApprovalNotificationManager @Inject constructor(
                 ApprovalKind.PERMISSION -> {
                     builder.addAction(0, context.getString(R.string.notification_approval_action_reject), actionIntent(ApprovalKind.PERMISSION, PermissionChoice.REJECT.name, requestId, 11))
                     builder.addAction(0, context.getString(R.string.notification_approval_action_allow), actionIntent(ApprovalKind.PERMISSION, PermissionChoice.ONCE.name, requestId, 12))
+                    val request = toolPermissions.pendingById(requestId)?.takeIf { it.sessionId == single.sessionId }
+                    if (request?.canAllowSession == true) {
+                        builder.addAction(0, context.getString(R.string.chat_perm_session_allow), actionIntent(ApprovalKind.PERMISSION, PermissionChoice.ALWAYS_SESSION.name, requestId, 13))
+                    } else {
+                        builder.setStyle(NotificationCompat.BigTextStyle().bigText("$body\n${context.getString(R.string.permission_session_unavailable)}"))
+                    }
                 }
                 ApprovalKind.QUESTION, ApprovalKind.PLAN -> Unit
             }

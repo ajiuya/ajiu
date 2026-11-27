@@ -43,8 +43,6 @@ class ToolPermissionManager @Inject constructor(
         try {
             val choice = decision.await()
             val grant = request.sessionGrant
-            // Legacy exact-command grants keep their original persistence contract. A host-write
-            // scope is only a choice here: the workflow must validate its frozen proof first.
             if (choice == PermissionChoice.ALWAYS_SESSION && !grant.isNullOrBlank() &&
                 request.sessionId.isNotBlank() && !grant.startsWith(HOST_WRITE_GRANT_PREFIX)
             ) {
@@ -66,6 +64,8 @@ class ToolPermissionManager @Inject constructor(
         ) return
         sessionPermissionGrants.allow(sessionId, grant)
     }
+
+    fun pendingById(id: String): PendingToolPermission? = synchronized(lock) { pending[id]?.request }
 
     /** UI 回传用户选择，唤醒对应 id 的挂起请求。 */
     fun resolve(id: String, choice: PermissionChoice) {

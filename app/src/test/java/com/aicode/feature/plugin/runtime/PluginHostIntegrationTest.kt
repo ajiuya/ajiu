@@ -40,10 +40,15 @@ import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
+import io.mockk.spyk
 import java.io.File
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.test.setMain
+import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
@@ -196,6 +201,159 @@ class PluginHostIntegrationTest {
         assertEquals(JsonPrimitive(0), value["exitCode"])
         assertEquals(JsonPrimitive("/work"), value["output"])
         coVerify(exactly = 1) { commands.runCommandSyncWithExit("pwd", "/work", 3000) }
+    }
+
+    @Test fun sessionFileApprovalIncludesActualTextBinaryAndAppendContents() = runBlocking<Unit> {
+        val source = gateway.captureContext(capture, "chat-A")
+        for (method in listOf("fs.write", "fs.append", "fs.writeBinary")) {
+            val path = "${method.substringAfter('.')}.txt"
+            val file = File(manager.dataDirectory(capture.id), path).apply { writeText("start") }
+            fun params(content: String) = buildJsonObject {
+                put("path", "data://$path")
+                if (method == "fs.writeBinary") put("base64", java.util.Base64.getEncoder().encodeToString(content.toByteArray()))
+                else put("content", content)
+            }
+            val first = async { gateway.call(source, method, params("alpha")) }
+            val request = visibleApproval()
+            assertFalse(request.details.contains("alpha"))
+            approvals.resolve(request.id, PluginApprovalChoice.ALWAYS_SESSION)
+            first.await()
+            withTimeout(5000) { gateway.call(source, method, params("alpha")) }
+            val before = file.readBytes()
+            val changed = async { error { gateway.call(source, method, params("bravo")) } }
+            approvals.resolve(visibleApproval().id, PluginApprovalChoice.REJECT)
+            assertEquals("USER_REJECTED", changed.await())
+            assertArrayEquals(before, file.readBytes())
+        }
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun clipboardSessionApprovalNeverMatchesDifferentTextWithTheSameLength() = runBlocking<Unit> {
+        Dispatchers.setMain(Dispatchers.Unconfined)
+        try {
+            val api = PluginSystemHostApi(app, javax.inject.Provider { gateway }, mockk(), mockk(), mockk())
+            val source = gateway.captureContext(capture, "chat-A")
+            fun params(text: String) = buildJsonObject { put("text", text) }
+            val first = async { api.call(source, "clipboard.write", params("alpha")) }
+            val request = visibleApproval()
+            assertFalse(request.details.contains("alpha"))
+            approvals.resolve(request.id, PluginApprovalChoice.ALWAYS_SESSION)
+            first.await()
+            withTimeout(5000) { api.call(source, "clipboard.write", params("alpha")) }
+            val changed = async { error { api.call(source, "clipboard.write", params("bravo")) } }
+            approvals.resolve(visibleApproval().id, PluginApprovalChoice.REJECT)
+            assertEquals("USER_REJECTED", changed.await())
+            assertEquals("alpha", app.getSystemService(android.content.ClipboardManager::class.java).primaryClip?.getItemAt(0)?.text?.toString())
+        } finally { Dispatchers.resetMain() }
+    }
+
+    @Test fun httpSessionApprovalIncludesBodyAndHeaderValuesWithoutDisplayingThem() = runBlocking<Unit> {
+        val http = spyk(PluginHttpService(okhttp3.OkHttpClient()))
+        coEvery { http.execute(any(), any()) } returns buildJsonObject { put("status", 200) }
+        val api = PluginSystemHostApi(app, javax.inject.Provider { gateway }, mockk(), http, mockk())
+        val source = gateway.captureContext(capture, "chat-A")
+        fun params(body: String = "alpha", token: String = "token-a") = buildJsonObject {
+            put("url", "https://example.com/test"); put("method", "POST"); put("body", body)
+            put("headers", buildJsonObject { put("Authorization", token) })
+        }
+        val first = async { api.call(source, "http.request", params()) }
+        val request = visibleApproval()
+        assertFalse(request.details.contains("alpha")); assertFalse(request.details.contains("token-a"))
+        approvals.resolve(request.id, PluginApprovalChoice.ALWAYS_SESSION)
+        first.await()
+        withTimeout(5000) { api.call(source, "http.request", params()) }
+        for (changedParams in listOf(params(body = "bravo"), params(token = "token-b"))) {
+            val changed = async { error { api.call(source, "http.request", changedParams) } }
+            approvals.resolve(visibleApproval().id, PluginApprovalChoice.REJECT)
+            assertEquals("USER_REJECTED", changed.await())
+        }
+        coVerify(exactly = 2) { http.execute(any(), any()) }
+    }
+
+    @Test fun nativeSessionChoiceReusesSameChatSourceButNeverAnotherChat() = runBlocking<Unit> {
+        val source = gateway.captureContext(capture, "chat-A")
+        val first = async { gateway.call(source, "bash", shellArgs) }
+        val approval = visibleApproval()
+        assertTrue(approval.canAllowSession)
+        assertFalse(approval.pluginRunSession)
+        approvals.resolve(approval.id, PluginApprovalChoice.ALWAYS_SESSION)
+        assertEquals(JsonPrimitive(0), first.await().jsonObject["exitCode"])
+        val same = withTimeout(5000) { gateway.call(gateway.captureContext(capture, "chat-A"), "bash", shellArgs) }
+        assertEquals(JsonPrimitive(0), same.jsonObject["exitCode"])
+        assertNull(approvals.pending.value)
+        val other = async { error { gateway.call(gateway.captureContext(capture, "chat-B"), "bash", shellArgs) } }
+        approvals.resolve(visibleApproval().id, PluginApprovalChoice.REJECT)
+        assertEquals("USER_REJECTED", other.await())
+        coVerify(exactly = 2) { commands.runCommandSyncWithExit("pwd", "/work", 3000) }
+    }
+
+    @Test fun nativeRunChoiceIsSharedByChildrenButNotByAnotherInvocation() = runBlocking<Unit> {
+        val source = gateway.captureContext(capture)
+        val first = async { gateway.call(source, "bash", shellArgs) }
+        val approval = visibleApproval()
+        assertTrue(approval.canAllowSession)
+        assertTrue(approval.pluginRunSession)
+        approvals.resolve(approval.id, PluginApprovalChoice.ALWAYS_SESSION)
+        first.await()
+        withTimeout(5000) { gateway.call(source.child(), "bash", shellArgs) }
+        assertNull(approvals.pending.value)
+        val nextRun = async { error { gateway.call(gateway.captureContext(capture), "bash", shellArgs) } }
+        approvals.resolve(visibleApproval().id, PluginApprovalChoice.REJECT)
+        assertEquals("USER_REJECTED", nextRun.await())
+        coVerify(exactly = 2) { commands.runCommandSyncWithExit("pwd", "/work", 3000) }
+    }
+
+    @Test fun rememberedPluginSessionStillChecksDenyAndChangedSource() = runBlocking<Unit> {
+        val source = gateway.captureContext(capture, "chat-A")
+        val first = async { gateway.call(source, "bash", shellArgs) }
+        approvals.resolve(visibleApproval().id, PluginApprovalChoice.ALWAYS_SESSION)
+        first.await()
+        rules.set(listOf(PermissionRule.fromCompact("Bash(pwd)", PermissionDecision.DENY)))
+        assertEquals("SYSTEM_DENIED", error { gateway.call(source, "bash", shellArgs) })
+        assertNull(approvals.pending.value)
+        rules.set(emptyList())
+        selection.value = WorkspaceRepository.Selection(Workspace("work", "/work", WorkspaceType.INTERNAL))
+        val changed = async { error { gateway.call(gateway.captureContext(capture, "chat-A"), "bash", shellArgs) } }
+        approvals.resolve(visibleApproval().id, PluginApprovalChoice.REJECT)
+        assertEquals("USER_REJECTED", changed.await())
+        coVerify(exactly = 1) { commands.runCommandSyncWithExit("pwd", "/work", 3000) }
+    }
+
+    @Test fun denyArrivingBeforeSessionChoicePreventsRememberingIt() = runBlocking<Unit> {
+        val source = gateway.captureContext(capture, "chat-A")
+        val first = async { error { gateway.call(source, "bash", shellArgs) } }
+        val request = visibleApproval()
+        rules.set(listOf(PermissionRule.fromCompact("Bash", PermissionDecision.DENY)))
+        approvals.resolve(request.id, PluginApprovalChoice.ALWAYS_SESSION)
+        assertEquals("SYSTEM_DENIED", first.await())
+        rules.set(emptyList())
+        val retry = async { error { gateway.call(source, "bash", shellArgs) } }
+        approvals.resolve(visibleApproval().id, PluginApprovalChoice.REJECT)
+        assertEquals("USER_REJECTED", retry.await())
+        coVerify(exactly = 0) { commands.runCommandSyncWithExit(any(), any(), any()) }
+    }
+
+    @Test fun nativePermissionApiHasSessionChoiceWithoutResolvingQuestionsOrPlans() = runBlocking<Unit> {
+        val api = PluginNativePermissionApi(javax.inject.Provider { gateway }, approvals)
+        val source = gateway.captureContext(capture, "chat-A")
+        fun params(kind: String, sessionId: String = "chat-A") = buildJsonObject {
+            put("requestId", "plugin-request"); put("sessionId", sessionId)
+            put("title", "Permission"); put("description", "Exact operation")
+            put("operation", buildJsonObject { put("kind", kind); put("target", "sample") })
+        }
+        val first = async { api.call(source, "permissions.request", params("sampleOperation")) }
+        val approval = visibleApproval()
+        assertTrue(approval.canAllowSession)
+        approvals.resolve(approval.id, PluginApprovalChoice.ALWAYS_SESSION)
+        assertEquals(JsonPrimitive("allow"), first.await().jsonObject["decision"])
+        assertEquals(JsonPrimitive("allow"), withTimeout(5000) {
+            api.call(source, "permissions.request", params("sampleOperation"))
+        }.jsonObject["decision"])
+        assertNull(approvals.pending.value)
+        for (kind in listOf("Root", "Shizuku", "submitPlan", "planMode", "askUserQuestion")) {
+            assertEquals("SYSTEM_PROTECTED", error { api.call(source, "permissions.request", params(kind)) })
+        }
+        assertEquals("CONTEXT_CHANGED", error { api.call(source, "permissions.request", params("sampleOperation", "chat-B")) })
     }
 
     @Test fun ruleChangedWhileApprovalVisibleDeniesEvenAfterAllowClick() = runBlocking<Unit> {

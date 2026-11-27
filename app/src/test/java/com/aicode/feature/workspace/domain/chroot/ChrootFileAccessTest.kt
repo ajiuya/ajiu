@@ -201,7 +201,11 @@ class ChrootFileAccessTest {
     fun reservedGuestTreesAndNulAreRejectedBeforeAcquiringAWorker() {
         val fixture = Fixture()
         for (path in listOf("/proc/self/fd", "/dev/null", "/sys", "/tmp/a", "/run/a", "../../proc/a", "/root/../dev/a")) {
-            assertEquals(13, assertThrows(ChrootFileOperationException::class.java) { fixture.access.exists(path) }.errno)
+            val failure = assertThrows(ChrootFileOperationException::class.java) { fixture.access.exists(path) }
+            assertEquals(13, failure.errno)
+            assertEquals("validate-path", failure.operation)
+            assertEquals(if (path.startsWith('/')) path else "/root/workspace/$path", failure.guestPath)
+            assertTrue(failure.message.orEmpty().contains(failure.guestPath!!))
         }
         assertThrows(IOException::class.java) { fixture.access.openRead("a\u0000b") }
         assertEquals(0, fixture.captures)
@@ -219,9 +223,36 @@ class ChrootFileAccessTest {
             fixture.statErrors["/root/workspace/denied"] = errno
             val failure = assertThrows(ChrootFileOperationException::class.java) { fixture.access.exists("denied") }
             assertEquals(errno, failure.errno)
+            assertEquals("/root/workspace/denied", failure.guestPath)
+            assertEquals("request", failure.operation)
+            assertEquals(errno, (failure.cause as ChrootFileOperationException).errno)
             assertFalse(failure.message.orEmpty().contains("/data/"))
             assertEquals(errno, assertThrows(ChrootFileOperationException::class.java) { fixture.access.fingerprint("denied") }.errno)
         }
+    }
+
+    @Test
+    fun privateConfigFilesAndToolOutputUseGuestPathsAndMissingFilesKeepEnoent() {
+        val fixture = Fixture(writable = listOf("/root"), readOnly = listOf("/root/.aicode/docs"))
+        fixture.stats["/root/.aicode"] = directory()
+        fixture.access.writeFile("~/.aicode/settings.json", "config", false, Charsets.UTF_8)
+        assertEquals("config", fixture.access.readFile("~/.aicode/settings.json"))
+        fixture.access.writeFile("~/.aicode/tool-output/result.log", "archive", false, Charsets.UTF_8)
+        assertEquals("archive", fixture.access.readFile("~/.aicode/tool-output/result.log"))
+        assertFalse(fixture.access.exists("~/.aicode/missing.json"))
+        val failure = assertThrows(NoSuchFileException::class.java) { fixture.access.readFile("~/.aicode/missing.json") }
+        val native = failure.cause as ChrootFileOperationException
+        assertEquals(2, native.errno)
+        assertEquals("/root/.aicode/missing.json", native.guestPath)
+        fixture.file("/root/.aicode/docs/guide.md", "read-only".toByteArray())
+        assertEquals("r--", fixture.access.permissions("~/.aicode/docs/guide.md"))
+        fixture.writeError = 30
+        val denied = assertThrows(ChrootFileOperationException::class.java) {
+            fixture.access.writeFile("~/.aicode/docs/guide.md", "replacement", true, Charsets.UTF_8)
+        }
+        assertEquals(30, denied.errno)
+        assertEquals("/root/.aicode/docs/guide.md", denied.guestPath)
+        assertEquals("read-only", fixture.access.readFile("~/.aicode/docs/guide.md"))
     }
 
     @Test

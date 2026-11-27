@@ -90,10 +90,12 @@ class ChrootFileAccess internal constructor(
                     throw changed
                 }
                 if (failure is ChrootFileOperationException) {
+                    val contextual = failure.withGuestPath(path)
                     when (failure.errno) {
-                        ENOENT -> throw NoSuchFileException(File(path))
-                        EEXIST -> throw FileAlreadyExistsException(File(path))
+                        ENOENT -> throw NoSuchFileException(File(path)).apply { initCause(contextual) }
+                        EEXIST -> throw FileAlreadyExistsException(File(path)).apply { initCause(contextual) }
                     }
+                    throw contextual
                 }
                 throw failure
             }
@@ -571,7 +573,7 @@ class ChrootFileAccess internal constructor(
     private fun ensureDirectory(operation: Operation, path: String) {
         val existing = statOrNull(operation, path)
         if (existing != null) {
-            if (existing.kind != DIRECTORY) throw ChrootFileOperationException(ENOTDIR)
+            if (existing.kind != DIRECTORY) throw ChrootFileOperationException(ENOTDIR, path, "mkdirs")
             return
         }
         operation.request(path) { it.mkdirs(path) }
@@ -699,7 +701,7 @@ class ChrootFileAccess internal constructor(
                         if (count != current.size) throw IOException("Chroot copy size changed")
                         if (operation.request(from) { it.stat(from, false) } != current) throw IOException("Chroot copy source changed")
                     }
-                    else -> throw ChrootFileOperationException(EOPNOTSUPP)
+                    else -> throw ChrootFileOperationException(EOPNOTSUPP, from, "copy", to)
                 }
             }
         }
@@ -710,7 +712,8 @@ class ChrootFileAccess internal constructor(
         var index = 0
         while (index < entries.size) {
             val (relative, stat) = entries[index++]
-            if (stat.kind == SYMLINK) throw ChrootFileOperationException(EOPNOTSUPP)
+            if (stat.kind == SYMLINK) throw ChrootFileOperationException(EOPNOTSUPP,
+                if (relative.isEmpty()) source else child(source, relative), "copy")
             if (stat.kind != DIRECTORY) continue
             val directory = if (relative.isEmpty()) source else child(source, relative)
             for ((name, childStat) in operation.request(directory) { it.list(directory) }) {
@@ -726,7 +729,7 @@ class ChrootFileAccess internal constructor(
     private fun checkCopyTarget(operation: Operation, target: String, sourceKind: Int, overwrite: Boolean) {
         val existing = statOrNull(operation, target, false) ?: return
         if (!overwrite) throw FileAlreadyExistsException(File(target))
-        if (sourceKind != REGULAR || existing.kind != REGULAR) throw ChrootFileOperationException(EOPNOTSUPP)
+        if (sourceKind != REGULAR || existing.kind != REGULAR) throw ChrootFileOperationException(EOPNOTSUPP, target, "copy")
     }
 
     override fun move(path: String, newPath: String, overwrite: Boolean) {
@@ -781,7 +784,7 @@ class ChrootFileAccess internal constructor(
                     ".." -> if (components.isNotEmpty()) components.removeAt(components.lastIndex)
                     else -> components += part
                 }
-                if (components.firstOrNull() in FORBIDDEN_ROOTS) throw ChrootFileOperationException(13)
+                if (components.firstOrNull() in FORBIDDEN_ROOTS) throw ChrootFileOperationException(13, guest, "validate-path")
             }
             return guest
         }

@@ -41,6 +41,7 @@ import javax.inject.Singleton
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Mutex
@@ -74,9 +75,11 @@ class PluginFileBridge @Inject constructor(private val routing: FileBackendRouti
         params: JsonObject,
         authorize: suspend (tool: String, arguments: JsonObject, operation: PluginApprovalOperation, details: String) -> Unit
     ): JsonElement {
-        val installed = currentCoroutineContext()[WorkspaceExecutionContext]
+        val caller = currentCoroutineContext()
+        val installed = caller[WorkspaceExecutionContext]
         if (installed != null && installed !== context.execution) changed()
-        return withContext(Dispatchers.IO + (context.execution ?: EmptyCoroutineContext)) {
+        val execution = context.execution?.ownedBlockingContext(requireNotNull(caller[Job])) ?: EmptyCoroutineContext
+        return withContext(execution + Dispatchers.IO) {
             val owner = currentCoroutineContext()
             fun check() { owner.ensureActive(); context.checkCurrent() }
             fun integrity() { check(); context.checkIntegrity(); check() }

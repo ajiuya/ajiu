@@ -270,7 +270,7 @@ class ToolPermissionPolicyEngineSourceTest {
         coVerify(exactly = 0) { fixture.settings.captureProfileSnapshot() }
     }
 
-    @Test fun prootAndRemotePreserveLegacyRootAndHighRiskRules() = runTest {
+    @Test fun prootAndRemoteKeepOneShotReviewWhenWorkspaceSourceIsMissing() = runTest {
         val fixture = Fixture()
         fixture.profile = ContainerProfile.BUILTIN_ALPINE
         for (mode in listOf(ExecutionMode.LOCAL_PROOT, ExecutionMode.REMOTE_SSH)) {
@@ -279,7 +279,7 @@ class ToolPermissionPolicyEngineSourceTest {
             val root = fixture.engine.evaluate("Bash", commandArgs("sudo id"), "s1")
             val unsafe = fixture.engine.evaluate("Bash", commandArgs("cat > /etc/passwd"), "s1")
             assertEquals(Verdict.ASK, root.verdict)
-            assertEquals("root:sudo id", root.sessionGrant)
+            assertNull(root.sessionGrant)
             assertEquals(Verdict.DENY, unsafe.verdict)
             assertEquals(if (mode == ExecutionMode.LOCAL_PROOT) PermissionNamespace.PROOT_GUEST else PermissionNamespace.REMOTE, root.permissionSource?.namespace)
         }

@@ -59,9 +59,45 @@ class ChrootFileWorkerClientTest {
             throw AssertionError("Expected EACCES")
         } catch (failure: ChrootFileOperationException) {
             assertEquals(13, failure.errno)
+            assertEquals("/root/workspace/a", failure.guestPath)
+            assertEquals("stat", failure.operation)
+            assertTrue(failure.message.orEmpty().contains("/root/workspace/a"))
         }
         assertFalse(closed)
         assertEquals(2, client.stat("/root/workspace/b").kind)
+    }
+
+    @Test
+    fun writeAndRenameErrorsKeepGuestPathsWithoutIncludingFileContent() {
+        val path = "/root/.aicode/settings.json"
+        val content = "sensitive-file-content"
+        val bytes = response(7, 1) { writeInt(7) } + response(8, 2, 30) + response(10, 3) + response(13, 4, 16)
+        val client = ChrootFileWorkerClient(ByteArrayInputStream(bytes), ByteArrayOutputStream(), {}, {})
+        val writeFailure = assertThrows(ChrootFileOperationException::class.java) {
+            client.write(path, ByteArrayInputStream(content.toByteArray()), true)
+        }
+        assertEquals(30, writeFailure.errno)
+        assertEquals("write", writeFailure.operation)
+        assertEquals(path, writeFailure.guestPath)
+        assertFalse(writeFailure.message.orEmpty().contains(content))
+        val target = "/root/.aicode/new.json"
+        val renameFailure = assertThrows(ChrootFileOperationException::class.java) { client.rename(path, target, false) }
+        assertEquals(16, renameFailure.errno)
+        assertEquals("rename", renameFailure.operation)
+        assertEquals(path, renameFailure.guestPath)
+        assertEquals(target, renameFailure.targetGuestPath)
+        assertTrue(renameFailure.message.orEmpty().contains(target))
+    }
+
+    @Test
+    fun readHandleFailuresRetainTheirOriginalGuestPath() {
+        val path = "/root/.aicode/settings.json"
+        val bytes = response(4, 1) { writeInt(7) } + response(5, 2, 116) + response(6, 3)
+        val client = ChrootFileWorkerClient(ByteArrayInputStream(bytes), ByteArrayOutputStream(), {}, {})
+        val failure = assertThrows(ChrootFileOperationException::class.java) { client.openRead(path).use { it.read() } }
+        assertEquals(116, failure.errno)
+        assertEquals("read", failure.operation)
+        assertEquals(path, failure.guestPath)
     }
 
     @Test

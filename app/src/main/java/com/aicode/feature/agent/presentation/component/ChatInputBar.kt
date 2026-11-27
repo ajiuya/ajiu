@@ -1073,13 +1073,19 @@ internal fun ToolPermissionPanel(
                             tone = AgentActionTone.Success
                         )
                     }
-                    if (request.sessionGrant != null) {
-                        Spacer(Modifier.height(Spacing.sm))
-                        AgentActionButton(
-                            text = stringResource(R.string.chat_perm_session_allow),
-                            onClick = { onChoice(PermissionChoice.ALWAYS_SESSION) },
-                            modifier = Modifier.fillMaxWidth(),
-                            tone = AgentActionTone.Neutral
+                    Spacer(Modifier.height(Spacing.sm))
+                    AgentActionButton(
+                        text = stringResource(R.string.chat_perm_session_allow),
+                        onClick = { onChoice(PermissionChoice.ALWAYS_SESSION) },
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = request.canAllowSession,
+                        tone = AgentActionTone.Neutral
+                    )
+                    if (!request.canAllowSession) {
+                        Text(
+                            text = stringResource(R.string.permission_session_unavailable),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                 }

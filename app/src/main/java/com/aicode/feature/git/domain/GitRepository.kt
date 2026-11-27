@@ -105,6 +105,18 @@ class GitRepository @Inject constructor(
 
         /** diff 允许读取的单侧文件字节上限：超过则不拉内容，直接降级为「文件过大」。 */
         const val MAX_DIFF_FILE_BYTES = 2L * 1024 * 1024
+
+        val INSTALL_CHROOT_GIT = """
+            set -e;
+            . /root/.aicode/lib/env-common.sh;
+            detect_pmgr;
+            case "${'$'}PMGR" in
+                apk|apt) pkg_add git ca-certificates openssh-client ;;
+                dnf|yum) pkg_add git ca-certificates openssh-clients ;;
+                pacman) pkg_add git ca-certificates openssh ;;
+                *) pkg_add git ca-certificates ;;
+            esac
+        """.trimIndent().replace('\n', ' ')
     }
     /**
      * 执行一条 `git` 子命令，返回合并后的 stdout+stderr 文本。仅用于只读命令（status/branches/log/remote 等）：
@@ -271,6 +283,27 @@ class GitRepository @Inject constructor(
             engine.notReadyHint().also { operation.checkCurrent() }
         }
 
+    private suspend fun ensureChrootGit(operation: FrozenGitOperation) {
+        if (operation.mode != ExecutionMode.LOCAL_PROOT) return
+        operation.execution()
+        if (operation.runtimeProfile?.isChroot != true) return
+        val available = execute(operation, "/bin/sh -c ${shellQuote("command -v git")}")
+        if (available.outputTruncated) throw GitOutputTooLargeException()
+        when (available.exitCode) {
+            0 -> Unit
+            1, 127 -> requireGitSetupSuccess(execute(operation, "/bin/sh -c ${shellQuote(INSTALL_CHROOT_GIT)}", timeoutMs = 600_000L))
+            else -> requireGitSetupSuccess(available)
+        }
+        requireGitSetupSuccess(execute(operation, "/bin/sh -c ${shellQuote("git --version")}"))
+    }
+
+    private fun requireGitSetupSuccess(result: CommandResult) {
+        if (result.outputTruncated) throw GitOutputTooLargeException()
+        if (result.exitCode != 0) {
+            throw GitCommandFailureException(result.output.ifBlank { "Git setup exited with code ${result.exitCode}" })
+        }
+    }
+
     /**
      * 在当前工作区初始化 git 仓库。
      *
@@ -278,6 +311,7 @@ class GitRepository @Inject constructor(
      * 若环境 Git 版本较低不支持 `-b` 参数，降级为先 `git init` 再将未初始化的 HEAD 指向 `refs/heads/main`。
      */
     suspend fun initRepo(operation: FrozenGitOperation = captureOperation()): String {
+        ensureChrootGit(operation)
         return gitAttempt { gitChecked(operation, "init", "-b", "main") }
             .getOrElse {
                 val out = gitChecked(operation, "init")
@@ -287,8 +321,10 @@ class GitRepository @Inject constructor(
     }
 
     /** 克隆远程仓库到当前工作区根目录（`git clone <url> .`）。据退出码判成败，失败抛 [GitCommandFailureException]。 */
-    suspend fun cloneRepo(url: String, operation: FrozenGitOperation = captureOperation()): String =
-        gitCheckedWithTimeout(operation, 600_000L, "clone", url.trim(), ".")
+    suspend fun cloneRepo(url: String, operation: FrozenGitOperation = captureOperation()): String {
+        ensureChrootGit(operation)
+        return gitCheckedWithTimeout(operation, 600_000L, "clone", url.trim(), ".")
+    }
 
     /** 是否已配置至少一个远程仓库（`git remote` 输出非空）。拉取/推送前据此门控。 */
     suspend fun hasRemote(operation: FrozenGitOperation = captureOperation()): Boolean = git(operation, "remote").trim().isNotEmpty()

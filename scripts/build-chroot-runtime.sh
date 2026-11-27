@@ -43,6 +43,10 @@ esac
     native/chroot/runtime_protocol_io.c -o "$output_dir/runtime-namespace-test"
 "$output_dir/runtime-namespace-test"
 "$compiler" -std=c11 -O2 -Wall -Wextra -Werror -Wpedantic -fsanitize=undefined -fno-sanitize-recover=all \
+    native/chroot/runtime_home_target_test.c native/chroot/runtime_launch.c native/chroot/runtime_protocol.c \
+    native/chroot/runtime_protocol_io.c -o "$output_dir/runtime-home-target-test"
+"$output_dir/runtime-home-target-test"
+"$compiler" -std=c11 -O2 -Wall -Wextra -Werror -Wpedantic -fsanitize=undefined -fno-sanitize-recover=all \
     native/chroot/runtime_guest_test.c native/chroot/runtime_launch.c native/chroot/runtime_protocol.c \
     native/chroot/runtime_protocol_io.c -o "$output_dir/runtime-guest-test"
 "$output_dir/runtime-guest-test"
@@ -50,6 +54,10 @@ esac
     native/chroot/runtime_control_eof_test.c native/chroot/runtime_launch.c native/chroot/runtime_protocol.c \
     native/chroot/runtime_protocol_io.c -o "$output_dir/runtime-control-eof-test"
 "$output_dir/runtime-control-eof-test"
+"$compiler" -std=c11 -O2 -Wall -Wextra -Werror -Wpedantic -fsanitize=undefined -fno-sanitize-recover=all \
+    native/chroot/runtime_supervision_test.c native/chroot/runtime_launch.c native/chroot/runtime_protocol.c \
+    native/chroot/runtime_protocol_io.c -o "$output_dir/runtime-supervision-test"
+"$output_dir/runtime-supervision-test"
 for name in file_worker rootfs_install; do
     "$compiler" -std=c11 -O2 -Wall -Wextra -Werror -Wpedantic -fsanitize=undefined -fno-sanitize-recover=all \
         "native/chroot/${name}_test.c" -o "$output_dir/$name-test"

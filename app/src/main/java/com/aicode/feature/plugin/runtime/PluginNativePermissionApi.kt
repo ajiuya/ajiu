@@ -47,7 +47,7 @@ class PluginNativePermissionApi @Inject constructor(
         val description = text(params, "description", 4000)
         val operation = params["operation"] as? JsonObject ?: invalid()
         val kind = text(operation, "kind", 100)
-        if (kind in setOf("Root", "submitPlan", "planMode", "Shizuku")) {
+        if (kind in setOf("Root", "submitPlan", "planMode", "askUserQuestion", "Shizuku")) {
             throw PluginHostException("SYSTEM_PROTECTED", "This operation requires the host's dedicated native authorization")
         }
         val limit = (params["timeoutMs"] as? JsonPrimitive)?.takeUnless { it.isString }?.longOrNull

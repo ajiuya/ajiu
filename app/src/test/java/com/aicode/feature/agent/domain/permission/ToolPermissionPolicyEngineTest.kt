@@ -2,6 +2,13 @@ package com.aicode.feature.agent.domain.permission
 
 import android.content.Context
 import com.aicode.R
+import com.aicode.feature.agent.domain.container.ContainerProfile
+import com.aicode.feature.settings.data.repository.ContainerProfileSnapshot
+import com.aicode.feature.settings.data.repository.ContainerSettingsRepository
+import com.aicode.feature.settings.data.repository.ExecutionModeHolder
+import com.aicode.feature.workspace.data.repository.WorkspaceRepository
+import com.aicode.feature.workspace.domain.model.Workspace
+import kotlinx.coroutines.flow.MutableStateFlow
 import com.aicode.feature.agent.domain.root.RootCommandManager
 import com.aicode.feature.agent.domain.root.RootAccessState
 import com.aicode.feature.agent.domain.shizuku.ShizukuIdentity
@@ -16,6 +23,8 @@ import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonPrimitive
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -41,11 +50,20 @@ class ToolPermissionPolicyEngineTest {
         }
     }
 
+    private val modes = ExecutionModeHolder()
+    private val selection = MutableStateFlow(WorkspaceRepository.Selection(Workspace("work", "/work")))
+    private val workspaces = mockk<WorkspaceRepository> { every { selection } returns this@ToolPermissionPolicyEngineTest.selection }
+    private val profiles = mockk<ContainerSettingsRepository> {
+        coEvery { captureProfileSnapshot() } returns ContainerProfileSnapshot(ContainerProfile.BUILTIN_ID, ContainerProfile.BUILTIN_ID,
+            listOf(ContainerProfile.BUILTIN_ALPINE), 1, 1, Any())
+        every { checkProfileSnapshot(any()) } returns Unit
+    }
+
     private fun engine(vararg rules: PermissionRule): ToolPermissionPolicyEngine {
         val repository = mockk<PermissionRulesRepository> {
             coEvery { loadEffectiveForCurrentProject() } returns rules.toList()
         }
-        return ToolPermissionPolicyEngine(repository, grants, context, rootManager, shizukuManager)
+        return ToolPermissionPolicyEngine(repository, grants, context, rootManager, shizukuManager, modes, profiles, workspaces)
     }
 
     private fun commandArgs(
@@ -80,6 +98,13 @@ class ToolPermissionPolicyEngineTest {
         assertNotNull(label, result.askTitle)
         assertNotNull(label, result.approvalNote)
         assertNull(result.denyReason)
+    }
+
+    private fun assertCommandGrant(result: ToolPermissionPolicyEngine.EvalResult, command: String) {
+        val grant = requireNotNull(result.sessionGrant)
+        assertTrue(grant.matches(Regex("command-session-v1:[0-9a-f]{64}")))
+        assertFalse(grant.contains(command))
+        assertNotNull(result.permissionSource)
     }
 
     private fun keepOnlyLegacyGrants() {
@@ -401,15 +426,16 @@ class ToolPermissionPolicyEngineTest {
         val command = "sudo id 2>/dev/null"
         val approval = evaluator.evaluate("Bash", commandArgs(command), "s1")
         assertEquals(Verdict.ASK, approval.verdict)
-        assertEquals("root:$command", approval.sessionGrant)
+        assertCommandGrant(approval, command)
 
-        coEvery { grants.isAllowed("s1", "root:$command") } returns true
+        coEvery { grants.isAllowed("s1", requireNotNull(approval.sessionGrant)) } returns true
         assertEquals(Verdict.ALLOW, evaluator.evaluate("Bash", commandArgs(command), "s1").verdict)
         assertEquals(Verdict.ASK, evaluator.evaluate("Bash", commandArgs(command), "s2").verdict)
         val otherCommand = "sudo id 2>>/dev/null"
         val other = evaluator.evaluate("Bash", commandArgs(otherCommand), "s1")
         assertEquals(Verdict.ASK, other.verdict)
-        assertEquals("root:$otherCommand", other.sessionGrant)
+        assertCommandGrant(other, otherCommand)
+        assertNotEquals(approval.sessionGrant, other.sessionGrant)
 
         val shizuku = evaluator.evaluate("Shizuku", commandArgs("id 2>/dev/null"), "s1")
         assertEquals(Verdict.ALLOW, shizuku.verdict)
@@ -637,7 +663,7 @@ class ToolPermissionPolicyEngineTest {
                 val result = evaluator.evaluate(toolName, commandArgs(command, toolName), "s1")
 
                 assertEquals("$toolName: $command", Verdict.ASK, result.verdict)
-                assertEquals("root:$command", result.sessionGrant)
+                assertCommandGrant(result, command)
                 assertEquals("resource:${R.string.tool_root_confirmation_title}", result.askTitle)
                 assertEquals("resource:${R.string.tool_root_confirmation_reason}", result.approvalNote)
             }
@@ -653,20 +679,21 @@ class ToolPermissionPolicyEngineTest {
         )
 
         assertEquals(Verdict.ASK, result.verdict)
-        assertEquals("root:su -c id", result.sessionGrant)
+        assertCommandGrant(result, "su -c id")
     }
 
     @Test
     fun rootGrant_isScopedToSessionAndExactFullCommand() = runTest {
-        coEvery { grants.isAllowed("s1", "root:sudo id") } returns true
         val evaluator = engine()
+        val approval = evaluator.evaluate("Bash", commandArgs("sudo id"), "s1")
+        coEvery { grants.isAllowed("s1", requireNotNull(approval.sessionGrant)) } returns true
 
         assertEquals(Verdict.ALLOW, evaluator.evaluate("Bash", commandArgs("sudo id"), "s1").verdict)
         for (command in listOf("sudo id -u", "sudo id && echo extra", "sudo  id", "sudo id ")) {
             val result = evaluator.evaluate("Bash", commandArgs(command), "s1")
 
             assertEquals(command, Verdict.ASK, result.verdict)
-            assertEquals("root:$command", result.sessionGrant)
+            assertCommandGrant(result, command)
         }
         assertEquals(Verdict.ASK, evaluator.evaluate("Bash", commandArgs("sudo id"), "s2").verdict)
     }
@@ -815,7 +842,7 @@ class ToolPermissionPolicyEngineTest {
             val result = evaluator.evaluate("Bash", commandArgs(command, elevate = true), "s1")
 
             assertEquals(command, Verdict.ASK, result.verdict)
-            assertEquals("elevate:$command", result.sessionGrant)
+            assertCommandGrant(result, command)
             assertNotNull(result.askTitle)
             assertNotNull(result.approvalNote)
             assertNull(result.denyReason)
@@ -834,14 +861,16 @@ class ToolPermissionPolicyEngineTest {
         val evaluator = engine()
 
         for ((command, otherCommand) in pairs) {
-            coEvery { grants.isAllowed("s1", "elevate:$command") } returns true
+            val approval = evaluator.evaluate("Bash", commandArgs(command, elevate = true), "s1")
+            coEvery { grants.isAllowed("s1", requireNotNull(approval.sessionGrant)) } returns true
 
             assertEquals(command, Verdict.ALLOW, evaluator.evaluate("Bash", commandArgs(command, elevate = true), "s1").verdict)
             assertEquals(command, Verdict.DENY, evaluator.evaluate("Bash", commandArgs(command), "s1").verdict)
             assertEquals(command, Verdict.ASK, evaluator.evaluate("Bash", commandArgs(command, elevate = true), "s2").verdict)
             val other = evaluator.evaluate("Bash", commandArgs(otherCommand, elevate = true), "s1")
             assertEquals(otherCommand, Verdict.ASK, other.verdict)
-            assertEquals("elevate:$otherCommand", other.sessionGrant)
+            assertCommandGrant(other, otherCommand)
+            assertNotEquals(approval.sessionGrant, other.sessionGrant)
         }
     }
 
@@ -851,7 +880,7 @@ class ToolPermissionPolicyEngineTest {
         for (command in listOf("echo \$(sudo id)", "echo `su -c id`", "(sudo id)", "echo \"\$(sudo id)\"")) {
             val result = evaluator.evaluate("Bash", commandArgs(command), "s1")
             assertEquals(command, Verdict.ASK, result.verdict)
-            assertEquals("root:$command", result.sessionGrant)
+            assertCommandGrant(result, command)
         }
     }
 
@@ -869,12 +898,13 @@ class ToolPermissionPolicyEngineTest {
         )
         for (command in commands) {
             coEvery { grants.isAllowed("s1", "root:$command") } returns true
-            coEvery { grants.isAllowed("s1", "elevate:$command") } returns true
+            val requested = evaluator.evaluate("Bash", commandArgs(command, elevate = true), "s1")
+            coEvery { grants.isAllowed("s1", requireNotNull(requested.sessionGrant)) } returns true
             assertEquals(command, Verdict.DENY, evaluator.evaluate("Bash", commandArgs(command), "s1").verdict)
             assertEquals(command, Verdict.ALLOW, evaluator.evaluate("Bash", commandArgs(command, elevate = true), "s1").verdict)
             val approval = evaluator.evaluate("Bash", commandArgs(command, elevate = true), "s2")
             assertEquals(command, Verdict.ASK, approval.verdict)
-            assertEquals("elevate:$command", approval.sessionGrant)
+            assertCommandGrant(approval, command)
         }
     }
 

@@ -33,7 +33,8 @@ internal class ChrootRuntimeManager internal constructor(
     private val dispatcher: CoroutineDispatcher,
     private val controlFactory: (ChrootLaunch) -> ChrootControlTransport,
     private val clock: () -> Long,
-    private val diagnostics: ChrootRuntimeDiagnostics? = null
+    private val diagnostics: ChrootRuntimeDiagnostics? = null,
+    private val cleanupTimeoutMs: Long = ChrootRuntimeTimeouts.CLEANUP_TIMEOUT_MS
 ) {
     @Inject
     constructor(
@@ -71,6 +72,7 @@ internal class ChrootRuntimeManager internal constructor(
         @Volatile var go = false
         @Volatile var finished = false
         @Volatile var startupStage = ChrootRuntimeFailureStage.HELPER_CAPTURE
+        var intentReserved = false
         var journaled = false
         var birthAttempted = false
         var ready = false
@@ -142,7 +144,7 @@ internal class ChrootRuntimeManager internal constructor(
             }
         }
         try {
-            withTimeout(10_000L) { pending.forEach { it.handle.awaitCleanup() } }
+            withTimeout(ChrootRuntimeTimeouts.CLEANUP_AWAIT_TIMEOUT_MS) { pending.forEach { it.handle.awaitCleanup() } }
             authority.withLock { check(active.isEmpty()) { "Runtime launches have not settled" } }
             return block()
         } finally {
@@ -304,7 +306,13 @@ internal class ChrootRuntimeManager internal constructor(
             }
             execution.startupStage = ChrootRuntimeFailureStage.HELPER_CAPTURE
             val helper = factory.captureHelper()
-            if (execution.stopOnly || execution.finished) {
+            val reserved = authority.withLock {
+                if (execution.stopOnly || execution.finished) false else {
+                    execution.intentReserved = true
+                    true
+                }
+            }
+            if (!reserved) {
                 finishUnstarted(execution)
                 return
             }
@@ -384,7 +392,14 @@ internal class ChrootRuntimeManager internal constructor(
                 if (execution.stopOnly || execution.finished) false else {
                     goAttempted = true
                     if (!canRunLocked(execution) || !execution.ready) false
-                    else control.trySend(ChrootFrameType.GO).also { if (it) execution.go = true }
+                    else control.trySend(ChrootFrameType.GO).also { sent ->
+                        if (sent) {
+                            execution.go = true
+                            // EXIT is consumed under the same authority gate. Publish successful
+                            // startup before a fast task can complete and resolve readiness false.
+                            execution.handle.markReady()
+                        }
+                    }
                 }
             } == true
             if (!sent) {
@@ -394,7 +409,6 @@ internal class ChrootRuntimeManager internal constructor(
                 requestStop(execution)
                 return
             }
-            execution.handle.markReady()
             flushInputEof(execution)
             execution.startupStage = ChrootRuntimeFailureStage.RUNNING_JOURNAL
             recovery.recordPhase(execution.spec.launchId, ChrootRecoveryPhase.RUNNING)
@@ -629,9 +643,13 @@ internal class ChrootRuntimeManager internal constructor(
     }
 
     private fun stopExecution(execution: Execution) {
+        var claimedBeforeIntent = false
         val undispatched = authority.withLock {
             if (execution.finished) return@withLock null
-            if ((execution.process as? ChrootBrokerProcess)?.wasCancelledBeforeDispatch == true) true
+            if (!execution.intentReserved) {
+                claimedBeforeIntent = claimFinalLocked(execution, ChrootCleanupResult.VERIFIED)
+                true
+            } else if ((execution.process as? ChrootBrokerProcess)?.wasCancelledBeforeDispatch == true) true
             else {
                 // STOP before native READY can abort enrollment and cannot provide the existing
                 // cleanup proof. Keep both listener and stdin alive while the cancelled startup
@@ -645,7 +663,8 @@ internal class ChrootRuntimeManager internal constructor(
                 false
             }
         } ?: return
-        if (undispatched) completeFinal(execution, ChrootCleanupResult.VERIFIED)
+        if (claimedBeforeIntent) publishFinal(execution, ChrootCleanupResult.VERIFIED)
+        else if (undispatched) completeFinal(execution, ChrootCleanupResult.VERIFIED)
         else scheduleStopDeadline(execution)
     }
 
@@ -658,8 +677,8 @@ internal class ChrootRuntimeManager internal constructor(
             }
         }
         if (schedule) scope.launch(dispatcher) {
-            val deadline = clock() + STOP_TIMEOUT_MS
-            delay((deadline - clock()).coerceIn(1L, STOP_TIMEOUT_MS))
+            val deadline = clock() + cleanupTimeoutMs
+            delay((deadline - clock()).coerceIn(1L, cleanupTimeoutMs))
             val decision = authority.withLock {
                 if (execution.finished) null else {
                     // EOF/status collectors may have published their proof just before this
@@ -800,7 +819,6 @@ internal class ChrootRuntimeManager internal constructor(
 
     private companion object {
         const val START_TIMEOUT_MS = 5_000L
-        const val STOP_TIMEOUT_MS = 4_000L
         val NONCE = Regex("[0-9a-f]{24}")
     }
 }
