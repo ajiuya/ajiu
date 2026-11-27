@@ -4,6 +4,13 @@ import com.aicode.core.util.FileLogger
 import com.aicode.feature.agent.domain.plugin.PluginDefinitionReadOnlyException
 import com.aicode.feature.agent.domain.plugin.PluginDefinitionSource
 import com.aicode.feature.workspace.domain.FileAccessProvider
+import com.aicode.feature.workspace.domain.WorkspaceExecutionContext
+import com.aicode.feature.workspace.domain.WorkspaceExecutionContextFactory
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
 import javax.inject.Inject
@@ -14,8 +21,8 @@ import javax.inject.Singleton
  * 启停状态由 [AgentDefinitionConfigRepository] 持有：被禁用的定义仍出现在设置页列表里，
  * 但不进主代理的可派发清单、也不能被 [find] 派发出去。
  *
- * 全局定义 `~/.aicode/agents`、项目级定义 `<workspace>/.aicode/agents`，两者都经 [FileAccessProvider]
- * 以容器路径读写，跟随当前执行环境（本地宿主目录或远程 SSH 工作区）。
+ * CHROOT 的定义与启停配置从固定 App/项目配置目录读写，不要求可运行的实例或 Root 授权。
+ * PRoot/SSH 仍经 [FileAccessProvider] 访问当前环境；所有来源按配置和工作区代次校验。
  */
 @Singleton
 class AgentDefinitionRepository @Inject constructor(
@@ -23,7 +30,8 @@ class AgentDefinitionRepository @Inject constructor(
     private val projectSource: ProjectDirectoryAgentSource,
     private val configRepository: AgentDefinitionConfigRepository,
     private val fileAccess: FileAccessProvider,
-    private val pluginSource: PluginDefinitionSource
+    private val pluginSource: PluginDefinitionSource,
+    private val localDefinitions: LocalAgentDefinitionSource
 ) {
     /**
      * 定义内容版本：经本仓库的 save/delete/setDisabled 修改定义后递增。
@@ -35,25 +43,65 @@ class AgentDefinitionRepository @Inject constructor(
     val definitionsVersion: Long get() = definitionsVersionField.get() + BuiltinAgentPublication.revision.value + pluginSource.revision
 
     fun sourceIdentity(): String =
-        "${fileAccess.agentConfigSourceIdentity()}:${definitionsVersionField.get() + BuiltinAgentPublication.revision.value}:plugins:${pluginSource.revision}"
+        "${localDefinitions.sourceIdentity()}:${definitionsVersionField.get() + BuiltinAgentPublication.revision.value}:plugins:${pluginSource.revision}"
 
     fun checkSourceIdentity(expected: String) {
-        if (sourceIdentity() != expected) throw CancellationException("Agent definition source changed")
+        if (sourceIdentity() != expected) throw AgentDefinitionSourceChanged()
     }
 
     private fun bumpVersion() {
         definitionsVersionField.incrementAndGet()
     }
+    data class DefinitionSnapshot(
+        val sourceIdentity: String,
+        val entries: List<AgentDefinitionEntry>,
+        val disabledNames: Set<String>
+    )
+
+    private fun <T> blockingRead(block: suspend () -> T): T =
+        runBlocking(WorkspaceExecutionContext.blockingContext()) { withContext(Dispatchers.IO) { block() } }
+
+    private fun withPlugins(host: List<AgentDefinitionEntry>): List<AgentDefinitionEntry> {
+        val names = host.map { it.definition.name.lowercase() }.toSet()
+        return (host + pluginSource.agents().filterNot { it.definition.name.lowercase() in names })
+            .sortedBy { it.definition.name.lowercase() }
+    }
+
+    private fun legacyEntries(forceRefresh: Boolean): List<AgentDefinitionEntry> = withPlugins(
+        mergeAll(globalSource.listDefinitions(forceRefresh), projectSource.listDefinitions(forceRefresh)))
+
+    private suspend fun localEntries(capture: LocalAgentDefinitionSource.Capture): List<AgentDefinitionEntry> =
+        withPlugins(mergeAll(localDefinitions.definitions(capture, AgentDefinitionScope.GLOBAL),
+            localDefinitions.definitions(capture, AgentDefinitionScope.PROJECT))).also { localDefinitions.check(capture) }
+
+    suspend fun readDefinitionSnapshot(executionFactory: WorkspaceExecutionContextFactory, forceRefresh: Boolean = false): DefinitionSnapshot {
+        val source = sourceIdentity()
+        val local = localDefinitions.capture()
+        val snapshot = if (local != null) withContext(Dispatchers.IO) {
+            DefinitionSnapshot(source, localEntries(local), localDefinitions.disabledNames(local))
+                .also { localDefinitions.check(local) }
+        } else {
+            val execution = executionFactory.freeze()
+            withContext(Dispatchers.IO + execution) {
+                DefinitionSnapshot(source, legacyEntries(forceRefresh), configRepository.disabledNames())
+                    .also { execution.checkCurrent() }
+            }
+        }
+        currentCoroutineContext().ensureActive()
+        checkSourceIdentity(source)
+        return snapshot
+    }
+
     /** 全部定义（含来源作用域），未过滤禁用，按名称排序。 */
     fun listAll(): List<AgentDefinitionEntry> = listAll(forceRefresh = false)
 
     fun listAll(forceRefresh: Boolean): List<AgentDefinitionEntry> {
         val source = sourceIdentity()
-        val host = mergeAll(globalSource.listDefinitions(forceRefresh), projectSource.listDefinitions(forceRefresh))
-        val hostNames = host.map { it.definition.name.lowercase() }.toSet()
-        return (host + pluginSource.agents().filterNot { it.definition.name.lowercase() in hostNames })
-            .sortedBy { it.definition.name.lowercase() }
-            .also { checkSourceIdentity(source) }
+        return blockingRead {
+            val local = localDefinitions.capture()
+            (if (local != null) localEntries(local) else legacyEntries(forceRefresh))
+                .also { checkSourceIdentity(source) }
+        }
     }
 
     private fun definitionsIn(scope: AgentDefinitionScope): List<AgentDefinition> {
@@ -70,9 +118,15 @@ class AgentDefinitionRepository @Inject constructor(
 
     private fun listEnabled(forceRefresh: Boolean): List<AgentDefinitionEntry> {
         val source = sourceIdentity()
-        val disabled = configRepository.disabledNames()
-        return listAll(forceRefresh).filterNot { it.definition.name.lowercase() in disabled }
-            .also { checkSourceIdentity(source) }
+        return blockingRead {
+            val local = localDefinitions.capture()
+            val disabled = if (local != null) localDefinitions.disabledNames(local) else configRepository.disabledNames()
+            val entries = if (local != null) localEntries(local) else legacyEntries(forceRefresh)
+            entries.filterNot { it.definition.name.lowercase() in disabled }.also {
+                if (local != null) localDefinitions.check(local)
+                checkSourceIdentity(source)
+            }
+        }
     }
 
     /** 按名称查找可派发的定义（忽略大小写）；不存在或已被禁用时返回 null。 */
@@ -112,6 +166,19 @@ class AgentDefinitionRepository @Inject constructor(
         val name = form.name.trim()
         if (!isValidName(name)) return AgentSaveError.INVALID_NAME
         if (form.prompt.isBlank()) return AgentSaveError.EMPTY_PROMPT
+
+        try {
+            blockingRead {
+                val local = localDefinitions.capture()
+                if (local != null) true to localDefinitions.save(local, form, scope, originalName) else false to null
+            }.let { (handled, result) ->
+                if (handled) { if (result == null) bumpVersion(); return result }
+            }
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            FileLogger.e(TAG, "保存子代理定义失败: $name", e)
+            return AgentSaveError.IO_FAILED
+        }
 
         val entries = try { definitionsIn(scope) } catch (e: Exception) {
             if (e is CancellationException) throw e
@@ -167,6 +234,14 @@ class AgentDefinitionRepository @Inject constructor(
     /** 删除指定作用域的定义文件，不可恢复。返回是否成功。 */
     fun delete(name: String, scope: AgentDefinitionScope): Boolean {
         if (scope == AgentDefinitionScope.PLUGIN) return false
+        val localResult = blockingRead {
+            val local = localDefinitions.capture()
+            if (local != null) localDefinitions.delete(local, name, scope) else null
+        }
+        if (localResult != null) {
+            if (localResult) bumpVersion()
+            return localResult
+        }
         val entry = definitionsIn(scope).firstOrNull { it.name.equals(name, ignoreCase = true) } ?: return false
         val filePath = entry.filePath ?: return false
         val provider = fileAccess

@@ -35,8 +35,8 @@ import javax.inject.Singleton
  * - 静态基线：`prompts/` 顶层 `<NN>-<名称>.md`，可被 `prompts.custom/` 按数字身份覆盖或新增；
  * - 按需叶子：`prompts/agent/` 下的无数字片段（子代理基线、压缩/标题提示词），按精确同名覆盖。
  *
- * `prompts.custom/` 存在 [PromptFragmentResolver.DISABLE_BUILTIN_FILE] 时，主代理提示词只由自定义数字片段组成，
- * 不再注入任何内置来源；此时用 `{{AICODE_*}}` 变量按需取回动态内容。
+ * `prompts.custom/` 存在 [PromptFragmentResolver.DISABLE_BUILTIN_FILE] 时，行为提示词只由自定义数字片段组成。
+ * 可用子代理名称与派发参数仍作为工具元数据提供；其它动态内容通过 `{{AICODE_*}}` 按需取回。
  */
 @Singleton
 class SystemPromptProvider @Inject constructor(
@@ -125,6 +125,7 @@ class SystemPromptProvider @Inject constructor(
         private val cachedByKey = ConcurrentHashMap<SourceCacheKey, String>()
 
         override fun build(ctx: AgentContext): String? {
+            if (ctx.isSubagent) return null
             val source = try { agentDefinitionRepository.sourceIdentity() } catch (e: Exception) {
                 if (e is CancellationException) throw e
                 return null
@@ -407,33 +408,39 @@ class SystemPromptProvider @Inject constructor(
     }
 
     /**
-     * [PromptFragmentResolver.DISABLE_BUILTIN_FILE] 生效时：只输出 `prompts.custom/` 顶层的数字片段，
-     * 不注入任何内置来源；动态内容仅通过 `{{AICODE_*}}` 变量按需取回。
+     * 禁用内置行为片段不移除 task 选择命名代理所需的目录；自定义片段已有清单变量时不重复列表。
+     * 其它来源仍只通过自定义片段的变量展示。
      */
     private fun buildCustomOnly(ctx: AgentContext, environmentContent: String): String {
         val content = promptFragmentCatalog.renderCustomOnly(ctx.projectRoot)
         if (content.isEmpty()) {
             FileLogger.w(
                 TAG,
-                "已启用 ${PromptFragmentResolver.DISABLE_BUILTIN_FILE}，但 $customDir 下没有 <两位数字>-<名称>.md 片段，系统提示词为空"
+                "已启用 ${PromptFragmentResolver.DISABLE_BUILTIN_FILE}，但 $customDir 下没有 <两位数字>-<名称>.md 片段，仅保留可用子代理元数据"
             )
-            return ""
         }
-        val memories = memoryListSource.build(ctx)
-        val projectRules = projectRuleSource.build(ctx)
-        return renderVariables(
+        val subAgents = subAgentListSource.build(ctx)
+        val memories = if (MEMORY_GLOBAL_VAR in content || MEMORY_PROJECT_VAR in content) memoryListSource.build(ctx)
+            else MemoryLists(null, null)
+        val projectRules = if (PROJECT_RULES_GLOBAL_VAR in content || PROJECT_RULES_PROJECT_VAR in content || PROJECT_RULES_VAR in content)
+            projectRuleSource.build(ctx) else null
+        val rendered = renderVariables(
             content,
-            activeSkillsSource.build(ctx),
+            if (SKILLS_VAR in content) activeSkillsSource.build(ctx) else null,
             memories.global,
             memories.project,
-            subAgentListSource.build(ctx),
+            subAgents,
             projectRules?.global,
             projectRules?.project,
             workspaceSource.build(ctx),
             environmentContent,
             currentDate(),
-            goal = renderGoalBlock(ctx)
+            goal = if (GOAL_VAR in content) renderGoalBlock(ctx) else null
         )
+        if (subAgents.isNullOrBlank()) return rendered
+        val catalog = resolvePrompt(SUBAGENT_CATALOG_FILE)
+            .replace(SUBAGENTS_VAR, if (SUBAGENTS_VAR in content) "" else subAgents)
+        return collapseBlankLines(listOf(rendered, catalog).filter { it.isNotBlank() }.joinToString("\n\n"))
     }
 
     /**
@@ -591,6 +598,7 @@ class SystemPromptProvider @Inject constructor(
         const val CLAUDE_FILE = "CLAUDE.md"
         const val SUBAGENT_BASE_FILE = "agent/subagent-base.md"
         const val SUBAGENT_CONTEXT_FILE = "agent/subagent-context.md"
+        const val SUBAGENT_CATALOG_FILE = "agent/subagent-catalog.md"
         const val MAX_AGENTS_CHARS = 32_000
         /** 会话级缓存 key 数量上限：超过后整体清空，仅防长期累积；正常会话数远小于此。 */
         const val SOURCE_CACHE_LIMIT = 32

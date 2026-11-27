@@ -77,7 +77,8 @@ class PluginDefinitionRepositoryTest {
         SkillRepository(GlobalDirectorySkillSource(fileAccess), ProjectDirectorySkillSource(fileAccess), skillConfig, fileAccess, pluginSource, localDefinitions)
     }
     private val agents by lazy {
-        AgentDefinitionRepository(GlobalDirectoryAgentSource(fileAccess), ProjectDirectoryAgentSource(fileAccess), agentConfig, fileAccess, pluginSource)
+        AgentDefinitionRepository(GlobalDirectoryAgentSource(fileAccess), ProjectDirectoryAgentSource(fileAccess), agentConfig, fileAccess, pluginSource,
+            com.aicode.feature.agent.domain.subagent.legacyAgentDefinitions(fileAccess))
     }
 
     private fun hostFile(path: String) = File(temp.root, "host/" + path.removePrefix("~/"))
@@ -312,7 +313,8 @@ class PluginDefinitionRepositoryTest {
         every { hub.watchAicode(any(), any(), any(), any(), any()) } returns emptyFlow()
         every { hub.watchWorkspace(any(), any(), any(), any(), any()) } returns emptyFlow()
         val skillConfig = SkillConfigRepository(installer, projectRoot, hub, access, localDefinitions)
-        val agentConfig = AgentDefinitionConfigRepository(installer, projectRoot, hub, access)
+        val agentConfig = AgentDefinitionConfigRepository(installer, projectRoot, hub, access,
+            com.aicode.feature.agent.domain.subagent.legacyAgentDefinitions(access))
         assertThrows(PluginDefinitionReadOnlyException::class.java) { skillConfig.setDisabled("any", true, SkillScope.PLUGIN) }
         assertThrows(PluginDefinitionReadOnlyException::class.java) { agentConfig.setDisabled("any", true, AgentDefinitionScope.PLUGIN) }
         verify { installer wasNot Called; projectRoot wasNot Called; access wasNot Called }

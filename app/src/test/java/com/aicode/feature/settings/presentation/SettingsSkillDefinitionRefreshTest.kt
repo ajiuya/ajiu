@@ -81,6 +81,9 @@ class SettingsSkillDefinitionRefreshTest {
     private val dispatcher = StandardTestDispatcher()
     private val store = ViewModelStore()
     private val skillRepository = mockk<SkillRepository>()
+    private val agentRepository = mockk<com.aicode.feature.agent.domain.subagent.AgentDefinitionRepository>()
+    private var agentSource = "fixture-subagents"
+    private var agentSnapshot = com.aicode.feature.agent.domain.subagent.AgentDefinitionRepository.DefinitionSnapshot(agentSource, emptyList(), emptySet())
     private val definitionFactory = mockk<WorkspaceExecutionContextFactory>()
     private val skillChanges = MutableSharedFlow<Unit>()
     private val chrootProfile = ContainerProfile(
@@ -112,8 +115,13 @@ class SettingsSkillDefinitionRefreshTest {
             snapshotReads++
             readSnapshot()
         }
+        every { agentRepository.sourceIdentity() } answers { agentSource }
+        every { agentRepository.checkSourceIdentity(any()) } answers {
+            if (firstArg<String>() != agentSource) throw com.aicode.feature.agent.domain.subagent.AgentDefinitionSourceChanged()
+        }
+        coEvery { agentRepository.readDefinitionSnapshot(definitionFactory, forceRefresh = true) } answers { agentSnapshot }
         coEvery { definitionFactory.freeze(null, null, null) } throws
-            CancellationException("fixture-unrelated-subagent-startup")
+            AssertionError("Settings definition refresh must not freeze guest execution")
         viewModel = createViewModel()
         store.put("settings-skills", viewModel)
         settle()
@@ -139,6 +147,33 @@ class SettingsSkillDefinitionRefreshTest {
             unmockkObject(FileLogger)
             Dispatchers.resetMain()
         }
+    }
+
+    @Test
+    fun subagentRefreshIncludesDisabledRolesWithoutFreezingUncreatedChroot() {
+        val role = com.aicode.feature.agent.domain.subagent.AgentDefinition(name = "编码员", description = "code", prompt = "body")
+        agentSnapshot = agentSnapshot.copy(entries = listOf(com.aicode.feature.agent.domain.subagent.AgentDefinitionEntry(
+            role, com.aicode.feature.agent.domain.subagent.AgentDefinitionScope.GLOBAL)), disabledNames = setOf("编码员"))
+        viewModel.refreshSubAgents()
+        settle()
+        assertEquals("编码员", viewModel.subAgents.value.single().name)
+        assertTrue(viewModel.subAgents.value.single().disabled)
+        assertNoGuestFreezeForExplicitSkillOperations()
+    }
+
+    @Test
+    fun subagentSourceChangeCannotPublishAStaleSnapshot() {
+        val role = com.aicode.feature.agent.domain.subagent.AgentDefinition(name = "旧角色", description = "", prompt = "body")
+        agentSnapshot = agentSnapshot.copy(entries = listOf(com.aicode.feature.agent.domain.subagent.AgentDefinitionEntry(
+            role, com.aicode.feature.agent.domain.subagent.AgentDefinitionScope.GLOBAL)))
+        viewModel.refreshSubAgents()
+        settle()
+        assertEquals("旧角色", viewModel.subAgents.value.single().name)
+        agentSource = "another-workspace"
+        viewModel.refreshSubAgents()
+        settle()
+        assertTrue(viewModel.subAgents.value.isEmpty())
+        assertNoGuestFreezeForExplicitSkillOperations()
     }
 
     @Test
@@ -466,9 +501,7 @@ class SettingsSkillDefinitionRefreshTest {
             every { currentProjectRulesFlow } returns MutableStateFlow(emptyList())
         },
         skillRepository = skillRepository,
-        agentDefinitionRepository = mockk(relaxed = true) {
-            every { sourceIdentity() } returns "fixture-subagents"
-        },
+        agentDefinitionRepository = agentRepository,
         agentDefinitionConfigRepository = mockk(relaxed = true) {
             every { changes } returns MutableSharedFlow()
         },

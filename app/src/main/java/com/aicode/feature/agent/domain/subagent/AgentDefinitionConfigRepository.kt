@@ -7,6 +7,17 @@ import com.aicode.feature.agent.domain.plugin.PluginDefinitionReadOnlyException
 import com.aicode.feature.agent.domain.container.ContainerInstaller
 import com.aicode.feature.workspace.domain.FileAccessProvider
 import com.aicode.feature.workspace.domain.ProjectAicodeRoot
+import com.aicode.feature.workspace.domain.WorkspaceExecutionContext
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.emitAll
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flow
 import java.io.File
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -36,12 +47,14 @@ import kotlinx.serialization.json.putJsonArray
  * 格式 `{"disabled": ["name-a"]}`，只存禁用名单；生效禁用集合 = 全局 + 项目并集。
  * 每次读取都从磁盘加载，外部手工编辑即时生效；名单里已不存在的子代理名在过滤时天然被忽略。
  */
+@OptIn(ExperimentalCoroutinesApi::class)
 @Singleton
 class AgentDefinitionConfigRepository @Inject constructor(
     private val containerInstaller: ContainerInstaller,
     private val projectAicodeRoot: ProjectAicodeRoot,
     private val fileChangeHub: FileChangeHub,
-    private val fileAccess: FileAccessProvider
+    private val fileAccess: FileAccessProvider,
+    private val localDefinitions: LocalAgentDefinitionSource
 ) {
     /** 本地全局配置文件，仅用于宿主文件变更监听。 */
     private fun globalFile(): File = File(containerInstaller.aicodeDir, CONFIG_FILE)
@@ -56,7 +69,7 @@ class AgentDefinitionConfigRepository @Inject constructor(
      * 子代理目录或配置文件被外部修改时广播一次。订阅驱动：只在有订阅者（设置页）期间才由
      * [FileChangeHub] 监听子代理目录与两个 agents.json，无人订阅时零开销。
      */
-    val changes: SharedFlow<Unit> = merge(
+    private fun legacyChanges() = merge(
         fileChangeHub.watchAicode(AGENTS_DIR, recursive = true),
         fileChangeHub.watchAicode(),
         fileChangeHub.watchWorkspace("${FileChangeHub.CONTAINER_ROOT}/$AICODE_DIR/$AGENTS_DIR", recursive = true),
@@ -65,6 +78,21 @@ class AgentDefinitionConfigRepository @Inject constructor(
         if (!batch.changes.any(::isAgentChange)) return@mapNotNull null
         FileLogger.i(TAG, "检测到子代理目录或配置变化，已通知刷新")
         Unit
+    }
+
+    val changes: SharedFlow<Unit> = localDefinitions.sourceSignals().flatMapLatest {
+        flow {
+            emit(Unit)
+            val local = localDefinitions.capture()
+            if (local != null) emitAll(localDefinitions.changes(local, fileChangeHub))
+            else emitAll(legacyChanges())
+        }.catch { failure ->
+            when (failure) {
+                is AgentDefinitionSourceChanged -> currentCoroutineContext().ensureActive()
+                is CancellationException -> throw failure
+                else -> FileLogger.w(TAG, "Agent definition watch unavailable", failure)
+            }
+        }
     }.shareIn(watchScope, SharingStarted.WhileSubscribed(), replay = 0)
 
     /** 子代理相关变更：两个 agents.json，或全局/项目子代理目录自身及其下的任何文件。 */
@@ -79,19 +107,28 @@ class AgentDefinitionConfigRepository @Inject constructor(
     }
 
     /** 当前生效的禁用子代理名集合（全局 + 项目并集，归一化为小写）。 */
-    fun disabledNames(): Set<String> =
-        (readGlobalDisabled() + readDisabled(projectFile())).map { it.lowercase() }.toSet()
+    fun disabledNames(): Set<String> = runBlocking(WorkspaceExecutionContext.blockingContext()) {
+        withContext(Dispatchers.IO) {
+            val local = localDefinitions.capture()
+            if (local != null) localDefinitions.disabledNames(local)
+            else (readGlobalDisabled() + readDisabled(projectFile())).map { it.lowercase() }.toSet()
+        }
+    }
 
     /** 在指定作用域的配置中启用/禁用某个子代理。 */
     fun setDisabled(name: String, disabled: Boolean, scope: AgentDefinitionScope) {
         if (scope == AgentDefinitionScope.PLUGIN) throw PluginDefinitionReadOnlyException()
-        val names = (if (scope == AgentDefinitionScope.GLOBAL) readGlobalDisabled() else readDisabled(projectFile()))
-            .toMutableSet()
-        if (disabled) names.add(name) else names.removeAll { it.equals(name, ignoreCase = true) }
-        if (scope == AgentDefinitionScope.GLOBAL) {
-            fileAccess.writeFile(GLOBAL_CONFIG_PATH, serializeDisabled(names))
-        } else {
-            writeDisabled(projectFile(), names)
+        runBlocking(WorkspaceExecutionContext.blockingContext()) {
+            withContext(Dispatchers.IO) {
+                val local = localDefinitions.capture()
+                if (local != null) localDefinitions.setDisabled(local, name, disabled, scope) else {
+                    val names = (if (scope == AgentDefinitionScope.GLOBAL) readGlobalDisabled() else readDisabled(projectFile()))
+                        .toMutableSet()
+                    if (disabled) names.add(name) else names.removeAll { it.equals(name, ignoreCase = true) }
+                    if (scope == AgentDefinitionScope.GLOBAL) fileAccess.writeFile(GLOBAL_CONFIG_PATH, serializeDisabled(names))
+                    else writeDisabled(projectFile(), names)
+                }
+            }
         }
     }
 
@@ -99,6 +136,7 @@ class AgentDefinitionConfigRepository @Inject constructor(
         if (fileAccess.isFile(GLOBAL_CONFIG_PATH)) parseDisabled(fileAccess.readFile(GLOBAL_CONFIG_PATH))
         else emptySet()
     }.getOrElse {
+        if (it is CancellationException) throw it
         FileLogger.w(TAG, "读取 $CONFIG_FILE 失败: ${it.message}")
         emptySet()
     }

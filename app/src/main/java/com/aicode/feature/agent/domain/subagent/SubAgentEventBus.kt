@@ -72,7 +72,7 @@ data class SubAgentEvent(
  * 在子会话上启动 AI 工作流；子会话工作流结束时 ViewModel 再发 COMPLETED/FAILED，
  * 父会话据此注入后台通知（类比 terminal 的 notify=true 异步回调）。
  *
- * 同时维护活跃子代理会话 id 集合，供 TaskTool 查询并发上限（最多 5 个运行中）。
+ * 同时维护活跃子代理会话 id 集合，供 TaskTool 查询并发上限（最多 9 个运行中）。
  * 活跃集合与预留计数都在 [slotLock] 内更新：同一批工具并行执行时多个 task(create)
  * 会并发触达这里，读-改-写不持锁会丢更新（多占或漏占名额）。
  */
@@ -203,6 +203,6 @@ class SubAgentEventBus private constructor(
     companion object {
 
         /** 同时运行的子代理上限。判定以此为准，工具层只引用不自己再写一份。 */
-        const val MAX_RUNNING = 5
+        const val MAX_RUNNING = 9
     }
 }

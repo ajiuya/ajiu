@@ -80,7 +80,8 @@ class BuiltinAgentPublicationTest {
         val pluginSource = mockk<PluginDefinitionSource>()
         every { pluginSource.revision } returns 0
         every { pluginSource.agents() } returns emptyList()
-        val repository = AgentDefinitionRepository(global, project, config, provider, pluginSource)
+        val repository = AgentDefinitionRepository(global, project, config, provider, pluginSource,
+            com.aicode.feature.agent.domain.subagent.legacyAgentDefinitions(provider))
         val before = repository.definitionsVersion
         assertTrue(repository.listAll().isEmpty())
         LocalBuiltinDefinitionStore.install(root, agents)

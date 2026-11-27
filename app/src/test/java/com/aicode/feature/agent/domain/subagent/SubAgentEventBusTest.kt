@@ -106,8 +106,10 @@ class SubAgentEventBusTest {
         // 预留未落地时 active 集合还是空，但计数必须把预留算进去，否则并行的创建会双双通过检查
         assertEquals(0, bus.activeSubSessionIds.value.size)
         assertEquals(3, bus.activeCount)
-        assertFalse("3 预留 + 3 再要 > 5，应拒绝", bus.tryReserveSlots(3))
-        assertTrue("3 预留 + 2 再要 = 5，应允许", bus.tryReserveSlots(2))
+        assertTrue("3 预留 + 6 再要 = 9，应允许", bus.tryReserveSlots(6))
+        assertEquals(9, bus.activeCount)
+        assertTrue(bus.isFull)
+        assertFalse("第十个名额应拒绝", bus.tryReserveSlots(1))
     }
 
     @Test
@@ -165,7 +167,7 @@ class SubAgentEventBusTest {
         threads.forEach { it.start() }
         threads.forEach { it.join() }
 
-        assertEquals("并发下恰好只有 5 个线程能占住名额", SubAgentEventBus.MAX_RUNNING, acquired.get())
+        assertEquals("并发下恰好只有 9 个线程能占住名额", SubAgentEventBus.MAX_RUNNING, acquired.get())
         assertEquals(SubAgentEventBus.MAX_RUNNING, bus.activeCount)
     }
 

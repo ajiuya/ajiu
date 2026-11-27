@@ -50,7 +50,7 @@ class AgentDefinitionTest {
         every { fileAccess.writeFile("~/.aicode/agents.json", any(), any(), any()) } answers {
             File(activeGlobalRoot, "agents.json").writeText(secondArg())
         }
-        configRepository = AgentDefinitionConfigRepository(installer, projectAicodeRoot, hub, fileAccess)
+        configRepository = AgentDefinitionConfigRepository(installer, projectAicodeRoot, hub, fileAccess, legacyAgentDefinitions(fileAccess))
     }
 
     @Test

@@ -1717,52 +1717,50 @@ class SettingsViewModel @Inject constructor(
     fun refreshSubAgents() {
         val owner = ++subAgentRefreshOwner
         viewModelScope.launch {
-            val result = try {
-                val execution = definitionExecutionContextFactory.freeze()
-                withContext(Dispatchers.IO + execution) {
-                    val source = agentDefinitionRepository.sourceIdentity()
-                    if (owner == subAgentRefreshOwner && subAgentsListSource != source) {
-                        _subAgents.value = emptyList()
-                        subAgentsListSource = source
-                    }
-                    val disabled = agentDefinitionRepository.disabledNames()
-                    val entries = agentDefinitionRepository.listAll(forceRefresh = true).map { entry ->
-                        SubAgentUiEntry(
-                            name = entry.definition.name,
-                            description = entry.definition.description,
-                            scope = entry.scope,
-                            disabled = entry.definition.name.lowercase() in disabled,
-                            providerId = entry.definition.providerId,
-                            model = entry.definition.model,
-                            reasoningEffort = entry.definition.reasoningEffort,
-                            allowedTools = entry.definition.allowedTools,
-                            disallowedTools = entry.definition.disallowedTools,
-                            inject = entry.definition.inject,
-                            prompt = entry.definition.prompt,
-                            filePath = entry.definition.filePath
-                        )
-                    }
-                    agentDefinitionRepository.checkSourceIdentity(source)
-                    source to entries
+            try {
+                val source = agentDefinitionRepository.sourceIdentity()
+                if (owner == subAgentRefreshOwner && subAgentsListSource != source) {
+                    _subAgents.value = emptyList()
+                    subAgentsListSource = null
                 }
-            } catch (e: Exception) {
+                val snapshot = agentDefinitionRepository.readDefinitionSnapshot(definitionExecutionContextFactory, forceRefresh = true)
+                val entries = snapshot.entries.map { entry ->
+                    SubAgentUiEntry(
+                        name = entry.definition.name,
+                        description = entry.definition.description,
+                        scope = entry.scope,
+                        disabled = entry.definition.name.lowercase() in snapshot.disabledNames,
+                        providerId = entry.definition.providerId,
+                        model = entry.definition.model,
+                        reasoningEffort = entry.definition.reasoningEffort,
+                        allowedTools = entry.definition.allowedTools,
+                        disallowedTools = entry.definition.disallowedTools,
+                        inject = entry.definition.inject,
+                        prompt = entry.definition.prompt,
+                        filePath = entry.definition.filePath
+                    )
+                }
+                kotlinx.coroutines.currentCoroutineContext().ensureActive()
                 if (owner == subAgentRefreshOwner) {
-                    try {
-                        if (agentDefinitionRepository.sourceIdentity() != subAgentsListSource) { _subAgents.value = emptyList(); subAgentsListSource = null }
-                    } catch (changed: Exception) {
-                        _subAgents.value = emptyList()
-                        subAgentsListSource = null
-                        if (changed is kotlinx.coroutines.CancellationException) throw changed
-                    }
+                    agentDefinitionRepository.checkSourceIdentity(snapshot.sourceIdentity)
+                    subAgentsListSource = snapshot.sourceIdentity
+                    _subAgents.value = entries
                 }
-                if (e is kotlinx.coroutines.CancellationException) throw e
-                FileLogger.w("SettingsViewModel", "刷新子代理失败", e)
-                return@launch
-            }
-            if (owner == subAgentRefreshOwner) {
-                agentDefinitionRepository.checkSourceIdentity(result.first)
-                subAgentsListSource = result.first
-                _subAgents.value = result.second
+            } catch (_: com.aicode.feature.agent.domain.subagent.AgentDefinitionSourceChanged) {
+                kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                if (owner == subAgentRefreshOwner) {
+                    _subAgents.value = emptyList()
+                    subAgentsListSource = null
+                }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                if (owner == subAgentRefreshOwner) {
+                    _subAgents.value = emptyList()
+                    subAgentsListSource = null
+                }
+                FileLogger.w("SettingsViewModel", "刷新子代理失败", failure)
             }
         }
     }

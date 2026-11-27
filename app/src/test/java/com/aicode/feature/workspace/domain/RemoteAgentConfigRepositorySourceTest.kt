@@ -63,7 +63,7 @@ class RemoteAgentConfigRepositorySourceTest {
     private fun agentRepository(disabled: Set<String> = emptySet()): AgentDefinitionRepository {
         val config = mockk<AgentDefinitionConfigRepository>()
         every { config.disabledNames() } returns disabled
-        return AgentDefinitionRepository(GlobalDirectoryAgentSource(provider), ProjectDirectoryAgentSource(provider), config, provider, pluginSource)
+        return AgentDefinitionRepository(GlobalDirectoryAgentSource(provider), ProjectDirectoryAgentSource(provider), config, provider, pluginSource, legacyAgentDefinitions(provider))
     }
 
     @Test fun skillSourcesKeepProjectPrioritySkillMdPreferenceFrontmatterAndCompleteInstructions() {

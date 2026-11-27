@@ -86,6 +86,7 @@ class SystemPromptEnvironmentTest {
         // No real app assets, guest rootfs, installer, Root, or execution factory is needed.
         writePrompt("prompts/$MAIN_FILE", "MAIN_ENV=$ENV")
         writePrompt("prompts/agent/subagent-base.md", "BASE_ENV=$ENV")
+        writePrompt("prompts/agent/subagent-catalog.md", "CATALOG\n{{AICODE_SUBAGENTS}}\nUse task.agent for named roles.")
         writePrompt("prompts/agent/subagent-context.md", "CONTEXT_ENV=$ENV\nNAME={{AICODE_SUBAGENT_NAME}}")
         val projectRoot = mockk<ProjectAicodeRoot>()
         every { projectRoot.forPath(any()) } answers { File(firstArg<String>(), ".aicode") }
@@ -388,11 +389,43 @@ class SystemPromptEnvironmentTest {
         assertThrows(CancellationException::class.java) { provider.build(context) }
     }
 
-    @Test fun disabledBuiltinWithoutCustomFragmentsRemainsEmptyEvenIfMetadataIsUnreadable() {
+    @Test fun disabledBuiltinWithoutCustomFragmentsStillDiscoversRolesWithoutRestoringOtherSources() {
         disableBuiltin()
         store.readFailure = IOException("fixture unavailable")
+        val result = provider.build(context)
+        assertTrue(result.contains("nested-agent-sentinel"))
+        assertTrue(result.contains("task.agent"))
+        assertFalse(result.contains("MAIN_ENV="))
+        assertFalse(result.contains("skill-sentinel"))
+        assertFalse(result.contains("memory-sentinel"))
+        verify(exactly = 0) { skills.listSkills() }
+        verify(exactly = 1) { agents.listEnabled() }
+    }
+
+    @Test fun customRoleVariableIsNotDuplicatedByTheIndependentCatalog() {
+        disableBuiltin()
+        writePrompt("prompts.custom/10-roles.md", "MY_ROLES={{AICODE_SUBAGENTS}}")
+        val result = provider.build(context)
+        assertEquals(1, Regex("nested-agent-sentinel").findAll(result).count())
+        assertTrue(result.contains("MY_ROLES="))
+        assertTrue(result.contains("task.agent"))
+    }
+
+    @Test fun disabledOrDeletedRolesDisappearFromCustomOnlyPromptInTheSameSession() {
+        disableBuiltin()
+        var revision = 0L
+        every { agents.definitionsVersion } answers { revision }
+        assertTrue(provider.build(context).contains("nested-agent-sentinel"))
+        every { agents.listEnabled() } returns emptyList()
+        revision++
         assertEquals("", provider.build(context))
-        verify(exactly = 0) { skills.listSkills(); agents.listEnabled() }
+    }
+
+    @Test fun genericChildDoesNotReceiveNamedRoleCatalogWhenBuiltinIsDisabled() {
+        disableBuiltin()
+        val result = provider.build(context.copy(isSubagent = true))
+        assertEquals("", result)
+        verify(exactly = 0) { agents.listEnabled() }
     }
 
     @Test fun emptyCustomOnlyStillRejectsModeAbaBeforeReturning() {
@@ -406,7 +439,10 @@ class SystemPromptEnvironmentTest {
         writePrompt("prompts.custom/99-empty.md", "")
         assertEquals("", provider.build(context))
         disableBuiltin()
-        assertEquals("", provider.build(context))
+        val result = provider.build(context)
+        assertTrue(result.contains("nested-agent-sentinel"))
+        assertFalse(result.contains("MAIN_ENV="))
+        assertFalse(result.contains("CHROOT"))
     }
 
     @Test fun disabledNumberedFragmentIsNotRestoredByEnvironmentRendering() {

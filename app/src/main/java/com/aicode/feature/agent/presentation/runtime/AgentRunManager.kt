@@ -1599,6 +1599,7 @@ class AgentRunManager internal constructor(
                     goalStatus = sessionDomain?.goalStatus,
                     reasoningEffort = sessionDomain?.reasoningEffort?.apiValue,
                     agentDefinition = agentDefinition,
+                    isSubagent = isSubSession,
                     recoveryRunId = ownedRun.id,
                     requireFreshFileRead = resuming,
                     projectMemoryIdentity = frozenCapture.identity,
@@ -2563,6 +2564,7 @@ class AgentRunManager internal constructor(
                     language = currentFile?.let { detectLanguage(it) }, projectRoot = entity.workspacePath,
                     sessionId = sid, goal = domain.goal, goalStatus = domain.goalStatus,
                     reasoningEffort = domain.reasoningEffort?.apiValue, agentDefinition = definition,
+                    isSubagent = entity.parentId != null,
                     projectMemoryCapture = capture, projectMemoryIdentity = capture.identity)
                 val tools = effectiveSessionTools(definition, entity.parentId != null, domain.goalStatus == GoalStatus.ACTIVE)
                 val changed = agentWorkflow.compactSession(sid, snapshot, tools) { event ->

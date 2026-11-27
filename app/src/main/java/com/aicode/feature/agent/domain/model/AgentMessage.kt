@@ -99,6 +99,8 @@ data class AgentContext(
     val persistInputSnapshot: Boolean = false,
     val transientInput: Boolean = false,
     val recoveryRunId: String? = null,
-    val requireFreshFileRead: Boolean = false
+    val requireFreshFileRead: Boolean = false,
+    /** 默认通用子代理也属于子会话，不能因没有命名定义而收到父代理的角色目录。 */
+    val isSubagent: Boolean = false
 ) {
 }
