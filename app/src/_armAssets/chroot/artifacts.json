@@ -1,13 +1,13 @@
 [
   {
     "name": "libajiu_chroot_runtime.so",
-    "bytes": 892160,
-    "sha256": "cee99a59051175bf77fa0e5263afc9714a20d5fe9a4580f402d124dd7164bef4"
+    "bytes": 892240,
+    "sha256": "5114a9d464cd3acb922e4e3e6bb75eb2270a8506761e1d1395c5eb39a6ea6418"
   },
   {
     "name": "libajiu_chroot_installer.so",
-    "bytes": 726952,
-    "sha256": "d39b2857957ca04f5f9225d4624ea29c135fdacd2b833b99062082eb01afa935"
+    "bytes": 727552,
+    "sha256": "7fcc6766d42d281005ff0e2ed3017a9574ebdf335ee0c764256c583cce095299"
   },
   {
     "name": "libajiu_file_worker.so",
@@ -16,7 +16,7 @@
   },
   {
     "name": "libajiu_chroot_broker.so",
-    "bytes": 749800,
-    "sha256": "6c8892c5b8bb9e719eaf7d36e677c4701fa19061da0f6a6fb508a994bc56b506"
+    "bytes": 749776,
+    "sha256": "20bcee9e4c01f143166c2cea80e8ef359ee39a9a76abc62d6fba64c070c64753"
   }
 ]

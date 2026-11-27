@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <linux/magic.h>
 #include <linux/openat2.h>
 #include <linux/stat.h>
 #include <poll.h>
@@ -17,6 +18,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/vfs.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -27,6 +29,17 @@
 #define HASH_SIZE (MAX_ENTRIES * 2U)
 #define PREFIX "ajiu-chroot-rootfs-"
 #define DIR_FLAGS (O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+/* Presence alone also blocks runtime_helper, even if this file is incomplete. */
+#define REMOVE_RECEIPT "remove-after-reboot"
+#define REMOVE_MAGIC UINT64_C(0x414a525200000001)
+#define MAX_RECOVERY_VIEWS 4096U
+
+struct removal_receipt {
+    uint64_t magic, identity[8]; /* base, root, views, manifest: dev/ino pairs */
+    char instance[24], boot_id[36];
+    uint32_t reserved;
+};
+_Static_assert(sizeof(struct removal_receipt) == 136, "bounded receipt layout");
 
 struct entry {
     char *path;
@@ -41,11 +54,14 @@ struct install {
     uint32_t *index;
     uint32_t count;
     uint64_t bytes, names;
-    int local, base, root, views, manifest;
+    int local, base, root, views, manifest, receipt;
     char name[sizeof(PREFIX) + 24];
     struct stat base_stat, root_stat, views_stat;
     uint64_t mount_id;
     bool base_created, root_created, views_created, base_known, root_known, views_known, validate, mutable_tree;
+    bool recover_remove, recovery_ready, reboot_required;
+    struct removal_receipt receipt_data;
+    struct stat receipt_stat;
 };
 static const char *stage = "arguments";
 static volatile sig_atomic_t timed_out;
@@ -340,15 +356,30 @@ static int views_empty(struct install *s)
 }
 
 static int remove_mutable_tree(struct install *s);
+static int recovery_gate(struct install *s);
+static int finish_base(struct install *s);
+static int installed_anchors_current(struct install *s, bool empty_views);
+
+static int receipt_absent(int base)
+{
+    struct stat st;
+    if (fstatat(base, REMOVE_RECEIPT, &st, AT_SYMLINK_NOFOLLOW) == 0) { errno = EBUSY; return -1; }
+    return errno == ENOENT ? 0 : -1;
+}
 
 static int rollback(struct install *s)
 {
     /* A failed installation still rolls back exactly its created-inode ledger. An installed guest
      * is mutable: apt/editor replacements are not foreign outer instance anchors. */
+    /* setup may have created base but failed before opening/identifying it.
+     * Leave that case to instance_current's ESTALE refusal, without querying fd -1. */
+    if (s->recover_remove ? recovery_gate(s) < 0 : s->base_known && receipt_absent(s->base) < 0) return -1;
     if (s->mutable_tree) return remove_mutable_tree(s);
-    if (instance_current(s) < 0 || views_empty(s) < 0) return -1;
+    if (instance_current(s) < 0 || views_empty(s) < 0 ||
+        (s->recover_remove && installed_anchors_current(s, true) < 0)) return -1;
     for (uint32_t i = s->count; i > 0; --i) {
-        if (time_remaining() < 0) return -1;
+        if (time_remaining() < 0 || (s->recover_remove ?
+            recovery_gate(s) < 0 || installed_anchors_current(s, true) < 0 : receipt_absent(s->base) < 0)) return -1;
         struct entry *e = &s->entries[i - 1];
         if (!e->created) continue;
         const char *leaf;
@@ -365,7 +396,8 @@ static int rollback(struct install *s)
         close(parent);
         if (rc < 0) { errno = saved; return -1; }
     }
-    if (instance_current(s) < 0 || views_empty(s) < 0) return -1;
+    if (instance_current(s) < 0 || views_empty(s) < 0 || (s->recover_remove ?
+        recovery_gate(s) < 0 || installed_anchors_current(s, true) < 0 : receipt_absent(s->base) < 0)) return -1;
     if (s->views_created && unlinkat(s->base, "views", AT_REMOVEDIR) < 0) return -1;
     if (s->root_created && unlinkat(s->base, "root", AT_REMOVEDIR) < 0) return -1;
     if (s->manifest >= 0) {
@@ -374,7 +406,7 @@ static int rollback(struct install *s)
             !same_object(&saved, &current) || current.st_uid != 0 || !S_ISREG(current.st_mode) ||
             current.st_nlink != 1 || (current.st_mode & 0022) || unlinkat(s->base, "manifest", 0) < 0) return -1;
     }
-    return unlinkat(s->local, s->name, AT_REMOVEDIR);
+    return finish_base(s);
 }
 
 #define MUTABLE_MAX_DEPTH 128U
@@ -415,16 +447,18 @@ static int mutable_named_current(struct install *s, int parent, const char *name
     return 0;
 }
 
-static int mutable_anchors_current(struct install *s)
+static int installed_anchors_current(struct install *s, bool empty_views)
 {
-    struct stat held, named, base, root;
+    struct stat held, named, base, root, views;
     uint64_t id;
     if (mutable_parent_current(s) < 0 ||
         mutable_named_current(s, s->local, s->name, s->base, &s->base_stat) < 0 ||
         mutable_named_current(s, s->base, "root", s->root, &s->root_stat) < 0 ||
         mutable_named_current(s, s->base, "views", s->views, &s->views_stat) < 0 ||
         mutable_named_current(s, s->base, "manifest", s->manifest, NULL) < 0 ||
-        instance_current(s) < 0 || views_empty(s) < 0 ||
+        instance_current(s) < 0 || (empty_views && views_empty(s) < 0) ||
+        fstat(s->views, &views) < 0 || views.st_uid != 0 || views.st_gid != 0 ||
+        (views.st_mode & 07777) != 0700 ||
         fstat(s->base, &base) < 0 || !same_object(&base, &s->base_stat) ||
         base.st_uid != 0 || base.st_gid != 0 || (base.st_mode & 07777) != 0700 ||
         fstat(s->root, &root) < 0 || !same_object(&root, &s->root_stat) ||
@@ -436,10 +470,16 @@ static int mutable_anchors_current(struct install *s)
         mount_identity(s->manifest, &id) < 0 || id != s->mount_id) { errno = ESTALE; return -1; }
     uint64_t header[AJIU_MANIFEST_HEADER_WORDS];
     if (pread(s->manifest, header, sizeof(header), 0) != (ssize_t)sizeof(header) ||
-        header[0] != AJIU_MANIFEST_V2 || header[1] != (uint64_t)s->root_stat.st_dev ||
+        header[0] != (s->mutable_tree ? AJIU_MANIFEST_V2 : AJIU_MANIFEST_V1) || header[1] != (uint64_t)s->root_stat.st_dev ||
         header[2] != (uint64_t)s->root_stat.st_ino || header[3] != (uint64_t)s->views_stat.st_dev ||
         header[4] != (uint64_t)s->views_stat.st_ino || !header[5]) { errno = ESTALE; return -1; }
     return 0;
+}
+
+static int mutable_anchors_current(struct install *s)
+{
+    return installed_anchors_current(s, true) < 0 ||
+        (s->recover_remove ? recovery_gate(s) < 0 : receipt_absent(s->base) < 0) ? -1 : 0;
 }
 
 static int mutable_remember(struct mutable_tree *tree, const char *path, const struct stat *st, uint64_t mount_id)
@@ -547,7 +587,7 @@ static int remove_mutable_tree(struct install *s)
     if (!error && unlinkat(s->base, "views", AT_REMOVEDIR) < 0) error = errno;
     if (!error && unlinkat(s->base, "root", AT_REMOVEDIR) < 0) error = errno;
     if (!error && unlinkat(s->base, "manifest", 0) < 0) error = errno;
-    if (!error && unlinkat(s->local, s->name, AT_REMOVEDIR) < 0) error = errno;
+    if (!error && finish_base(s) < 0) error = errno;
     if (error) { errno = error; return -1; }
     return 0;
 }
@@ -674,6 +714,9 @@ static int load_existing(struct install *s, uint64_t device, uint64_t inode)
         (uint64_t)s->base_stat.st_dev != device || (uint64_t)s->base_stat.st_ino != inode ||
         mount_identity(s->base, &s->mount_id) < 0) { errno = ESTALE; return -1; }
     s->base_created = s->base_known = true;
+    stage = "removal_receipt";
+    if (!s->recover_remove && receipt_absent(s->base) < 0) return -1;
+    stage = "existing_instance";
     s->root = openat(s->base, "root", DIR_FLAGS);
     if (s->root < 0 || fstat(s->root, &s->root_stat) < 0 || s->root_stat.st_uid != 0 ||
         (s->root_stat.st_mode & 07777) != 0755) { errno = ESTALE; return -1; }
@@ -691,7 +734,7 @@ static int load_existing(struct install *s, uint64_t device, uint64_t inode)
     if (read(s->manifest, header, sizeof(header)) != (ssize_t)sizeof(header) ||
         (header[0] != AJIU_MANIFEST_V1 && header[0] != AJIU_MANIFEST_V2) || header[1] != (uint64_t)s->root_stat.st_dev ||
         header[2] != (uint64_t)s->root_stat.st_ino || header[3] != (uint64_t)s->views_stat.st_dev ||
-        header[4] != (uint64_t)s->views_stat.st_ino || !header[5] || views_empty(s) < 0) {
+        header[4] != (uint64_t)s->views_stat.st_ino || !header[5] || (!s->recover_remove && views_empty(s) < 0)) {
         errno = ESTALE; return -1;
     }
     for (;;) {
@@ -724,7 +767,7 @@ static int load_existing(struct install *s, uint64_t device, uint64_t inode)
     }
     if (instance_current(s) < 0) return -1;
     s->mutable_tree = header[0] == AJIU_MANIFEST_V2;
-    return 0;
+    return s->recover_remove ? installed_anchors_current(s, false) : 0;
 }
 
 static bool nonce_valid(const char *nonce)
@@ -733,6 +776,248 @@ static bool nonce_valid(const char *nonce)
     for (int i = 0; i < 24; ++i)
         if (!((nonce[i] >= '0' && nonce[i] <= '9') || (nonce[i] >= 'a' && nonce[i] <= 'f'))) return false;
     return true;
+}
+
+static bool boot_id_valid(const char id[36])
+{
+    bool nonzero = false;
+    for (size_t i = 0; i < 36; ++i) {
+        if (i == 8 || i == 13 || i == 18 || i == 23) { if (id[i] != '-') return false; }
+        else {
+            if (!((id[i] >= '0' && id[i] <= '9') || (id[i] >= 'a' && id[i] <= 'f'))) return false;
+            if (id[i] != '0') nonzero = true;
+        }
+    }
+    return nonzero;
+}
+
+static int read_boot_id(char id[36])
+{
+    stage = "recovery_boot_id";
+    int slash = open("/", DIR_FLAGS);
+    if (slash < 0) return -1;
+    /* /proc is a mount boundary: pin it first, then forbid every further mount
+     * crossing. Merely checking the leaf's procfs type would accept random/uuid
+     * bind-mounted over boot_id and mistake a changing UUID for a reboot. */
+    int proc = at_root(slash, "proc", DIR_FLAGS), saved = errno;
+    close(slash);
+    if (proc < 0) { errno = saved; return -1; }
+    struct stat st;
+    struct statfs fs;
+    uint64_t proc_mount, boot_mount;
+    int error = 0, fd = -1;
+    if (fstat(proc, &st) < 0 || !S_ISDIR(st.st_mode) || st.st_uid != 0 || st.st_gid != 0 ||
+        (st.st_mode & 0022) || fstatfs(proc, &fs) < 0 || fs.f_type != PROC_SUPER_MAGIC ||
+        mount_identity(proc, &proc_mount) < 0 || !proc_mount) error = ESTALE;
+    if (!error) {
+        struct open_how how = { .flags = O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW,
+            .resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV };
+        fd = (int)syscall(SYS_openat2, proc, "sys/kernel/random/boot_id", &how, sizeof(how));
+        if (fd < 0) error = errno;
+    }
+    if (!error && (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_uid != 0 || st.st_gid != 0 ||
+        (st.st_mode & 0022) || mount_identity(fd, &boot_mount) < 0 || boot_mount != proc_mount)) error = ESTALE;
+    char bytes[38];
+    ssize_t n = -1;
+    if (!error) {
+        do {
+            if (time_remaining() < 0) break;
+            n = pread(fd, bytes, sizeof(bytes), 0);
+        } while (n < 0 && errno == EINTR);
+        if (n != 37 || bytes[36] != '\n' || !boot_id_valid(bytes)) error = ESTALE;
+    }
+    if (fd >= 0) close(fd);
+    close(proc);
+    if (error) { errno = error; return -1; }
+    memcpy(id, bytes, 36);
+    return 0;
+}
+
+/* No other base entries can be discarded or hidden by finalization. */
+static int base_contents(struct install *s, unsigned int expected)
+{
+    int fd = openat(s->base, ".", DIR_FLAGS);
+    if (fd < 0) return -1;
+    DIR *dir = fdopendir(fd);
+    if (!dir) { close(fd); return -1; }
+    unsigned int seen = 0;
+    int error = 0;
+    for (;;) {
+        if (time_remaining() < 0) { error = errno; break; }
+        errno = 0; struct dirent *entry = readdir(dir);
+        if (!entry) { error = errno; break; }
+        const char *name = entry->d_name;
+        if (!strcmp(name, ".") || !strcmp(name, "..")) continue;
+        unsigned int bit = !strcmp(name, "root") ? 1U : !strcmp(name, "views") ? 2U :
+            !strcmp(name, "manifest") ? 4U : !strcmp(name, REMOVE_RECEIPT) ? 8U : 0U;
+        if (!bit || !(expected & bit) || (seen & bit)) { error = ENOTEMPTY; break; }
+        seen |= bit;
+    }
+    if (!error && seen != expected) error = ESTALE;
+    if (closedir(dir) < 0 && !error) error = errno;
+    return error ? (errno = error, -1) : 0;
+}
+
+static int receipt_current(struct install *s)
+{
+    struct stat st, base;
+    struct removal_receipt data;
+    if (mutable_parent_current(s) < 0 ||
+        mutable_named_current(s, s->local, s->name, s->base, &s->base_stat) < 0 ||
+        fstat(s->base, &base) < 0 || base.st_uid != 0 || base.st_gid != 0 || (base.st_mode & 07777) != 0700 ||
+        mutable_named_current(s, s->base, REMOVE_RECEIPT, s->receipt, &s->receipt_stat) < 0 ||
+        fstat(s->receipt, &st) < 0 || !S_ISREG(st.st_mode) || st.st_uid != 0 || st.st_gid != 0 ||
+        (st.st_mode & 07777) != 0600 || st.st_nlink != 1 || st.st_size != (off_t)sizeof(data) ||
+        pread(s->receipt, &data, sizeof(data), 0) != (ssize_t)sizeof(data) ||
+        memcmp(&data, &s->receipt_data, sizeof(data))) { errno = ESTALE; return -1; }
+    return 0;
+}
+
+static int recovery_gate(struct install *s)
+{
+    /* recovery_ready is set only after comparing the durable receipt to this boot.
+     * A running installer cannot itself survive that boot, so retain that proof. */
+    if (!s->recovery_ready) { errno = EBUSY; return -1; }
+    return receipt_current(s);
+}
+
+static int receipt_create(struct install *s)
+{
+    s->receipt = openat(s->base, REMOVE_RECEIPT, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (s->receipt < 0) return -1;
+    int error = 0;
+    if (fchown(s->receipt, 0, 0) < 0 || fchmod(s->receipt, 0600) < 0 ||
+        exact_write(s->receipt, &s->receipt_data, sizeof(s->receipt_data)) < 0 ||
+        fstat(s->receipt, &s->receipt_stat) < 0) error = errno;
+    /* Even a partial/failed receipt remains a startup barrier. Never roll it back. */
+    if (fsync(s->receipt) < 0 && !error) error = errno;
+    if (fsync(s->base) < 0 && !error) error = errno;
+    if (!error && receipt_current(s) < 0) error = errno;
+    return error ? (errno = error, -1) : 0;
+}
+
+static int recovery_view(struct install *s, const char *name, const struct stat *expected, struct stat *out)
+{
+    int fd = openat(s->views, name, DIR_FLAGS);
+    if (fd < 0) return -1;
+    struct stat st;
+    uint64_t id;
+    int error = 0;
+    if (fstat(fd, &st) < 0 || !S_ISDIR(st.st_mode) || st.st_uid != 0 || st.st_gid != 0 ||
+        (st.st_mode & 07777) != 0700 || st.st_dev != s->base_stat.st_dev ||
+        (expected && !same_object(&st, expected)) || mount_identity(fd, &id) < 0 || id != s->mount_id ||
+        mutable_named_current(s, s->views, name, fd, &st) < 0) error = ESTALE;
+    DIR *dir = NULL;
+    if (!error) { dir = fdopendir(fd); if (!dir) error = errno; }
+    if (dir) {
+        for (;;) {
+            if (time_remaining() < 0) { error = errno; break; }
+            errno = 0; struct dirent *entry = readdir(dir);
+            if (!entry) { error = errno; break; }
+            if (strcmp(entry->d_name, ".") && strcmp(entry->d_name, "..")) { error = ENOTEMPTY; break; }
+        }
+        if (!error && mutable_named_current(s, s->views, name, fd, &st) < 0) error = errno;
+        if (closedir(dir) < 0 && !error) error = errno;
+    } else close(fd);
+    if (error) { errno = error; return -1; }
+    if (out) *out = st;
+    return 0;
+}
+
+static int recovery_views(struct install *s, bool remove)
+{
+    struct recovery_view_entry { char name[25]; struct stat st; };
+    struct recovery_view_entry *entries = calloc(MAX_RECOVERY_VIEWS, sizeof(*entries));
+    if (!entries) return -1;
+    int fd = openat(s->views, ".", DIR_FLAGS), error = 0;
+    DIR *dir = fd < 0 ? NULL : fdopendir(fd);
+    size_t count = 0;
+    if (!dir) { error = errno; if (fd >= 0) close(fd); }
+    while (dir && !error) {
+        if (time_remaining() < 0) { error = errno; break; }
+        errno = 0; struct dirent *entry = readdir(dir);
+        if (!entry) { error = errno; break; }
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        if (count == MAX_RECOVERY_VIEWS) { error = EOVERFLOW; break; }
+        if (!nonce_valid(entry->d_name)) { error = EPROTO; break; }
+        if (recovery_view(s, entry->d_name, NULL, &entries[count].st) < 0) { error = errno; break; }
+        memcpy(entries[count++].name, entry->d_name, 25);
+    }
+    if (dir && closedir(dir) < 0 && !error) error = errno;
+    /* Preflight every child before the first rmdir. No cgroup name or membership is inferred. */
+    for (size_t i = 0; remove && !error && i < count; ++i) {
+        if (installed_anchors_current(s, false) < 0 || recovery_gate(s) < 0 ||
+            recovery_view(s, entries[i].name, &entries[i].st, NULL) < 0 ||
+            unlinkat(s->views, entries[i].name, AT_REMOVEDIR) < 0) error = errno;
+    }
+    free(entries);
+    if (remove && !error && (views_empty(s) < 0 || fsync(s->views) < 0)) error = errno;
+    return error ? (errno = error, -1) : 0;
+}
+
+static int finish_base(struct install *s)
+{
+    if (!s->recover_remove) {
+        if (unlinkat(s->local, s->name, AT_REMOVEDIR) < 0) return -1;
+        stage = "remove_parent_sync";
+        return fsync(s->local);
+    }
+    stage = "recovery_finalize";
+    /* The receipt outlives ALL rootfs unlinks and any failure in that deletion.
+     * Only the receipt may remain here; never call ordinary rollback's base rmdir. */
+    if (recovery_gate(s) < 0 || base_contents(s, 8U) < 0 || fsync(s->base) < 0 ||
+        unlinkat(s->base, REMOVE_RECEIPT, 0) < 0) return -1;
+    if (unlinkat(s->local, s->name, AT_REMOVEDIR) == 0) {
+        /* A failed parent sync is cleanup_unknown even though the name is now
+         * absent. A later retry must still reject missing instance identities. */
+        stage = "recovery_parent_sync";
+        return fsync(s->local);
+    }
+    int saved = errno;
+    /* Two unlinks cannot be atomic. Root/views/manifest are already gone, so a
+     * crash here cannot start a guest. Restore the barrier on a failed rmdir. */
+    close(s->receipt); s->receipt = -1;
+    if (receipt_create(s) < 0) stage = "recovery_receipt_restore";
+    errno = saved;
+    return -1;
+}
+
+static int recover_remove(struct install *s)
+{
+    s->recovery_ready = s->reboot_required = false;
+    char boot[36];
+    if (read_boot_id(boot) < 0) return -1;
+    struct stat manifest;
+    if (fstat(s->manifest, &manifest) < 0) return -1;
+    struct removal_receipt expected = { .magic = REMOVE_MAGIC, .identity = {
+        s->base_stat.st_dev, s->base_stat.st_ino, s->root_stat.st_dev, s->root_stat.st_ino,
+        s->views_stat.st_dev, s->views_stat.st_ino, manifest.st_dev, manifest.st_ino } };
+    memcpy(expected.instance, s->name + strlen(PREFIX), sizeof(expected.instance));
+    memcpy(expected.boot_id, boot, sizeof(boot));
+    stage = "recovery_receipt";
+    s->receipt = openat(s->base, REMOVE_RECEIPT, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+    if (s->receipt < 0) {
+        if (errno != ENOENT || receipt_absent(s->base) < 0 || base_contents(s, 7U) < 0 ||
+            installed_anchors_current(s, false) < 0 || recovery_views(s, false) < 0) return -1;
+        s->receipt_data = expected;
+        if (receipt_create(s) < 0) return -1;
+        s->reboot_required = true;
+        return 0;
+    }
+    if (fstat(s->receipt, &s->receipt_stat) < 0 ||
+        pread(s->receipt, &s->receipt_data, sizeof(s->receipt_data), 0) != (ssize_t)sizeof(s->receipt_data) ||
+        !boot_id_valid(s->receipt_data.boot_id)) { errno = ESTALE; return -1; }
+    memcpy(expected.boot_id, s->receipt_data.boot_id, sizeof(expected.boot_id));
+    if (memcmp(&expected, &s->receipt_data, sizeof(expected)) || receipt_current(s) < 0 ||
+        base_contents(s, 15U) < 0 || installed_anchors_current(s, false) < 0) { errno = ESTALE; return -1; }
+    /* Re-sync also makes a valid receipt left by an interrupted first call durable. */
+    if (fsync(s->receipt) < 0 || fsync(s->base) < 0) return -1;
+    if (!memcmp(boot, s->receipt_data.boot_id, sizeof(boot))) { s->reboot_required = true; return 0; }
+    s->recovery_ready = true;
+    stage = "recovery_views";
+    if (recovery_gate(s) < 0 || recovery_views(s, true) < 0) return -1;
+    stage = "recovery_rootfs";
+    return rollback(s);
 }
 
 static bool decimal(const char *text, uint64_t *value)
@@ -753,14 +1038,16 @@ int main(int argc, char **argv)
     bool validate = argc == 2 && !strcmp(argv[1], "--validate");
     bool install = argc == 3 && !strcmp(argv[1], "--install") && nonce_valid(argv[2]);
     uint64_t device = 0, inode = 0;
-    bool remove = argc == 5 && !strcmp(argv[1], "--remove") && nonce_valid(argv[2]) &&
+    bool recover = argc == 5 && !strcmp(argv[1], "--recover-remove");
+    bool remove = argc == 5 && (!strcmp(argv[1], "--remove") || recover) && nonce_valid(argv[2]) &&
                   decimal(argv[3], &device) && decimal(argv[4], &inode);
-    if (help) { puts("--help | --validate (read-only stdin) | --install <24hex> | --remove <24hex> <device> <inode>"); return 0; }
+    if (help) { puts("--help | --validate (read-only stdin) | --install <24hex> | --remove <24hex> <device> <inode> | --recover-remove <24hex> <device> <inode>"); return 0; }
     if (!validate && !install && !remove) { puts("{\"passed\":false,\"stage\":\"arguments\",\"created_directory\":null}"); return 2; }
     int flags = fcntl(STDOUT_FILENO, F_GETFL);
     if (flags < 0 || fcntl(STDOUT_FILENO, F_SETFL, flags | O_NONBLOCK) < 0) return 3;
     (void)signal(SIGPIPE, SIG_IGN);
-    struct install s = { .local = -1, .base = -1, .root = -1, .views = -1, .manifest = -1, .validate = validate };
+    struct install s = { .local = -1, .base = -1, .root = -1, .views = -1, .manifest = -1, .receipt = -1,
+        .validate = validate, .recover_remove = recover };
     s.entries = calloc(MAX_ENTRIES, sizeof(*s.entries));
     s.index = calloc(HASH_SIZE, sizeof(*s.index));
     int rc = -1;
@@ -777,7 +1064,7 @@ int main(int argc, char **argv)
     if (ready && s.entries && s.index) {
         if (install || remove) (void)snprintf(s.name, sizeof(s.name), "%s%s", PREFIX, argv[2]);
         if (remove) {
-            if (load_existing(&s, device, inode) == 0) rc = rollback(&s);
+            if (load_existing(&s, device, inode) == 0) rc = recover ? recover_remove(&s) : rollback(&s);
         } else if (validate || setup(&s) == 0) rc = parse_stream(&s);
         if (rc == 0 && install) {
             rc = prepare_runtime_layout(&s);
@@ -789,7 +1076,8 @@ int main(int argc, char **argv)
         }
     }
     int saved = errno;
-    const char *cleanup = remove ? (rc == 0 ? "removed" : "cleanup_unknown") : (s.base_created ? "installed" : "not_created");
+    const char *cleanup = remove ? (rc == 0 ? (s.reboot_required ? "reboot_required" : "removed") : "cleanup_unknown") :
+        (s.base_created ? "installed" : "not_created");
     if (rc < 0 && s.base_created && !remove) {
         timed_out = 0;
         deadline = monotonic_ms() + 5000;
@@ -801,6 +1089,7 @@ int main(int argc, char **argv)
     if (s.base_created) printf("\"/data/local/%s\"}\n", s.name); else puts("null}");
     if (s.entries) for (uint32_t i = 0; i < s.count; ++i) free(s.entries[i].path);
     free(s.entries); free(s.index);
+    if (s.receipt >= 0) close(s.receipt);
     if (s.views >= 0) close(s.views);
     if (s.manifest >= 0) close(s.manifest);
     if (s.root >= 0) close(s.root);

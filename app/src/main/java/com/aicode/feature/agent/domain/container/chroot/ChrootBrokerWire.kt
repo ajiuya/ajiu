@@ -17,6 +17,7 @@ internal object ChrootBrokerWire {
     const val RUNTIME = 1
     const val INSTALL = 2
     const val REMOVE = 3
+    const val RECOVER_REMOVE = 4
     const val MAX_BODY = 256
     private const val MAGIC = 0x414a4252
     private const val EXIT_MAGIC = 0x414a4558
@@ -48,13 +49,14 @@ internal object ChrootBrokerWire {
     }
 
     fun start(id: Long, operation: Int, instanceId: String? = null, device: Long = 0, inode: Long = 0): ByteArray {
-        require(id > 0 && operation in RUNTIME..REMOVE)
+        require(id > 0 && operation in RUNTIME..RECOVER_REMOVE)
         val instance = if (operation == RUNTIME) {
             require(instanceId == null && device == 0L && inode == 0L)
             ByteArray(24)
         } else {
             require(instanceId != null && instanceId.matches(Regex("[0-9a-f]{24}")))
             if (operation == INSTALL) require(device == 0L && inode == 0L)
+            else if (operation == RECOVER_REMOVE) require(device > 0 && inode > 0)
             else require(device >= 0 && inode > 0)
             instanceId.toByteArray(Charsets.US_ASCII)
         }

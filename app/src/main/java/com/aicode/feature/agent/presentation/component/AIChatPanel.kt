@@ -121,6 +121,7 @@ import com.aicode.feature.agent.presentation.preview.ToolPreviewHost
 import com.aicode.feature.agent.presentation.preview.ToolPreviewHostState
 import com.aicode.feature.agent.presentation.preview.ToolPreviewWorkVisibility
 import com.aicode.feature.agent.presentation.preview.UiWorkEffect
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import com.aicode.feature.agent.presentation.preview.rememberToolPreviewHostState
@@ -1045,8 +1046,8 @@ fun AIChatPanel(
     LaunchedEffect(inputText) {
         if (inputText == "/") viewModel.refreshSlashCommands()
     }
-    var pendingAttachments by remember { mutableStateOf<List<PendingUploadAttachment>>(emptyList()) }
-    var uploadingCount by remember { mutableStateOf(0) }
+    var pendingAttachments by remember(currentSessionId, projectRoot) { mutableStateOf<List<PendingUploadAttachment>>(emptyList()) }
+    var uploadingCount by remember(currentSessionId, projectRoot) { mutableStateOf(0) }
     var messageForMenu by remember { mutableStateOf<AgentUIMessage?>(null) }
     var editingMessage by remember { mutableStateOf<AgentUIMessage?>(null) }
     var fullScreenInputVisible by remember { mutableStateOf(false) }
@@ -1163,8 +1164,8 @@ fun AIChatPanel(
     val reasoningDurations = viewModel.reasoningDurations
     val activeModel = activeProvider?.effectiveModel.orEmpty()
     val activeModelMetadata = activeProvider?.let { modelMetadata[modelMetadataKey(it.id, activeModel)] }
-    val canUploadFiles = projectRoot.isNotBlank() && activeModelMetadata?.supportsTools == true
-    val canUploadImages = projectRoot.isNotBlank()
+    val canUploadFiles = projectRoot.isNotBlank() && uploadingCount == 0 && activeModelMetadata?.supportsTools == true
+    val canUploadImages = projectRoot.isNotBlank() && uploadingCount == 0
     val reasoningEffort by viewModel.currentSessionReasoningEffort.collectAsStateWithLifecycle()
 
     val providerDashboards by (settingsViewModel?.providerDashboards?.collectAsStateWithLifecycle() ?: remember { mutableStateOf(emptyMap()) })
@@ -1305,8 +1306,8 @@ fun AIChatPanel(
         pendingAttachments = pendingAttachments.filterIndexed { i, _ -> i != index }
     }
 
-    fun handlePickedAttachments(uris: List<Uri>, images: Boolean) {
-        if (uris.isEmpty()) return
+    fun handlePickedAttachments(uris: List<Uri>, images: Boolean, checkSelection: () -> Unit) {
+        if (uris.isEmpty() || uploadingCount > 0) return
         if (projectRoot.isBlank()) {
             Toast.makeText(context, emptyWorkspaceMessage(context), Toast.LENGTH_SHORT).show()
             return
@@ -1316,19 +1317,28 @@ fun AIChatPanel(
             return
         }
         val selected = selectedAttachments(uris, pendingAttachments.size)
+        uploadingCount = selected.size
         scope.launch {
             var successCount = 0
             val failures = mutableListOf<String>()
-            uploadingCount = selected.size
             try {
+                checkSelection()
                 selected.forEach { uri ->
+                    currentCoroutineContext().ensureActive()
+                    checkSelection()
                     runCatching {
-                        copyUriToWorkspace(context, uri, viewModel.fileAccess, includeImageData = images)
+                        copyUriToWorkspace(context, uri, viewModel.fileAccess,
+                            captureFile = { path -> viewModel.captureAttachmentFile(path, checkSelection) },
+                            includeImageData = images)
                     }.onSuccess { uploaded ->
+                        checkSelection()
                         pendingAttachments = pendingAttachments + uploaded.toPendingAttachment()
                         successCount += 1
                     }.onFailure { error ->
-                        failures += (error.message ?: uploadFallbackError(context))
+                        if (error is CancellationException) throw error
+                        failures += if (error is com.aicode.feature.agent.domain.container.runtime.LocalRuntimeAuthorizationRequired) {
+                            context.getString(R.string.local_runtime_authorization_required)
+                        } else error.message ?: uploadFallbackError(context)
                     }
                 }
             } finally {
@@ -1347,20 +1357,23 @@ fun AIChatPanel(
         }
     }
 
+    fun finishAttachmentSelection(uris: List<Uri>, images: Boolean) {
+        val selection = viewModel.consumeAttachmentSelection()
+        if (selection != null) handlePickedAttachments(uris, images, selection.checkCurrent)
+    }
     val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
-        handlePickedAttachments(uris, images = false)
+        finishAttachmentSelection(uris, images = false)
     }
     val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia()) { uris ->
-        handlePickedAttachments(uris, images = true)
+        finishAttachmentSelection(uris, images = true)
     }
 
     // 拍照：输出到 cache 临时文件（FileProvider 授权 uri），拍完按图片附件处理。
-    var cameraPhotoUri by remember { mutableStateOf<Uri?>(null) }
     val takePictureLauncher = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { success ->
-        val uri = cameraPhotoUri
-        cameraPhotoUri = null
-        if (success && uri != null) {
-            handlePickedAttachments(listOf(uri), images = true)
+        val selection = viewModel.consumeAttachmentSelection()
+        val uri = selection?.cameraUri
+        if (success && selection != null && uri != null) {
+            handlePickedAttachments(listOf(uri), images = true, checkSelection = selection.checkCurrent)
         }
     }
     fun takePhoto() {
@@ -1376,7 +1389,7 @@ fun AIChatPanel(
             Toast.makeText(context, context.getString(R.string.chat_camera_file_failed), Toast.LENGTH_SHORT).show()
             return
         }
-        cameraPhotoUri = uri
+        viewModel.beginAttachmentSelection(cameraUri = uri)
         takePictureLauncher.launch(uri)
     }
 
@@ -2314,8 +2327,12 @@ fun AIChatPanel(
                 onRemoveAttachment = ::removePendingAttachment,
                 canUploadFiles = canUploadFiles,
                 canUploadImages = canUploadImages,
-                onUploadFile = { filePicker.launch(arrayOf("*/*")) },
+                onUploadFile = {
+                    viewModel.beginAttachmentSelection()
+                    filePicker.launch(arrayOf("*/*"))
+                },
                 onUploadImage = {
+                    viewModel.beginAttachmentSelection()
                     imagePicker.launch(
                         PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
                     )

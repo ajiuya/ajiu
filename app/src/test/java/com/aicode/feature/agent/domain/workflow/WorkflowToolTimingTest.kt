@@ -9,6 +9,9 @@ import com.aicode.feature.agent.data.local.dao.RecoveryDaoFixture
 import com.aicode.feature.agent.data.local.database.AgentDatabase
 import com.aicode.feature.agent.data.remote.openai.ChatCompletionRequest
 import com.aicode.feature.agent.data.remote.openai.OpenAIApi
+import com.aicode.feature.agent.domain.container.ChrootInstance
+import com.aicode.feature.agent.domain.container.ContainerProfile
+import com.aicode.feature.agent.domain.container.LocalContainerRuntime
 import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeAuthorizationRequired
 import com.aicode.feature.agent.domain.model.AgentContext
 import com.aicode.feature.agent.domain.model.AgentMessage
@@ -19,6 +22,8 @@ import com.aicode.feature.agent.domain.notification.AgentNotificationKind
 import com.aicode.feature.agent.domain.notification.NotificationOutcome
 import com.aicode.feature.agent.domain.notification.PendingNotification
 import com.aicode.feature.agent.domain.permission.PermissionChoice
+import com.aicode.feature.agent.domain.permission.PermissionRulesRepository
+import com.aicode.feature.agent.domain.permission.SessionPermissionGrantRepository
 import com.aicode.feature.agent.domain.permission.ToolPermissionPolicyEngine
 import com.aicode.feature.agent.domain.prompt.SystemPromptProvider
 import com.aicode.feature.agent.domain.provider.AIProvider
@@ -49,7 +54,10 @@ import com.aicode.feature.agent.presentation.MessageRole
 import com.aicode.feature.settings.data.remote.ModelMetadataService
 import com.aicode.feature.settings.data.repository.CompactionModelSettingsRepository
 import com.aicode.feature.settings.data.repository.DefaultModelSettingsRepository
+import com.aicode.feature.settings.data.repository.ContainerProfileSnapshot
+import com.aicode.feature.settings.data.repository.ContainerSettingsRepository
 import com.aicode.feature.settings.data.repository.ExecutionMode
+import com.aicode.feature.settings.data.repository.ExecutionModeHolder
 import com.aicode.feature.settings.domain.model.AIProviderConfig
 import com.aicode.feature.settings.domain.model.ModelMetadata
 import com.aicode.feature.settings.domain.model.ProviderType
@@ -159,6 +167,7 @@ class WorkflowToolTimingTest {
     private val context = AgentContext(null, null, "/project", null, sessionId = "session")
     private val hooks = mockk<com.aicode.feature.plugin.runtime.PluginHookDispatcher>(relaxed = true)
     private var beforeFreeze: suspend () -> Unit = {}
+    private var permissionProfileSnapshot: ContainerProfileSnapshot? = null
     private val capturedExecutions = java.util.concurrent.CopyOnWriteArrayList<WorkspaceExecutionContext>()
     private val workflow = StatefulAgentWorkflow(
         toolRegistry = registry,
@@ -192,7 +201,10 @@ class WorkflowToolTimingTest {
         workspaceExecutionContextFactory = mockk {
             coEvery { freeze(any(), any()) } coAnswers {
                 beforeFreeze()
-                WorkspaceExecutionContext(ExecutionMode.LOCAL_PROOT, "timing-test", mockk(), null, null) {}
+                WorkspaceExecutionContext(
+                    ExecutionMode.LOCAL_PROOT, "timing-test", mockk(), null, null,
+                    profileSnapshot = permissionProfileSnapshot, checkSource = {}
+                )
                     .also { capturedExecutions += it }
             }
         }
@@ -2292,7 +2304,7 @@ class WorkflowToolTimingTest {
         verdict = ToolPermissionPolicyEngine.Verdict.ASK,
         sessionGrant = "host-write-session-v1:chroot-scope",
         permissionSource = permissionSource("chroot-profile").copy(namespace = ToolPermissionPolicyEngine.PermissionNamespace.CHROOT_GUEST),
-        hostSystemUncertainties = setOf("unknown-script"),
+        hostSystemUncertainties = setOf("host-linked-opaque-script"),
         hostWriteRootGeneration = 42,
         hostWriteRootAuthorityId = "root-authority"
     )
@@ -2352,7 +2364,7 @@ class WorkflowToolTimingTest {
                 decision.complete(secondArg())
                 Unit
             }
-            responses(AIResponse("unknown CHROOT command", listOf(ToolCall("chroot-pending-$index", tool.name, emptyMap()))), AIResponse("done"))
+            responses(AIResponse("host-linked CHROOT command", listOf(ToolCall("chroot-pending-$index", tool.name, emptyMap()))), AIResponse("done"))
             val events = mutableListOf<AgentEvent>()
             val job = async { collect(listOf(tool), events) }
             try {
@@ -2409,6 +2421,67 @@ class WorkflowToolTimingTest {
             assertFalse(events.filterIsInstance<AgentEvent.ToolCallFinished>().single().isError)
             assertTrue(events.none { it is AgentEvent.Failed })
             assertTrue(events.last() is AgentEvent.Completed)
+            coVerify(exactly = 0) { rootManager.authorize(any(), any(), any(), any()) }
+            verify(exactly = 0) { shizukuManager.authorize(any(), any(), any()) }
+        }
+    }
+
+    @Test
+    fun chrootGuestBuildsScriptsAndInteractionExecuteWithRealPolicyWithoutHostApproval() = runBlocking {
+        withTimeout(10_000) {
+            val profile = ContainerProfile.BUILTIN_ALPINE.copy(
+                id = "chroot-policy", isBuiltin = false, localRuntime = LocalContainerRuntime.CHROOT,
+                chrootInstance = ChrootInstance("instance", 1, 2, 3)
+            )
+            val snapshot = ContainerProfileSnapshot(profile.id, profile.id, listOf(profile), 1, 1, Any())
+            permissionProfileSnapshot = snapshot
+            val settings = mockk<ContainerSettingsRepository> {
+                coEvery { captureProfileSnapshot() } returns snapshot
+                every { checkProfileSnapshot(any()) } returns Unit
+            }
+            val rules = mockk<PermissionRulesRepository> { coEvery { loadEffectiveForCurrentProject() } returns emptyList() }
+            val grants = mockk<SessionPermissionGrantRepository>()
+            val engine = ToolPermissionPolicyEngine(
+                rules, grants, mockk(), rootManager, shizukuManager, ExecutionModeHolder(), settings
+            )
+            rootState.value = RootAccessState(false, 43, "")
+            val results = mutableListOf<ToolPermissionPolicyEngine.EvalResult>()
+            coEvery { policy.evaluate(any(), any(), any(), any()) } coAnswers {
+                engine.evaluate(firstArg(), secondArg(), thirdArg(), arg(3)).also { results += it }
+            }
+            val calls = listOf(
+                "Bash" to mapOf("command" to JsonPrimitive("npm install")),
+                "Bash" to mapOf("command" to JsonPrimitive("sh /root/opaque.sh")),
+                "terminal" to mapOf("action" to JsonPrimitive("send"), "input" to JsonPrimitive("python3 build.py")),
+                "terminal" to mapOf("action" to JsonPrimitive("key"), "key" to JsonPrimitive("enter"))
+            )
+            for ((index, call) in calls.withIndex()) {
+                val (name, args) = call
+                val tool = GatedTool(name)
+                register(tool)
+                tool.release.complete(Unit)
+                responses(AIResponse("guest operation", listOf(ToolCall("guest-$index", name, args))), AIResponse("done"))
+                val events = mutableListOf<AgentEvent>()
+                collect(listOf(tool), events)
+                assertTrue(name, tool.entered.isCompleted)
+                assertFalse(events.filterIsInstance<AgentEvent.ToolCallFinished>().single().isError)
+                assertTrue(events.none { it is AgentEvent.Failed })
+                assertTrue(events.last() is AgentEvent.Completed)
+            }
+            assertEquals(calls.size * 2, results.size)
+            results.chunked(2).forEach { assertEquals(it.first(), it.last()) }
+            results.forEach {
+                assertEquals(ToolPermissionPolicyEngine.Verdict.ALLOW, it.verdict)
+                assertEquals(ToolPermissionPolicyEngine.PermissionNamespace.CHROOT_GUEST, it.permissionSource?.namespace)
+                assertTrue(it.hostSystemUncertainties.isEmpty())
+                assertTrue(it.ordinaryGuestUncertainties.isNotEmpty())
+                assertNull(it.hostWriteRootGeneration)
+                assertNull(it.rootGeneration)
+            }
+            coVerify(exactly = 0) { permissions.awaitApproval(any()) }
+            coVerify(exactly = 0) { permissions.confirmHostWriteSessionGrant(any(), any()) }
+            coVerify(exactly = 0) { grants.isAllowed(any(), any()) }
+            coVerify(exactly = 0) { rootManager.accessSnapshot() }
             coVerify(exactly = 0) { rootManager.authorize(any(), any(), any(), any()) }
             verify(exactly = 0) { shizukuManager.authorize(any(), any(), any()) }
         }

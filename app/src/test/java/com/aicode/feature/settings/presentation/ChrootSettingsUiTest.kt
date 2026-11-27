@@ -3,6 +3,7 @@ package com.aicode.feature.settings.presentation
 import android.app.Application
 import android.os.Looper
 import android.view.View
+import android.view.ViewGroup
 import androidx.activity.ComponentActivity
 import androidx.compose.foundation.layout.Column
 import androidx.compose.runtime.BroadcastFrameClock
@@ -35,6 +36,7 @@ import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeState
 import com.aicode.feature.agent.domain.container.runtime.RuntimeOwner
 import com.aicode.feature.agent.domain.container.runtime.RuntimeOwnerKind
 import com.aicode.feature.agent.domain.root.RootAccessState
+import com.aicode.feature.settings.data.repository.ContainerProfileSnapshot
 import com.aicode.feature.settings.presentation.component.ChrootAuthorizationSummary
 import com.aicode.feature.settings.presentation.component.ChrootProfileSettings
 import com.aicode.feature.settings.presentation.component.ChrootSettingsDialogs
@@ -58,6 +60,7 @@ import org.junit.runner.RunWith
 import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
+import org.robolectric.shadows.ShadowDialog
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.ConscryptMode
 import org.robolectric.annotation.GraphicsMode
@@ -97,7 +100,7 @@ class ChrootSettingsUiTest {
     }
 
     @Test(timeout = 30_000)
-    fun unknownOrUnhealthyInstancesHaveNoCreateAuthorizeStopOrDeleteClickActions() {
+    fun uninstalledUnknownOrUnhealthyProfilesWithoutRepairCapabilityHaveNoLifecycleActions() {
         val available = LocalRuntimeState(null, true, true, false, 0, 0, false)
         var state by mutableStateOf(available)
         val actions = mutableListOf<ChrootInstanceAction>()
@@ -121,6 +124,130 @@ class ChrootSettingsUiTest {
             }
             assertTrue(authorizations.isEmpty())
             assertEquals(listOf(ChrootInstanceAction.CREATE), actions)
+        }
+    }
+
+    @Test(timeout = 30_000)
+    fun unknownInstancesExposeRepairAndRecoveryOnlyWhenTheirCapabilitiesAreAvailable() {
+        val installed = profile.copy(chrootInstance = instance)
+        val repairable = LocalRuntimeState(instance, true, false, true, 0, 0, false, journalRepairAvailable = true)
+        var state by mutableStateOf(repairable)
+        var currentRoot by mutableStateOf(root)
+        var workingProfileId by mutableStateOf<String?>(null)
+        val actions = mutableListOf<ChrootInstanceAction>()
+        render(content = {
+            ChrootProfileSettings(installed, ChrootSettingsUiState(states = mapOf(profile.id to state),
+                rootState = currentRoot, workingProfileId = workingProfileId), { _, action -> actions += action }, {})
+        }) {
+            assertTrue(allText().contains(text(R.string.container_chroot_status_unknown)))
+            assertTrue(textEnabled(R.string.container_chroot_repair_journal))
+            assertTrue(textEnabled(R.string.container_chroot_recover_remove))
+            for (blocked in listOf(R.string.container_chroot_create, R.string.container_chroot_stop, R.string.container_chroot_remove)) {
+                assertTrue(!textEnabled(blocked))
+            }
+            assertTrue(actions.isEmpty())
+            clickText(text(R.string.container_chroot_repair_journal))
+            clickText(text(R.string.container_chroot_recover_remove))
+            pump()
+            assertEquals(listOf(ChrootInstanceAction.REPAIR_JOURNAL, ChrootInstanceAction.RECOVER_REMOVE), actions)
+            state = repairable.copy(journalHealthy = true, journalRepairAvailable = false)
+            pump()
+            assertTrue(!textEnabled(R.string.container_chroot_repair_journal))
+            assertTrue(textEnabled(R.string.container_chroot_recover_remove))
+            for (blocked in listOf(repairable.copy(rootEnabled = false), repairable.copy(busy = true),
+                repairable.copy(journalRepairAvailable = false))) {
+                state = blocked
+                pump()
+                assertTrue(!textEnabled(R.string.container_chroot_repair_journal))
+                assertTrue(!textEnabled(R.string.container_chroot_recover_remove))
+            }
+            state = repairable
+            currentRoot = root.copy(enabled = false)
+            pump()
+            assertTrue(!textEnabled(R.string.container_chroot_repair_journal))
+            assertTrue(!textEnabled(R.string.container_chroot_recover_remove))
+            currentRoot = root
+            workingProfileId = "another-profile"
+            pump()
+            assertTrue(!textEnabled(R.string.container_chroot_repair_journal))
+            assertTrue(!textEnabled(R.string.container_chroot_recover_remove))
+            workingProfileId = null
+            state = repairable.copy(instance = null)
+            pump()
+            assertTrue(!textEnabled(R.string.container_chroot_recover_remove))
+        }
+    }
+
+    @Test(timeout = 30_000)
+    fun containerListDeleteRoutesUnknownAndPendingRemovalToRecoveryAndHealthyToNormalRemoval() {
+        val installed = profile.copy(chrootInstance = instance)
+        val repairable = LocalRuntimeState(instance, true, false, true, 0, 0, false, journalRepairAvailable = true)
+        var state by mutableStateOf(repairable)
+        var currentRoot by mutableStateOf(root)
+        var workingProfileId by mutableStateOf<String?>(null)
+        val actions = mutableListOf<ChrootInstanceAction>()
+        var ordinaryDeletes = 0
+        render(content = {
+            ContainerSection(profiles = listOf(installed), activeProfileId = profile.id, onSelect = {},
+                onSaveCustom = { _, _, _ -> }, onEditCustom = { _, _ -> }, onDeleteProfile = { ordinaryDeletes++ },
+                chrootUiState = ChrootSettingsUiState(states = mapOf(profile.id to state), rootState = currentRoot,
+                    workingProfileId = workingProfileId), onChrootInstanceAction = { _, action -> actions += action })
+        }) {
+            assertTrue(allText().contains(text(R.string.container_chroot_status_unknown)))
+            assertTrue(textEnabled(R.string.common_delete))
+            clickText(text(R.string.common_delete))
+            pump()
+            assertEquals(listOf(ChrootInstanceAction.RECOVER_REMOVE), actions)
+            state = repairable.copy(journalHealthy = true, recoveryRequired = false, journalRepairAvailable = false)
+            pump()
+            clickText(text(R.string.common_delete))
+            pump()
+            assertEquals(listOf(ChrootInstanceAction.RECOVER_REMOVE, ChrootInstanceAction.REMOVE), actions)
+            state = state.copy(removalRebootRequired = true)
+            pump()
+            assertTrue(allText().contains(text(R.string.container_chroot_status_removal_reboot_required)))
+            assertTrue(textEnabled(R.string.common_delete))
+            clickText(text(R.string.common_delete))
+            pump()
+            assertEquals(listOf(ChrootInstanceAction.RECOVER_REMOVE, ChrootInstanceAction.REMOVE, ChrootInstanceAction.RECOVER_REMOVE), actions)
+            for (blocked in listOf(repairable.copy(journalRepairAvailable = false), repairable.copy(busy = true), repairable.copy(rootEnabled = false))) {
+                state = blocked
+                pump()
+                assertTrue(!textEnabled(R.string.common_delete))
+            }
+            state = repairable
+            currentRoot = root.copy(enabled = false)
+            pump()
+            assertTrue(!textEnabled(R.string.common_delete))
+            currentRoot = root
+            workingProfileId = "another-profile"
+            pump()
+            assertTrue(!textEnabled(R.string.common_delete))
+            assertEquals(0, ordinaryDeletes)
+        }
+    }
+
+    @Test(timeout = 30_000)
+    fun unknownProfileEditSheetContainsBothExplicitRecoveryActions() {
+        val installed = profile.copy(chrootInstance = instance)
+        val state = LocalRuntimeState(instance, true, false, true, 0, 0, false, journalRepairAvailable = true)
+        val actions = mutableListOf<ChrootInstanceAction>()
+        render(content = {
+            ContainerSection(profiles = listOf(installed), activeProfileId = profile.id, onSelect = {},
+                onSaveCustom = { _, _, _ -> }, onEditCustom = { _, _ -> }, onDeleteProfile = {},
+                chrootUiState = ChrootSettingsUiState(states = mapOf(profile.id to state), rootState = root),
+                onChrootInstanceAction = { _, action -> actions += action })
+        }) {
+            clickDescription(R.string.common_edit)
+            pump()
+            assertTrue(allText().contains(text(R.string.container_edit_image)))
+            assertTrue(textEnabled(R.string.container_chroot_repair_journal))
+            assertTrue(textEnabled(R.string.container_chroot_recover_remove))
+            assertTrue(!textEnabled(R.string.common_save))
+            clickText(text(R.string.container_chroot_repair_journal))
+            clickText(text(R.string.container_chroot_recover_remove))
+            pump()
+            assertEquals(listOf(ChrootInstanceAction.REPAIR_JOURNAL, ChrootInstanceAction.RECOVER_REMOVE), actions)
         }
     }
 
@@ -191,6 +318,140 @@ class ChrootSettingsUiTest {
             pump()
             assertEquals(listOf(ChrootInstanceAction.STOP, ChrootInstanceAction.REMOVE), actions)
             assertTrue(authorizations.isEmpty())
+        }
+    }
+
+    @Test(timeout = 30_000)
+    fun recoverySummaryKeepsIdentityFieldsAndRechecksActionCapabilityAndRoot() {
+        val installed = profile.copy(chrootInstance = instance)
+        val snapshot = ContainerProfileSnapshot(profile.id, profile.id, listOf(installed), 1, 41, Any())
+        val repairable = LocalRuntimeState(instance, true, false, true, 0, 0, false, journalRepairAvailable = true)
+        val confirmation = ChrootConfirmation.Instance(ChrootInstanceAction.REPAIR_JOURNAL, installed, root, snapshot)
+        var uiState by mutableStateOf(ChrootSettingsUiState(states = mapOf(profile.id to repairable),
+            rootState = root, confirmation = confirmation))
+        var confirmed = 0
+        render(content = { ChrootSettingsDialogs(uiState, { confirmed++ }, {}, {}) }) {
+            for (expected in listOf(profile.id, instance.id, "41", "1234", root.authorityId, "alpine-rootfs.bin")) {
+                assertTrue("Missing confirmation field: $expected", allText().contains(expected))
+            }
+            assertTrue(allText().contains(text(R.string.container_chroot_repair_journal_notice)))
+            assertTrue(textEnabled(R.string.common_confirm))
+            assertEquals(0, confirmed)
+            clickText(text(R.string.common_confirm))
+            assertEquals(1, confirmed)
+            uiState = uiState.copy(states = mapOf(profile.id to repairable.copy(journalRepairAvailable = false)))
+            pump()
+            assertTrue(!textEnabled(R.string.common_confirm))
+            assertTrue(allText().contains(text(R.string.container_chroot_summary_stale)))
+            uiState = uiState.copy(confirmation = confirmation.copy(action = ChrootInstanceAction.RECOVER_REMOVE),
+                states = mapOf(profile.id to repairable))
+            pump()
+            assertTrue(textEnabled(R.string.common_confirm))
+            assertTrue(allText().contains(text(R.string.container_chroot_recover_remove_notice)))
+            assertTrue(!allText().contains(text(R.string.container_chroot_summary_stale)))
+            val healthyRecords = repairable.copy(journalHealthy = true, journalRepairAvailable = false)
+            uiState = uiState.copy(states = mapOf(profile.id to healthyRecords))
+            pump()
+            assertTrue(textEnabled(R.string.common_confirm))
+            for (blocked in listOf(repairable.copy(journalRepairAvailable = false), repairable.copy(rootEnabled = false),
+                repairable.copy(busy = true), repairable.copy(instance = null),
+                repairable.copy(instance = instance.copy(installGeneration = instance.installGeneration + 1)))) {
+                uiState = uiState.copy(states = mapOf(profile.id to blocked))
+                pump()
+                assertTrue(!textEnabled(R.string.common_confirm))
+            }
+            for (changedRoot in listOf(root.copy(enabled = false), root.copy(generation = root.generation + 1),
+                root.copy(authorityId = "replacement-authority"))) {
+                uiState = uiState.copy(states = mapOf(profile.id to repairable), rootState = changedRoot)
+                pump()
+                assertTrue(!textEnabled(R.string.common_confirm))
+            }
+            uiState = uiState.copy(rootState = root, workingProfileId = "another-profile")
+            pump()
+            assertTrue(!textEnabled(R.string.common_confirm))
+            assertEquals(1, confirmed)
+        }
+    }
+
+    @Test(timeout = 30_000)
+    fun uninstalledRemovalSummaryDescribesConfigurationOnlyAndRepairDoesNotRequireAnInstance() {
+        val healthy = LocalRuntimeState(null, true, true, false, 0, 0, false)
+        val snapshot = ContainerProfileSnapshot(profile.id, profile.id, listOf(profile), 1, 41, Any())
+        val confirmation = ChrootConfirmation.Instance(ChrootInstanceAction.REMOVE, profile, root, snapshot)
+        var uiState by mutableStateOf(ChrootSettingsUiState(states = mapOf(profile.id to healthy),
+            rootState = root, confirmation = confirmation))
+        var confirmed = 0
+        render(content = { ChrootSettingsDialogs(uiState, { confirmed++ }, {}, {}) }) {
+            assertTrue(allText().contains(text(R.string.container_chroot_remove_configuration)))
+            assertTrue(allText().contains(text(R.string.container_chroot_remove_configuration_notice)))
+            assertTrue(!allText().contains(text(R.string.container_chroot_remove_notice)))
+            assertTrue(!allText().contains(text(R.string.container_chroot_summary_instance)))
+            assertTrue(textEnabled(R.string.common_confirm))
+            uiState = uiState.copy(states = mapOf(profile.id to healthy.copy(recoveryRequired = true)))
+            pump()
+            assertTrue(!textEnabled(R.string.common_confirm))
+            uiState = uiState.copy(confirmation = confirmation.copy(action = ChrootInstanceAction.REPAIR_JOURNAL),
+                states = mapOf(profile.id to healthy.copy(journalHealthy = false, recoveryRequired = true, journalRepairAvailable = true)))
+            pump()
+            assertTrue(allText().contains(text(R.string.container_chroot_repair_journal_notice)))
+            assertTrue(textEnabled(R.string.common_confirm))
+            uiState = uiState.copy(confirmation = confirmation.copy(action = ChrootInstanceAction.RECOVER_REMOVE))
+            pump()
+            assertTrue(!textEnabled(R.string.common_confirm))
+            assertEquals(0, confirmed)
+        }
+    }
+
+    @Test(timeout = 30_000)
+    fun rebootRequiredIsInformationAndPendingRemovalKeepsAnExplicitRetryEntry() {
+        val installed = profile.copy(chrootInstance = instance)
+        val pending = LocalRuntimeState(instance, true, true, true, 0, 0, false, removalRebootRequired = true)
+        var uiState by mutableStateOf(ChrootSettingsUiState(states = mapOf(profile.id to pending), rootState = root,
+            info = R.string.container_chroot_removal_reboot_required))
+        var dismissals = 0
+        val actions = mutableListOf<ChrootInstanceAction>()
+        render(content = {
+            Column {
+                ChrootProfileSettings(installed, uiState, { _, action -> actions += action }, {})
+                ChrootSettingsDialogs(uiState, {}, {}, { dismissals++; uiState = uiState.copy(info = null) })
+            }
+        }) {
+            assertTrue(allText().contains(text(R.string.container_chroot_info_title)))
+            assertTrue(allText().contains(text(R.string.container_chroot_removal_reboot_required)))
+            assertTrue(allText().contains(text(R.string.container_chroot_status_removal_reboot_required)))
+            assertTrue(!allText().contains(text(R.string.container_chroot_error_title)))
+            assertTrue(actions.isEmpty())
+            clickText(text(R.string.common_confirm))
+            pump()
+            assertEquals(1, dismissals)
+            assertTrue(!allText().contains(text(R.string.container_chroot_info_title)))
+            assertTrue(allText().contains(text(R.string.container_chroot_removal_reboot_required)))
+            assertTrue(!textEnabled(R.string.container_chroot_remove))
+            assertTrue(textEnabled(R.string.container_chroot_recover_remove))
+            clickText(text(R.string.container_chroot_recover_remove))
+            pump()
+            assertEquals(listOf(ChrootInstanceAction.RECOVER_REMOVE), actions)
+        }
+    }
+
+    @Test(timeout = 30_000)
+    fun recoveryWorkShowsProgressInsteadOfAnIdleUnknownOrRebootStatus() {
+        val installed = profile.copy(chrootInstance = instance)
+        val state = LocalRuntimeState(instance, true, false, true, 0, 0, true,
+            journalRepairAvailable = true, removalRebootRequired = true)
+        var action by mutableStateOf(ChrootInstanceAction.REPAIR_JOURNAL)
+        render(content = {
+            ChrootProfileSettings(installed, ChrootSettingsUiState(states = mapOf(profile.id to state), rootState = root,
+                workingProfileId = profile.id, workingAction = action), { _, _ -> }, {})
+        }) {
+            assertTrue(allText().contains(text(R.string.container_chroot_status_repairing)))
+            assertTrue(!allText().contains(text(R.string.container_chroot_status_unknown)))
+            assertTrue(!allText().contains(text(R.string.container_chroot_status_removal_reboot_required)))
+            assertTrue(nodes().none { it.config.contains(SemanticsActions.OnClick) })
+            action = ChrootInstanceAction.RECOVER_REMOVE
+            pump()
+            assertTrue(allText().contains(text(R.string.container_chroot_status_cleanup)))
+            assertTrue(!allText().contains(text(R.string.container_chroot_status_unknown)))
         }
     }
 
@@ -321,16 +582,40 @@ class ChrootSettingsUiTest {
     }
 
     private class Ui(val view: ComposeView, val pump: () -> Unit) {
-        private val root get() = view.getChildAt(0) as ViewRootForTest
-        fun nodes(): List<SemanticsNode> = root.semanticsOwner.getAllSemanticsNodes(mergingEnabled = true)
+        fun nodes(): List<SemanticsNode> = listOfNotNull(findRoot(view), dialogView()?.let(::findRoot))
+            .distinct().flatMap { it.semanticsOwner.getAllSemanticsNodes(mergingEnabled = true) }
         fun text(resource: Int): String = view.context.getString(resource)
         fun allText(): String = nodes().flatMap { it.config.getOrNull(SemanticsProperties.Text).orEmpty() }
             .joinToString("\n") { it.text }
+        fun textEnabled(resource: Int): Boolean = nodes().any {
+            it.config.contains(SemanticsActions.OnClick) && !it.config.contains(SemanticsProperties.Disabled) &&
+                it.config.getOrNull(SemanticsProperties.Text)?.any { label -> label.text == text(resource) } == true
+        }
         fun clickText(value: String) {
             val target = nodes().single {
-                it.config.contains(SemanticsActions.OnClick) && it.config.getOrNull(SemanticsProperties.Text)?.any { text -> text.text == value } == true
+                it.config.contains(SemanticsActions.OnClick) && !it.config.contains(SemanticsProperties.Disabled) &&
+                    it.config.getOrNull(SemanticsProperties.Text)?.any { text -> text.text == value } == true
             }
             assertTrue(requireNotNull(target.config.getOrNull(SemanticsActions.OnClick)?.action).invoke())
+        }
+        fun clickDescription(resource: Int) {
+            val target = nodes().single {
+                it.config.contains(SemanticsActions.OnClick) && !it.config.contains(SemanticsProperties.Disabled) &&
+                    it.config.getOrNull(SemanticsProperties.ContentDescription)?.contains(text(resource)) == true
+            }
+            assertTrue(requireNotNull(target.config.getOrNull(SemanticsActions.OnClick)?.action).invoke())
+        }
+    }
+
+    companion object {
+        private fun dialogView(): View? = ShadowDialog.getLatestDialog()?.takeIf { it.isShowing }?.window?.decorView
+
+        private fun findRoot(view: View): ViewRootForTest? {
+            if (view is ViewRootForTest) return view
+            if (view is ViewGroup) repeat(view.childCount) { index ->
+                findRoot(view.getChildAt(index))?.let { return it }
+            }
+            return null
         }
     }
 
@@ -354,7 +639,12 @@ class ChrootSettingsUiTest {
                 Snapshot.sendApplyNotifications()
                 view.measure(View.MeasureSpec.makeMeasureSpec(400, View.MeasureSpec.EXACTLY), View.MeasureSpec.makeMeasureSpec(1000, View.MeasureSpec.AT_MOST))
                 view.layout(0, 0, view.measuredWidth, view.measuredHeight)
-                (view.getChildAt(0) as? ViewRootForTest)?.measureAndLayoutForTest()
+                findRoot(view)?.measureAndLayoutForTest()
+                dialogView()?.let { dialog ->
+                    dialog.measure(View.MeasureSpec.makeMeasureSpec(400, View.MeasureSpec.EXACTLY), View.MeasureSpec.makeMeasureSpec(1000, View.MeasureSpec.AT_MOST))
+                    dialog.layout(0, 0, dialog.measuredWidth, dialog.measuredHeight)
+                    findRoot(dialog)?.measureAndLayoutForTest()
+                }
             }
         }
         try {

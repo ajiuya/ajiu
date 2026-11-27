@@ -90,7 +90,9 @@ class ToolPermissionPolicyEngine @Inject constructor(
         val hostSystemUncertainties: Set<String> = emptySet(),
         // CHROOT file/command review authority, never a Root tool command-permit request.
         val hostWriteRootGeneration: Long? = null,
-        val hostWriteRootAuthorityId: String? = null
+        val hostWriteRootAuthorityId: String? = null,
+        // Diagnostic only: ordinary CHROOT uncertainty never requires host approval authority.
+        val ordinaryGuestUncertainties: Set<String> = emptySet()
     )
 
     suspend fun evaluate(
@@ -139,16 +141,20 @@ class ToolPermissionPolicyEngine @Inject constructor(
         if (source.namespace == PermissionNamespace.HOST || source.namespace == PermissionNamespace.CHROOT_GUEST) {
             val namespace = if (source.namespace == PermissionNamespace.HOST) HostSystemFileAccessClassifier.Namespace.HOST
                 else HostSystemFileAccessClassifier.Namespace.CHROOT_GUEST
-            val assessment = if (command != null) HostSystemFileAccessClassifier.assessCommand(command, namespace)
-                else HostSystemFileAccessClassifier.assessFileTool(toolName, args, namespace)
+            val assessment = if (toolName == TERMINAL_TOOL && action in setOf("send", "key"))
+                HostSystemFileAccessClassifier.assessFileTool(toolName, args, namespace)
+            else if (command != null) HostSystemFileAccessClassifier.assessCommand(command, namespace)
+            else HostSystemFileAccessClassifier.assessFileTool(toolName, args, namespace)
             val targets = immutable(assessment.targets)
-            val interactiveInput = source.namespace == PermissionNamespace.CHROOT_GUEST &&
-                toolName == TERMINAL_TOOL && action in setOf("send", "key")
-            val uncertainties = immutable(assessment.uncertainties + if (interactiveInput) setOf("interactive-terminal-input") else emptySet())
+            // Host proof contains only review evidence. Preserve ordinary guest uncertainty in
+            // a separate diagnostic snapshot so it cannot be mistaken for approval authority.
+            val reviewUncertainties = if (source.namespace == PermissionNamespace.HOST) assessment.uncertainties
+                else assessment.hostLinkedUncertainties
+            val guestUncertainties = assessment.ordinaryGuestUncertainties
             val writes = targets.filter { it.startsWith("WRITE:") || it.startsWith("READ_WRITE:") }.sorted()
-            val needsReview = writes.isNotEmpty() || uncertainties.isNotEmpty()
-            // Ordinary guest work and proven reads need no additional Root access. Host writes and
-            // unknown CHROOT behavior do: bind their separate proof slots to the live Root epoch.
+            val needsReview = writes.isNotEmpty() || reviewUncertainties.isNotEmpty()
+            // Ordinary guest work and reads need no additional Root access. Host-linked writes and
+            // uncertainty bind their separate proof slots to the live Root epoch.
             val hostWriteRoot = if (source.namespace == PermissionNamespace.CHROOT_GUEST && needsReview) {
                 rootCommandManager.accessSnapshot()
             } else null
@@ -157,16 +163,17 @@ class ToolPermissionPolicyEngine @Inject constructor(
                 return EvalResult(
                     Verdict.DENY, denyReason = appContext.getString(R.string.root_access_disabled),
                     permissionSource = source, hostSystemTargets = targets,
-                    hostSystemUncertainties = uncertainties, channelUnavailable = true
+                    hostSystemUncertainties = reviewUncertainties, ordinaryGuestUncertainties = guestUncertainties,
+                    channelUnavailable = true
                 )
             }
             val result = if (!needsReview) EvalResult(Verdict.ALLOW) else {
                 val title = appContext.getString(R.string.tool_host_system_file_confirmation_title)
                 // READ evidence remains in the proof but is never described as needing write approval.
-                val note = if (uncertainties.isEmpty()) {
+                val note = if (reviewUncertainties.isEmpty()) {
                     appContext.getString(R.string.tool_host_system_file_confirmation_reason, writes.joinToString("\n"))
                 } else {
-                    appContext.getString(R.string.tool_host_system_file_uncertain_reason, (writes + uncertainties.sorted()).joinToString("\n"))
+                    appContext.getString(R.string.tool_host_system_file_uncertain_reason, (writes + reviewUncertainties.sorted()).joinToString("\n"))
                 }
                 val grant = hostWriteGrant(toolName, source, rootState ?: hostWriteRoot, shizukuIdentity)
                 if (grant == null) EvalResult(Verdict.ASK, askTitle = title, approvalNote = note)
@@ -177,8 +184,8 @@ class ToolPermissionPolicyEngine @Inject constructor(
             return result.copy(
                 rootGeneration = rootState?.generation, rootAuthorityId = rootState?.authorityId,
                 shizukuIdentity = shizukuIdentity, permissionSource = source, hostSystemTargets = targets,
-                hostSystemUncertainties = uncertainties, hostWriteRootGeneration = hostWriteRoot?.generation,
-                hostWriteRootAuthorityId = hostWriteRoot?.authorityId
+                hostSystemUncertainties = reviewUncertainties, hostWriteRootGeneration = hostWriteRoot?.generation,
+                hostWriteRootAuthorityId = hostWriteRoot?.authorityId, ordinaryGuestUncertainties = guestUncertainties
             )
         }
         if (command == null) return EvalResult(Verdict.ALLOW, permissionSource = source)

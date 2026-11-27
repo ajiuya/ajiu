@@ -45,7 +45,8 @@ enum ajiu_broker_type {
 enum ajiu_broker_operation {
     AJIU_BROKER_RUNTIME = 1,
     AJIU_BROKER_INSTALL = 2,
-    AJIU_BROKER_REMOVE = 3
+    AJIU_BROKER_REMOVE = 3,
+    AJIU_BROKER_RECOVER_REMOVE = 4
 };
 
 enum ajiu_broker_failure {

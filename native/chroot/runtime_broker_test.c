@@ -137,7 +137,9 @@ static void make_start(unsigned char *b, uint64_t id, uint32_t operation)
 {
     memset(b, 0, AJIU_BROKER_START_SIZE); put64(b, id); put32(b + 8, operation);
     if (operation != AJIU_BROKER_RUNTIME) memset(b + 16, 'a', AJIU_BROKER_INSTANCE_SIZE);
-    if (operation == AJIU_BROKER_REMOVE) { put64(b + 40, 1234); put64(b + 48, 5678); }
+    if (operation == AJIU_BROKER_REMOVE || operation == AJIU_BROKER_RECOVER_REMOVE) {
+        put64(b + 40, 1234); put64(b + 48, 5678);
+    }
 }
 
 static void rejected_request(uint16_t type, const unsigned char *b, uint32_t length, uint64_t next)
@@ -156,7 +158,7 @@ static void check_requests(void)
     struct ajiu_broker_header h = { .type = AJIU_BROKER_START, .length = AJIU_BROKER_START_SIZE };
     struct ajiu_broker_request r;
     uint64_t next = 1;
-    for (uint32_t op = AJIU_BROKER_RUNTIME; op <= AJIU_BROKER_REMOVE; ++op) {
+    for (uint32_t op = AJIU_BROKER_RUNTIME; op <= AJIU_BROKER_RECOVER_REMOVE; ++op) {
         make_start(b, next, op);
         CHECK(parse_request(&h, b, &next, &r) == 0 && r.id == next - 1 && r.operation == op);
         CHECK(r.instance[AJIU_BROKER_INSTANCE_SIZE] == 0);
@@ -174,21 +176,29 @@ static void check_requests(void)
     for (size_t offset = 12; offset < AJIU_BROKER_START_SIZE; ++offset) {
         b[offset] = 1; rejected_request(AJIU_BROKER_START, b, AJIU_BROKER_START_SIZE, 1); b[offset] = 0;
     }
-    const uint32_t operations[] = { 0, 4, UINT32_MAX, 0x65786563 };
+    const uint32_t operations[] = { 0, 5, UINT32_MAX, 0x65786563 };
     for (size_t i = 0; i < sizeof(operations) / sizeof(*operations); ++i) {
+        make_start(b, 1, AJIU_BROKER_RECOVER_REMOVE);
         put32(b + 8, operations[i]); rejected_request(AJIU_BROKER_START, b, AJIU_BROKER_START_SIZE, 1);
     }
-    make_start(b, 1, AJIU_BROKER_INSTALL);
     const unsigned char bad_instance[] = { 0, 'A', 'g', '/', '\\', ';', ' ', '\n', '.', '$', 255 };
-    for (size_t i = 0; i < sizeof(bad_instance); ++i) {
-        for (size_t j = 0; j < AJIU_BROKER_INSTANCE_SIZE; ++j) {
-            b[16 + j] = bad_instance[i]; rejected_request(AJIU_BROKER_START, b, AJIU_BROKER_START_SIZE, 1); b[16 + j] = 'a';
+    for (uint32_t op = AJIU_BROKER_INSTALL; op <= AJIU_BROKER_RECOVER_REMOVE; ++op) {
+        make_start(b, 1, op);
+        for (size_t i = 0; i < sizeof(bad_instance); ++i) {
+            for (size_t j = 0; j < AJIU_BROKER_INSTANCE_SIZE; ++j) {
+                b[16 + j] = bad_instance[i]; rejected_request(AJIU_BROKER_START, b, AJIU_BROKER_START_SIZE, 1); b[16 + j] = 'a';
+            }
         }
     }
+    make_start(b, 1, AJIU_BROKER_INSTALL);
     put64(b + 40, 1); rejected_request(AJIU_BROKER_START, b, AJIU_BROKER_START_SIZE, 1); put64(b + 40, 0);
     put64(b + 48, 1); rejected_request(AJIU_BROKER_START, b, AJIU_BROKER_START_SIZE, 1);
-    make_start(b, 1, AJIU_BROKER_REMOVE); put64(b + 40, 0); rejected_request(AJIU_BROKER_START, b, AJIU_BROKER_START_SIZE, 1);
-    make_start(b, 1, AJIU_BROKER_REMOVE); put64(b + 48, 0); rejected_request(AJIU_BROKER_START, b, AJIU_BROKER_START_SIZE, 1);
+    for (uint32_t op = AJIU_BROKER_REMOVE; op <= AJIU_BROKER_RECOVER_REMOVE; ++op) {
+        make_start(b, 1, op); put64(b + 40, 0); rejected_request(AJIU_BROKER_START, b, AJIU_BROKER_START_SIZE, 1);
+        make_start(b, 1, op); put64(b + 48, 0); rejected_request(AJIU_BROKER_START, b, AJIU_BROKER_START_SIZE, 1);
+        make_start(b, 1, op); put64(b + 40, 0); put64(b + 48, 0);
+        rejected_request(AJIU_BROKER_START, b, AJIU_BROKER_START_SIZE, 1);
+    }
     memset(b, 0, sizeof(b)); put64(b, 2); put64(b + 8, 1); next = 2;
     h.type = AJIU_BROKER_STOP; h.length = AJIU_BROKER_STOP_SIZE;
     CHECK(parse_request(&h, b, &next, &r) == 0 && next == 3 && r.target == 1);
@@ -458,8 +468,12 @@ static void check_spawn(void)
     r.id = 5; r.operation = AJIU_BROKER_REMOVE; r.device = 1234; r.inode = 5678;
     CHECK(spawn_job(sockets[0], &r, jobs, &e, &e) == 0); (void)take_started(sockets[1], 5, fds);
     await_reap(jobs, 0); CHECK(exit_record(fds[3], &value) == AJIU_BROKER_EXITED && value == 24); close_fds(fds, 4);
-    r.id = 6; r.operation = AJIU_BROKER_RUNTIME;
-    CHECK(spawn_job(sockets[0], &r, jobs, &e, &e) == 0); (void)take_started(sockets[1], 6, fds);
+    r.id = 6; r.operation = AJIU_BROKER_RECOVER_REMOVE;
+    struct broker_executable unavailable_runtime = { .fd = -1 };
+    CHECK(spawn_job(sockets[0], &r, jobs, &unavailable_runtime, &e) == 0); (void)take_started(sockets[1], 6, fds);
+    await_reap(jobs, 0); CHECK(exit_record(fds[3], &value) == AJIU_BROKER_EXITED && value == 25); close_fds(fds, 4);
+    r.id = 7; r.operation = AJIU_BROKER_RUNTIME;
+    CHECK(spawn_job(sockets[0], &r, jobs, &e, &e) == 0); (void)take_started(sockets[1], 7, fds);
     stop_jobs(jobs); CHECK(exit_record(fds[3], &value) == AJIU_BROKER_SIGNAL && value == SIGTERM); close_fds(fds, 4);
     close_fds(sockets, 2); CHECK(close(e.fd) == 0); CHECK(close(inherited_high) == 0);
     CHECK(fd_count() == before); ++cases;
@@ -849,6 +863,8 @@ static int fixture_main(int argc, char **argv)
     }
     if (argc == 5 && !strcmp(argv[1], "--remove") && strlen(argv[2]) == AJIU_BROKER_INSTANCE_SIZE &&
         !strcmp(argv[3], "1234") && !strcmp(argv[4], "5678")) return 24;
+    if (argc == 5 && !strcmp(argv[0], AJIU_BROKER_INSTALLER_NAME) && !strcmp(argv[1], "--recover-remove") &&
+        !strcmp(argv[2], "aaaaaaaaaaaaaaaaaaaaaaaa") && !strcmp(argv[3], "1234") && !strcmp(argv[4], "5678")) return 25;
     return 86;
 }
 

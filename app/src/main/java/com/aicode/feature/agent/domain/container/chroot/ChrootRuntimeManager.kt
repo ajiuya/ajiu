@@ -32,16 +32,18 @@ internal class ChrootRuntimeManager internal constructor(
     private val scope: CoroutineScope,
     private val dispatcher: CoroutineDispatcher,
     private val controlFactory: (ChrootLaunch) -> ChrootControlTransport,
-    private val clock: () -> Long
+    private val clock: () -> Long,
+    private val diagnostics: ChrootRuntimeDiagnostics? = null
 ) {
     @Inject
     constructor(
         authority: RootAuthorityCoordinator,
         factory: ChrootRuntimeProcessFactory,
-        recovery: ChrootRecoveryRepository
+        recovery: ChrootRecoveryRepository,
+        diagnostics: ChrootRuntimeDiagnostics
     ) : this(
         authority, factory, recovery, CoroutineScope(SupervisorJob() + Dispatchers.IO), Dispatchers.IO,
-        { ChrootControlChannel(it.token(), it.appIdentity.uid) }, { System.nanoTime() / 1_000_000L }
+        { ChrootControlChannel(it.token(), it.appIdentity.uid) }, { System.nanoTime() / 1_000_000L }, diagnostics
     )
 
     private data class Configuration(val revision: Long, val instanceId: String, val rootfs: ChrootFileIdentity)
@@ -72,6 +74,8 @@ internal class ChrootRuntimeManager internal constructor(
         var journaled = false
         var birthAttempted = false
         var ready = false
+        var controlAuthenticated = false
+        var stopSent = false
         @Volatile var exitReceived = false
         var cleanupEvidence: ChrootCleanupResult? = null
         var stdoutEnded = false
@@ -79,6 +83,8 @@ internal class ChrootRuntimeManager internal constructor(
         var wrapperExited = false
         var wrapperStatusVerified = false
         var stopScheduled = false
+        var stopTrigger: ChrootStopTrigger? = null
+        @Volatile var completionEvidence: ChrootCompletionEvidence? = null
     }
 
     private val leases = mutableMapOf<String, Lease>()
@@ -90,6 +96,7 @@ internal class ChrootRuntimeManager internal constructor(
     private val localBlocked = MutableStateFlow<Set<String>>(emptySet())
     private var activationEpoch = 0L
     private var exhausted = false
+    private var journalMaintenance = false
     val stateRevision = MutableStateFlow(0L)
 
     private fun changedLocked() {
@@ -107,12 +114,40 @@ internal class ChrootRuntimeManager internal constructor(
         )
     }
 
+    fun failureSummary(instanceId: String): String? = diagnostics?.let { store ->
+        (store.latestForLaunches(instanceId, recovery.unknownLaunchIds(instanceId)) ?: store.latestUnknown(instanceId))?.let {
+            it.summary() + if (store.isHealthy) "" else ";diagnosticPersistence=UNAVAILABLE"
+        }
+    }
+
     suspend fun stopAndAwaitInstance(instanceId: String): List<ChrootCleanupResult> {
         val handles = authority.withLock {
             stopInstance(instanceId)
             active.values.filter { it.spec.instanceId == instanceId }.map { it.handle }
         }
         return handles.map { it.awaitCleanup() }
+    }
+
+    /** Stops known launches and prevents new leases/permits while a user repairs the journal. */
+    suspend fun <T> withJournalMaintenance(block: suspend () -> T): T {
+        val pending = authority.withLock {
+            check(!journalMaintenance) { "Runtime journal maintenance is already active" }
+            journalMaintenance = true
+            leases.clear()
+            permits.clear()
+            active.values.toList().also { executions ->
+                executions.forEach { markStopOnlyLocked(it) }
+                scope.launch(dispatcher) { executions.forEach { stopExecution(it) } }
+                changedLocked()
+            }
+        }
+        try {
+            withTimeout(10_000L) { pending.forEach { it.handle.awaitCleanup() } }
+            authority.withLock { check(active.isEmpty()) { "Runtime launches have not settled" } }
+            return block()
+        } finally {
+            authority.withLock { journalMaintenance = false; changedLocked() }
+        }
     }
 
     val accessState get() = authority.accessState
@@ -239,7 +274,7 @@ internal class ChrootRuntimeManager internal constructor(
         Unit
     }
 
-    private fun availableLocked(instanceId: String): Boolean = recovery.isHealthy.value &&
+    private fun availableLocked(instanceId: String): Boolean = !journalMaintenance && recovery.isHealthy.value &&
         instanceId !in recovery.blockedInstances.value && instanceId !in uncertainInstances
 
     private fun validLeaseLocked(lease: Lease, current: RootAccessState): Boolean = !exhausted && current.enabled &&
@@ -286,7 +321,9 @@ internal class ChrootRuntimeManager internal constructor(
             val process = authority.withCurrent(execution.lease.root.authorityId, execution.lease.root.generation) {
                 if (!canRunLocked(execution)) null else {
                     execution.birthAttempted = true
-                    factory.start(helper).also { execution.process = it }
+                    factory.startChecked(helper) {
+                        authority.withLock { canRunLocked(execution) }
+                    }.also { execution.process = it }
                 }
             }
             if (process == null) {
@@ -310,13 +347,17 @@ internal class ChrootRuntimeManager internal constructor(
                         execution.wrapperStatusVerified = wrapperStatus == 0
                     }
                     if (wrapperStatus != 0) requestStop(execution)
-                    scheduleStopDeadline(execution)
+                    scheduleStopDeadline(execution, ChrootStopTrigger.HELPER_EXIT)
                     tryFinish(execution)
                 }
             }
             scope.launch(dispatcher) {
                 delay(START_TIMEOUT_MS)
-                if (!execution.go && !execution.finished) {
+                val startupIncomplete = authority.withLock {
+                    !execution.go && !execution.finished &&
+                        !(execution.stopOnly && execution.controlAuthenticated && execution.ready && execution.stopSent)
+                }
+                if (startupIncomplete) {
                     recordFailure(execution, ChrootRuntimeFailureKind.TIMEOUT, execution.startupStage)
                     failChannel(execution)
                 }
@@ -326,16 +367,30 @@ internal class ChrootRuntimeManager internal constructor(
             withTimeout(START_TIMEOUT_MS) {
                 execution.startupStage = ChrootRuntimeFailureStage.CONTROL_HANDSHAKE
                 control.awaitHelper()
+                authority.withLock { execution.controlAuthenticated = true }
                 execution.startupStage = ChrootRuntimeFailureStage.PREPARED_READY
                 execution.prepared.await()
             }
+            // An already-dispatched helper still needs its authenticated control channel and
+            // native READY to stop cleanly. Cancellation never grants GO or resets the stop budget.
+            if (execution.finished) return
+            if (execution.stopOnly) {
+                stopExecution(execution)
+                return
+            }
             execution.startupStage = ChrootRuntimeFailureStage.GO
+            var goAttempted = false
             val sent = authority.withCurrent(execution.lease.root.authorityId, execution.lease.root.generation) {
-                if (!canRunLocked(execution) || !execution.ready) false
-                else control.trySend(ChrootFrameType.GO).also { if (it) execution.go = true }
+                if (execution.stopOnly || execution.finished) false else {
+                    goAttempted = true
+                    if (!canRunLocked(execution) || !execution.ready) false
+                    else control.trySend(ChrootFrameType.GO).also { if (it) execution.go = true }
+                }
             } == true
             if (!sent) {
-                recordFailure(execution, ChrootRuntimeFailureKind.STARTUP, ChrootRuntimeFailureStage.GO)
+                if (goAttempted && !execution.finished) {
+                    recordFailure(execution, ChrootRuntimeFailureKind.STARTUP, ChrootRuntimeFailureStage.GO)
+                }
                 requestStop(execution)
                 return
             }
@@ -465,8 +520,8 @@ internal class ChrootRuntimeManager internal constructor(
                 stage = ChrootRuntimeFailureStage.FRAME_SEQUENCE
                 if (frame.type == ChrootFrameType.ERROR) {
                     val failure = ChrootRuntimeFailure.nativeError(frame.body)
-                    execution.handle.recordNativeFailure(failure)
-                    execution.handle.recordFailure(failure)
+                    recordNativeFailure(execution, failure)
+                    recordFailure(execution, failure)
                 }
                 var observedFailure: ChrootRuntimeFailure? = null
                 val accepted = authority.withLock {
@@ -487,10 +542,15 @@ internal class ChrootRuntimeManager internal constructor(
                                 if (!it) observedFailure = ChrootRuntimeFailure.local(ChrootRuntimeFailureKind.PROTOCOL, ChrootRuntimeFailureStage.OUTPUT_BUFFER)
                             }
                         ChrootFrameType.EXIT -> {
-                            if (!execution.go || execution.exitReceived) false else {
+                            val cancelledBeforeGo = execution.stopOnly && execution.controlAuthenticated &&
+                                execution.ready && execution.stopSent && !execution.go
+                            if (execution.exitReceived || (!execution.go && !cancelledBeforeGo)) false else {
                                 val result = ChrootWireProtocol.exit(frame.body)
                                 execution.exitReceived = true
-                                execution.handle.completeTask(ChrootTaskResult.Exited(result))
+                                // The bootstrap can exit after STOP without ever executing the
+                                // requested command. Its exit is not a successful task execution.
+                                execution.handle.completeTask(if (execution.go) ChrootTaskResult.Exited(result)
+                                    else ChrootTaskResult.Unknown)
                                 true
                             }
                         }
@@ -507,14 +567,15 @@ internal class ChrootRuntimeManager internal constructor(
                         else -> false
                     }
                 }
-                observedFailure?.let { execution.handle.recordFailure(it) }
+                observedFailure?.let { recordFailure(execution, it) }
                 if (!accepted) {
                     recordFailure(execution, ChrootRuntimeFailureKind.PROTOCOL, ChrootRuntimeFailureStage.FRAME_SEQUENCE)
                     failChannel(execution)
                     return
                 }
                 if (frame.type == ChrootFrameType.CLEANUP || frame.type == ChrootFrameType.EXIT) {
-                    scheduleStopDeadline(execution)
+                    scheduleStopDeadline(execution,
+                        if (frame.type == ChrootFrameType.EXIT) ChrootStopTrigger.TASK_EXIT else ChrootStopTrigger.CLEANUP)
                     tryFinish(execution)
                 }
             }
@@ -538,7 +599,7 @@ internal class ChrootRuntimeManager internal constructor(
                         val bytes = ByteArray(available + 1)
                         bytes[0] = first.toByte()
                         if (available == 0 || input.read(bytes, 1, available) == available) {
-                            ChrootRuntimeFailure.nativeStderr(bytes)?.let { execution.handle.recordNativeFailure(it) }
+                            ChrootRuntimeFailure.nativeStderr(bytes)?.let { recordNativeFailure(execution, it) }
                         }
                     }
                 } finally {
@@ -568,46 +629,109 @@ internal class ChrootRuntimeManager internal constructor(
     }
 
     private fun stopExecution(execution: Execution) {
-        if (execution.finished) return
-        val control = execution.control
-        val sent = runCatching { control?.trySend(ChrootFrameType.STOP) == true }.getOrDefault(false)
-        if (!sent) runCatching { control?.close() }
-        scheduleStopDeadline(execution)
+        val undispatched = authority.withLock {
+            if (execution.finished) return@withLock null
+            if ((execution.process as? ChrootBrokerProcess)?.wasCancelledBeforeDispatch == true) true
+            else {
+                // STOP before native READY can abort enrollment and cannot provide the existing
+                // cleanup proof. Keep both listener and stdin alive while the cancelled startup
+                // reaches READY, without allowing GO. The original deadline still bounds this wait.
+                if (execution.controlAuthenticated && execution.ready && !execution.stopSent) {
+                    val control = execution.control
+                    val sent = runCatching { control?.trySend(ChrootFrameType.STOP) == true }.getOrDefault(false)
+                    execution.stopSent = sent
+                    if (!sent) runCatching { control?.close() }
+                }
+                false
+            }
+        } ?: return
+        if (undispatched) completeFinal(execution, ChrootCleanupResult.VERIFIED)
+        else scheduleStopDeadline(execution)
     }
 
-    private fun scheduleStopDeadline(execution: Execution) {
+    private fun scheduleStopDeadline(execution: Execution, trigger: ChrootStopTrigger = ChrootStopTrigger.STOP) {
         val schedule = authority.withLock {
             if (execution.finished || execution.stopScheduled) false else {
                 execution.stopScheduled = true
+                execution.stopTrigger = trigger
                 true
             }
         }
         if (schedule) scope.launch(dispatcher) {
             val deadline = clock() + STOP_TIMEOUT_MS
             delay((deadline - clock()).coerceIn(1L, STOP_TIMEOUT_MS))
-            if (!execution.finished) {
+            val decision = authority.withLock {
+                if (execution.finished) null else {
+                    // EOF/status collectors may have published their proof just before this
+                    // deadline without yet reaching tryFinish. Decide and claim under one gate.
+                    val complete = completionResultLocked(execution)
+                    val result = complete ?: ChrootCleanupResult.UNKNOWN
+                    if (complete == null) execution.completionEvidence = completionEvidenceLocked(execution)
+                    if (claimFinalLocked(execution, result)) result to (complete == null) else null
+                }
+            } ?: return@launch
+            if (decision.second) {
                 recordFailure(execution, ChrootRuntimeFailureKind.TIMEOUT, ChrootRuntimeFailureStage.STOP_DEADLINE)
-                completeFinal(execution, ChrootCleanupResult.UNKNOWN)
             }
+            publishFinal(execution, decision.first)
         }
     }
 
-    private fun recordFailure(execution: Execution, kind: ChrootRuntimeFailureKind, stage: ChrootRuntimeFailureStage) {
-        execution.handle.recordFailure(ChrootRuntimeFailure.local(kind, stage))
+    private fun completionEvidenceLocked(execution: Execution): ChrootCompletionEvidence {
+        var flags = 0
+        if (execution.ready) flags = flags or ChrootCompletionEvidence.READY
+        if (execution.go) flags = flags or ChrootCompletionEvidence.GO
+        if (execution.exitReceived) flags = flags or ChrootCompletionEvidence.TASK_EXIT
+        if (execution.cleanupEvidence != null) flags = flags or ChrootCompletionEvidence.CLEANUP_SEEN
+        if (execution.cleanupEvidence == ChrootCleanupResult.VERIFIED) flags = flags or ChrootCompletionEvidence.CLEANUP_VERIFIED
+        if (execution.stdoutEnded) flags = flags or ChrootCompletionEvidence.STDOUT_ENDED
+        if (execution.helperErrorsEnded) flags = flags or ChrootCompletionEvidence.STDERR_ENDED
+        if (execution.wrapperExited) flags = flags or ChrootCompletionEvidence.HELPER_EXITED
+        if (execution.wrapperStatusVerified) flags = flags or ChrootCompletionEvidence.HELPER_STATUS_VERIFIED
+        return ChrootCompletionEvidence(checkNotNull(execution.stopTrigger), flags)
+    }
+
+    private fun recordFailure(execution: Execution, kind: ChrootRuntimeFailureKind, stage: ChrootRuntimeFailureStage) =
+        recordFailure(execution, ChrootRuntimeFailure.local(kind, stage))
+
+    private fun recordFailure(execution: Execution, failure: ChrootRuntimeFailure) {
+        if (execution.handle.recordFailure(failure)) reportDiagnostic(execution)
+    }
+
+    private fun recordNativeFailure(execution: Execution, failure: ChrootRuntimeFailure) {
+        if (execution.handle.recordNativeFailure(failure)) reportDiagnostic(execution)
+    }
+
+    private fun reportDiagnostic(execution: Execution, cleanup: ChrootCleanupResult? = null) {
+        val store = diagnostics ?: return
+        val failure = execution.handle.failure.value
+        val nativeFailure = execution.handle.nativeFailure.value
+        val cleanupEvidence = cleanup ?: execution.handle.cleanupState.value
+        val completionEvidence = execution.completionEvidence
+        // Never put diagnostic disk I/O inside the authority gate or delay STOP/UNKNOWN publication.
+        scope.launch(dispatcher) {
+            store.record(execution.spec.instanceId, execution.spec.launchId, failure, nativeFailure, cleanupEvidence, completionEvidence)
+        }
     }
 
     private fun failChannel(execution: Execution) {
         requestStop(execution)
-        completeFinal(execution, ChrootCleanupResult.UNKNOWN)
+        // Only the broker's successful pending->cancelled CAS proves no START was committed.
+        // A dead/failed process, missing descriptor reply or absent PID is not such proof.
+        val undispatched = (execution.process as? ChrootBrokerProcess)?.wasCancelledBeforeDispatch == true
+        completeFinal(execution, if (undispatched) ChrootCleanupResult.VERIFIED else ChrootCleanupResult.UNKNOWN)
     }
+
+    private fun completionResultLocked(execution: Execution): ChrootCleanupResult? =
+        if (execution.finished || !execution.stdoutEnded || !execution.helperErrorsEnded || !execution.wrapperExited) null
+        else if (!execution.wrapperStatusVerified) ChrootCleanupResult.UNKNOWN
+        else execution.cleanupEvidence ?: ChrootCleanupResult.UNKNOWN
 
     private fun tryFinish(execution: Execution) {
         val result = authority.withLock {
-            if (execution.finished || !execution.stdoutEnded || !execution.helperErrorsEnded || !execution.wrapperExited) null
-            else if (!execution.wrapperStatusVerified) ChrootCleanupResult.UNKNOWN
-            else execution.cleanupEvidence ?: ChrootCleanupResult.UNKNOWN
+            completionResultLocked(execution)?.takeIf { claimFinalLocked(execution, it) }
         } ?: return
-        completeFinal(execution, result)
+        publishFinal(execution, result)
     }
 
     private fun finishUnstarted(execution: Execution) {
@@ -618,19 +742,22 @@ internal class ChrootRuntimeManager internal constructor(
         completeFinal(execution, ChrootCleanupResult.VERIFIED)
     }
 
-    private fun completeFinal(execution: Execution, proposed: ChrootCleanupResult) {
-        val accepted = authority.withLock {
-            if (execution.finished) false else {
-                execution.finished = true
-                markStopOnlyLocked(execution)
-                if (proposed == ChrootCleanupResult.UNKNOWN) {
-                    uncertainInstances.add(execution.spec.instanceId)
-                    localBlocked.value = uncertainInstances.toSet()
-                }
-                true
-            }
+    private fun claimFinalLocked(execution: Execution, proposed: ChrootCleanupResult): Boolean {
+        if (execution.finished) return false
+        execution.finished = true
+        markStopOnlyLocked(execution)
+        if (proposed == ChrootCleanupResult.UNKNOWN) {
+            uncertainInstances.add(execution.spec.instanceId)
+            localBlocked.value = uncertainInstances.toSet()
         }
-        if (!accepted) return
+        return true
+    }
+
+    private fun completeFinal(execution: Execution, proposed: ChrootCleanupResult) {
+        if (authority.withLock { claimFinalLocked(execution, proposed) }) publishFinal(execution, proposed)
+    }
+
+    private fun publishFinal(execution: Execution, proposed: ChrootCleanupResult) {
         scope.launch(dispatcher) {
             var result = proposed
             try {
@@ -650,6 +777,7 @@ internal class ChrootRuntimeManager internal constructor(
             runCatching { execution.control?.close() }
             execution.handle.completeTask(ChrootTaskResult.Unknown)
             execution.handle.completeCleanup(result)
+            reportDiagnostic(execution, result)
             val process = execution.process
             if (result == ChrootCleanupResult.VERIFIED && process != null && !process.isAlive) {
                 runCatching { process.outputStream.close() }

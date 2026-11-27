@@ -132,12 +132,27 @@ class ChrootBrokerWireTest {
     }
 
     @Test
+    fun recoveryRemovalUsesTheFixedOperationAndExactPositiveInstanceIdentity() {
+        for ((device, inode) in listOf(1L to 1L, Long.MAX_VALUE to Long.MAX_VALUE)) {
+            val body = ChrootBrokerWire.start(Long.MAX_VALUE, ChrootBrokerWire.RECOVER_REMOVE, instanceId, device, inode)
+            assertArrayEquals(ByteBuffer.allocate(56).putLong(Long.MAX_VALUE).putInt(4).putInt(0)
+                .put(instanceId.toByteArray(Charsets.US_ASCII)).putLong(device).putLong(inode).array(), body)
+        }
+        for ((device, inode) in listOf(0L to 1L, 1L to 0L, 0L to 0L, -1L to 1L, 1L to -1L,
+            Long.MIN_VALUE to 1L, 1L to Long.MIN_VALUE)) {
+            assertThrows(IllegalArgumentException::class.java) {
+                ChrootBrokerWire.start(1, ChrootBrokerWire.RECOVER_REMOVE, instanceId, device, inode)
+            }
+        }
+    }
+
+    @Test
     fun startRejectsInvalidRequestIdsOperationsAndAnyRuntimeInstanceOrIdentity() {
         for (id in listOf(Long.MIN_VALUE, -1L, 0L)) {
             assertThrows(IllegalArgumentException::class.java) { ChrootBrokerWire.start(id, 1) }
         }
-        for (operation in listOf(Int.MIN_VALUE, -1, 0, 4, Int.MAX_VALUE)) {
-            assertThrows(IllegalArgumentException::class.java) { ChrootBrokerWire.start(1, operation) }
+        for (operation in listOf(Int.MIN_VALUE, -1, 0, 5, Int.MAX_VALUE)) {
+            assertThrows(IllegalArgumentException::class.java) { ChrootBrokerWire.start(1, operation, instanceId, 1, 1) }
         }
         for (candidate in listOf("", instanceId, "/bin/sh", "sh -c anything")) {
             assertThrows(IllegalArgumentException::class.java) { ChrootBrokerWire.start(1, 1, candidate) }
@@ -149,11 +164,12 @@ class ChrootBrokerWireTest {
 
     @Test
     fun instanceOperationsRejectNonHexNamesCommandArgumentsAndInvalidDeviceOrInode() {
-        for (operation in listOf(ChrootBrokerWire.INSTALL, ChrootBrokerWire.REMOVE)) {
+        for (operation in listOf(ChrootBrokerWire.INSTALL, ChrootBrokerWire.REMOVE, ChrootBrokerWire.RECOVER_REMOVE)) {
             for (candidate in listOf(null, "", instanceId.dropLast(1), instanceId + "0", instanceId.uppercase(),
                 "g".repeat(24), "../$instanceId", "$instanceId --remove", "/bin/sh -c anything")) {
                 assertThrows(IllegalArgumentException::class.java) {
-                    ChrootBrokerWire.start(1, operation, candidate, inode = if (operation == 3) 1 else 0)
+                    val identity = if (operation == ChrootBrokerWire.INSTALL) 0L else 1L
+                    ChrootBrokerWire.start(1, operation, candidate, device = identity, inode = identity)
                 }
             }
         }

@@ -9,9 +9,12 @@ import com.aicode.feature.agent.domain.model.AgentImage
 import com.aicode.feature.agent.presentation.AgentAttachment
 import com.aicode.feature.workspace.domain.FileAccessProvider
 import com.aicode.feature.workspace.domain.WorkspacePathMapper
+import com.aicode.feature.workspace.domain.WorkspaceExecutionContext
 import java.io.File
 import java.util.Base64
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 
 internal data class UploadedWorkspaceFile(
@@ -173,58 +176,78 @@ internal suspend fun copyUriToWorkspace(
     context: Context,
     uri: Uri,
     fileAccess: FileAccessProvider,
+    captureFile: suspend (String) -> WorkspaceExecutionContext,
     includeImageData: Boolean = false
 ): UploadedWorkspaceFile = withContext(Dispatchers.IO) {
     val attachmentsDir = "${WorkspacePathMapper.CONTAINER_ROOT}/.aicode/attachments"
-    val fileName = uniqueUploadName(fileAccess, attachmentsDir, safeUploadFileName(context, uri))
-    val containerPath = "$attachmentsDir/$fileName"
+    // Bind once, before even checking a name. CHROOT, PRoot and SSH then use the same
+    // captured workspace throughout the upload, without a separate user grant.
+    val execution = captureFile(attachmentsDir)
+    withContext(execution) {
+        val operation = currentCoroutineContext()
+        fun checkUpload() {
+            operation.ensureActive()
+            execution.checkCurrent()
+        }
+        checkUpload()
+        val fileName = uniqueUploadName(fileAccess, attachmentsDir, safeUploadFileName(context, uri))
+        checkUpload()
+        val containerPath = "$attachmentsDir/$fileName"
 
-    val mimeType = if (includeImageData) {
-        imageMimeType(context, uri, fileName)
-    } else {
-        fileMimeType(context, uri, fileName)
-    }
+        val mimeType = if (includeImageData) {
+            imageMimeType(context, uri, fileName)
+        } else {
+            fileMimeType(context, uri, fileName)
+        }
 
-    // 原图要整份读进内存再缩小，这里只拦会顶爆堆的超大文件；发给模型的副本在缩小后再按上限校验。
-    if (includeImageData) {
-        val declared = context.contentSize(uri)
-        if (declared != null && declared > MAX_IMAGE_SOURCE_BYTES) error(imageLimitError(context, MAX_IMAGE_SOURCE_BYTES))
-    }
+        // 原图要整份读进内存再缩小，这里只拦会顶爆堆的超大文件；发给模型的副本在缩小后再按上限校验。
+        if (includeImageData) {
+            val declared = context.contentSize(uri)
+            if (declared != null && declared > MAX_IMAGE_SOURCE_BYTES) error(imageLimitError(context, MAX_IMAGE_SOURCE_BYTES))
+        }
+        checkUpload()
 
-    val sizeBytes: Long
-    val image: AgentImage?
-    if (includeImageData) {
-        val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-            ?: error(unreadableFileMessage(context))
-        if (bytes.size > MAX_IMAGE_SOURCE_BYTES) error(imageLimitError(context, MAX_IMAGE_SOURCE_BYTES))
-        val scaled = ImageDownscaler.downscale(bytes, mimeType)
-        if (scaled.bytes.size > MAX_IMAGE_UPLOAD_BYTES) error(imageLimitError(context, MAX_IMAGE_UPLOAD_BYTES))
-        fileAccess.writeBytes(containerPath, bytes, overwrite = true)
-        sizeBytes = bytes.size.toLong()
-        image = AgentImage(
-            mimeType = scaled.mimeType,
-            base64Data = Base64.getEncoder().encodeToString(scaled.bytes),
-            path = containerPath
+        val sizeBytes: Long
+        val image: AgentImage?
+        if (includeImageData) {
+            val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                ?: error(unreadableFileMessage(context))
+            checkUpload()
+            if (bytes.size > MAX_IMAGE_SOURCE_BYTES) error(imageLimitError(context, MAX_IMAGE_SOURCE_BYTES))
+            val scaled = ImageDownscaler.downscale(bytes, mimeType)
+            if (scaled.bytes.size > MAX_IMAGE_UPLOAD_BYTES) error(imageLimitError(context, MAX_IMAGE_UPLOAD_BYTES))
+            checkUpload()
+            fileAccess.writeBytes(containerPath, bytes, overwrite = true)
+            checkUpload()
+            sizeBytes = bytes.size.toLong()
+            image = AgentImage(
+                mimeType = scaled.mimeType,
+                base64Data = Base64.getEncoder().encodeToString(scaled.bytes),
+                path = containerPath
+            )
+        } else {
+            // 普通附件流式落盘：不再整份读进内存，于是文件多大都不会顶爆堆
+            sizeBytes = context.contentResolver.openInputStream(uri)?.use { input ->
+                checkUpload()
+                fileAccess.writeStream(containerPath, input, overwrite = true)
+            } ?: error(unreadableFileMessage(context))
+            checkUpload()
+            image = null
+        }
+
+        // CHROOT／SSH 生成本地缓存，PRoot 返回当前工作区文件；始终使用同一执行上下文。
+        val localFile = fileAccess.copyToLocal(containerPath)
+        checkUpload()
+
+        UploadedWorkspaceFile(
+            fileName = fileName,
+            containerPath = containerPath,
+            localPath = localFile.absolutePath,
+            mimeType = mimeType,
+            sizeBytes = sizeBytes,
+            image = image
         )
-    } else {
-        // 普通附件流式落盘：不再整份读进内存，于是文件多大都不会顶爆堆
-        sizeBytes = context.contentResolver.openInputStream(uri)?.use { input ->
-            fileAccess.writeStream(containerPath, input, overwrite = true)
-        } ?: error(unreadableFileMessage(context))
-        image = null
     }
-
-    // 缩略图与图片数据需要本地文件：本地模式直接给宿主文件，远程模式下载到临时文件
-    val localFile = fileAccess.copyToLocal(containerPath)
-
-    UploadedWorkspaceFile(
-        fileName = fileName,
-        containerPath = containerPath,
-        localPath = localFile.absolutePath,
-        mimeType = mimeType,
-        sizeBytes = sizeBytes,
-        image = image
-    )
 }
 
 private fun Context.displayName(uri: Uri): String {

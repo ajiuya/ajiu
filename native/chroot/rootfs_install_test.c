@@ -17,6 +17,8 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/vfs.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -26,10 +28,11 @@ struct test_node {
     uid_t uid;
     gid_t gid;
     uint64_t mount_id;
+    nlink_t link_override;
 };
 struct test_seam {
-    int root;
-    struct test_node nodes[64];
+    int root, proc, boot, base, local;
+    struct test_node nodes[8192];
     size_t count, root_open_calls, openat2_calls, statx_calls, unlink_calls, rejected_calls;
     uid_t uid, euid;
     gid_t gid, egid;
@@ -37,7 +40,13 @@ struct test_seam {
     bool named_mount_changed;
     dev_t named_dev; ino_t named_ino;
     uint64_t named_mount, named_fd_mounts[1024];
-    size_t named_mount_reads;
+    size_t named_mount_reads, sync_calls, receipt_syncs, base_syncs, local_syncs;
+    int fail_sync_call;
+    bool fail_receipt_write, unsafe_unlink, enforce_receipt, replace_view_on_reopen, fail_local_sync;
+    unsigned int view_reopens, base_change_after_manifest;
+    bool proc_wrong_fs, boot_parent_submount;
+    size_t boot_opens, boot_mount_rejections;
+    const char *fail_unlink;
 };
 static struct test_seam seam;
 static int checks;
@@ -54,12 +63,17 @@ static int synthetic_fstat(int fd, struct stat *st);
 static int synthetic_fstatat(int fd, const char *path, struct stat *st, int flags);
 static long synthetic_syscall(long number, ...);
 static int synthetic_unlinkat(int fd, const char *path, int flags);
+static int synthetic_fstatfs(int fd, struct statfs *fs);
+static int synthetic_fsync(int fd);
+static int synthetic_fchown(int fd, uid_t uid, gid_t gid);
+static ssize_t synthetic_write(int fd, const void *bytes, size_t size);
 static uid_t synthetic_getuid(void) { return seam.uid; }
 static uid_t synthetic_geteuid(void) { return seam.euid; }
 static gid_t synthetic_getgid(void) { return seam.gid; }
 static gid_t synthetic_getegid(void) { return seam.egid; }
 
-/* Only production calls use these seams; no production main, setup, chroot or mount is run. */
+/* Only production calls use these seams. Focused CLI tests fork and return the
+ * actual main exit status; absolute paths/privileged queries stay synthetic. */
 #define main rootfs_install_production_main_not_called
 #define open synthetic_open
 #define openat synthetic_openat
@@ -73,6 +87,10 @@ static gid_t synthetic_getegid(void) { return seam.egid; }
 #define getegid synthetic_getegid
 #define read synthetic_read
 #define poll synthetic_poll
+#define fstatfs synthetic_fstatfs
+#define fsync synthetic_fsync
+#define fchown synthetic_fchown
+#define write synthetic_write
 #include "rootfs_install.c"
 #undef main
 #undef open
@@ -87,6 +105,10 @@ static gid_t synthetic_getegid(void) { return seam.egid; }
 #undef getegid
 #undef read
 #undef poll
+#undef fstatfs
+#undef fsync
+#undef fchown
+#undef write
 
 #define CHECK(condition) do { \
     ++checks; \
@@ -97,6 +119,7 @@ static gid_t synthetic_getegid(void) { return seam.egid; }
 } while (0)
 #define CURRENT_MOUNT UINT64_C(9001)
 #define OLD_MOUNT UINT64_C(41)
+#define PROC_MOUNT UINT64_C(9017)
 
 static ssize_t synthetic_read(int fd, void *bytes, size_t size)
 {
@@ -141,7 +164,7 @@ static int remember(const struct stat *st)
 {
     if (node_for(st)) return 0;
     if (seam.count == sizeof(seam.nodes) / sizeof(*seam.nodes)) { errno = EOVERFLOW; return -1; }
-    seam.nodes[seam.count++] = (struct test_node){ st->st_dev, st->st_ino, 0, 0, CURRENT_MOUNT };
+    seam.nodes[seam.count++] = (struct test_node){ .dev = st->st_dev, .ino = st->st_ino, .mount_id = CURRENT_MOUNT };
     return 0;
 }
 
@@ -173,7 +196,17 @@ static int synthetic_openat(int parent, const char *name, int flags, ...)
 {
     mode_t mode = 0;
     if (flags & O_CREAT) { va_list args; va_start(args, flags); mode = (mode_t)va_arg(args, int); va_end(args); }
+    if (seam.replace_view_on_reopen && (flags & O_DIRECTORY) && !strcmp(name, "abcdef0123456789abcdef01") &&
+        ++seam.view_reopens == 2) {
+        if (renameat(parent, name, seam.root, "saved-view") < 0 || mkdirat(parent, name, 0700) < 0) return -1;
+        struct stat st;
+        if (fstatat(parent, name, &st, AT_SYMLINK_NOFOLLOW) < 0 || remember(&st) < 0) return -1;
+    }
     int fd = openat(parent, name, flags, mode);
+    if (fd >= 0 && (flags & O_CREAT) && !strcmp(name, REMOVE_RECEIPT)) {
+        struct stat st;
+        if (fstat(fd, &st) < 0 || remember(&st) < 0) { close(fd); return -1; }
+    }
     remember_named_open(parent, name, fd);
     return fd;
 }
@@ -184,6 +217,7 @@ static int synthetic_fstat(int fd, struct stat *st)
     struct test_node *node = node_for(st);
     if (!node) { ++seam.rejected_calls; errno = EPERM; return -1; }
     st->st_uid = node->uid; st->st_gid = node->gid;
+    if (node->link_override) st->st_nlink = node->link_override;
     return 0;
 }
 
@@ -204,6 +238,7 @@ static int synthetic_fstatat(int fd, const char *path, struct stat *st, int flag
     struct test_node *node = node_for(st);
     if (!node) { ++seam.rejected_calls; errno = EPERM; return -1; }
     st->st_uid = node->uid; st->st_gid = node->gid;
+    if (node->link_override) st->st_nlink = node->link_override;
     return 0;
 }
 
@@ -212,6 +247,22 @@ static int synthetic_openat2(int fd, const char *path, const struct open_how *ho
 {
     ++seam.openat2_calls;
     const uint64_t resolve = RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS;
+    if (seam.proc >= 0 && node_fd(fd) == node_fd(seam.proc)) {
+        const uint64_t proc_resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV;
+        if (strcmp(path, "sys/kernel/random/boot_id") || size != sizeof(*how) || how->resolve != proc_resolve ||
+            how->flags != (O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW) || how->mode || seam.boot < 0) {
+            ++seam.rejected_calls; errno = EINVAL; return -1;
+        }
+        ++seam.boot_opens;
+        /* Both sources are modeled procfs; a bind to random/uuid still crosses
+         * a mount boundary. The parent's proc mount differs from / on purpose. */
+        if (seam.boot_parent_submount || node_fd(seam.boot)->mount_id != node_fd(seam.proc)->mount_id) {
+            ++seam.boot_mount_rejections; errno = EXDEV; return -1;
+        }
+        int boot = fcntl(seam.boot, F_DUPFD_CLOEXEC, 3);
+        remember_named_open(fd, path, boot);
+        return boot;
+    }
     const uint64_t allowed = O_PATH | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW;
     if (!node_fd(fd) || !path || strlen(path) > 4096 || !safe_path(path) || size != sizeof(*how) ||
         how->resolve != resolve || (how->flags & ~allowed) || how->mode) {
@@ -280,12 +331,67 @@ static int synthetic_unlinkat(int fd, const char *path, int flags)
         ++seam.rejected_calls; errno = EPERM; return -1;
     }
     ++seam.unlink_calls;
+    if (seam.enforce_receipt && strcmp(path, REMOVE_RECEIPT) && strncmp(path, PREFIX, strlen(PREFIX))) {
+        struct stat receipt;
+        if (fstatat(seam.base, REMOVE_RECEIPT, &receipt, AT_SYMLINK_NOFOLLOW) < 0 ||
+            !S_ISREG(receipt.st_mode) || !seam.receipt_syncs || !seam.base_syncs) seam.unsafe_unlink = true;
+    }
+    if (seam.fail_unlink && !strcmp(path, seam.fail_unlink)) { errno = EIO; return -1; }
     if (seam.named_mount_changed) {
         struct stat named;
         if (fstatat(fd, path, &named, AT_SYMLINK_NOFOLLOW) == 0 &&
             named.st_dev == seam.named_dev && named.st_ino == seam.named_ino) { errno = EBUSY; return -1; }
     }
-    return unlinkat(fd, path, flags);
+    int rc = unlinkat(fd, path, flags);
+    if (!rc && seam.base_change_after_manifest && !strcmp(path, "manifest")) {
+        struct test_node *base = node_fd(seam.base);
+        if (!base) { errno = ESTALE; return -1; }
+        if (seam.base_change_after_manifest == 1) base->uid = 10000;
+        else if (seam.base_change_after_manifest == 2) base->gid = 10000;
+        else if (fchmod(seam.base, 0755) < 0) return -1;
+    }
+    return rc;
+}
+
+static int synthetic_fstatfs(int fd, struct statfs *fs)
+{
+    struct test_node *held = node_fd(fd);
+    if (!held || seam.proc < 0 || (held != node_fd(seam.proc) && held != node_fd(seam.boot))) {
+        ++seam.rejected_calls; errno = EPERM; return -1;
+    }
+    memset(fs, 0, sizeof(*fs));
+    fs->f_type = held == node_fd(seam.proc) && seam.proc_wrong_fs ? TMPFS_MAGIC : PROC_SUPER_MAGIC;
+    return 0;
+}
+
+static int synthetic_fsync(int fd)
+{
+    ++seam.sync_calls;
+    if ((int)seam.sync_calls == seam.fail_sync_call) { errno = EIO; return -1; }
+    struct stat st, receipt;
+    if (fstat(fd, &st) < 0) return -1;
+    if (seam.local >= 0 && fstat(seam.local, &receipt) == 0 && same_object(&st, &receipt)) {
+        ++seam.local_syncs;
+        if (seam.fail_local_sync) { errno = EIO; return -1; }
+    }
+    if (seam.base >= 0 && fstatat(seam.base, REMOVE_RECEIPT, &receipt, AT_SYMLINK_NOFOLLOW) == 0 && same_object(&st, &receipt))
+        ++seam.receipt_syncs;
+    if (fd == seam.base || (seam.base >= 0 && fstat(seam.base, &receipt) == 0 && same_object(&st, &receipt))) ++seam.base_syncs;
+    return fsync(fd);
+}
+
+static int synthetic_fchown(int fd, uid_t uid, gid_t gid)
+{
+    struct test_node *node = node_fd(fd);
+    if (!node || uid || gid) { ++seam.rejected_calls; errno = EPERM; return -1; }
+    node->uid = uid; node->gid = gid;
+    return 0;
+}
+
+static ssize_t synthetic_write(int fd, const void *bytes, size_t size)
+{
+    if (seam.fail_receipt_write) { errno = EIO; return -1; }
+    return write(fd, bytes, size);
 }
 
 struct fixture {
@@ -345,8 +451,8 @@ static int fixture_open(struct fixture *f)
 {
     memset(f, 0, sizeof(*f));
     f->sandbox = f->data = f->local = f->base = f->root = f->views = -1;
-    f->loaded = (struct install){ .local = -1, .base = -1, .root = -1, .views = -1, .manifest = -1 };
-    memset(&seam, 0, sizeof(seam)); seam.root = -1;
+    f->loaded = (struct install){ .local = -1, .base = -1, .root = -1, .views = -1, .manifest = -1, .receipt = -1 };
+    memset(&seam, 0, sizeof(seam)); seam.root = seam.proc = seam.boot = seam.base = seam.local = -1;
     (void)snprintf(f->temp, sizeof(f->temp), "/tmp/ajiu-rootfs-install-test-XXXXXX");
     if (!mkdtemp(f->temp)) return -1;
     f->sandbox = open(f->temp, DIR_FLAGS);
@@ -355,8 +461,10 @@ static int fixture_open(struct fixture *f)
     seam.root = f->sandbox;
     f->data = mkdir_open(f->sandbox, "data", 0700);
     f->local = f->data < 0 ? -1 : mkdir_open(f->data, "local", 0700);
+    seam.local = f->local;
     (void)snprintf(f->loaded.name, sizeof(f->loaded.name), "%s%s", PREFIX, "0123456789abcdef01234567");
     f->base = f->local < 0 ? -1 : mkdir_open(f->local, f->loaded.name, 0700);
+    seam.base = f->base;
     f->root = f->base < 0 ? -1 : mkdir_open(f->base, "root", 0755);
     f->views = f->base < 0 ? -1 : mkdir_open(f->base, "views", 0700);
     if (f->root < 0 || f->views < 0 || fstat(f->base, &f->base_stat) < 0 ||
@@ -413,8 +521,8 @@ static int fixture_close(struct fixture *f)
 {
     for (uint32_t i = 0; i < f->loaded.count; ++i) free(f->loaded.entries[i].path);
     free(f->loaded.entries); free(f->loaded.index);
-    int fds[] = { f->loaded.local, f->loaded.base, f->loaded.root, f->loaded.views, f->loaded.manifest,
-                  f->data, f->local, f->base, f->root, f->views };
+    int fds[] = { f->loaded.local, f->loaded.base, f->loaded.root, f->loaded.views, f->loaded.manifest, f->loaded.receipt,
+                  f->data, f->local, f->base, f->root, f->views, seam.boot, seam.proc };
     for (size_t i = 0; i < sizeof(fds) / sizeof(*fds); ++i) if (fds[i] >= 0) close(fds[i]);
     int rc = 0;
     if (f->sandbox >= 0) {
@@ -424,7 +532,7 @@ static int fixture_close(struct fixture *f)
         close(f->sandbox);
         if (!rc && rmdir(f->temp) < 0) rc = -1;
     } else if (*f->temp && rmdir(f->temp) < 0 && errno != ENOENT) rc = -1;
-    seam.root = -1;
+    seam.root = seam.proc = seam.boot = seam.base = seam.local = -1;
     return rc;
 }
 
@@ -771,26 +879,412 @@ static int test_review_regression_named_anchor_mount(void)
     return 0;
 }
 
+struct cli_result {
+    char json[2048];
+    int status;
+    struct { size_t unlinks, rejected, receipt_syncs, base_syncs, local_syncs, boot_opens, boot_mount_rejections; bool unsafe; } calls;
+};
+
+static int recovery_boot(struct fixture *f, bool next)
+{
+    if (seam.proc < 0) {
+        seam.proc = mkdir_open(f->sandbox, "proc", 0555);
+        if (seam.proc < 0) return -1;
+        node_fd(seam.proc)->mount_id = PROC_MOUNT;
+    }
+    if (seam.boot < 0) {
+        struct stat st;
+        if (make_file(f->sandbox, "boot-id", "", &st) < 0) return -1;
+        seam.boot = openat(f->sandbox, "boot-id", O_RDWR | O_NOFOLLOW | O_CLOEXEC);
+        if (seam.boot < 0) return -1;
+        node_fd(seam.boot)->mount_id = PROC_MOUNT;
+    }
+    const char *id = next ? "22222222-2222-4222-8222-222222222222\n" : "11111111-1111-4111-8111-111111111111\n";
+    return pwrite(seam.boot, id, 37, 0) == 37 && ftruncate(seam.boot, 37) == 0 ? 0 : -1;
+}
+
+static int recovery_cli(struct fixture *f, const char *operation, bool wrong_identity, struct cli_result *out)
+{
+    int output[2], report[2];
+    if (pipe(output) < 0) return -1;
+    if (pipe(report) < 0) { close(output[0]); close(output[1]); return -1; }
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        close(output[0]); close(report[0]);
+        if (dup2(output[1], STDOUT_FILENO) < 0) _exit(99);
+        close(output[1]);
+        char dev[32], ino[32];
+        (void)snprintf(dev, sizeof(dev), "%ju", (uintmax_t)f->base_stat.st_dev);
+        (void)snprintf(ino, sizeof(ino), "%ju", (uintmax_t)f->base_stat.st_ino + (wrong_identity ? 1U : 0U));
+        char *args[] = { "installer-fixture", (char *)operation, f->loaded.name + strlen(PREFIX), dev, ino, NULL };
+        int rc = rootfs_install_production_main_not_called(!strcmp(operation, "--install") ? 3 : 5, args);
+        out->calls.unlinks = seam.unlink_calls; out->calls.rejected = seam.rejected_calls;
+        out->calls.receipt_syncs = seam.receipt_syncs; out->calls.base_syncs = seam.base_syncs;
+        out->calls.local_syncs = seam.local_syncs;
+        out->calls.boot_opens = seam.boot_opens; out->calls.boot_mount_rejections = seam.boot_mount_rejections;
+        out->calls.unsafe = seam.unsafe_unlink;
+        if (write_all(report[1], &out->calls, sizeof(out->calls)) < 0 || fflush(stdout) != 0) _exit(98);
+        close(report[1]); _exit(rc);
+    }
+    close(output[1]); close(report[1]);
+    int error = 0, status = 0; size_t used = 0;
+    if (child < 0) error = errno;
+    while (!error && used < sizeof(out->json) - 1) {
+        ssize_t n = read(output[0], out->json + used, sizeof(out->json) - 1 - used);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) { error = errno; break; }
+        if (!n) break;
+        used += (size_t)n;
+    }
+    out->json[used] = 0;
+    if (child >= 0) {
+        if (read(report[0], &out->calls, sizeof(out->calls)) != (ssize_t)sizeof(out->calls)) error = EIO;
+        if (waitpid(child, &status, 0) != child || !WIFEXITED(status)) error = ECHILD;
+        else out->status = WEXITSTATUS(status);
+    }
+    close(output[0]); close(report[0]);
+    struct stat st;
+    if (!error && fstatat(f->base, REMOVE_RECEIPT, &st, AT_SYMLINK_NOFOLLOW) == 0 && remember(&st) < 0) error = errno;
+    return error ? (errno = error, -1) : 0;
+}
+
+enum recovery_case {
+    REC_EMPTY, REC_VIEWS, REC_LEGACY, REC_SAME_BOOT_WITH_VIEW,
+    REC_BAD_ID_0, REC_BAD_ID_1, REC_BAD_ID_2, REC_BAD_ID_3, REC_BAD_ID_4, REC_BAD_ID_5, REC_BAD_ID_6, REC_BAD_ID_7,
+    REC_BAD_INSTANCE, REC_BAD_MAGIC, REC_BAD_BOOT, REC_RESERVED, REC_SHORT, REC_LONG,
+    REC_OWNER, REC_GROUP, REC_MODE, REC_LINK, REC_SYMLINK, REC_MOUNT, REC_NAMED_MOUNT, REC_MANIFEST_REPLACED,
+    REC_VIEW_BAD_NAME, REC_VIEW_SYMLINK, REC_VIEW_MOUNT, REC_VIEW_NAMED_MOUNT, REC_VIEW_NONEMPTY, REC_VIEW_OWNER, REC_VIEW_MODE, REC_VIEW_RACE,
+    REC_ROOT_MOUNT, REC_EXTRA_BASE, REC_WRONG_ARGUMENT,
+    REC_WRITE_FAIL, REC_FILE_SYNC_FAIL, REC_BASE_SYNC_FAIL, REC_ROOT_UNLINK_FAIL, REC_BASE_UNLINK_FAIL,
+    REC_PARENT_SYNC_FAIL, REC_FINAL_BASE_OWNER, REC_FINAL_BASE_GROUP, REC_FINAL_BASE_MODE,
+    REC_CASES
+};
+
+static int test_recovery_case(enum recovery_case scenario)
+{
+    char test_name_buffer[64];
+    (void)snprintf(test_name_buffer, sizeof(test_name_buffer), "recovery_case_%d", scenario);
+    const char *test_name = test_name_buffer;
+    struct fixture f; struct cli_result out = {0};
+    int result = 0, view = -1, receipt = -1;
+    const char *view_name = "abcdef0123456789abcdef01";
+    CHECK(fixture_open(&f) == 0);
+    f.header[0] = scenario == REC_LEGACY ? AJIU_MANIFEST_V1 : AJIU_MANIFEST_V2;
+    CHECK(manifest_write(&f) == 0 && recovery_boot(&f, false) == 0);
+    if (scenario != REC_EMPTY) { view = mkdir_open(f.views, view_name, 0700); CHECK(view >= 0); }
+    seam.enforce_receipt = true;
+    if (scenario == REC_WRITE_FAIL) seam.fail_receipt_write = true;
+    if (scenario == REC_FILE_SYNC_FAIL) seam.fail_sync_call = 1;
+    if (scenario == REC_BASE_SYNC_FAIL) seam.fail_sync_call = 2;
+    CHECK(recovery_cli(&f, "--recover-remove", false, &out) == 0);
+    CHECK(out.calls.unlinks == 0 && !out.calls.unsafe && entry_present(&f));
+    CHECK(out.calls.local_syncs == 0);
+    CHECK(faccessat(f.base, REMOVE_RECEIPT, F_OK, AT_SYMLINK_NOFOLLOW) == 0);
+    if (scenario >= REC_WRITE_FAIL && scenario <= REC_BASE_SYNC_FAIL) {
+        CHECK(out.status == 5 && strstr(out.json, "\"passed\":false") && strstr(out.json, "cleanup_unknown"));
+        CHECK(recovery_cli(&f, "--remove", false, &out) == 0 && out.status == 5 && !out.calls.unlinks);
+        goto done;
+    }
+    CHECK(out.status == 0 && strstr(out.json, "\"passed\":true") && strstr(out.json, "\"cleanup_state\":\"reboot_required\""));
+    CHECK(out.calls.receipt_syncs == 1 && out.calls.base_syncs == 1 && !out.calls.rejected);
+    char expected[128];
+    CHECK(snprintf(expected, sizeof(expected), "\"device\":%ju,\"inode\":%ju", (uintmax_t)f.base_stat.st_dev,
+        (uintmax_t)f.base_stat.st_ino) > 0 && strstr(out.json, expected));
+    CHECK(snprintf(expected, sizeof(expected), "\"created_directory\":\"/data/local/%s\"", f.loaded.name) > 0 && strstr(out.json, expected));
+    struct stat receipt_stat;
+    CHECK(fstatat(f.base, REMOVE_RECEIPT, &receipt_stat, AT_SYMLINK_NOFOLLOW) == 0);
+    CHECK((receipt_stat.st_mode & 07777) == 0600 && receipt_stat.st_nlink == 1 && receipt_stat.st_size == 136);
+    receipt = openat(f.base, REMOVE_RECEIPT, O_RDWR | O_NOFOLLOW | O_CLOEXEC); CHECK(receipt >= 0);
+    struct removal_receipt data;
+    CHECK(pread(receipt, &data, sizeof(data), 0) == (ssize_t)sizeof(data));
+    CHECK(recovery_cli(&f, "--remove", false, &out) == 0 && out.status == 5 && !out.calls.unlinks && entry_present(&f));
+    CHECK(recovery_cli(&f, "--install", false, &out) == 0 && out.status != 0 && !out.calls.unlinks && entry_present(&f));
+    CHECK(recovery_cli(&f, "--recover-remove", false, &out) == 0 && out.status == 0 && !out.calls.unlinks &&
+        strstr(out.json, "reboot_required") && entry_present(&f));
+    if (scenario == REC_SAME_BOOT_WITH_VIEW) goto done;
+    CHECK(recovery_boot(&f, true) == 0);
+    if (scenario >= REC_BAD_ID_0 && scenario <= REC_BAD_ID_7) ++data.identity[scenario - REC_BAD_ID_0];
+    switch (scenario) {
+    case REC_BAD_INSTANCE: data.instance[0] = 'f'; break;
+    case REC_BAD_MAGIC: ++data.magic; break;
+    case REC_BAD_BOOT: data.boot_id[0] = 'x'; break;
+    case REC_RESERVED: data.reserved = 1; break;
+    default: break;
+    }
+    CHECK(pwrite(receipt, &data, sizeof(data), 0) == (ssize_t)sizeof(data));
+    switch (scenario) {
+    case REC_SHORT: CHECK(ftruncate(receipt, sizeof(data) - 1) == 0); break;
+    case REC_LONG: CHECK(ftruncate(receipt, sizeof(data) + 1) == 0); break;
+    case REC_OWNER: node_for(&receipt_stat)->uid = 10000; break;
+    case REC_GROUP: node_for(&receipt_stat)->gid = 10000; break;
+    case REC_MODE: CHECK(fchmod(receipt, 0644) == 0); break;
+    case REC_LINK: node_for(&receipt_stat)->link_override = 2; break;
+    case REC_SYMLINK:
+        CHECK(renameat(f.base, REMOVE_RECEIPT, f.sandbox, "saved-receipt") == 0);
+        CHECK(symlinkat("/nonexistent-receipt", f.base, REMOVE_RECEIPT) == 0); break;
+    case REC_MOUNT: node_for(&receipt_stat)->mount_id = CURRENT_MOUNT + 1; break;
+    case REC_NAMED_MOUNT:
+        seam.named_mount_changed = true; seam.named_dev = receipt_stat.st_dev; seam.named_ino = receipt_stat.st_ino;
+        seam.named_mount = CURRENT_MOUNT + 1; break;
+    case REC_MANIFEST_REPLACED:
+        CHECK(renameat(f.base, "manifest", f.sandbox, "old-manifest") == 0); CHECK(manifest_write(&f) == 0); break;
+    case REC_VIEW_BAD_NAME: CHECK(renameat(f.views, view_name, f.views, "bad-view") == 0); break;
+    case REC_VIEW_SYMLINK:
+        CHECK(renameat(f.views, view_name, f.sandbox, "saved-view") == 0);
+        CHECK(symlinkat("/nonexistent-view", f.views, view_name) == 0); break;
+    case REC_VIEW_MOUNT: node_fd(view)->mount_id = CURRENT_MOUNT + 1; break;
+    case REC_VIEW_NAMED_MOUNT: {
+        struct stat st; CHECK(fstat(view, &st) == 0);
+        seam.named_mount_changed = true; seam.named_dev = st.st_dev; seam.named_ino = st.st_ino;
+        seam.named_mount = CURRENT_MOUNT + 1; break;
+    }
+    case REC_VIEW_NONEMPTY: { struct stat st; CHECK(make_file(view, "keep", "unproven", &st) == 0); break; }
+    case REC_VIEW_OWNER: node_fd(view)->uid = 10000; break;
+    case REC_VIEW_MODE: CHECK(fchmod(view, 0755) == 0); break;
+    case REC_VIEW_RACE: seam.replace_view_on_reopen = true; break;
+    case REC_ROOT_MOUNT: node_for(&f.root_stat)->mount_id = CURRENT_MOUNT + 1; break;
+    case REC_EXTRA_BASE: { struct stat st; CHECK(make_file(f.base, "unrecognized", "keep", &st) == 0); break; }
+    case REC_ROOT_UNLINK_FAIL: seam.fail_unlink = "payload"; break;
+    case REC_BASE_UNLINK_FAIL: seam.fail_unlink = f.loaded.name; break;
+    case REC_PARENT_SYNC_FAIL: seam.fail_local_sync = true; break;
+    case REC_FINAL_BASE_OWNER: seam.base_change_after_manifest = 1; break;
+    case REC_FINAL_BASE_GROUP: seam.base_change_after_manifest = 2; break;
+    case REC_FINAL_BASE_MODE: seam.base_change_after_manifest = 3; break;
+    default: break;
+    }
+    CHECK(recovery_cli(&f, "--recover-remove", scenario == REC_WRONG_ARGUMENT, &out) == 0);
+    CHECK(!out.calls.unsafe);
+    if (scenario == REC_EMPTY || scenario == REC_VIEWS || scenario == REC_LEGACY) {
+        CHECK(out.status == 0 && strstr(out.json, "\"cleanup_state\":\"removed\"") && strstr(out.json, "\"passed\":true"));
+        CHECK(faccessat(f.local, f.loaded.name, F_OK, AT_SYMLINK_NOFOLLOW) < 0 && errno == ENOENT);
+        CHECK(out.calls.unlinks == (scenario == REC_EMPTY ? 7U : 8U));
+        CHECK(!out.calls.rejected && out.calls.local_syncs == 1);
+    } else if (scenario == REC_PARENT_SYNC_FAIL) {
+        CHECK(out.status == 5 && strstr(out.json, "\"passed\":false") && strstr(out.json, "cleanup_unknown"));
+        CHECK(strstr(out.json, "\"stage\":\"recovery_parent_sync\"") && out.calls.local_syncs == 1);
+        CHECK(faccessat(f.local, f.loaded.name, F_OK, AT_SYMLINK_NOFOLLOW) < 0 && errno == ENOENT);
+        CHECK(recovery_cli(&f, "--recover-remove", false, &out) == 0 && out.status == 5 && !out.calls.unlinks);
+        CHECK(strstr(out.json, "cleanup_unknown") && !strstr(out.json, "\"passed\":true"));
+    } else {
+        CHECK(out.status == 5 && strstr(out.json, "\"passed\":false") && strstr(out.json, "cleanup_unknown"));
+        CHECK(faccessat(f.base, REMOVE_RECEIPT, F_OK, AT_SYMLINK_NOFOLLOW) == 0);
+        bool finalized = scenario == REC_BASE_UNLINK_FAIL || scenario >= REC_FINAL_BASE_OWNER;
+        if (!finalized) CHECK(entry_present(&f));
+        if (scenario != REC_ROOT_UNLINK_FAIL && !finalized) CHECK(!out.calls.unlinks);
+        CHECK(out.calls.local_syncs == 0);
+        if (finalized) {
+            CHECK(faccessat(f.base, "root", F_OK, AT_SYMLINK_NOFOLLOW) < 0 && errno == ENOENT);
+            if (scenario == REC_BASE_UNLINK_FAIL) CHECK(out.calls.receipt_syncs >= 2 && out.calls.base_syncs >= 3);
+            else {
+                struct stat kept; CHECK(fstatat(f.base, REMOVE_RECEIPT, &kept, AT_SYMLINK_NOFOLLOW) == 0 &&
+                    same_object(&kept, &receipt_stat));
+                CHECK(out.calls.unlinks == 6 && out.calls.receipt_syncs == 1);
+            }
+            /* Missing root/manifest on a partial finalize must never count as a successful retry. */
+            CHECK(recovery_cli(&f, "--recover-remove", false, &out) == 0 && out.status == 5 && !out.calls.unlinks);
+            CHECK(strstr(out.json, "cleanup_unknown"));
+        }
+    }
+done:
+    if (receipt >= 0) close(receipt);
+    if (view >= 0) close(view);
+    if (fixture_close(&f) < 0) { fprintf(stderr, "Recovery fixture cleanup failed: %s errno=%d\n", test_name, errno); result = -1; }
+    return result;
+}
+
+static int test_recovery_first_phase_rejection(void)
+{
+    for (int scenario = 0; scenario < 9; ++scenario) {
+        const char *test_name = "recovery_first_phase_rejection";
+        int result = 0, view = -1; struct fixture f; struct cli_result out;
+        CHECK(fixture_open(&f) == 0); f.header[0] = AJIU_MANIFEST_V2;
+        CHECK(manifest_write(&f) == 0 && recovery_boot(&f, false) == 0);
+        const char *name = scenario == 0 ? "non-nonce" : "abcdef0123456789abcdef01";
+        if (scenario == 1) CHECK(symlinkat("/foreign", f.views, name) == 0);
+        else { view = mkdir_open(f.views, name, 0700); CHECK(view >= 0); }
+        if (scenario == 2) node_fd(view)->mount_id = CURRENT_MOUNT + 1;
+        if (scenario == 3) { struct stat st; CHECK(make_file(view, "unproven", "keep", &st) == 0); }
+        if (scenario == 4) node_fd(view)->gid = 10000;
+        if (scenario == 5) CHECK(fchmod(view, 0755) == 0);
+        if (scenario == 6) CHECK(pwrite(seam.boot, "invalid", 7, 0) == 7);
+        if (scenario == 8) {
+            for (unsigned int i = 0; i < MAX_RECOVERY_VIEWS; ++i) {
+                char nonce[25]; CHECK(snprintf(nonce, sizeof(nonce), "%024x", i) == 24);
+                int extra = mkdir_open(f.views, nonce, 0700); CHECK(extra >= 0 && close(extra) == 0);
+            }
+        }
+        CHECK(recovery_cli(&f, "--recover-remove", scenario == 7, &out) == 0);
+        CHECK(out.status == 5 && !out.calls.unlinks && entry_present(&f));
+        if (scenario == 8) {
+            char error[32]; CHECK(snprintf(error, sizeof(error), "\"errno\":%d", EOVERFLOW) > 0 && strstr(out.json, error));
+        }
+        CHECK(faccessat(f.base, REMOVE_RECEIPT, F_OK, AT_SYMLINK_NOFOLLOW) < 0 && errno == ENOENT);
+    done:
+        if (view >= 0) close(view);
+        if (fixture_close(&f) < 0) result = -1;
+        if (result) return -1;
+    }
+    return 0;
+}
+
+static int test_boot_source(void)
+{
+    enum { BOOT_NORMAL, BOOT_FOREIGN_PROCFS_LEAF, BOOT_FOREIGN_PARENT, BOOT_WRONG_FS, BOOT_NOT_DIRECTORY,
+        BOOT_SYMLINK, BOOT_UNKNOWN_MOUNT, BOOT_PROC_OWNER, BOOT_PROC_MODE, BOOT_FILE_OWNER, BOOT_SOURCE_CASES };
+    for (int scenario = 0; scenario < BOOT_SOURCE_CASES; ++scenario) {
+        const char *test_name = "boot_source_mount_boundary";
+        int result = 0; struct fixture f; struct cli_result out;
+        CHECK(fixture_open(&f) == 0); f.header[0] = AJIU_MANIFEST_V2;
+        CHECK(manifest_write(&f) == 0 && recovery_boot(&f, false) == 0);
+        CHECK(node_fd(seam.proc)->mount_id != node_fd(seam.root)->mount_id);
+        switch (scenario) {
+        case BOOT_FOREIGN_PROCFS_LEAF: node_fd(seam.boot)->mount_id = PROC_MOUNT + 1; break;
+        case BOOT_FOREIGN_PARENT: seam.boot_parent_submount = true; break;
+        case BOOT_WRONG_FS: seam.proc_wrong_fs = true; break;
+        case BOOT_NOT_DIRECTORY: {
+            struct stat st;
+            CHECK(renameat(f.sandbox, "proc", f.sandbox, "saved-proc") == 0);
+            CHECK(make_file(f.sandbox, "proc", "foreign", &st) == 0); break;
+        }
+        case BOOT_SYMLINK:
+            CHECK(renameat(f.sandbox, "proc", f.sandbox, "saved-proc") == 0);
+            CHECK(symlinkat("saved-proc", f.sandbox, "proc") == 0); break;
+        case BOOT_UNKNOWN_MOUNT: node_fd(seam.proc)->mount_id = 0; break;
+        case BOOT_PROC_OWNER: node_fd(seam.proc)->uid = 10000; break;
+        case BOOT_PROC_MODE: CHECK(fchmod(seam.proc, 0777) == 0); break;
+        case BOOT_FILE_OWNER: node_fd(seam.boot)->uid = 10000; break;
+        default: break;
+        }
+        CHECK(recovery_cli(&f, "--recover-remove", false, &out) == 0);
+        CHECK(!out.calls.unlinks && !out.calls.rejected && entry_present(&f));
+        if (scenario == BOOT_NORMAL) {
+            CHECK(out.status == 0 && strstr(out.json, "reboot_required") && out.calls.boot_opens == 1 && !out.calls.boot_mount_rejections);
+            CHECK(recovery_cli(&f, "--recover-remove", false, &out) == 0 && out.status == 0 && !out.calls.unlinks);
+            CHECK(strstr(out.json, "reboot_required") && entry_present(&f));
+            CHECK(recovery_boot(&f, true) == 0);
+            CHECK(recovery_cli(&f, "--recover-remove", false, &out) == 0 && out.status == 0 && strstr(out.json, "\"cleanup_state\":\"removed\""));
+        } else {
+            CHECK(out.status == 5 && strstr(out.json, "\"stage\":\"recovery_boot_id\"") && strstr(out.json, "cleanup_unknown"));
+            CHECK(faccessat(f.base, REMOVE_RECEIPT, F_OK, AT_SYMLINK_NOFOLLOW) < 0 && errno == ENOENT);
+            if (scenario == BOOT_FOREIGN_PROCFS_LEAF || scenario == BOOT_FOREIGN_PARENT) {
+                CHECK(out.calls.boot_opens == 1 && out.calls.boot_mount_rejections == 1);
+                /* Create the legitimate receipt, then simulate random/uuid bound
+                 * over boot_id in this SAME boot. Changing legal UUID contents
+                 * must not upgrade the foreign procfs source to reboot proof. */
+                node_fd(seam.boot)->mount_id = PROC_MOUNT; seam.boot_parent_submount = false;
+                CHECK(recovery_cli(&f, "--recover-remove", false, &out) == 0 && out.status == 0 && strstr(out.json, "reboot_required"));
+                struct stat receipt; CHECK(fstatat(f.base, REMOVE_RECEIPT, &receipt, AT_SYMLINK_NOFOLLOW) == 0);
+                const char *uuid = "33333333-3333-4333-8333-333333333333\n";
+                CHECK(pwrite(seam.boot, uuid, 37, 0) == 37);
+                if (scenario == BOOT_FOREIGN_PROCFS_LEAF) node_fd(seam.boot)->mount_id = PROC_MOUNT + 1;
+                else seam.boot_parent_submount = true;
+                CHECK(recovery_cli(&f, "--recover-remove", false, &out) == 0 && out.status == 5 && !out.calls.unlinks);
+                struct stat kept;
+                CHECK(fstatat(f.base, REMOVE_RECEIPT, &kept, AT_SYMLINK_NOFOLLOW) == 0 && same_object(&receipt, &kept));
+                CHECK(out.calls.boot_mount_rejections == 1 && entry_present(&f));
+            }
+        }
+    done:
+        if (fixture_close(&f) < 0) result = -1;
+        if (result) return -1;
+    }
+    puts("Boot source: validated pinned procfs and relative BENEATH/NO_XDEV; foreign procfs leaf or parent mount never creates a receipt or permits same-boot deletion.");
+    return 0;
+}
+
+static int test_partial_internal_retry(void)
+{
+    for (unsigned int version = 1; version <= 2; ++version) {
+        const char *test_name = version == 1 ? "v1_partial_internal_retry_refused" : "v2_partial_internal_retry_rescans";
+        int result = 0; struct fixture f; struct cli_result out;
+        CHECK(fixture_open(&f) == 0); f.header[0] = version == 1 ? AJIU_MANIFEST_V1 : AJIU_MANIFEST_V2;
+        CHECK(manifest_write(&f) == 0 && recovery_boot(&f, false) == 0);
+        seam.enforce_receipt = true;
+        CHECK(recovery_cli(&f, "--recover-remove", false, &out) == 0 && out.status == 0 && strstr(out.json, "reboot_required"));
+        struct stat receipt, kept;
+        CHECK(fstatat(f.base, REMOVE_RECEIPT, &receipt, AT_SYMLINK_NOFOLLOW) == 0);
+        CHECK(recovery_boot(&f, true) == 0);
+        seam.fail_unlink = "etc"; /* payload is already removed when its parent rmdir fails. */
+        CHECK(recovery_cli(&f, "--recover-remove", false, &out) == 0 && out.status == 5 && strstr(out.json, "cleanup_unknown"));
+        CHECK(out.calls.unlinks == 2 && !out.calls.unsafe);
+        CHECK(faccessat(f.root, "etc/payload", F_OK, AT_SYMLINK_NOFOLLOW) < 0 && errno == ENOENT);
+        CHECK(fstatat(f.root, "etc", &kept, AT_SYMLINK_NOFOLLOW) == 0 && same_object(&kept, &f.entries[0]));
+        CHECK(fstatat(f.base, REMOVE_RECEIPT, &kept, AT_SYMLINK_NOFOLLOW) == 0 && same_object(&kept, &receipt));
+        CHECK(faccessat(f.base, "root", F_OK, AT_SYMLINK_NOFOLLOW) == 0 &&
+            faccessat(f.base, "views", F_OK, AT_SYMLINK_NOFOLLOW) == 0 && faccessat(f.base, "manifest", F_OK, AT_SYMLINK_NOFOLLOW) == 0);
+        seam.fail_unlink = NULL;
+        CHECK(recovery_cli(&f, "--recover-remove", false, &out) == 0 && !out.calls.unsafe);
+        if (version == 1) {
+            CHECK(out.status == 5 && !out.calls.unlinks && strstr(out.json, "cleanup_unknown"));
+            CHECK(fstatat(f.base, REMOVE_RECEIPT, &kept, AT_SYMLINK_NOFOLLOW) == 0 && same_object(&kept, &receipt));
+            CHECK(fstatat(f.root, "etc", &kept, AT_SYMLINK_NOFOLLOW) == 0 && same_object(&kept, &f.entries[0]));
+        } else {
+            CHECK(out.status == 0 && strstr(out.json, "\"cleanup_state\":\"removed\"") && out.calls.local_syncs == 1);
+            CHECK(faccessat(f.local, f.loaded.name, F_OK, AT_SYMLINK_NOFOLLOW) < 0 && errno == ENOENT);
+        }
+        printf("Partial internal deletion V%u: payload removed, original receipt retained on failure; retry %s.\n",
+            version, version == 1 ? "refuses missing immutable-ledger entry" : "rescans remaining mutable tree and completes");
+    done:
+        if (fixture_close(&f) < 0) result = -1;
+        if (result) return -1;
+    }
+    return 0;
+}
+
+static int test_incomplete_install_rollback(void)
+{
+    const char *test_name = "incomplete_install_without_base_identity";
+    int result = 0;
+    struct fixture f; CHECK(fixture_open(&f) == 0);
+    f.loaded.base_created = true;
+    CHECK(f.loaded.base == -1 && !f.loaded.base_known);
+    errno = 0;
+    CHECK(rollback(&f.loaded) == -1 && errno == ESTALE);
+    CHECK(!seam.unlink_calls && !seam.rejected_calls && entry_present(&f));
+    f.loaded.base = fcntl(f.base, F_DUPFD_CLOEXEC, 3); CHECK(f.loaded.base >= 0);
+    errno = 0;
+    CHECK(rollback(&f.loaded) == -1 && errno == ESTALE);
+    CHECK(!seam.unlink_calls && !seam.rejected_calls && entry_present(&f));
+    /* Possessing a descriptor alone cannot authorize deletion without its checked identity. */
+    CHECK(!f.loaded.base_known);
+ done:
+    if (fixture_close(&f) < 0) result = -1;
+    return result;
+}
+
+static int test_recover_remove(void)
+{
+    for (int i = 0; i < REC_CASES; ++i) if (test_recovery_case((enum recovery_case)i) < 0) return -1;
+    if (test_recovery_first_phase_rejection() < 0 || test_incomplete_install_rollback() < 0 ||
+        test_boot_source() < 0 || test_partial_internal_retry() < 0) return -1;
+    puts("Recovery coverage: same boot never unlinks; changed boot matches all receipt identities; view replacement/4097 budget, final owner/group/mode changes, parent fsync failure and strict missing-identity retries.");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2) {
         int rc;
-        if (!strcmp(argv[1], "reviewRegressionNamedAnchorMount")) rc = test_review_regression_named_anchor_mount();
+        if (!strcmp(argv[1], "recoverRemove")) rc = test_recover_remove();
+        else if (!strcmp(argv[1], "bootSource")) rc = test_boot_source();
+        else if (!strcmp(argv[1], "partialInternalRetry")) rc = test_partial_internal_retry();
+        else if (!strcmp(argv[1], "reviewRegressionNamedAnchorMount")) rc = test_review_regression_named_anchor_mount();
         else if (!strcmp(argv[1], "mutableRemoveV2")) rc = test_mutable_remove_v2();
         else if (!strcmp(argv[1], "archivePermissionControls")) rc = test_archive_permission_controls();
         else if (!strcmp(argv[1], "defaultAllowRootGuestArchivePermissions"))
             rc = test_archive_permission_controls() || test_default_allow_root_guest_archive_permissions();
         else { fputs("Unknown focused test name.\n", stderr); return 2; }
-        if (!rc) printf("Installer focused checks passed: %s, %d assertions; existing parse_stream validate mode with synthetic memory input only.\n", argv[1], checks);
+        if (!rc) printf("Installer focused checks passed: %s, %d assertions; local fixtures and synthetic privilege/mount/boot inputs only.\n", argv[1], checks);
         return rc ? 1 : 0;
     }
     if (argc != 1) { fputs("Expected no arguments or one focused test name.\n", stderr); return 2; }
     for (int test = 0; test < TEST_CASE_COUNT; ++test)
         if (run_case((enum test_case)test) < 0) return 1;
     if (test_archive_permission_controls() < 0 || test_default_allow_root_guest_archive_permissions() < 0 ||
-        test_mutable_remove_v2() < 0 || test_review_regression_named_anchor_mount() < 0) return 1;
+        test_mutable_remove_v2() < 0 || test_review_regression_named_anchor_mount() < 0 || test_recover_remove() < 0) return 1;
     printf("Installer load/rollback and archive checks passed: %d load/rollback cases, %d assertions.\n", TEST_CASE_COUNT, checks);
-    puts("Mocked: Root query/registered ownership, synthetic root/openat2 resolution, current/submount statx IDs; parse_stream validate mode reads synthetic memory input.");
-    puts("Real: owned-temp openat/fstat/read/write/readdir/unlinkat. No production main, Root, chroot or mount; kernel openat2/statx semantics not tested.");
+    puts("Mocked: Root query/registered ownership/link counts, synthetic root/openat2 resolution, current/submount statx IDs and procfs boot_id; injected write/fsync/unlink failures.");
+    puts("Real: owned-temp openat/fstat/read/write/fsync/readdir/unlinkat, CLI main in forked children with checked exit status and JSON. No host/device, chroot, mount or real reboot; kernel mount and reboot durability semantics not proved.");
     return 0;
 }

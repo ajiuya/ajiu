@@ -48,6 +48,7 @@
 #define MAX_TASKS 4096U
 #define FRAME_WAIT 1000U
 #define CLEANUP_WAIT 5000
+#define MEMBER_EXIT_OBSERVE_MS 20
 #define IPC_MAGIC UINT32_C(0x414a4931)
 #define TRY(label, expression) do { stage = (label); if ((expression) < 0) return -1; } while (0)
 #define NEED(label, expression) do { stage = (label); if (!(expression)) { errno = ESTALE; return -1; } } while (0)
@@ -480,6 +481,26 @@ static bool guest_namespace_matches(const struct shared *shared, const struct st
 
 static int pidfd_dead(int fd);
 
+static int64_t member_exit_deadline(void)
+{
+    int64_t now = now_ms();
+    return now < 0 ? 0 : now + MEMBER_EXIT_OBSERVE_MS;
+}
+
+/* Observation only: this never establishes a live identity or permits a signal.
+ * All members of one guard/signal operation share the same absolute deadline. */
+static void observe_exit_until(int fd, int64_t deadline)
+{
+    while (deadline > 0) {
+        int64_t now = now_ms();
+        if (now < 0 || now >= deadline) return;
+        struct pollfd p = { .fd = fd, .events = POLLIN };
+        int rc = poll(&p, 1, (int)(deadline - now));
+        if (rc < 0 && errno == EINTR) continue;
+        return;
+    }
+}
+
 static bool member_credentials(const struct runtime *r, const struct identity *id, bool bootstrap)
 {
     if (bootstrap && !load(&r->shared->dropped)) {
@@ -523,8 +544,9 @@ static int thread_candidate_snapshot(const struct runtime *r, pid_t pid, pid_t t
 }
 
 static int live_thread_snapshot(const struct runtime *r, pid_t pid, uint64_t process_start,
-                                pid_t process_parent, bool bootstrap, struct identity *id)
+                                pid_t process_parent, bool bootstrap, struct identity *id, bool *no_witness)
 {
+    *no_witness = false;
     /* The group anchor and THREADS inode are pinned/root-owned by group_guard before registry scans.
      * Linux <=6.8 has no PIDFD_THREAD: keep a TGID pidfd and double-check each candidate's Tgid/start.
      * Never depend on /proc/TGID/task after leader pthread_exit, or scan the host /proc directory. */
@@ -571,13 +593,16 @@ static int live_thread_snapshot(const struct runtime *r, pid_t pid, uint64_t pro
         result = 0; break;
     }
     free(buffer);
-    if (result < 0) errno = error ? error : EAGAIN; /* Churn/no stable witness remains UNKNOWN. */
+    if (result < 0) {
+        *no_witness = !error; /* Distinguish exhausted witnesses from a syscall returning EAGAIN. */
+        errno = error ? error : EAGAIN;
+    }
     return result;
 }
 
 /* A UID transition or a dead thread-group leader is not loss of process ownership. */
-static int member_snapshot(const struct runtime *r, pid_t pid, uint64_t expected_start,
-                           bool bootstrap, struct identity *id)
+static int member_snapshot_until(const struct runtime *r, pid_t pid, uint64_t expected_start,
+                                 bool bootstrap, struct identity *id, int64_t exit_deadline)
 {
     int fd = (int)syscall(SYS_pidfd_open, pid, 0);
     if (fd < 0) return -1;
@@ -599,11 +624,25 @@ static int member_snapshot(const struct runtime *r, pid_t pid, uint64_t expected
             if (errno == ENOENT || errno == ESRCH) fallback = true; else error = ESTALE;
         } else if (before.st_dev != after.st_dev || before.st_ino != after.st_ino) error = ESTALE;
     }
-    if (!error && fallback && live_thread_snapshot(r, pid, start, parent, bootstrap, id) < 0) error = errno;
+    if (!error && fallback) {
+        bool no_witness;
+        if (live_thread_snapshot(r, pid, start, parent, bootstrap, id, &no_witness) < 0) {
+            error = errno;
+            /* exit_task_namespaces can precede pidfd readiness. Never accept the
+             * missing identity: allow the caller's pinned pidfd to prove death. */
+            if (no_witness) observe_exit_until(fd, exit_deadline);
+        }
+    }
     if (!error && (proc_start(pid, &again, &parent_again) < 0 || again != start || pidfd_dead(fd) != 0 ||
         process_group(pid, r->group_name, true) < 0)) error = ESTALE;
     close(fd);
     return error ? (errno = error, -1) : 0;
+}
+
+static int member_snapshot(const struct runtime *r, pid_t pid, uint64_t expected_start,
+                           bool bootstrap, struct identity *id)
+{
+    return member_snapshot_until(r, pid, expected_start, bootstrap, id, 0);
 }
 
 static int pidfd_dead(int fd)
@@ -666,6 +705,16 @@ static int guest_manifest_version(uint64_t magic)
     return 0;
 }
 
+static int removal_receipt_absent(int base)
+{
+    /* Match rootfs_install.c: even a damaged receipt is a permanent startup
+     * barrier until recovery has removed the entire instance after reboot. */
+    stage = "removal_receipt";
+    struct stat st;
+    if (fstatat(base, "remove-after-reboot", &st, AT_SYMLINK_NOFOLLOW) == 0) { errno = EBUSY; return -1; }
+    return errno == ENOENT ? 0 : -1;
+}
+
 static int instance(struct runtime *r, bool view)
 {
     TRY("rootfs_parent", r->a[LOCAL].fd = protected_walk(false));
@@ -673,6 +722,7 @@ static int instance(struct runtime *r, bool view)
     const struct stat *b = &r->a[BASE].st;
     NEED("rootfs_instance", b->st_uid == 0 && b->st_gid == 0 && (b->st_mode & 07777) == 0700 &&
         (uint64_t)b->st_dev == r->launch->rootfs_dev && (uint64_t)b->st_ino == r->launch->rootfs_ino);
+    if (removal_receipt_absent(r->a[BASE].fd) < 0) return -1;
     if (anchored(&r->a[ROOT], r->a[BASE].fd, "root", DF) < 0 ||
         anchored(&r->a[MANIFEST], r->a[BASE].fd, "manifest", O_RDONLY) < 0 ||
         anchored(&r->a[VIEWS], r->a[BASE].fd, "views", DF) < 0) return -1;
@@ -1037,7 +1087,7 @@ static int open_sources(struct runtime *r)
     return 0;
 }
 
-static int track(struct runtime *r, pid_t pid, uint64_t expected_start, bool bootstrap)
+static int track(struct runtime *r, pid_t pid, uint64_t expected_start, bool bootstrap, int64_t exit_deadline)
 {
     struct registry *registry = &r->registry;
     for (size_t i = 0; i < registry->count; ++i) if (registry->tasks[i].pid == pid) {
@@ -1049,7 +1099,7 @@ static int track(struct runtime *r, pid_t pid, uint64_t expected_start, bool boo
     int fd = (int)syscall(SYS_pidfd_open, pid, 0);
     if (fd < 0) return errno == ESRCH ? 0 : -1;
     struct identity id;
-    bool ok = member_snapshot(r, pid, expected_start, bootstrap, &id) == 0;
+    bool ok = member_snapshot_until(r, pid, expected_start, bootstrap, &id, exit_deadline) == 0;
     int dead = pidfd_dead(fd);
     if (dead > 0) { close(fd); return 0; }
     if (!ok || dead < 0) { close(fd); errno = ESTALE; return -1; }
@@ -1064,7 +1114,7 @@ static int track(struct runtime *r, pid_t pid, uint64_t expected_start, bool boo
     return 0;
 }
 
-static int members_guard(struct runtime *r)
+static int members_guard_until(struct runtime *r, int64_t exit_deadline)
 {
     if (group_guard(r) < 0) goto unsafe;
     for (size_t i = 0; i < r->registry.count;) {
@@ -1074,7 +1124,7 @@ static int members_guard(struct runtime *r)
         if (dead < 0) goto unsafe;
         struct identity id;
         bool bootstrap = load(&r->shared->enrolled) && task->pid == r->shared->bootstrap && task->start == r->shared->start;
-        bool ok = member_snapshot(r, task->pid, task->start, bootstrap, &id) == 0;
+        bool ok = member_snapshot_until(r, task->pid, task->start, bootstrap, &id, exit_deadline) == 0;
         dead = pidfd_dead(task->fd);
         if (dead > 0) { close(task->fd); *task = r->registry.tasks[--r->registry.count]; continue; }
         if (!ok || dead < 0) goto unsafe;
@@ -1091,7 +1141,7 @@ static int members_guard(struct runtime *r)
             free(buffer); goto unsafe;
         }
         bool bootstrap = load(&r->shared->enrolled) && (pid_t)pid == r->shared->bootstrap;
-        if (track(r, (pid_t)pid, bootstrap ? r->shared->start : 0, bootstrap) < 0) { free(buffer); goto unsafe; }
+        if (track(r, (pid_t)pid, bootstrap ? r->shared->start : 0, bootstrap, exit_deadline) < 0) { free(buffer); goto unsafe; }
         p = end + 1;
     }
     free(buffer);
@@ -1100,13 +1150,18 @@ unsafe:
     store(&r->shared->unsafe, 1); errno = ESTALE; return -1;
 }
 
-static int signal_task(struct runtime *r, const struct task *task, int sig)
+static int members_guard(struct runtime *r)
+{
+    return members_guard_until(r, member_exit_deadline());
+}
+
+static int signal_task(struct runtime *r, const struct task *task, int sig, int64_t exit_deadline)
 {
     int dead = pidfd_dead(task->fd);
     if (dead > 0) return 0;
     struct identity id;
     bool bootstrap = load(&r->shared->enrolled) && task->pid == r->shared->bootstrap && task->start == r->shared->start;
-    bool valid = dead == 0 && member_snapshot(r, task->pid, task->start, bootstrap, &id) == 0;
+    bool valid = dead == 0 && member_snapshot_until(r, task->pid, task->start, bootstrap, &id, exit_deadline) == 0;
     dead = pidfd_dead(task->fd);
     if (dead > 0) return 0;
     if (!valid || dead < 0) { store(&r->shared->unsafe, 1); errno = ESTALE; return -1; }
@@ -1116,9 +1171,10 @@ static int signal_task(struct runtime *r, const struct task *task, int sig)
 
 static int signal_members(struct runtime *r, int sig)
 {
-    if (members_guard(r) < 0) return -1;
+    int64_t exit_deadline = member_exit_deadline();
+    if (members_guard_until(r, exit_deadline) < 0) return -1;
     for (size_t i = 0; i < r->registry.count; ++i)
-        if (signal_task(r, &r->registry.tasks[i], sig) < 0) return -1;
+        if (signal_task(r, &r->registry.tasks[i], sig, exit_deadline) < 0) return -1;
     return 0;
 }
 

@@ -4,12 +4,15 @@ import com.aicode.feature.agent.domain.container.ChrootInstance
 import com.aicode.feature.agent.domain.container.ContainerProfile
 import com.aicode.feature.agent.domain.container.LocalContainerRuntime
 import com.aicode.feature.agent.domain.container.RootfsSource
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeRemoval
 import com.aicode.feature.agent.domain.root.RootAccessState
 import com.aicode.feature.agent.domain.root.RootAuthorityCoordinator
 import com.aicode.feature.agent.domain.root.RootMemoryDataStore
 import com.aicode.feature.settings.data.repository.RootAccessSettingsRepository
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
@@ -32,6 +35,8 @@ import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.DataInputStream
+import java.io.DataOutputStream
 import java.io.File
 import java.io.IOException
 import java.io.InputStream
@@ -58,7 +63,8 @@ class ChrootInstanceInstallerTest {
         private val result: () -> String,
         private val exit: Int = 0,
         private val error: ByteArray = byteArrayOf(),
-        private val finishOnClose: Boolean = true
+        private val finishOnClose: Boolean = true,
+        private val closeFailure: IOException? = null
     ) : Process() {
         val closed = AtomicBoolean()
         val destroyed = AtomicInteger()
@@ -91,6 +97,7 @@ class ChrootInstanceInstallerTest {
                 if (closed.compareAndSet(false, true)) {
                     onClose()
                     if (finishOnClose) ended.countDown()
+                    closeFailure?.let { throw it }
                 }
             }
         }
@@ -146,7 +153,9 @@ class ChrootInstanceInstallerTest {
         files: File = temporary.newFolder(),
         journal: File = File(temporary.newFolder(), "installer.bin"),
         enabled: Boolean = true,
-        startBound: ((String, ChrootFileIdentity?, ChrootRuntimeSession) -> Process)? = null
+        startBound: ((String, ChrootFileIdentity?, ChrootRuntimeSession) -> Process)? = null,
+        checkRecoverySession: ((ChrootRuntimeSession) -> Unit)? = null,
+        startRecoveryBound: ((String, ChrootFileIdentity, ChrootRuntimeSession, () -> Unit) -> Process)? = null
     ): Fixture {
         val repository = RootAccessSettingsRepository(RootMemoryDataStore(), backgroundScope)
         val authority = RootAuthorityCoordinator(repository, backgroundScope)
@@ -162,7 +171,9 @@ class ChrootInstanceInstallerTest {
                 synchronized(calls) { calls.add(instance to remove) }
                 process
             }, { inputs.incrementAndGet(); input() }, files, journal, scope, Dispatchers.IO, { 1234 }, { 10445 }, newId, timeout, rollback,
-            startBound = startBound
+            startBound = startBound,
+            checkRecoverySession = checkRecoverySession,
+            startRecoveryBound = startRecoveryBound
         )
         return Fixture(installer, authority, root, scope, files, journal, process, starts, inputs, calls)
     }
@@ -176,6 +187,33 @@ class ChrootInstanceInstallerTest {
         entries: Int = 2,
         bytes: Int = 2
     ): String = """{"passed":$passed,"stage":"root_mode","errno":${if (passed) 0 else 22},"entries":$entries,"file_bytes":$bytes,"cleanup_state":"$cleanup","device":$device,"inode":$inode,"created_directory":${path?.let { "\"$it\"" } ?: "null"}}"""
+
+    private fun writeInstallerJournal(journal: File, version: Int, operation: Int, target: ChrootInstance = instance) {
+        DataOutputStream(journal.outputStream()).use { output ->
+            output.writeInt(0x414a4950)
+            output.writeInt(version)
+            output.writeInt(1)
+            output.writeUTF(target.id)
+            output.writeByte(operation)
+            output.writeLong(target.installGeneration)
+            output.writeLong(target.device)
+            output.writeLong(target.inode)
+        }
+    }
+
+    private fun assertRecoveryIntent(journal: File, target: ChrootInstance = instance) {
+        DataInputStream(journal.inputStream()).use { input ->
+            assertEquals(0x414a4950, input.readInt())
+            assertEquals(2, input.readInt())
+            assertEquals(1, input.readInt())
+            assertEquals(target.id, input.readUTF())
+            assertEquals(2, input.readUnsignedByte())
+            assertEquals(target.installGeneration, input.readLong())
+            assertEquals(target.device, input.readLong())
+            assertEquals(target.inode, input.readLong())
+            assertEquals(-1, input.read())
+        }
+    }
 
     private suspend fun fails(block: suspend () -> Unit): Throwable {
         try {
@@ -644,6 +682,442 @@ class ChrootInstanceInstallerTest {
                 assertEquals(0, recovered.starts.get())
                 assertArrayEquals(retained, journal.readBytes())
             }
+        }
+    }
+
+    @Test
+    fun queuedRecoveryRechecksItsSourceAfterAnotherInstancesTransactionReleasesTheMutex() = runTest {
+        val otherId = "abcdef0123456789abcdef01"
+        val process = FakeProcess({ native(path = "/data/local/ajiu-chroot-rootfs-$otherId") })
+        val recoveryStarts = AtomicInteger()
+        fixture(process, newId = { otherId }, startRecoveryBound = { _, _, _, _ ->
+            recoveryStarts.incrementAndGet()
+            FakeProcess({ native(cleanup = "removed") })
+        }).use { f ->
+            val firstPublishing = CompletableDeferred<Unit>()
+            val releaseFirst = CompletableDeferred<Unit>()
+            val first = async {
+                f.installer.installFromUser(profile, f.root) {
+                    firstPublishing.complete(Unit)
+                    releaseFirst.await()
+                }
+            }
+            try {
+                firstPublishing.await()
+                val sourceCurrent = AtomicBoolean(true)
+                val checks = AtomicInteger()
+                val publications = AtomicInteger()
+                val session = ChrootRuntimeSession("reviewed", f.root)
+                // Same dispatcher as the installer and UNDISPATCHED enter the real locked mutex
+                // before this async returns; no mocked facade or delay is needed to create the queue.
+                val queued = async(Dispatchers.IO, start = CoroutineStart.UNDISPATCHED) {
+                    fails {
+                        f.installer.recoverAndRemoveFromUser(instance, f.root, session, checkCurrent = {
+                            checks.incrementAndGet()
+                            if (!sourceCurrent.get()) throw CancellationException("Recovery configuration changed while queued")
+                        }) { publications.incrementAndGet() }
+                    }
+                }
+                assertEquals(0, checks.get())
+                assertFalse(queued.isCompleted)
+                assertEquals(0, recoveryStarts.get())
+                sourceCurrent.set(false)
+                releaseFirst.complete(Unit)
+                assertEquals(otherId, first.await().id)
+                assertTrue(queued.await() is CancellationException)
+                assertEquals(1, checks.get())
+                assertEquals(0, recoveryStarts.get())
+                assertEquals(0, publications.get())
+                assertEquals(1, f.starts.get())
+                assertEquals(12L, f.journal.length())
+                assertTrue(f.installer.failedInstances.value.isEmpty())
+                assertTrue(f.installer.removalRebootRequired.value.isEmpty())
+            } finally {
+                releaseFirst.complete(Unit)
+            }
+        }
+    }
+
+    @Test
+    fun recoveryForwardsTheLiveCheckAndSuccessfulPublicationMayChangeItsOwnConfigurationRevision() = runTest {
+        val process = FakeProcess({ native(cleanup = "removed") })
+        val sourceCurrent = AtomicBoolean(true)
+        val checkCurrent: () -> Unit = {
+            if (!sourceCurrent.get()) throw CancellationException("Profile revision changed")
+        }
+        fixture(process, startRecoveryBound = { _, _, _, dispatchCheck ->
+            assertSame(checkCurrent, dispatchCheck)
+            dispatchCheck()
+            process
+        }).use { f ->
+            val publications = AtomicInteger()
+            assertEquals(LocalRuntimeRemoval.REMOVED,
+                f.installer.recoverAndRemoveFromUser(instance, f.root, ChrootRuntimeSession("reviewed", f.root), checkCurrent) {
+                    publications.incrementAndGet()
+                    sourceCurrent.set(false)
+                })
+            assertEquals(1, publications.get())
+            assertEquals(12L, f.journal.length())
+            assertTrue(f.installer.failedInstances.value.isEmpty())
+            assertTrue(f.installer.removalRebootRequired.value.isEmpty())
+        }
+    }
+
+    @Test
+    fun recoveryRechecksSourceAfterNativeExitBeforeAcceptingReceiptOrPublishingRemoval() = runTest {
+        for (cleanup in listOf("reboot_required", "removed")) {
+            val sourceCurrent = AtomicBoolean(true)
+            val process = FakeProcess({ native(cleanup = cleanup) })
+            process.onClose = { sourceCurrent.set(false) }
+            fixture(process, startRecoveryBound = { _, _, _, _ -> process }).use { f ->
+                val publications = AtomicInteger()
+                val failure = fails {
+                    f.installer.recoverAndRemoveFromUser(instance, f.root, ChrootRuntimeSession("reviewed", f.root), checkCurrent = {
+                        if (!sourceCurrent.get()) throw CancellationException("Recovery source changed while native was running")
+                    }) { publications.incrementAndGet() }
+                }
+                assertTrue(failure is CancellationException)
+                assertEquals(0, publications.get())
+                assertRecoveryIntent(f.journal)
+                assertEquals(setOf(id), f.installer.failedInstances.value)
+                assertTrue(f.installer.removalRebootRequired.value.isEmpty())
+            }
+        }
+    }
+
+    @Test
+    fun recoveryReceiptPersistsWithoutPublicationAndOnlyExactRecoveryCanResumeAfterRestart() = runTest {
+        val files = temporary.newFolder()
+        val journal = File(temporary.newFolder(), "recovery.bin")
+        val publications = AtomicInteger()
+        val recoveryStarts = AtomicInteger()
+        val receipt = FakeProcess({ native(cleanup = "reboot_required") })
+        lateinit var session: ChrootRuntimeSession
+        lateinit var installer: ChrootInstanceInstaller
+        fixture(receipt, files = files, journal = journal, startRecoveryBound = { target, targetIdentity, captured, _ ->
+            assertEquals(id, target)
+            assertEquals(identity, targetIdentity)
+            assertSame(session, captured)
+            assertRecoveryIntent(journal)
+            assertEquals(setOf(id), installer.failedInstances.value)
+            recoveryStarts.incrementAndGet()
+            receipt
+        }).use { f ->
+            installer = f.installer
+            session = ChrootRuntimeSession("receipt-session", f.root)
+            val home = installer.prepareHome(instance)
+            File(home, "user-data").writeText("keep")
+            assertEquals(LocalRuntimeRemoval.REBOOT_REQUIRED,
+                installer.recoverAndRemoveFromUser(instance, f.root, session) { publications.incrementAndGet() })
+            assertRecoveryIntent(journal)
+            assertEquals(setOf(id), installer.removalRebootRequired.value)
+            assertEquals(setOf(id), installer.failedInstances.value)
+            assertTrue(installer.unpublishedInstalls.value.isEmpty())
+            assertTrue(installer.isHealthy.value)
+            assertEquals("keep", File(home, "user-data").readText())
+            assertEquals(0, publications.get())
+            assertEquals(0, f.starts.get())
+            assertEquals(0, f.inputs.get())
+            assertEquals(0, receipt.writes.size())
+            assertEquals(0, receipt.destroyed.get())
+            fails { installer.removeFromUser(instance, f.root, session) }
+            fails { installer.prepareHome(instance) }
+            assertEquals(1, recoveryStarts.get())
+        }
+        val retained = journal.readBytes()
+        val removed = FakeProcess({ native(cleanup = "removed") })
+        fixture(removed, files = files, journal = journal, startRecoveryBound = { target, targetIdentity, captured, _ ->
+            assertEquals(id, target)
+            assertEquals(identity, targetIdentity)
+            assertSame(session, captured)
+            assertRecoveryIntent(journal)
+            assertEquals(setOf(id), installer.failedInstances.value)
+            recoveryStarts.incrementAndGet()
+            removed
+        }).use { f ->
+            installer = f.installer
+            session = ChrootRuntimeSession("after-restart-session", f.root)
+            assertTrue(installer.removalRebootRequired.value.isEmpty())
+            assertEquals(setOf(id), installer.failedInstances.value)
+            assertArrayEquals(retained, journal.readBytes())
+            for (changed in listOf(instance.copy(device = identity.device + 1), instance.copy(inode = identity.inode + 1),
+                instance.copy(installGeneration = instance.installGeneration + 1))) {
+                fails { installer.recoverAndRemoveFromUser(changed, f.root, session) { publications.incrementAndGet() } }
+                assertArrayEquals(retained, journal.readBytes())
+            }
+            fails { installer.removeFromUser(instance, f.root, session) }
+            assertEquals(1, recoveryStarts.get())
+            assertEquals(LocalRuntimeRemoval.REMOVED,
+                installer.recoverAndRemoveFromUser(instance, f.root, session) {
+                    assertRecoveryIntent(journal)
+                    assertEquals(setOf(id), installer.failedInstances.value)
+                    publications.incrementAndGet()
+                })
+            assertEquals(2, recoveryStarts.get())
+            assertEquals(1, publications.get())
+            assertEquals(12L, journal.length())
+            assertTrue(installer.failedInstances.value.isEmpty())
+            assertTrue(installer.removalRebootRequired.value.isEmpty())
+            assertEquals("keep", File(files, "chroot-home/$id/user-data").readText())
+            assertEquals(0, f.starts.get())
+            assertEquals(0, f.inputs.get())
+        }
+    }
+
+    @Test
+    fun recoveryNeverAdoptsOrdinaryPendingAndJournalV1CannotSmuggleRecoveryOperations() = runTest {
+        val recoveryStarts = AtomicInteger()
+        for (version in listOf(1, 2)) for (operation in listOf(0, 1)) {
+            val journal = File(temporary.newFolder(), "ordinary-pending.bin")
+            writeInstallerJournal(journal, version, operation)
+            val retained = journal.readBytes()
+            fixture(journal = journal, startRecoveryBound = { _, _, _, _ ->
+                recoveryStarts.incrementAndGet()
+                FakeProcess({ native(cleanup = "removed") })
+            }).use { f ->
+                assertTrue(f.installer.isHealthy.value)
+                assertEquals(setOf(id), f.installer.failedInstances.value)
+                assertTrue(f.installer.removalRebootRequired.value.isEmpty())
+                val session = ChrootRuntimeSession("recovery-session", f.root)
+                fails { f.installer.recoverAndRemoveFromUser(instance, f.root, session) }
+                fails { f.installer.removeFromUser(instance, f.root, session) }
+                assertArrayEquals(retained, journal.readBytes())
+                assertEquals(0, f.starts.get())
+            }
+        }
+        for ((version, operation) in listOf(1 to 2, 2 to 3, 3 to 2)) {
+            val journal = File(temporary.newFolder(), "invalid-version-operation.bin")
+            writeInstallerJournal(journal, version, operation)
+            val retained = journal.readBytes()
+            fixture(journal = journal, startRecoveryBound = { _, _, _, _ ->
+                recoveryStarts.incrementAndGet()
+                FakeProcess({ native(cleanup = "removed") })
+            }).use { f ->
+                assertFalse(f.installer.isHealthy.value)
+                fails { f.installer.recoverAndRemoveFromUser(instance, f.root, ChrootRuntimeSession("invalid", f.root)) }
+                assertArrayEquals(retained, journal.readBytes())
+                assertEquals(0, f.starts.get())
+            }
+        }
+        assertEquals(0, recoveryStarts.get())
+    }
+
+    @Test
+    fun recoveryRejectsUnverifiedResultsTransportFailureTimeoutAndFailedEof() = runTest {
+        val processes = mutableListOf(
+            FakeProcess({ native(cleanup = "cleanup_unknown", passed = false) }, 5),
+            FakeProcess({ native(cleanup = "installed") }),
+            FakeProcess({ "{}" }),
+            FakeProcess({ throw IOException("broken stdout") }),
+            FakeProcess({ native(cleanup = "reboot_required") }, error = ByteArray(16 * 1024 + 1)),
+            FakeProcess({ native(cleanup = "reboot_required") }, finishOnClose = false),
+            FakeProcess({ native(cleanup = "removed") }, closeFailure = IOException("EOF failed")),
+            FakeProcess({ native(cleanup = "reboot_required") }, closeFailure = IOException("EOF failed"))
+        )
+        for (cleanup in listOf("reboot_required", "removed")) {
+            processes += FakeProcess({ native(cleanup = cleanup, passed = false) })
+            processes += FakeProcess({ native(cleanup = cleanup) }, 5)
+            processes += FakeProcess({ native(cleanup = cleanup, path = "/data/local/other") })
+            processes += FakeProcess({ native(cleanup = cleanup, device = identity.device + 1) })
+            processes += FakeProcess({ native(cleanup = cleanup, inode = identity.inode + 1) })
+        }
+        for (process in processes) {
+            fixture(process, timeout = 100, rollback = 50, startRecoveryBound = { _, _, _, _ -> process }).use { f ->
+                val publications = AtomicInteger()
+                fails {
+                    f.installer.recoverAndRemoveFromUser(instance, f.root, ChrootRuntimeSession("recovery", f.root)) {
+                        publications.incrementAndGet()
+                    }
+                }
+                assertEquals(0, publications.get())
+                assertRecoveryIntent(f.journal)
+                assertEquals(setOf(id), f.installer.failedInstances.value)
+                assertTrue(f.installer.removalRebootRequired.value.isEmpty())
+                assertEquals(0, f.starts.get())
+                assertEquals(0, f.inputs.get())
+                assertEquals(0, process.destroyed.get())
+            }
+        }
+    }
+
+    @Test
+    fun partialRecoveryFailureRetainsOnlyItsIdentityAndCanRetryWithoutOrdinaryRemoval() = runTest {
+        val failed = FakeProcess({ native(passed = false, cleanup = "cleanup_unknown") }, 5)
+        val removed = FakeProcess({ native(cleanup = "removed") })
+        val recoveryStarts = AtomicInteger()
+        fixture(failed, startRecoveryBound = { _, _, _, _ ->
+            if (recoveryStarts.getAndIncrement() == 0) failed else removed
+        }).use { f ->
+            val session = ChrootRuntimeSession("recovery", f.root)
+            val publications = AtomicInteger()
+            fails { f.installer.recoverAndRemoveFromUser(instance, f.root, session) { publications.incrementAndGet() } }
+            assertRecoveryIntent(f.journal)
+            fails { f.installer.removeFromUser(instance, f.root, session) }
+            assertEquals(1, recoveryStarts.get())
+            assertEquals(0, f.starts.get())
+            assertEquals(LocalRuntimeRemoval.REMOVED,
+                f.installer.recoverAndRemoveFromUser(instance, f.root, session) { publications.incrementAndGet() })
+            assertEquals(1, publications.get())
+            assertEquals(2, recoveryStarts.get())
+            assertTrue(f.installer.failedInstances.value.isEmpty())
+            assertTrue(f.installer.removalRebootRequired.value.isEmpty())
+        }
+    }
+
+    @Test
+    fun failedRecoveryRetryClearsTheReceiptHintWhileRetainingTheDurableRequest() = runTest {
+        val receipt = FakeProcess({ native(cleanup = "reboot_required") })
+        val failed = FakeProcess({ native(cleanup = "cleanup_unknown", passed = false) }, 5)
+        val starts = AtomicInteger()
+        fixture(receipt, startRecoveryBound = { _, _, _, _ ->
+            if (starts.getAndIncrement() == 0) receipt else failed
+        }).use { f ->
+            val session = ChrootRuntimeSession("reviewed", f.root)
+            assertEquals(LocalRuntimeRemoval.REBOOT_REQUIRED, f.installer.recoverAndRemoveFromUser(instance, f.root, session))
+            assertEquals(setOf(id), f.installer.removalRebootRequired.value)
+            fails { f.installer.recoverAndRemoveFromUser(instance, f.root, session) }
+            assertTrue(f.installer.removalRebootRequired.value.isEmpty())
+            assertEquals(setOf(id), f.installer.failedInstances.value)
+            assertRecoveryIntent(f.journal)
+            assertEquals(2, starts.get())
+        }
+    }
+
+    @Test
+    fun recoverySessionReplacementAfterNativeExitNeverPublishesOrClearsTheIntent() = runTest {
+        for (cleanup in listOf("reboot_required", "removed")) {
+            lateinit var session: ChrootRuntimeSession
+            var currentSession: ChrootRuntimeSession? = null
+            val process = FakeProcess({ native(cleanup = cleanup) })
+            process.onClose = { currentSession = ChrootRuntimeSession("replacement", session.rootState.copy()) }
+            fixture(process, checkRecoverySession = { captured ->
+                if (captured !== currentSession) throw ChrootRuntimeUnavailable("Recovery session replaced")
+            }, startRecoveryBound = { _, _, captured, _ ->
+                assertSame(session, captured)
+                process
+            }).use { f ->
+                session = ChrootRuntimeSession("reviewed", f.root)
+                currentSession = session
+                val publications = AtomicInteger()
+                val failure = fails {
+                    f.installer.recoverAndRemoveFromUser(instance, f.root, session) { publications.incrementAndGet() }
+                }
+                assertTrue(failure is ChrootRuntimeUnavailable)
+                assertEquals(0, publications.get())
+                assertRecoveryIntent(f.journal)
+                assertEquals(setOf(id), f.installer.failedInstances.value)
+                assertEquals(f.root, f.authority.accessSnapshot())
+            }
+        }
+    }
+
+    @Test
+    fun recoveryRejectsChangedAuthorityAndSessionRootBeforeRecordingIntentOrStarting() = runTest {
+        val recoveryStarts = AtomicInteger()
+        fixture(startRecoveryBound = { _, _, _, _ ->
+            recoveryStarts.incrementAndGet()
+            FakeProcess({ native(cleanup = "reboot_required") })
+        }).use { f ->
+            val session = ChrootRuntimeSession("reviewed", f.root)
+            for (changed in listOf(f.root.copy(authorityId = "other"), f.root.copy(generation = f.root.generation + 1),
+                f.root.copy(enabled = false))) {
+                fails { f.installer.recoverAndRemoveFromUser(instance, changed, session) }
+                fails { f.installer.recoverAndRemoveFromUser(instance, f.root, ChrootRuntimeSession("stale", changed)) }
+            }
+            f.authority.setEnabled(false)
+            fails { f.installer.recoverAndRemoveFromUser(instance, f.root, session) }
+            assertEquals(0, recoveryStarts.get())
+            assertEquals(0, f.starts.get())
+            assertFalse(f.journal.exists())
+            assertTrue(f.installer.failedInstances.value.isEmpty())
+            assertTrue(f.installer.removalRebootRequired.value.isEmpty())
+        }
+    }
+
+    @Test
+    fun verifiedRecoveryReceiptSettlesRevocationWithoutClaimingInstanceCleanupOrPublishingRemoval() = runTest {
+        val process = FakeProcess({ native(cleanup = "reboot_required") })
+        val proofChecked = CountDownLatch(1)
+        val releaseCheck = CountDownLatch(1)
+        fixture(process, checkRecoverySession = {
+            if (process.waited.get() && proofChecked.count != 0L) {
+                proofChecked.countDown()
+                releaseCheck.await()
+            }
+        }, startRecoveryBound = { _, _, _, _ -> process }).use { f ->
+            try {
+                val publications = AtomicInteger()
+                val operation = async {
+                    fails {
+                        f.installer.recoverAndRemoveFromUser(instance, f.root, ChrootRuntimeSession("reviewed", f.root)) {
+                            publications.incrementAndGet()
+                        }
+                    }
+                }
+                eventually { proofChecked.count == 0L }
+                // The installer and latch run on IO. Keep revocation's timeout on the same
+                // real clock so runTest cannot skip it while the proof check is still held.
+                val revocation = async(Dispatchers.IO) { f.authority.setEnabled(true) }
+                eventually { !f.authority.accessState.value.enabled }
+                releaseCheck.countDown()
+                operation.await()
+                revocation.await()
+                assertEquals(0, publications.get())
+                assertRecoveryIntent(f.journal)
+                assertEquals(setOf(id), f.installer.failedInstances.value)
+                assertTrue(f.installer.removalRebootRequired.value.isEmpty())
+                // The receipt only proves this installer helper settled. The instance stays blocked,
+                // while revocation does not incorrectly leave the entire Root authority unusable.
+                assertTrue(f.authority.accessSnapshot().enabled)
+                assertEquals(0, f.starts.get())
+                assertEquals(0, process.destroyed.get())
+            } finally {
+                releaseCheck.countDown()
+            }
+        }
+    }
+
+    @Test
+    fun recoveryRemovedButFailedProfilePublicationRetainsItsRecoverableIntent() = runTest {
+        val process = FakeProcess({ native(cleanup = "removed") })
+        fixture(process, startRecoveryBound = { _, _, _, _ -> process }).use { f ->
+            val publications = AtomicInteger()
+            fails {
+                f.installer.recoverAndRemoveFromUser(instance, f.root, ChrootRuntimeSession("reviewed", f.root)) {
+                    publications.incrementAndGet()
+                    throw IOException("Profile removal was not persisted")
+                }
+            }
+            assertEquals(1, publications.get())
+            assertRecoveryIntent(f.journal)
+            assertEquals(setOf(id), f.installer.failedInstances.value)
+            assertTrue(f.installer.removalRebootRequired.value.isEmpty())
+            assertTrue(f.installer.isHealthy.value)
+        }
+    }
+
+    @Test
+    fun recoveryRequiresItsIndependentStarterAndNeverFallsBackToOrdinaryInstallOrRemove() = runTest {
+        val ordinaryBoundStarts = AtomicInteger()
+        fixture(startBound = { _, _, _ ->
+            ordinaryBoundStarts.incrementAndGet()
+            FakeProcess({ native(cleanup = "removed") })
+        }).use { f ->
+            val publications = AtomicInteger()
+            val failure = fails {
+                f.installer.recoverAndRemoveFromUser(instance, f.root, ChrootRuntimeSession("recovery-session", f.root)) {
+                    publications.incrementAndGet()
+                }
+            }
+            assertTrue(failure is ChrootRuntimeUnavailable)
+            assertEquals(0, ordinaryBoundStarts.get())
+            assertEquals(0, f.starts.get())
+            assertEquals(0, f.inputs.get())
+            assertEquals(0, publications.get())
+            assertRecoveryIntent(f.journal)
+            assertEquals(setOf(id), f.installer.failedInstances.value)
+            // A recorded recovery request cannot claim that the native receipt exists.
+            assertTrue(f.installer.removalRebootRequired.value.isEmpty())
         }
     }
 

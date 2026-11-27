@@ -86,17 +86,18 @@ class ToolPermissionPolicyEngineSourceTest {
         coVerify(exactly = 1) { fixture.settings.captureProfileSnapshot() }
     }
 
-    @Test fun guestPathsAndHostReadsAllowWhileHostWritesAndOpaqueScriptsNeedReview() = runTest {
+    @Test fun guestPathsScriptsAndHostReadsAllowWhileHostLinkedWritesAndScriptsNeedReview() = runTest {
         val fixture = Fixture()
         for (tool in listOf("Bash", "terminal")) {
-            for (command in listOf("cat /etc/passwd", "touch /usr/bin/probe", "rm -rf /etc", "sudo id", "cat /proc/sys/kernel/hostname")) {
+            for (command in listOf("cat /etc/passwd", "touch /usr/bin/probe", "rm -rf /etc", "sudo id", "cat /proc/sys/kernel/hostname", "apt-get install -y make", "sh /root/opaque.sh")) {
                 val args = commandArgs(command) + if (tool == "terminal") mapOf("action" to JsonPrimitive("start")) else emptyMap()
                 val result = fixture.engine.evaluate(tool, args, "s1", fixture.execution())
                 assertEquals("$tool: $command", Verdict.ALLOW, result.verdict)
                 assertTrue(result.hostSystemUncertainties.isEmpty())
+                assertEquals(command.startsWith("apt-get") || command.startsWith("sh /root/"), result.ordinaryGuestUncertainties.isNotEmpty())
                 assertNull(result.hostWriteRootGeneration)
             }
-            for (command in listOf("touch /sys/probe", "dd of=/dev/block/boot", "apt-get install -y make", "sh /root/opaque.sh")) {
+            for (command in listOf("touch /sys/probe", "dd of=/dev/block/boot", "touch /system/probe", "sh /root/opaque.sh /system/probe")) {
                 val args = commandArgs(command) + if (tool == "terminal") mapOf("action" to JsonPrimitive("start")) else emptyMap()
                 val result = fixture.engine.evaluate(tool, args + ("elevate" to JsonPrimitive(true)), "s1", fixture.execution())
                 assertEquals("$tool: $command", Verdict.ASK, result.verdict)
@@ -112,9 +113,12 @@ class ToolPermissionPolicyEngineSourceTest {
             "action" to JsonPrimitive("send"), "input" to JsonPrimitive("cat /sys/probe"),
             "command" to JsonPrimitive("echo ignored"), "tab_id" to JsonPrimitive("term-1")
         ), "s1", fixture.execution())
-        assertEquals(Verdict.ASK, send.verdict)
+        assertEquals(Verdict.ALLOW, send.verdict)
         assertEquals(setOf("READ:/sys/probe"), send.hostSystemTargets)
-        assertTrue(send.hostSystemUncertainties.contains("interactive-terminal-input"))
+        assertTrue(send.ordinaryGuestUncertainties.contains("interactive-input"))
+        assertTrue(send.hostSystemUncertainties.isEmpty())
+        assertNull(send.hostWriteRootGeneration)
+        assertNull(send.sessionGrant)
     }
 
     @Test fun structuredFilePathFieldsCannotAvoidHostInterfaceReview() = runTest {

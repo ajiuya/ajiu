@@ -7,8 +7,10 @@ import com.aicode.feature.agent.domain.container.RootfsSource
 import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeAuthorizationRequired
 import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeAuthorization
 import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeCleanup
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeRemoval
 import com.aicode.feature.agent.domain.container.runtime.RuntimeOwner
 import com.aicode.feature.agent.domain.container.runtime.RuntimeOwnerKind
+import com.aicode.feature.agent.domain.root.RootAccessState
 import com.aicode.feature.agent.domain.root.RootAuthorityCoordinator
 import com.aicode.feature.agent.domain.root.RootMemoryDataStore
 import com.aicode.feature.settings.data.repository.ContainerSettingsRepository
@@ -33,6 +35,7 @@ import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -80,13 +83,17 @@ class ChrootRuntimeFacadeTest {
         val settings: ContainerSettingsRepository,
         val snapshot: ContainerProfileSnapshot,
         val unpublishedInstalls: MutableStateFlow<Set<String>>,
-        val recovery: ChrootRecoveryRepository
+        val recovery: ChrootRecoveryRepository,
+        val diagnostics: ChrootRuntimeDiagnostics,
+        val removalRebootRequired: MutableStateFlow<Set<String>>,
+        val storedProfiles: MutableStateFlow<List<ContainerProfile>>
     ) : AutoCloseable {
         override fun close() { scope.cancel() }
     }
 
     private suspend fun TestScope.fixture(
         profile: ContainerProfile = this@ChrootRuntimeFacadeTest.profile,
+        recoveryFile: File = File(temporary.newFolder(), "runtime.bin"),
         controlFactory: (ChrootLaunch) -> ChrootControlTransport = { error("No background request may start a control channel") }
     ): Fixture {
         val rootRepository = RootAccessSettingsRepository(RootMemoryDataStore(), backgroundScope)
@@ -94,17 +101,26 @@ class ChrootRuntimeFacadeTest {
         authority.setEnabled(true)
         authority.accessSnapshot()
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-        val recovery = ChrootRecoveryRepository(File(temporary.newFolder(), "runtime.bin"))
+        val recovery = ChrootRecoveryRepository(recoveryFile)
         val factory = mockk<ChrootProcessFactory>()
+        every { factory.startChecked(any(), any()) } answers {
+            if (!secondArg<() -> Boolean>()()) throw ChrootRuntimeUnavailable("Fixture runtime request expired before dispatch")
+            factory.start(firstArg())
+        }
+        val diagnostics = ChrootRuntimeDiagnostics(File(temporary.newFolder(), "failures.bin"))
         val manager = ChrootRuntimeManager(authority, factory, recovery, scope, Dispatchers.IO,
-            controlFactory, { System.nanoTime() / 1_000_000 })
+            controlFactory, { System.nanoTime() / 1_000_000 }, diagnostics)
         val installer = mockk<ChrootInstanceInstaller>()
         every { installer.isHealthy } returns MutableStateFlow(true)
         every { installer.failedInstances } returns MutableStateFlow(emptySet())
         val unpublishedInstalls = MutableStateFlow<Set<String>>(emptySet())
         every { installer.unpublishedInstalls } returns unpublishedInstalls
+        val removalRebootRequired = MutableStateFlow<Set<String>>(emptySet())
+        every { installer.removalRebootRequired } returns removalRebootRequired
         val revision = MutableStateFlow(7L)
         val settings = mockk<ContainerSettingsRepository>()
+        val storedProfiles = MutableStateFlow(listOf(profile))
+        every { settings.customProfilesFlow } returns storedProfiles
         every { settings.profileConfigurationRevision } answers { revision.value }
         every { settings.profileConfigurationRevisions } returns revision
         val snapshot = ContainerProfileSnapshot(profile.id, profile.id, listOf(profile), 1L, revision.value, Any())
@@ -112,7 +128,15 @@ class ChrootRuntimeFacadeTest {
         every { settings.checkProfileSnapshot(snapshot) } answers {
             if (snapshot.configurationRevision != revision.value) throw CancellationException("profile changed")
         }
-        coEvery { settings.publishChrootInstance(snapshot, profile, any()) } returns Unit
+        coEvery { settings.publishChrootInstance(snapshot, profile, any(), any()) } coAnswers {
+            arg<() -> Unit>(3).invoke()
+            settings.checkProfileSnapshot(snapshot)
+            val installed = thirdArg<ChrootInstance?>()
+            arg<() -> Unit>(3).invoke()
+            storedProfiles.value = if (installed == null) storedProfiles.value.filterNot { it.id == profile.id }
+            else storedProfiles.value.map { if (it.id == profile.id) it.copy(chrootInstance = installed) else it }
+            revision.value++
+        }
         val configurationRevocation = AtomicReference<() -> Unit>({})
         every { settings.registerConfigurationRevocation(any()) } answers {
             configurationRevocation.set(firstArg())
@@ -127,10 +151,15 @@ class ChrootRuntimeFacadeTest {
             AutoCloseable { sessionRevocation.set({}) }
         }
         every { runtimeFactory.checkSession(any()) } answers {
-            if (session.value !== firstArg<ChrootRuntimeSession>()) throw CancellationException("session revoked")
+            val expected = firstArg<ChrootRuntimeSession>()
+            if (session.value !== expected || authority.accessState.value != expected.rootState || !expected.rootState.enabled) {
+                throw CancellationException("session revoked")
+            }
         }
         coEvery { runtimeFactory.ensureFromUser(any()) } coAnswers {
-            session.value ?: ChrootRuntimeSession("user-session", firstArg()).also { session.value = it }
+            val expected = firstArg<RootAccessState>()
+            if (!expected.enabled || authority.accessSnapshot() != expected) throw CancellationException("Root changed")
+            session.value ?: ChrootRuntimeSession("user-session", expected).also { session.value = it }
         }
         coEvery { runtimeFactory.ensureSession(any()) } coAnswers {
             session.value ?: ChrootRuntimeSession("policy-session", firstArg()).also { session.value = it }
@@ -143,7 +172,7 @@ class ChrootRuntimeFacadeTest {
             temporary.newFolder(), scope),
             manager, authority, factory, sources, scope, revision, { configurationRevocation.get().invoke() },
             runtimeFactory, session, { session.value = null; sessionRevocation.get().invoke() },
-            installer, settings, snapshot, unpublishedInstalls, recovery)
+            installer, settings, snapshot, unpublishedInstalls, recovery, diagnostics, removalRebootRequired, storedProfiles)
     }
 
     @Test fun defaultAllowChrootFirstCaptureReturnsCurrentBindingWithoutPendingAuthorization() = runTest {
@@ -245,6 +274,35 @@ class ChrootRuntimeFacadeTest {
             assertTrue("$reason must fail closed", failure is IOException || failure is CancellationException)
             assertFalse("$reason must not request owner authorization", failure is LocalRuntimeAuthorizationRequired)
             assertEquals("$reason must not publish pending authorization", 0, pendingCount)
+        }
+    }
+
+    @Test fun unknownCleanupShowsBoundedFailureEvidenceWithoutBootstrapOrUnlock() = runTest {
+        for (diagnosticCleanup in listOf(null, ChrootCleanupResult.UNKNOWN)) {
+            fixture().use { fixture ->
+                val launchId = "89abcdef0123456789abcdef"
+                fixture.recovery.recordIntent(instance.id, launchId, ChrootFileIdentity(instance.device, instance.inode),
+                    owner.identity, fixture.authority.accessSnapshot().generation)
+                fixture.recovery.recordCleanup(launchId, ChrootCleanupResult.UNKNOWN)
+                fixture.diagnostics.record(instance.id, launchId,
+                    ChrootRuntimeFailure.local(ChrootRuntimeFailureKind.TRANSPORT, ChrootRuntimeFailureStage.HELPER_STDERR),
+                    ChrootRuntimeFailure.nativeError("code=runtime_failed;stage=supervision;errno=22".toByteArray()),
+                    diagnosticCleanup)
+
+                val failure = runCatching {
+                    fixture.facade.capture(profile, 7, workspace, owner, "source-1") {}
+                }.exceptionOrNull()
+
+                assertTrue(failure is IOException)
+                assertTrue(failure!!.message!!.contains("requires verified cleanup or recovery"))
+                assertTrue(failure.message!!.contains("failure=TRANSPORT/HELPER_STDERR"))
+                assertTrue(failure.message!!.contains("native=runtime_failed/supervision;errno=22"))
+                assertTrue(failure.message!!.contains("cleanup=${diagnosticCleanup?.name ?: "UNRECORDED"}"))
+                assertFalse(fixture.recovery.canStart(instance.id))
+                assertTrue(fixture.facade.state(profile).recoveryRequired)
+                verify(exactly = 0) { fixture.factory.start(any()) }
+                coVerify(exactly = 0) { fixture.runtimeFactory.ensureSession(any()) }
+            }
         }
     }
 
@@ -730,7 +788,7 @@ class ChrootRuntimeFacadeTest {
             coVerify(exactly = 1) {
                 fixture.installer.installFromUser(fresh, root, match { it === confirmed }, any())
             }
-            coVerify(exactly = 1) { fixture.settings.publishChrootInstance(fixture.snapshot, fresh, instance) }
+            coVerify(exactly = 1) { fixture.settings.publishChrootInstance(fixture.snapshot, fresh, instance, any()) }
         }
     }
 
@@ -747,7 +805,396 @@ class ChrootRuntimeFacadeTest {
             coVerify(exactly = 1) {
                 fixture.installer.removeFromUser(instance, root, match { it === confirmed }, any())
             }
-            coVerify(exactly = 1) { fixture.settings.publishChrootInstance(fixture.snapshot, profile, null) }
+            coVerify(exactly = 1) { fixture.settings.publishChrootInstance(fixture.snapshot, profile, null, any()) }
+        }
+    }
+
+    private fun interruptedJournal(): File {
+        val file = File(temporary.newFolder(), "runtime.bin")
+        val committed = ChrootRecoveryRepository(file)
+        committed.recordIntent(instance.id, "89abcdef0123456789abcdef", ChrootFileIdentity(instance.device, instance.inode),
+            owner.identity, 7)
+        committed.recordCleanup("89abcdef0123456789abcdef", ChrootCleanupResult.UNKNOWN)
+        File(file.path + ".pending").writeBytes(file.readBytes().copyOf(17))
+        return file
+    }
+
+    private fun Fixture.recordUnknown() {
+        recovery.recordIntent(instance.id, "89abcdef0123456789abcdef", ChrootFileIdentity(instance.device, instance.inode),
+            owner.identity, authority.accessState.value.generation)
+        recovery.recordCleanup("89abcdef0123456789abcdef", ChrootCleanupResult.UNKNOWN)
+    }
+
+    @Test fun unknownRecoveryRemovalKeepsTheProfileUntilTheInstallerPublishesVerifiedRemoval() = runTest {
+        fixture().use { fixture ->
+            fixture.recordUnknown()
+            val recorded = fixture.recovery.snapshot()
+            val root = fixture.authority.accessSnapshot()
+            val confirmed = ChrootRuntimeSession("confirmed-recovery", root)
+            fixture.session.value = confirmed
+            var result = LocalRuntimeRemoval.REBOOT_REQUIRED
+            coEvery { fixture.installer.recoverAndRemoveFromUser(instance, root, any(), any(), any()) } coAnswers {
+                arg<() -> Unit>(3).invoke()
+                assertSame(confirmed, thirdArg<ChrootRuntimeSession>())
+                assertEquals(recorded, fixture.recovery.snapshot())
+                assertTrue(fixture.facade.state(profile).recoveryRequired)
+                assertTrue(fixture.facade.state(profile).busy)
+                if (result == LocalRuntimeRemoval.REMOVED) {
+                    arg<suspend () -> Unit>(4).invoke()
+                    fixture.removalRebootRequired.value = emptySet()
+                } else {
+                    fixture.removalRebootRequired.value = setOf(instance.id)
+                }
+                result
+            }
+
+            assertTrue(runCatching { fixture.facade.capture(profile, 7, workspace, owner, "source-1") {} }.isFailure)
+            assertTrue(runCatching { fixture.facade.removeInstanceFromUser(profile, root) }.exceptionOrNull() is IOException)
+            coVerify(exactly = 0) { fixture.installer.removeFromUser(any(), any(), any(), any()) }
+            coVerify(exactly = 0) { fixture.installer.recoverAndRemoveFromUser(any(), any(), any(), any(), any()) }
+
+            assertEquals(LocalRuntimeRemoval.REBOOT_REQUIRED, fixture.facade.recoverAndRemoveInstanceFromUser(profile, root))
+            assertEquals(listOf(profile), fixture.storedProfiles.value)
+            assertTrue(fixture.facade.state(profile).removalRebootRequired)
+            assertFalse(fixture.facade.state(profile).busy)
+            assertEquals(recorded, fixture.recovery.snapshot())
+            coVerify(exactly = 0) { fixture.settings.publishChrootInstance(any(), any(), any(), any()) }
+
+            result = LocalRuntimeRemoval.REMOVED
+            assertEquals(LocalRuntimeRemoval.REMOVED, fixture.facade.recoverAndRemoveInstanceFromUser(profile, root))
+            assertTrue(fixture.storedProfiles.value.isEmpty())
+            assertEquals(fixture.snapshot.configurationRevision + 1, fixture.revision.value)
+            assertTrue(runCatching { fixture.settings.checkProfileSnapshot(fixture.snapshot) }.exceptionOrNull() is CancellationException)
+            assertFalse(fixture.facade.state(profile).removalRebootRequired)
+            assertEquals(recorded, fixture.recovery.snapshot())
+            assertFalse(fixture.recovery.canStart(instance.id))
+            coVerify(exactly = 2) { fixture.installer.recoverAndRemoveFromUser(instance, root, match { it === confirmed }, any(), any()) }
+            coVerify(exactly = 1) { fixture.settings.publishChrootInstance(fixture.snapshot, profile, null, any()) }
+            verify(exactly = 0) { fixture.factory.start(any()) }
+        }
+    }
+
+    @Test fun journalRepairPreservesUnknownEntriesAndDoesNotPermitOrdinaryCaptureOrRemoval() = runTest {
+        val file = interruptedJournal()
+        val before = file.readBytes()
+        val pending = File(file.path + ".pending")
+        val interrupted = pending.readBytes()
+        fixture(recoveryFile = file).use { fixture ->
+            val root = fixture.authority.accessSnapshot()
+            val recorded = fixture.recovery.snapshot()
+            assertFalse(fixture.facade.state(profile).journalHealthy)
+            assertTrue(fixture.facade.state(profile).journalRepairAvailable)
+            assertTrue(fixture.facade.state(profile).recoveryRequired)
+            assertTrue(runCatching { fixture.facade.capture(profile, 7, workspace, owner, "source-1") {} }.exceptionOrNull() is IOException)
+            assertArrayEquals(before, file.readBytes())
+            assertArrayEquals(interrupted, pending.readBytes())
+            coVerify(exactly = 0) { fixture.runtimeFactory.ensureFromUser(any()) }
+
+            fixture.facade.repairJournalFromUser(profile, root)
+
+            assertTrue(fixture.facade.state(profile).journalHealthy)
+            assertFalse(fixture.facade.state(profile).journalRepairAvailable)
+            assertTrue(fixture.facade.state(profile).recoveryRequired)
+            assertFalse(fixture.facade.state(profile).busy)
+            assertEquals(recorded, fixture.recovery.snapshot())
+            assertFalse(pending.exists())
+            assertFalse(fixture.recovery.canStart(instance.id))
+            assertTrue(runCatching { fixture.facade.capture(profile, 7, workspace, owner, "source-1") {} }.exceptionOrNull() is IOException)
+            assertTrue(runCatching { fixture.facade.removeInstanceFromUser(profile, root) }.exceptionOrNull() is IOException)
+            assertEquals(recorded, fixture.recovery.snapshot())
+            assertEquals(listOf(profile), fixture.storedProfiles.value)
+            coVerify(exactly = 0) { fixture.installer.removeFromUser(any(), any(), any(), any()) }
+            coVerify(exactly = 0) { fixture.installer.recoverAndRemoveFromUser(any(), any(), any(), any(), any()) }
+            coVerify(exactly = 0) { fixture.settings.publishChrootInstance(any(), any(), any(), any()) }
+            verify(exactly = 0) { fixture.factory.start(any()) }
+        }
+    }
+
+    @Test fun recoveryRemovalRepairsInterruptedJournalBeforeDispatchWithoutConvertingUnknownToSuccess() = runTest {
+        val file = interruptedJournal()
+        fixture(recoveryFile = file).use { fixture ->
+            val recorded = fixture.recovery.snapshot()
+            val root = fixture.authority.accessSnapshot()
+            coEvery { fixture.installer.recoverAndRemoveFromUser(instance, root, any(), any(), any()) } coAnswers {
+                arg<() -> Unit>(3).invoke()
+                assertTrue(fixture.recovery.isHealthy.value)
+                assertFalse(fixture.recovery.canRepairInterruptedWrite.value)
+                assertEquals(recorded, fixture.recovery.snapshot())
+                assertFalse(fixture.recovery.canStart(instance.id))
+                assertFalse(File(file.path + ".pending").exists())
+                LocalRuntimeRemoval.REBOOT_REQUIRED
+            }
+            assertEquals(LocalRuntimeRemoval.REBOOT_REQUIRED, fixture.facade.recoverAndRemoveInstanceFromUser(profile, root))
+            coVerify(exactly = 1) { fixture.installer.recoverAndRemoveFromUser(instance, root, any(), any(), any()) }
+            coVerify(exactly = 0) { fixture.settings.publishChrootInstance(any(), any(), any(), any()) }
+            assertEquals(listOf(profile), fixture.storedProfiles.value)
+            assertEquals(recorded, fixture.recovery.snapshot())
+        }
+    }
+
+    @Test fun corruptUnrepairableJournalRejectsRepairAndRecoveryWithoutRootBootstrapOrDeletingEvidence() = runTest {
+        val file = File(temporary.newFolder(), "runtime.bin").apply { writeBytes(byteArrayOf(1, 2, 3)) }
+        val pending = File(file.path + ".pending").apply { writeBytes(byteArrayOf(9)) }
+        fixture(recoveryFile = file).use { fixture ->
+            val root = fixture.authority.accessSnapshot()
+            assertFalse(fixture.facade.state(profile).journalHealthy)
+            assertFalse(fixture.facade.state(profile).journalRepairAvailable)
+            assertTrue(runCatching { fixture.facade.repairJournalFromUser(profile, root) }.exceptionOrNull() is IOException)
+            assertTrue(runCatching { fixture.facade.recoverAndRemoveInstanceFromUser(profile, root) }.exceptionOrNull() is IOException)
+            assertArrayEquals(byteArrayOf(1, 2, 3), file.readBytes())
+            assertArrayEquals(byteArrayOf(9), pending.readBytes())
+            assertFalse(fixture.facade.state(profile).busy)
+            assertEquals(listOf(profile), fixture.storedProfiles.value)
+            coVerify(exactly = 0) { fixture.runtimeFactory.ensureFromUser(any()) }
+            coVerify(exactly = 0) { fixture.installer.recoverAndRemoveFromUser(any(), any(), any(), any(), any()) }
+            coVerify(exactly = 0) { fixture.settings.publishChrootInstance(any(), any(), any(), any()) }
+        }
+    }
+
+    @Test fun changedRootConfigurationOrSessionBeforeRepairPreservesBothJournalFiles() = runTest {
+        for (change in listOf("root", "configuration", "session")) {
+            val file = interruptedJournal()
+            val before = file.readBytes()
+            val pending = File(file.path + ".pending")
+            val interrupted = pending.readBytes()
+            fixture(recoveryFile = file).use { fixture ->
+                val root = fixture.authority.accessSnapshot()
+                coEvery { fixture.runtimeFactory.ensureFromUser(root) } coAnswers {
+                    val confirmed = ChrootRuntimeSession("before-repair", root)
+                    fixture.session.value = confirmed
+                    when (change) {
+                        "root" -> fixture.authority.setEnabled(false)
+                        "configuration" -> fixture.revision.value++
+                        "session" -> fixture.revokeSession()
+                    }
+                    confirmed
+                }
+                assertTrue("$change must reject repair", runCatching {
+                    fixture.facade.repairJournalFromUser(profile, root)
+                }.exceptionOrNull() is CancellationException)
+                assertArrayEquals(before, file.readBytes())
+                assertArrayEquals(interrupted, pending.readBytes())
+                assertFalse(fixture.recovery.isHealthy.value)
+                assertFalse(fixture.facade.state(profile).busy)
+                assertTrue(fixture.recovery.canRepairInterruptedWrite.value)
+                coVerify(exactly = 0) { fixture.installer.recoverAndRemoveFromUser(any(), any(), any(), any(), any()) }
+                coVerify(exactly = 0) { fixture.settings.publishChrootInstance(any(), any(), any(), any()) }
+            }
+        }
+    }
+
+    @Test fun staleRootConfigurationOrSessionRejectsRecoveryBeforeInstallerDispatch() = runTest {
+        for (change in listOf("disabled-root", "root-generation", "configuration", "session")) {
+            fixture().use { fixture ->
+                fixture.recordUnknown()
+                val recorded = fixture.recovery.snapshot()
+                val root = fixture.authority.accessSnapshot()
+                coEvery { fixture.runtimeFactory.ensureFromUser(root) } coAnswers {
+                    val confirmed = ChrootRuntimeSession("before-recovery", root)
+                    fixture.session.value = confirmed
+                    when (change) {
+                        "disabled-root" -> fixture.authority.setEnabled(false)
+                        "root-generation" -> {
+                            fixture.authority.setEnabled(false)
+                            fixture.authority.setEnabled(true)
+                        }
+                        "configuration" -> fixture.revision.value++
+                        "session" -> fixture.session.value = ChrootRuntimeSession("replacement", root)
+                    }
+                    confirmed
+                }
+                assertTrue("$change must reject recovery", runCatching {
+                    fixture.facade.recoverAndRemoveInstanceFromUser(profile, root)
+                }.exceptionOrNull() is CancellationException)
+                assertEquals(recorded, fixture.recovery.snapshot())
+                assertEquals(listOf(profile), fixture.storedProfiles.value)
+                assertFalse(fixture.facade.state(profile).busy)
+                coVerify(exactly = 0) { fixture.installer.recoverAndRemoveFromUser(any(), any(), any(), any(), any()) }
+                coVerify(exactly = 0) { fixture.settings.publishChrootInstance(any(), any(), any(), any()) }
+            }
+        }
+    }
+
+    @Test fun recoveryGuardRejectsRootConfigurationOrSessionChangedDuringInstallerTransaction() = runTest {
+        for (change in listOf("root", "configuration", "session")) {
+            fixture().use { fixture ->
+                fixture.recordUnknown()
+                val root = fixture.authority.accessSnapshot()
+                val recorded = fixture.recovery.snapshot()
+                coEvery { fixture.installer.recoverAndRemoveFromUser(instance, root, any(), any(), any()) } coAnswers {
+                    arg<() -> Unit>(3).invoke()
+                    when (change) {
+                        "root" -> fixture.authority.setEnabled(false)
+                        "configuration" -> fixture.revision.value++
+                        "session" -> fixture.session.value = ChrootRuntimeSession("replacement", root)
+                    }
+                    arg<() -> Unit>(3).invoke()
+                    arg<suspend () -> Unit>(4).invoke()
+                    LocalRuntimeRemoval.REMOVED
+                }
+                assertTrue("$change must prevent publication", runCatching {
+                    fixture.facade.recoverAndRemoveInstanceFromUser(profile, root)
+                }.exceptionOrNull() is CancellationException)
+                assertEquals(listOf(profile), fixture.storedProfiles.value)
+                assertEquals(recorded, fixture.recovery.snapshot())
+                assertFalse(fixture.facade.state(profile).busy)
+                coVerify(exactly = 1) { fixture.installer.recoverAndRemoveFromUser(instance, root, any(), any(), any()) }
+                coVerify(exactly = 0) { fixture.settings.publishChrootInstance(any(), any(), any(), any()) }
+            }
+        }
+    }
+
+    @Test fun publicationGuardsRejectRootOrSessionChangedAfterTheRepositoryCallBegins() = runTest {
+        for (operation in listOf("create", "remove", "recover")) {
+            for (change in listOf("root", "session")) {
+                val selected = if (operation == "create") profile.copy(chrootInstance = null) else profile
+                fixture(selected).use { fixture ->
+                    if (operation == "recover") fixture.recordUnknown()
+                    val root = fixture.authority.accessSnapshot()
+                    var guardChecks = 0
+                    coEvery { fixture.settings.publishChrootInstance(fixture.snapshot, selected, any(), any()) } coAnswers {
+                        val guard = arg<() -> Unit>(3)
+                        guard()
+                        guardChecks++
+                        fixture.settings.checkProfileSnapshot(fixture.snapshot)
+                        if (change == "root") fixture.authority.setEnabled(false)
+                        else fixture.session.value = ChrootRuntimeSession("replacement-during-publication", root)
+                        guardChecks++
+                        guard()
+                        throw AssertionError("Changed authority must not reach persistence")
+                    }
+                    when (operation) {
+                        "create" -> coEvery { fixture.installer.installFromUser(selected, root, any(), any()) } coAnswers {
+                            arg<suspend (ChrootInstance) -> Unit>(3).invoke(instance)
+                            instance
+                        }
+                        "remove" -> coEvery { fixture.installer.removeFromUser(instance, root, any(), any()) } coAnswers {
+                            arg<suspend () -> Unit>(3).invoke()
+                        }
+                        "recover" -> coEvery { fixture.installer.recoverAndRemoveFromUser(instance, root, any(), any(), any()) } coAnswers {
+                            arg<() -> Unit>(3).invoke()
+                            arg<suspend () -> Unit>(4).invoke()
+                            LocalRuntimeRemoval.REMOVED
+                        }
+                    }
+                    val failure = runCatching {
+                        when (operation) {
+                            "create" -> fixture.facade.createInstanceFromUser(selected, root)
+                            "remove" -> fixture.facade.removeInstanceFromUser(selected, root)
+                            else -> fixture.facade.recoverAndRemoveInstanceFromUser(selected, root)
+                        }
+                    }.exceptionOrNull()
+                    assertTrue("$operation / $change must reject publication: $failure", failure is CancellationException)
+                    assertEquals(2, guardChecks)
+                    assertEquals(listOf(selected), fixture.storedProfiles.value)
+                    assertEquals(fixture.snapshot.configurationRevision, fixture.revision.value)
+                    assertFalse(fixture.facade.state(selected).busy)
+                    coVerify(exactly = 1) { fixture.settings.publishChrootInstance(fixture.snapshot, selected, any(), any()) }
+                }
+            }
+        }
+    }
+
+    @Test fun changedProfileIdentityAndUnavailableRootCannotDispatchRecoveryRemoval() = runTest {
+        for (change in listOf("profile", "disabled-root", "root-generation")) {
+            fixture().use { fixture ->
+                fixture.recordUnknown()
+                val expected = fixture.authority.accessSnapshot()
+                when (change) {
+                    "profile" -> coEvery { fixture.settings.captureProfileSnapshot() } returns ContainerProfileSnapshot(
+                        profile.id, profile.id, listOf(profile.copy(chrootInstance = instance.copy(installGeneration = 43))),
+                        1, fixture.revision.value, Any())
+                    "disabled-root" -> fixture.authority.setEnabled(false)
+                    "root-generation" -> {
+                        fixture.authority.setEnabled(false)
+                        fixture.authority.setEnabled(true)
+                    }
+                }
+                assertTrue(runCatching { fixture.facade.recoverAndRemoveInstanceFromUser(profile, expected) }
+                    .exceptionOrNull() is CancellationException)
+                assertEquals(listOf(profile), fixture.storedProfiles.value)
+                coVerify(exactly = 0) { fixture.installer.recoverAndRemoveFromUser(any(), any(), any(), any(), any()) }
+                coVerify(exactly = 0) { fixture.settings.publishChrootInstance(any(), any(), any(), any()) }
+            }
+        }
+    }
+
+    @Test fun uninstalledHealthyProfileRemovalOnlyDeletesItsConfigurationWithoutStartingRootOrInstaller() = runTest {
+        val fresh = profile.copy(chrootInstance = null)
+        fixture(fresh).use { fixture ->
+            val root = fixture.authority.accessSnapshot()
+            coEvery { fixture.settings.removeUninstalledChrootProfile(fixture.snapshot, fresh, any()) } coAnswers {
+                assertTrue(fixture.facade.state(fresh).busy)
+                thirdArg<() -> Unit>().invoke()
+                fixture.storedProfiles.value = emptyList()
+            }
+
+            fixture.facade.removeInstanceFromUser(fresh, root)
+
+            assertTrue(fixture.storedProfiles.value.isEmpty())
+            assertFalse(fixture.facade.state(fresh).busy)
+            assertTrue(fixture.recovery.snapshot().isEmpty())
+            coVerify(exactly = 1) { fixture.settings.removeUninstalledChrootProfile(fixture.snapshot, fresh, any()) }
+            coVerify(exactly = 0) { fixture.settings.publishChrootInstance(any(), any(), any(), any()) }
+            coVerify(exactly = 0) { fixture.runtimeFactory.ensureFromUser(any()) }
+            coVerify(exactly = 0) { fixture.installer.removeFromUser(any(), any(), any(), any()) }
+            coVerify(exactly = 0) { fixture.installer.recoverAndRemoveFromUser(any(), any(), any(), any(), any()) }
+            verify(exactly = 0) { fixture.factory.start(any()) }
+        }
+    }
+
+    @Test fun uninstalledRemovalRejectsStaleRootSnapshotUnpublishedInstallsAndUnhealthyRecords() = runTest {
+        val fresh = profile.copy(chrootInstance = null)
+        for (change in listOf("disabled-root", "root-generation", "configuration", "profile", "unpublished", "installer", "journal")) {
+            val file = File(temporary.newFolder(), "runtime.bin")
+            if (change == "journal") file.writeBytes(byteArrayOf(1, 2, 3))
+            fixture(fresh, recoveryFile = file).use { fixture ->
+                val expected = fixture.authority.accessSnapshot()
+                when (change) {
+                    "disabled-root" -> fixture.authority.setEnabled(false)
+                    "root-generation" -> {
+                        fixture.authority.setEnabled(false)
+                        fixture.authority.setEnabled(true)
+                    }
+                    "configuration" -> fixture.revision.value++
+                    "profile" -> coEvery { fixture.settings.captureProfileSnapshot() } returns ContainerProfileSnapshot(
+                        fresh.id, fresh.id, listOf(fresh.copy(env = mapOf("CHANGED" to "true"))), 1, fixture.revision.value, Any())
+                    "unpublished" -> fixture.unpublishedInstalls.value = setOf(instance.id)
+                    "installer" -> every { fixture.installer.isHealthy } returns MutableStateFlow(false)
+                }
+                val failure = runCatching { fixture.facade.removeInstanceFromUser(fresh, expected) }.exceptionOrNull()
+                assertTrue("$change must block configuration removal: $failure", failure is IOException || failure is CancellationException)
+                assertEquals(listOf(fresh), fixture.storedProfiles.value)
+                assertFalse(fixture.facade.state(fresh).busy)
+                coVerify(exactly = 0) { fixture.settings.removeUninstalledChrootProfile(any(), any(), any()) }
+                coVerify(exactly = 0) { fixture.runtimeFactory.ensureFromUser(any()) }
+                coVerify(exactly = 0) { fixture.installer.removeFromUser(any(), any(), any(), any()) }
+                coVerify(exactly = 0) { fixture.installer.recoverAndRemoveFromUser(any(), any(), any(), any(), any()) }
+            }
+        }
+    }
+
+    @Test fun uninstalledRemovalRechecksRootSnapshotAndUnpublishedInstallsInsideTheRepositoryTransaction() = runTest {
+        val fresh = profile.copy(chrootInstance = null)
+        for (change in listOf("root", "configuration", "unpublished")) {
+            fixture(fresh).use { fixture ->
+                val root = fixture.authority.accessSnapshot()
+                coEvery { fixture.settings.removeUninstalledChrootProfile(fixture.snapshot, fresh, any()) } coAnswers {
+                    when (change) {
+                        "root" -> fixture.authority.setEnabled(false)
+                        "configuration" -> fixture.revision.value++
+                        "unpublished" -> fixture.unpublishedInstalls.value = setOf(instance.id)
+                    }
+                    thirdArg<() -> Unit>().invoke()
+                    fixture.storedProfiles.value = emptyList()
+                }
+                val failure = runCatching { fixture.facade.removeInstanceFromUser(fresh, root) }.exceptionOrNull()
+                assertTrue("$change must block the transaction: $failure", failure is IOException || failure is CancellationException)
+                assertEquals(listOf(fresh), fixture.storedProfiles.value)
+                assertFalse(fixture.facade.state(fresh).busy)
+                coVerify(exactly = 1) { fixture.settings.removeUninstalledChrootProfile(fixture.snapshot, fresh, any()) }
+                coVerify(exactly = 0) { fixture.settings.publishChrootInstance(any(), any(), any(), any()) }
+            }
         }
     }
 
@@ -786,7 +1233,7 @@ class ChrootRuntimeFacadeTest {
                 assertNotEquals(confirmed.id, fixture.session.value!!.id)
                 assertEquals(confirmed.rootState, fixture.session.value!!.rootState)
                 coVerify(exactly = 1) { fixture.runtimeFactory.ensureFromUser(root) }
-                coVerify(exactly = 0) { fixture.settings.publishChrootInstance(any(), any(), any()) }
+                coVerify(exactly = 0) { fixture.settings.publishChrootInstance(any(), any(), any(), any()) }
             }
         }
     }

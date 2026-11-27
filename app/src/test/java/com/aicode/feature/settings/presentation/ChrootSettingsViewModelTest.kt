@@ -9,6 +9,7 @@ import com.aicode.feature.agent.domain.container.RootfsSource
 import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeAuthorization
 import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeCleanup
 import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeMount
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeRemoval
 import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeState
 import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeUserActions
 import com.aicode.feature.agent.domain.container.runtime.RuntimeOwner
@@ -93,6 +94,8 @@ class ChrootSettingsViewModelTest {
     fun observingSettingsDoesNotCreateAuthorizeOrStopAnything() {
         assertEquals(runtimeState, viewModel.uiState.value.states[profile.id])
         root.value = root.value.copy(generation = 8)
+        runtimeState = runtimeState.copy(journalHealthy = false, recoveryRequired = true,
+            journalRepairAvailable = true, removalRebootRequired = true)
         changes.value++
         settle()
         assertEquals(root.value, viewModel.uiState.value.rootState)
@@ -118,8 +121,10 @@ class ChrootSettingsViewModelTest {
     }
 
     @Test
-    fun stopAndRemovalStillRequireTheReviewedRootGeneration() {
-        for (action in listOf(ChrootInstanceAction.STOP, ChrootInstanceAction.REMOVE)) {
+    fun stopRemovalAndRecoveryStillRequireTheReviewedRootGeneration() {
+        runtimeState = runtimeState.copy(journalRepairAvailable = true)
+        for (action in listOf(ChrootInstanceAction.STOP, ChrootInstanceAction.REMOVE,
+            ChrootInstanceAction.REPAIR_JOURNAL, ChrootInstanceAction.RECOVER_REMOVE)) {
             viewModel.requestInstanceAction(profile.id, action)
             settle()
             assertNotNull(viewModel.uiState.value.confirmation)
@@ -140,8 +145,10 @@ class ChrootSettingsViewModelTest {
     }
 
     @Test
-    fun cancellingStopOrRemovalNeverDispatchesTheInstanceOperation() {
-        for (action in listOf(ChrootInstanceAction.STOP, ChrootInstanceAction.REMOVE)) {
+    fun cancellingStopRemovalOrRepairNeverDispatchesTheInstanceOperation() {
+        runtimeState = runtimeState.copy(journalRepairAvailable = true)
+        for (action in listOf(ChrootInstanceAction.STOP, ChrootInstanceAction.REMOVE,
+            ChrootInstanceAction.REPAIR_JOURNAL, ChrootInstanceAction.RECOVER_REMOVE)) {
             viewModel.requestInstanceAction(profile.id, action)
             settle()
             assertNotNull(viewModel.uiState.value.confirmation)
@@ -155,8 +162,9 @@ class ChrootSettingsViewModelTest {
     }
 
     @Test
-    fun unknownJournalOrRecoveryStateRejectsEveryDestructiveActionBeforeRuntimeCalls() {
-        for (state in listOf(runtimeState.copy(journalHealthy = false), runtimeState.copy(recoveryRequired = true), runtimeState.copy(busy = true))) {
+    fun irreparableJournalOrBusyStateRejectsEveryActionBeforeRuntimeCalls() {
+        for (state in listOf(runtimeState.copy(journalHealthy = false),
+            runtimeState.copy(busy = true, journalRepairAvailable = true))) {
             runtimeState = state
             changes.value++
             settle()
@@ -168,6 +176,238 @@ class ChrootSettingsViewModelTest {
             }
         }
         noLifecycleCalls()
+    }
+
+    @Test
+    fun repairOfUnknownRecordsUsesReviewedProfileAndRootExactlyOnce() {
+        runtimeState = runtimeState.copy(journalHealthy = false, recoveryRequired = true, journalRepairAvailable = true)
+        val finish = CompletableDeferred<Unit>()
+        coEvery { runtime.repairJournalFromUser(profile, root.value) } coAnswers {
+            finish.await()
+            runtimeState = runtimeState.copy(journalHealthy = true, journalRepairAvailable = false)
+            changes.value++
+        }
+        viewModel.requestInstanceAction(profile.id, ChrootInstanceAction.REPAIR_JOURNAL)
+        settle()
+        val confirmation = viewModel.uiState.value.confirmation as ChrootConfirmation.Instance
+        assertEquals(ChrootInstanceAction.REPAIR_JOURNAL, confirmation.action)
+        assertEquals(profile, confirmation.profile)
+        assertEquals(snapshot, confirmation.snapshot)
+        assertEquals(root.value, confirmation.rootState)
+        noLifecycleCalls()
+        viewModel.confirm()
+        viewModel.confirm()
+        viewModel.requestInstanceAction(profile.id, ChrootInstanceAction.RECOVER_REMOVE)
+        settle()
+        assertEquals(ChrootInstanceAction.REPAIR_JOURNAL, viewModel.uiState.value.workingAction)
+        coVerify(exactly = 1) { runtime.repairJournalFromUser(profile, root.value) }
+        finish.complete(Unit)
+        settle()
+        assertNull(viewModel.uiState.value.workingProfileId)
+        assertNull(viewModel.uiState.value.error)
+        assertNull(viewModel.uiState.value.info)
+        assertTrue(viewModel.uiState.value.states.getValue(profile.id).journalHealthy)
+        assertTrue(viewModel.uiState.value.states.getValue(profile.id).recoveryRequired)
+        viewModel.requestInstanceAction(profile.id, ChrootInstanceAction.REMOVE)
+        settle()
+        assertEquals(ChrootInstanceAction.RECOVER_REMOVE,
+            (viewModel.uiState.value.confirmation as ChrootConfirmation.Instance).action)
+        coVerify(exactly = 0) { runtime.removeInstanceFromUser(any(), any()) }
+        coVerify(exactly = 0) { runtime.recoverAndRemoveInstanceFromUser(any(), any()) }
+        coVerify(exactly = 0) { containers.upsertCustomProfile(any()) }
+        coVerify(exactly = 0) { containers.deleteCustomProfile(any()) }
+    }
+
+    @Test
+    fun repairCanBeRequestedWithoutAnInstalledInstance() {
+        val uninstalled = profile.copy(chrootInstance = null)
+        snapshot = snapshot(uninstalled)
+        profiles.value = listOf(uninstalled)
+        runtimeState = runtimeState.copy(instance = null, journalHealthy = false, recoveryRequired = true, journalRepairAvailable = true)
+        coEvery { runtime.repairJournalFromUser(uninstalled, root.value) } returns Unit
+        viewModel.requestInstanceAction(profile.id, ChrootInstanceAction.REPAIR_JOURNAL)
+        settle()
+        assertNotNull(viewModel.uiState.value.confirmation)
+        viewModel.confirm()
+        settle()
+        coVerify(exactly = 1) { runtime.repairJournalFromUser(uninstalled, root.value) }
+        assertNull(viewModel.uiState.value.error)
+        coVerify(exactly = 0) { runtime.createInstanceFromUser(any(), any()) }
+        coVerify(exactly = 0) { containers.deleteCustomProfile(any()) }
+    }
+
+    @Test
+    fun unknownRemovalReviewsRecoveryBeforeDispatchForHealthyOrRepairableRecords() {
+        val healthy = runtimeState
+        coEvery { runtime.recoverAndRemoveInstanceFromUser(profile, root.value) } returns LocalRuntimeRemoval.REMOVED
+        for (state in listOf(healthy.copy(recoveryRequired = true),
+            healthy.copy(journalHealthy = false, recoveryRequired = true, journalRepairAvailable = true))) {
+            runtimeState = state
+            viewModel.requestInstanceAction(profile.id, ChrootInstanceAction.REMOVE)
+            settle()
+            val confirmation = viewModel.uiState.value.confirmation as ChrootConfirmation.Instance
+            assertEquals(ChrootInstanceAction.RECOVER_REMOVE, confirmation.action)
+            assertEquals(profile, confirmation.profile)
+            assertEquals(snapshot, confirmation.snapshot)
+            viewModel.confirm()
+            settle()
+            assertNull(viewModel.uiState.value.error)
+            assertNull(viewModel.uiState.value.info)
+        }
+        coVerify(exactly = 2) { runtime.recoverAndRemoveInstanceFromUser(profile, root.value) }
+        coVerify(exactly = 0) { runtime.removeInstanceFromUser(any(), any()) }
+        coVerify(exactly = 0) { runtime.repairJournalFromUser(any(), any()) }
+        coVerify(exactly = 0) { containers.deleteCustomProfile(any()) }
+    }
+
+    @Test
+    fun rebootRequiredIsDismissibleInformationAndOnlyAnExplicitRetryRemoves() {
+        runtimeState = runtimeState.copy(recoveryRequired = true)
+        coEvery { runtime.recoverAndRemoveInstanceFromUser(profile, root.value) } returnsMany
+            listOf(LocalRuntimeRemoval.REBOOT_REQUIRED, LocalRuntimeRemoval.REMOVED)
+        viewModel.requestInstanceAction(profile.id, ChrootInstanceAction.REMOVE)
+        settle()
+        viewModel.confirm()
+        viewModel.confirm()
+        settle()
+        assertEquals(R.string.container_chroot_removal_reboot_required, viewModel.uiState.value.info)
+        assertNull(viewModel.uiState.value.error)
+        assertNull(viewModel.uiState.value.workingProfileId)
+        assertEquals(listOf(profile), profiles.value)
+        runtimeState = runtimeState.copy(removalRebootRequired = true)
+        changes.value++
+        settle()
+        coVerify(exactly = 1) { runtime.recoverAndRemoveInstanceFromUser(profile, root.value) }
+        viewModel.clearError()
+        assertNull(viewModel.uiState.value.info)
+        assertTrue(viewModel.uiState.value.states.getValue(profile.id).removalRebootRequired)
+        viewModel.requestInstanceAction(profile.id, ChrootInstanceAction.REMOVE)
+        settle()
+        assertEquals(ChrootInstanceAction.RECOVER_REMOVE,
+            (viewModel.uiState.value.confirmation as ChrootConfirmation.Instance).action)
+        viewModel.confirm()
+        settle()
+        coVerify(exactly = 2) { runtime.recoverAndRemoveInstanceFromUser(profile, root.value) }
+        assertNull(viewModel.uiState.value.error)
+        assertNull(viewModel.uiState.value.info)
+        coVerify(exactly = 0) { runtime.removeInstanceFromUser(any(), any()) }
+        coVerify(exactly = 0) { containers.deleteCustomProfile(any()) }
+    }
+
+    @Test
+    fun uninstalledConfigurationUsesNormalRemovalWithoutClaimingInstanceDeletion() {
+        val uninstalled = profile.copy(chrootInstance = null)
+        snapshot = snapshot(uninstalled)
+        profiles.value = listOf(uninstalled)
+        runtimeState = runtimeState.copy(instance = null)
+        coEvery { runtime.removeInstanceFromUser(uninstalled, root.value) } returns Unit
+        viewModel.requestInstanceAction(profile.id, ChrootInstanceAction.REMOVE)
+        settle()
+        val confirmation = viewModel.uiState.value.confirmation as ChrootConfirmation.Instance
+        assertEquals(ChrootInstanceAction.REMOVE, confirmation.action)
+        assertNull(confirmation.profile.chrootInstance)
+        viewModel.confirm()
+        settle()
+        coVerify(exactly = 1) { runtime.removeInstanceFromUser(uninstalled, root.value) }
+        coVerify(exactly = 0) { runtime.recoverAndRemoveInstanceFromUser(any(), any()) }
+        assertNull(viewModel.uiState.value.error)
+        assertNull(viewModel.uiState.value.info)
+        coVerify(exactly = 0) { containers.deleteCustomProfile(any()) }
+        val healthy = runtimeState
+        for (unavailable in listOf(healthy.copy(recoveryRequired = true), healthy.copy(journalHealthy = false, journalRepairAvailable = true))) {
+            runtimeState = unavailable
+            viewModel.requestInstanceAction(profile.id, ChrootInstanceAction.REMOVE)
+            settle()
+            assertNull(viewModel.uiState.value.confirmation)
+            assertNotNull(viewModel.uiState.value.error)
+        }
+        coVerify(exactly = 1) { runtime.removeInstanceFromUser(any(), any()) }
+    }
+
+    @Test
+    fun recoveryActionsRejectMissingRootBusyOrMissingCapabilities() {
+        val repairable = runtimeState.copy(journalHealthy = false, recoveryRequired = true, journalRepairAvailable = true)
+        for (action in listOf(ChrootInstanceAction.REPAIR_JOURNAL, ChrootInstanceAction.RECOVER_REMOVE)) {
+            for (unavailable in listOf(repairable.copy(rootEnabled = false), repairable.copy(busy = true),
+                repairable.copy(journalRepairAvailable = false))) {
+                runtimeState = unavailable
+                viewModel.requestInstanceAction(profile.id, action)
+                settle()
+                assertNull(viewModel.uiState.value.confirmation)
+                assertNotNull(viewModel.uiState.value.error)
+            }
+            runtimeState = repairable
+            root.value = root.value.copy(enabled = false)
+            viewModel.requestInstanceAction(profile.id, action)
+            settle()
+            assertNull(viewModel.uiState.value.confirmation)
+            assertNotNull(viewModel.uiState.value.error)
+            root.value = root.value.copy(enabled = true)
+        }
+        val uninstalled = profile.copy(chrootInstance = null)
+        snapshot = snapshot(uninstalled)
+        runtimeState = repairable.copy(instance = null)
+        viewModel.requestInstanceAction(profile.id, ChrootInstanceAction.RECOVER_REMOVE)
+        settle()
+        assertNull(viewModel.uiState.value.confirmation)
+        assertNotNull(viewModel.uiState.value.error)
+        noLifecycleCalls()
+    }
+
+    @Test
+    fun confirmationRechecksRecoveryCapabilitiesAndExactInstanceWithoutRelyingOnUiRefresh() {
+        val repairable = runtimeState.copy(journalHealthy = false, recoveryRequired = true, journalRepairAvailable = true)
+        for (action in listOf(ChrootInstanceAction.REPAIR_JOURNAL, ChrootInstanceAction.RECOVER_REMOVE)) {
+            for (unavailable in listOf(repairable.copy(rootEnabled = false), repairable.copy(busy = true),
+                repairable.copy(journalRepairAvailable = false), repairable.copy(instance = null),
+                repairable.copy(instance = instance.copy(installGeneration = instance.installGeneration + 1)))) {
+                runtimeState = repairable
+                viewModel.requestInstanceAction(profile.id, action)
+                settle()
+                assertNotNull(viewModel.uiState.value.confirmation)
+                runtimeState = unavailable // Deliberately do not emit runtime.changes.
+                viewModel.confirm()
+                settle()
+                assertNull(viewModel.uiState.value.confirmation)
+                assertNotNull(viewModel.uiState.value.error)
+                assertNull(viewModel.uiState.value.info)
+            }
+        }
+        noLifecycleCalls()
+    }
+
+    @Test
+    fun aNormalRemovalNeverEscalatesToRecoveryAfterItsSummaryWasReviewed() {
+        viewModel.requestInstanceAction(profile.id, ChrootInstanceAction.REMOVE)
+        settle()
+        assertEquals(ChrootInstanceAction.REMOVE, (viewModel.uiState.value.confirmation as ChrootConfirmation.Instance).action)
+        runtimeState = runtimeState.copy(recoveryRequired = true, journalRepairAvailable = true)
+        viewModel.confirm()
+        settle()
+        assertNotNull(viewModel.uiState.value.error)
+        noLifecycleCalls()
+        viewModel.requestInstanceAction(profile.id, ChrootInstanceAction.REMOVE)
+        settle()
+        assertEquals(ChrootInstanceAction.RECOVER_REMOVE,
+            (viewModel.uiState.value.confirmation as ChrootConfirmation.Instance).action)
+        noLifecycleCalls()
+    }
+
+    @Test
+    fun recoveryExceptionsAreErrorsWithoutExposingRuntimeDetailsOrClaimingRemoval() {
+        runtimeState = runtimeState.copy(recoveryRequired = true, journalRepairAvailable = true)
+        coEvery { runtime.repairJournalFromUser(any(), any()) } throws IOException("credential=not-for-ui")
+        coEvery { runtime.recoverAndRemoveInstanceFromUser(any(), any()) } throws IOException("credential=not-for-ui")
+        for (action in listOf(ChrootInstanceAction.REPAIR_JOURNAL, ChrootInstanceAction.RECOVER_REMOVE)) {
+            viewModel.requestInstanceAction(profile.id, action)
+            settle()
+            viewModel.confirm()
+            settle()
+            assertEquals(R.string.container_chroot_operation_failed, viewModel.uiState.value.error)
+            assertNull(viewModel.uiState.value.info)
+        }
+        coVerify(exactly = 0) { runtime.removeInstanceFromUser(any(), any()) }
+        coVerify(exactly = 0) { containers.deleteCustomProfile(any()) }
     }
 
     @Test
@@ -196,14 +436,19 @@ class ChrootSettingsViewModelTest {
     }
 
     @Test
-    fun changedProfileSnapshotBlocksAnAlreadyReviewedRemoval() {
-        viewModel.requestInstanceAction(profile.id, ChrootInstanceAction.REMOVE)
-        settle()
-        every { containers.checkProfileSnapshot(any()) } throws CancellationException("changed")
-        viewModel.confirm()
-        settle()
-        coVerify(exactly = 0) { runtime.removeInstanceFromUser(any(), any()) }
-        assertEquals(R.string.container_chroot_summary_stale, viewModel.uiState.value.error)
+    fun changedProfileSnapshotBlocksAlreadyReviewedRemovalAndRecovery() {
+        runtimeState = runtimeState.copy(journalRepairAvailable = true)
+        for (action in listOf(ChrootInstanceAction.REMOVE, ChrootInstanceAction.REPAIR_JOURNAL, ChrootInstanceAction.RECOVER_REMOVE)) {
+            every { containers.checkProfileSnapshot(any()) } just Runs
+            viewModel.requestInstanceAction(profile.id, action)
+            settle()
+            assertNotNull(viewModel.uiState.value.confirmation)
+            every { containers.checkProfileSnapshot(any()) } throws CancellationException("changed")
+            viewModel.confirm()
+            settle()
+            assertEquals(R.string.container_chroot_summary_stale, viewModel.uiState.value.error)
+            noLifecycleCalls()
+        }
     }
 
     @Test
@@ -518,6 +763,8 @@ class ChrootSettingsViewModelTest {
         coVerify(exactly = 0) { runtime.createInstanceFromUser(any(), any()) }
         coVerify(exactly = 0) { runtime.stopInstance(any()) }
         coVerify(exactly = 0) { runtime.removeInstanceFromUser(any(), any()) }
+        coVerify(exactly = 0) { runtime.repairJournalFromUser(any(), any()) }
+        coVerify(exactly = 0) { runtime.recoverAndRemoveInstanceFromUser(any(), any()) }
     }
 
     private fun authorization(scope: String = "existing-session") = LocalRuntimeAuthorization(

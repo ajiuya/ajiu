@@ -169,7 +169,7 @@ class AIAgentViewModel @Inject constructor(
     val recovering: StateFlow<Boolean> = agentRunManager.recovering
 
     private val _currentSessionId = MutableStateFlow<String?>(null)
-    private var sessionSelectionRevision = 0L
+    @Volatile private var sessionSelectionRevision = 0L
     private val sessionSelections = Channel<Pair<String, String>>(Channel.UNLIMITED)
     private val sessionCreationMutex = Mutex()
     private val selectionLoadedWorkspace = MutableStateFlow<String?>(null)
@@ -555,10 +555,14 @@ class AIAgentViewModel @Inject constructor(
     private val browseWorkspaceRevision = java.util.concurrent.atomic.AtomicLong()
     private fun fileRuntimeOwner() = RuntimeOwner(RuntimeOwnerKind.FILE, browseOwnerIdentity)
 
-    private suspend fun freezeFileExecution(paths: List<String>? = null): WorkspaceExecutionContext {
+    private suspend fun freezeFileExecution(
+        paths: List<String>? = null,
+        checkUiSource: () -> Unit = {}
+    ): WorkspaceExecutionContext {
         val workspace = _currentWorkspace.value
         val revision = browseWorkspaceRevision.get()
         val check = {
+            checkUiSource()
             if (!browseOwnerActive.get() || _currentWorkspace.value != workspace || browseWorkspaceRevision.get() != revision) {
                 throw CancellationException("File browser execution source changed")
             }
@@ -569,7 +573,41 @@ class AIAgentViewModel @Inject constructor(
 
     internal suspend fun captureUserFile(path: String): WorkspaceExecutionContext = freezeFileExecution(listOf(path))
 
+    // This is a local UI snapshot, not a runtime grant. Capture the actual runtime after the
+    // system picker returns and the app is foreground again, without asking the user to authorize.
+    internal fun captureAttachmentSelection(): () -> Unit {
+        val session = _currentSessionId.value
+        val sessionRevision = sessionSelectionRevision
+        val workspace = _currentWorkspace.value
+        val workspaceRevision = browseWorkspaceRevision.get()
+        val modeRevision = executionModeHolder.modeSelectionRevision
+        val profileRevision = containerSettingsRepository.activeProfileSelectionRevision
+        return {
+            if (!browseOwnerActive.get() || _currentSessionId.value != session ||
+                sessionSelectionRevision != sessionRevision || _currentWorkspace.value != workspace ||
+                browseWorkspaceRevision.get() != workspaceRevision ||
+                executionModeHolder.modeSelectionRevision != modeRevision ||
+                containerSettingsRepository.activeProfileSelectionRevision != profileRevision) {
+                throw CancellationException("Attachment destination changed")
+            }
+        }
+    }
+
+    internal suspend fun captureAttachmentFile(path: String, checkSelection: () -> Unit): WorkspaceExecutionContext =
+        freezeFileExecution(listOf(path), checkSelection)
+
+    internal data class AttachmentPickerSelection(val checkCurrent: () -> Unit, val cameraUri: android.net.Uri?)
+    private var pendingAttachmentSelection: AttachmentPickerSelection? = null
+
+    internal fun beginAttachmentSelection(cameraUri: android.net.Uri? = null) {
+        pendingAttachmentSelection = AttachmentPickerSelection(captureAttachmentSelection(), cameraUri)
+    }
+
+    internal fun consumeAttachmentSelection(): AttachmentPickerSelection? =
+        pendingAttachmentSelection.also { pendingAttachmentSelection = null }
+
     override fun onCleared() {
+        pendingAttachmentSelection = null
         browseOwnerActive.set(false)
         super.onCleared()
     }

@@ -186,13 +186,36 @@ internal class ChrootRootBroker internal constructor(
         }
     }
 
-    fun start(operation: Int, instanceId: String? = null, identity: ChrootFileIdentity? = null, expectedSession: ChrootRuntimeSession? = null, checkHelper: () -> Unit = {}): Process = authority.withLock {
+    fun start(operation: Int, instanceId: String? = null, identity: ChrootFileIdentity? = null, expectedSession: ChrootRuntimeSession? = null, checkHelper: () -> Unit = {}): Process =
+        startChecked(operation, instanceId, identity, expectedSession, checkHelper, {})
+
+    fun startChecked(
+        operation: Int,
+        instanceId: String?,
+        identity: ChrootFileIdentity?,
+        expectedSession: ChrootRuntimeSession?,
+        checkHelper: () -> Unit,
+        checkCurrent: () -> Unit
+    ): Process = startInternal(operation, instanceId, identity, expectedSession, checkHelper, checkCurrent, { true })
+
+    fun startRuntimeChecked(checkHelper: () -> Unit, canDispatch: () -> Boolean): Process =
+        startInternal(ChrootBrokerWire.RUNTIME, null, null, null, checkHelper, {}, canDispatch)
+
+    private fun startInternal(
+        operation: Int,
+        instanceId: String?,
+        identity: ChrootFileIdentity?,
+        expectedSession: ChrootRuntimeSession?,
+        checkHelper: () -> Unit,
+        checkCurrent: () -> Unit,
+        canDispatch: () -> Boolean
+    ): Process = authority.withLock {
         val live = connection.get() ?: throw ChrootRuntimeUnavailable("Root runtime session is unavailable or changed")
         if (expectedSession != null && live.session !== expectedSession) {
             throw ChrootRuntimeUnavailable("Root runtime session changed before dispatch")
         }
         checkSession(live.session)
-        live.start(operation, instanceId, identity, checkHelper)
+        live.start(operation, instanceId, identity, checkHelper, checkCurrent, canDispatch)
     }
 
     private fun requireCurrent(expected: RootAccessState) {
@@ -274,7 +297,8 @@ internal class ChrootRootBroker internal constructor(
             }
         }
 
-        fun start(operation: Int, instanceId: String?, identity: ChrootFileIdentity?, checkHelper: () -> Unit): ChrootBrokerProcess {
+        fun start(operation: Int, instanceId: String?, identity: ChrootFileIdentity?, checkHelper: () -> Unit,
+                  checkCurrent: () -> Unit, canDispatch: () -> Boolean): ChrootBrokerProcess {
             if (closed.get() || processes.size >= 32) throw IOException("Root runtime channel is unavailable or full")
             val process = ChrootBrokerProcess { target -> stop(target) }
             processes.add(process)
@@ -290,7 +314,13 @@ internal class ChrootRootBroker internal constructor(
                         checkHelper()
                         val dispatch = authority.withCurrent(session.rootState.authorityId, session.rootState.generation) {
                             checkSession(session)
-                            process.tryDispatch()
+                            checkCurrent()
+                            // Source expiry rejects this queued launch without retiring a shared session.
+                            val current = try { canDispatch() } catch (_: Exception) { false }
+                            if (!current) {
+                                process.cancelPendingLaunch()
+                                false
+                            } else process.tryDispatch()
                         } == true
                         if (!dispatch) {
                             process.fail(IOException("Root runtime request was cancelled before dispatch"))

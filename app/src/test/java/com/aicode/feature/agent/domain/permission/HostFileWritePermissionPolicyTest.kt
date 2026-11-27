@@ -159,7 +159,7 @@ class HostFileWritePermissionPolicyTest {
         coVerify(exactly = 0) { fixture.grants.isAllowed(any(), any()) }
     }
 
-    @Test fun readWritePolicyRegression_chrootInteractiveSendAndKeyAskEvenForReadonlyLookingInput() = runTest {
+    @Test fun readWritePolicyRegression_chrootInteractiveSendAndKeyAllowOrdinaryInputWithoutRootLookup() = runTest {
         val fixture = Fixture()
         val cases = listOf(
             mapOf("action" to JsonPrimitive("send"), "input" to JsonPrimitive("cat /sys/probe"),
@@ -167,21 +167,20 @@ class HostFileWritePermissionPolicyTest {
             mapOf("action" to JsonPrimitive("send"), "input" to JsonPrimitive("id"), "tab_id" to JsonPrimitive("term-1")),
             mapOf("action" to JsonPrimitive("key"), "key" to JsonPrimitive("enter"), "tab_id" to JsonPrimitive("term-1"))
         )
-        val keys = cases.map { args ->
+        fixture.rootState = RootAccessState(false, 43, "")
+        for (args in cases) {
             val result = fixture.engine.evaluate("terminal", args, SESSION, fixture.execution())
-            assertEquals(42L, result.hostWriteRootGeneration)
-            assertEquals("root-authority", result.hostWriteRootAuthorityId)
-            assertTrue(result.hostSystemUncertainties.contains("interactive-terminal-input"))
+            assertEquals(Verdict.ALLOW, result.verdict)
+            assertNull(result.hostWriteRootGeneration)
+            assertNull(result.hostWriteRootAuthorityId)
+            assertTrue(result.ordinaryGuestUncertainties.contains("interactive-input"))
+            assertTrue(result.hostSystemUncertainties.isEmpty())
             assertNull(result.rootGeneration)
             assertNull(result.rootAuthorityId)
-            assertWriteAsk(result, "interactive ${args["action"]}")
+            assertNull(result.sessionGrant)
         }
-        assertEquals("interactive uncertainty uses the same tool/source-wide scope", 1, keys.toSet().size)
-        val key = keys.first()
-        coEvery { fixture.grants.isAllowed(SESSION, key) } returns true
-        for (args in cases) {
-            assertEquals(Verdict.ALLOW, fixture.engine.evaluate("terminal", args, SESSION, fixture.execution()).verdict)
-        }
+        coVerify(exactly = 0) { fixture.root.accessSnapshot() }
+        coVerify(exactly = 0) { fixture.grants.isAllowed(any(), any()) }
     }
 
     @Test fun readWritePolicyRegression_structuredHostReadsAllowButWritesOfferSessionScope() = runTest {
@@ -233,7 +232,7 @@ class HostFileWritePermissionPolicyTest {
         }
     }
 
-    @Test fun readWritePolicyRegression_unknownScriptsAndDynamicWritersAskWithSessionGrant() = runTest {
+    @Test fun readWritePolicyRegression_unknownGuestScriptsAndDynamicWritersAllowWhileHostChannelsAsk() = runTest {
         val fixture = Fixture()
         for (tool in listOf("Root", "Shizuku", "Bash", "terminal")) {
             for (command in listOf(
@@ -243,7 +242,180 @@ class HostFileWritePermissionPolicyTest {
                 "printf value > \"\$TARGET\"",
                 "cd \"\$DIRECTORY\"; touch relative-probe"
             )) {
-                assertWriteAsk(fixture.engine.evaluate(tool, commandArgs(command, tool), SESSION, fixture.execution()), "$tool: $command")
+                val result = fixture.engine.evaluate(tool, commandArgs(command, tool), SESSION, fixture.execution())
+                if (tool in setOf("Root", "Shizuku")) {
+                    assertWriteAsk(result, "$tool: $command")
+                } else {
+                    assertEquals("$tool: $command", Verdict.ALLOW, result.verdict)
+                    assertTrue("diagnostics survive guest ALLOW", result.ordinaryGuestUncertainties.isNotEmpty())
+                    assertTrue(result.hostSystemUncertainties.isEmpty())
+                    assertNull(result.sessionGrant)
+                    assertNull(result.hostWriteRootGeneration)
+                }
+            }
+        }
+    }
+
+    @Test fun chrootPolicy_guestBuildsScriptsRelativeWritesAndTextAllowWithoutApprovalAuthority() = runTest {
+        val fixture = Fixture()
+        fixture.rootState = RootAccessState(false, 43, "")
+        val commands = listOf(
+            "apt update", "apt-get install -y make", "npm install", "git status", "make all", "./gradlew assembleDebug",
+            "python3 -c 'print(1)'", "node build.js", "awk '{print}' input.txt", "sh /root/opaque.sh",
+            "./custom-build.sh", "touch relative", "printf x >build/output", "echo x >\"\$TARGET\"",
+            "cd \"\$DIRECTORY\" && touch result", "touch /etc/guest", "touch /usr/local/guest", "mkdir /var/lib/guest",
+            "echo '/system'", "printf '%s' '/sys/kernel'", "echo /system && npm install",
+            "sh -c 'echo /system; npm install'", "cat /system/build.prop", "cp /system/source ./copy",
+            "printf x >/dev/null", "python3 -c 'open(\"/dev/null\", \"w\").write(\"x\")'"
+        )
+        for (tool in listOf("Bash", "terminal")) {
+            for (command in commands) {
+                val result = fixture.engine.evaluate(tool, commandArgs(command, tool), SESSION, fixture.execution())
+                assertEquals("$tool: $command", Verdict.ALLOW, result.verdict)
+                assertEquals(PermissionNamespace.CHROOT_GUEST, result.permissionSource?.namespace)
+                assertNull(result.sessionGrant)
+                assertNull(result.approvalNote)
+                assertNull(result.hostWriteRootGeneration)
+                assertNull(result.hostWriteRootAuthorityId)
+                assertNull(result.rootGeneration)
+            }
+        }
+        for (path in listOf("relative/output", "/etc/guest", "/usr/local/guest", "/var/lib/guest")) {
+            val result = fixture.engine.evaluate("writeFile", mapOf(
+                "path" to JsonPrimitive(path), "content" to JsonPrimitive("touch /system/probe")
+            ), SESSION, fixture.execution())
+            assertEquals(path, Verdict.ALLOW, result.verdict)
+        }
+        coVerify(exactly = 0) { fixture.root.accessSnapshot() }
+        coVerify(exactly = 0) { fixture.grants.isAllowed(any(), any()) }
+    }
+
+    @Test fun chrootPolicy_hostHintedWritesAndOpaqueCodeStillRequireBoundReview() = runTest {
+        val fixture = Fixture()
+        val commands = listOf(
+            "touch /system/probe", "cp /tmp/input /vendor/probe", "exec 3<>/system/probe",
+            "ln /system/source /tmp/link", "echo x >/system/\$NAME", "touch /data/system/\$NAME",
+            "cd /system/\$PART && touch probe", "python3 -c 'open(\"/system/probe\", \"w\").write(\"x\")'",
+            "node -e 'require(\"fs\").writeFileSync(\"/sys/kernel/probe\", \"x\")'",
+            "awk 'BEGIN {print 1 > \"/proc/sys/kernel/probe\"}'", "unknown-program --output=/system/probe",
+            "./custom-script /vendor/probe", "sh /root/opaque.sh /system/probe", "python3 build.py /dev/block/boot",
+            "sh -c 'echo x >\"\$1\"' sh /system/probe", "sh <<'EOF'\necho x >/system/probe\nEOF",
+            "env BASH_ENV=/system/startup bash -c id", "sed 'w /system/probe' input"
+        )
+        for (tool in listOf("Bash", "terminal")) {
+            for (command in commands) {
+                val result = fixture.engine.evaluate(tool, commandArgs(command, tool), SESSION, fixture.execution())
+                assertWriteAsk(result, "$tool: $command")
+                assertEquals(42L, result.hostWriteRootGeneration)
+                assertEquals("root-authority", result.hostWriteRootAuthorityId)
+                assertNull(result.rootGeneration)
+                assertNull(result.rootAuthorityId)
+            }
+        }
+        val typed = fixture.engine.evaluate("writeFile", mapOf("path" to JsonPrimitive("/system/\$LITERAL")), SESSION)
+        assertWriteAsk(typed, "typed Android path")
+        assertEquals(setOf("WRITE:/system/\$LITERAL"), typed.hostSystemTargets)
+    }
+
+    @Test fun chrootPolicy_interactiveHostHintsStillAskAndExplicitDenyStillWins() = runTest {
+        val fixture = Fixture()
+        for (input in listOf("echo x >/system/\$NAME", "touch /sys/probe", "open('/system/probe', 'w')")) {
+            val args = mapOf("action" to JsonPrimitive("send"), "input" to JsonPrimitive(input), "tab_id" to JsonPrimitive("term-1"))
+            assertWriteAsk(fixture.engine.evaluate("terminal", args, SESSION), input)
+        }
+        for ((tool, args, pattern) in listOf(
+            Triple("Bash", commandArgs("npm install"), "npm"),
+            Triple("terminal", mapOf("action" to JsonPrimitive("send"), "input" to JsonPrimitive("npm install")), "npm"),
+            Triple("terminal", mapOf("action" to JsonPrimitive("key"), "key" to JsonPrimitive("enter")), "*")
+        )) {
+            fixture.effectiveRules = listOf(PermissionRule(tool, pattern, PermissionDecision.DENY))
+            coEvery { fixture.grants.isAllowed(any(), any()) } returns true
+            assertEquals(tool, Verdict.DENY, fixture.engine.evaluate(tool, args, SESSION).verdict)
+        }
+    }
+
+    @Test fun chrootPolicy_guestDiagnosticsRemainFrozenAndDoNotPolluteHostWriteApprovalNote() = runTest {
+        val fixture = Fixture()
+        val args = commandArgs("npm install; touch /system/probe")
+        val initial = fixture.engine.evaluate("Bash", args, SESSION)
+        val actual = fixture.engine.evaluate("Bash", args, SESSION, fixture.execution())
+        assertWriteAsk(initial, "guest build followed by host write")
+        assertEquals(initial, actual)
+        assertEquals(setOf("unknown-executable"), initial.ordinaryGuestUncertainties)
+        assertTrue(initial.hostSystemUncertainties.isEmpty())
+        assertEquals("resource:${R.string.tool_host_system_file_confirmation_reason}", initial.approvalNote)
+        assertEquals(listOf("WRITE:/system/probe"), fixture.formatArgs[R.string.tool_host_system_file_confirmation_reason])
+        assertTrue(runCatching { (initial.ordinaryGuestUncertainties as MutableSet<String>).clear() }.isFailure)
+    }
+
+    @Test fun reviewFix_terminalSendCaseAndWhitespaceCannotAvoidHostReview() = runTest {
+        val fixture = Fixture()
+        for (action in listOf("send", "SEND", " send ", "\tSeNd\n")) {
+            val args = mapOf(
+                "action" to JsonPrimitive(action), "input" to JsonPrimitive("touch /sys/probe"),
+                "command" to JsonPrimitive("echo ignored"), "tab_id" to JsonPrimitive("term-1")
+            )
+            val result = fixture.engine.evaluate("terminal", args, SESSION, fixture.execution())
+            assertWriteAsk(result, action)
+            assertEquals(setOf("WRITE:/sys/probe"), result.hostSystemTargets)
+            assertEquals(42L, result.hostWriteRootGeneration)
+            assertEquals("root-authority", result.hostWriteRootAuthorityId)
+            val guest = fixture.engine.evaluate("terminal", args + ("input" to JsonPrimitive("npm install")), SESSION, fixture.execution())
+            assertEquals(action, Verdict.ALLOW, guest.verdict)
+            assertTrue(guest.hostSystemUncertainties.isEmpty())
+            assertTrue(guest.ordinaryGuestUncertainties.contains("interactive-input"))
+            assertNull(guest.hostWriteRootGeneration)
+        }
+    }
+
+    @Test fun reviewFix_leadingEnvironmentHostHintsBindCodeReviewButNotPrintedText() = runTest {
+        val fixture = Fixture()
+        for (tool in listOf("Root", "Shizuku", "Bash", "terminal")) {
+            for (command in listOf(
+                "TARGET=/sys/probe sh -c 'echo x >\"\$TARGET\"'",
+                "TARGET=/system/probe python3 -c 'import os; open(os.environ[\"TARGET\"], \"w\").write(\"x\")'",
+                "TARGET=/vendor/probe sh /root/opaque.sh", "TARGET=/system/probe ./opaque-script"
+            )) {
+                val result = fixture.engine.evaluate(tool, commandArgs(command, tool), SESSION, fixture.execution())
+                assertWriteAsk(result, "$tool: $command")
+                assertTrue(result.hostSystemUncertainties.isNotEmpty())
+                if (tool in setOf("Bash", "terminal")) assertEquals(42L, result.hostWriteRootGeneration)
+            }
+        }
+        for (tool in listOf("Bash", "terminal")) {
+            for (command in listOf(
+                "TARGET=/system/probe echo ordinary", "TARGET=/system/probe echo x >relative",
+                "TARGET=/tmp/probe sh -c 'echo x >\"\$TARGET\"'"
+            )) {
+                val result = fixture.engine.evaluate(tool, commandArgs(command, tool), SESSION, fixture.execution())
+                assertEquals("$tool: $command", Verdict.ALLOW, result.verdict)
+                assertTrue(result.hostSystemUncertainties.isEmpty())
+                assertNull(result.hostWriteRootGeneration)
+            }
+        }
+    }
+
+    @Test fun reviewFix_hereDocumentReviewUsesOnlyItsOwnBodyWhileHostChannelsStayStrict() = runTest {
+        val fixture = Fixture()
+        val cases = listOf(
+            "echo /system; python3 <<'EOF'\nprint(1)\nEOF" to false,
+            "cat <<'TEXT'; python3 <<'CODE'\n/system/probe\nTEXT\nprint(1)\nCODE" to false,
+            "python3 <<'CODE'; cat <<'TEXT'\nprint(1)\nCODE\n/system/probe\nTEXT" to false,
+            "cat <<'TEXT'; sh <<'CODE'\nordinary data\nTEXT\necho x >/system/probe\nCODE" to true,
+            "python3 <<'EOF'\nopen('/system/probe', 'w')\nEOF" to true
+        )
+        for (tool in listOf("Root", "Shizuku", "Bash", "terminal")) {
+            for ((command, hostHinted) in cases) {
+                val result = fixture.engine.evaluate(tool, commandArgs(command, tool), SESSION, fixture.execution())
+                if (hostHinted || tool in setOf("Root", "Shizuku")) {
+                    assertWriteAsk(result, "$tool: $command")
+                    assertTrue(result.hostSystemUncertainties.isNotEmpty())
+                } else {
+                    assertEquals("$tool: $command", Verdict.ALLOW, result.verdict)
+                    assertTrue(result.hostSystemUncertainties.isEmpty())
+                    assertTrue(result.ordinaryGuestUncertainties.isNotEmpty())
+                    assertNull(result.hostWriteRootGeneration)
+                }
             }
         }
     }
@@ -253,7 +425,8 @@ class HostFileWritePermissionPolicyTest {
             val fixture = Fixture()
             val capturedKeys = mutableListOf<String>()
             coEvery { fixture.grants.isAllowed(SESSION, capture(capturedKeys)) } returns false
-            val commands = listOf("touch /sys/probe-one", "printf value > /proc/sys/kernel/hostname", "sh /root/opaque-script.sh")
+            val opaqueScript = if (tool in setOf("Root", "Shizuku")) "sh /root/opaque-script.sh" else "sh /root/opaque-script.sh /system/probe"
+            val commands = listOf("touch /sys/probe-one", "printf value > /proc/sys/kernel/hostname", opaqueScript)
             val keys = commands.map { command ->
                 assertWriteAsk(fixture.engine.evaluate(tool, commandArgs(command, tool), SESSION), "$tool: $command")
             }
@@ -370,7 +543,7 @@ class HostFileWritePermissionPolicyTest {
         assertTrue(disabled.channelUnavailable)
         assertNull(disabled.sessionGrant)
         fixture.rootState = RootAccessState(true, 44, "root-authority")
-        val newKey = assertWriteAsk(fixture.engine.evaluate("Bash", commandArgs("sh /root/opaque-script.sh"), SESSION), "after Root on")
+        val newKey = assertWriteAsk(fixture.engine.evaluate("Bash", commandArgs("sh /root/opaque-script.sh /system/probe"), SESSION), "after Root on")
         assertNotEquals(key, newKey)
     }
 
@@ -436,12 +609,12 @@ class HostFileWritePermissionPolicyTest {
         coVerify(exactly = 0) { fixture.grants.isAllowed(any(), any()) }
     }
 
-    @Test fun readWritePolicyRegression_chrootWritesAndUnknownRejectUnavailableRootBeforeGrant() = runTest {
+    @Test fun readWritePolicyRegression_chrootHostWritesAndHostLinkedUnknownRejectUnavailableRootBeforeGrant() = runTest {
         for (state in listOf(RootAccessState(false, 43, "root-authority"), RootAccessState(true, 44, ""))) {
             val fixture = Fixture()
             fixture.rootState = state
             coEvery { fixture.grants.isAllowed(any(), any()) } returns true
-            for (command in listOf("touch /sys/probe", "sh /root/opaque-script.sh")) {
+            for (command in listOf("touch /sys/probe", "sh /root/opaque-script.sh /system/probe", "echo x >/system/\$NAME")) {
                 val result = fixture.engine.evaluate("Bash", commandArgs(command), SESSION)
                 assertEquals(command, Verdict.DENY, result.verdict)
                 assertTrue(result.channelUnavailable)
@@ -546,7 +719,7 @@ class HostFileWritePermissionPolicyTest {
         coEvery { fixture.grants.isAllowed(SESSION, key) } returns true
         fixture.workspaceSelections.value = WorkspaceRepository.Selection(Workspace("other", "/root/workspace/other"))
         fixture.workspaceSelections.value = WorkspaceRepository.Selection(original.workspace)
-        val changed = fixture.engine.evaluate("Bash", commandArgs("sh /root/opaque-script.sh"), SESSION)
+        val changed = fixture.engine.evaluate("Bash", commandArgs("sh /root/opaque-script.sh /system/probe"), SESSION)
         assertNotEquals(key, assertWriteAsk(changed, "workspace selection ABA"))
         assertEquals(first.permissionSource?.workspacePath, changed.permissionSource?.workspacePath)
         assertNotEquals(first.permissionSource?.workspaceSelectionId, changed.permissionSource?.workspaceSelectionId)

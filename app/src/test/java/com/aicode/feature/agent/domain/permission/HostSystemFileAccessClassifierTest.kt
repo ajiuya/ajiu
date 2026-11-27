@@ -17,7 +17,7 @@ class HostSystemFileAccessClassifierTest {
         HostSystemFileAccessClassifier.assessCommand(command, namespace)
 
     private fun asks(assessment: HostSystemFileAccessClassifier.Assessment) =
-        assessment.uncertainties.isNotEmpty() || assessment.targets.any { it.startsWith("WRITE:") || it.startsWith("READ_WRITE:") }
+        assessment.hostLinkedUncertainties.isNotEmpty() || assessment.targets.any { it.startsWith("WRITE:") || it.startsWith("READ_WRITE:") }
 
     @Test fun reviewRegression_fdDuplicationAndCloseAreNotFilesButNumericFilesRemainTargets() {
         for ((namespace, directory) in listOf(Namespace.HOST to "/system", Namespace.CHROOT_GUEST to "/sys")) {
@@ -126,12 +126,12 @@ class HostSystemFileAccessClassifierTest {
         assertTrue(targets("rm -rf /data/local/tmp/build").isEmpty())
     }
 
-    @Test fun guestEtcUsrSystemAndPackageManagerHaveNoLiteralAndroidHostTargets() {
+    @Test fun guestEtcUsrVarAndPackageManagerDifferFromExplicitAndroidHostHints() {
         for (command in listOf(
             "cat /etc/passwd", "touch /usr/local/bin/probe", "rm -rf /etc", "apt update",
-            "apt-get install -y make", "sudo id", "cat /system/guest-file", "sh /root/unknown.sh"
+            "apt-get install -y make", "sudo id", "mkdir /var/lib/guest", "sh /root/unknown.sh"
         )) assertTrue(command, targets(command, Namespace.CHROOT_GUEST).isEmpty())
-        for (command in listOf("cat /proc/sys/kernel/hostname", "touch /sys/kernel/probe", "dd of=/dev/block/boot")) {
+        for (command in listOf("cat /system/probe", "cat /proc/sys/kernel/hostname", "touch /sys/kernel/probe", "dd of=/dev/block/boot")) {
             assertFalse(command, targets(command, Namespace.CHROOT_GUEST).isEmpty())
         }
     }
@@ -242,7 +242,10 @@ class HostSystemFileAccessClassifierTest {
             "echo \"\$(unknown-program)\"", "cat <<EOF\n\$(unknown-program)\nEOF"
         )) assertTrue(command, asks(assess(command)))
         for (command in listOf("apt update", "apt-get install -y make", "npm install")) {
-            assertTrue(command, asks(assess(command, Namespace.CHROOT_GUEST)))
+            val guest = assess(command, Namespace.CHROOT_GUEST)
+            assertFalse(command, asks(guest))
+            assertEquals(setOf("unknown-executable"), guest.ordinaryGuestUncertainties)
+            assertTrue(guest.hostLinkedUncertainties.isEmpty())
         }
         assertTrue(assess("unknown-program /system/x").targets.isEmpty())
         assertTrue(assess("/tmp/cat /system/x").targets.isEmpty())
@@ -607,6 +610,163 @@ class HostSystemFileAccessClassifierTest {
         assertEquals(setOf("READ:/system/source"), suffix.targets)
         assertTrue("backup-write-path" in suffix.uncertainties)
         assertTrue(asks(suffix))
+    }
+
+    @Test fun chrootPolicy_ordinaryUnknownsKeepDiagnosticsWithoutHostReview() {
+        for (command in listOf(
+            "apt update", "npm install", "git status", "./gradlew test", "make all", "./build-script",
+            "python3 -c 'print(1)'", "node build.js", "awk '{print}' input", "sh /root/opaque.sh",
+            "touch relative", "echo x >\"\$TARGET\"", "cd \"\$DIRECTORY\" && touch relative",
+            "python3 -c 'open(\"/dev/null\", \"w\").write(\"x\")'", "unknown-program /etc/guest /usr/guest /var/guest",
+            "unknown-program /systematic/x /syslog/x /tmp/system/x", "echo /system; npm install",
+            "sh -c 'echo /system; npm install'", "cp /system/source ./copy"
+        )) {
+            val guest = assess(command, Namespace.CHROOT_GUEST)
+            assertFalse(command, asks(guest))
+            assertTrue(command, guest.ordinaryGuestUncertainties.isNotEmpty())
+            assertEquals(command, guest.uncertainties, guest.ordinaryGuestUncertainties)
+            assertTrue(command, guest.hostLinkedUncertainties.isEmpty())
+        }
+    }
+
+    @Test fun chrootPolicy_dynamicHostPrefixesRemainUncertainWithoutInventingLiteralTargets() {
+        for (command in listOf(
+            "echo x >/system/\$NAME", "touch /vendor/\$NAME", "touch /system\${SUFFIX}/probe",
+            "dd of=/dev/block/\$DEVICE", "echo x >/proc/sys/\$NAME", "touch /data/system/\$NAME",
+            "cd /system/\$PART && touch probe", "sh -c 'echo x >\"\$1\"' sh /system/probe"
+        )) {
+            val result = assess(command, Namespace.CHROOT_GUEST)
+            assertTrue(command, asks(result))
+            assertTrue(command, result.hostLinkedUncertainties.isNotEmpty())
+            assertTrue("$command must not claim expansion/mount resolution", result.targets.isEmpty())
+        }
+        for (root in listOf("/system", "/system_ext", "/vendor", "/product", "/odm", "/oem", "/apex", "/metadata", "/persist", "/data/system", "/data/misc", "/data/adb", "/data/property")) {
+            val write = assess("touch $root/probe", Namespace.CHROOT_GUEST)
+            assertEquals(setOf("WRITE:$root/probe"), write.targets)
+            assertTrue(root, asks(write))
+            assertFalse(root, asks(assess("cat $root/probe", Namespace.CHROOT_GUEST)))
+        }
+    }
+
+    @Test fun chrootPolicy_opaqueCodeUnknownOperandsAndShellInputAssociateHostHints() {
+        for (command in listOf(
+            "unknown-program /system/probe", "unknown-program --output=/system/probe", "./custom /vendor/probe",
+            "python3 -c 'open(\"/system/probe\", \"w\").write(\"x\")'", "node -e 'f(\"/sys/kernel/probe\")'",
+            "awk 'BEGIN {print 1 > \"/proc/sys/kernel/probe\"}'", "python3 /root/build.py /dev/block/boot",
+            "sh /root/build.sh /system/probe", "sh /system/script", "sh -c '\$SCRIPT /system/probe'",
+            "sh <<'EOF'\necho x >/system/probe\nEOF", "python3 <<'EOF'\nopen('/system/probe', 'w')\nEOF",
+            "bash <<< 'echo x >/system/probe'", "sh < /system/script", "env BASH_ENV=/system/script bash -c id",
+            "sed 'w /system/output' /tmp/input", "find /tmp -exec touch /system/probe \\;"
+        )) {
+            val result = assess(command, Namespace.CHROOT_GUEST)
+            assertTrue(command, asks(result))
+            assertTrue(command, result.hostLinkedUncertainties.isNotEmpty())
+            assertTrue(command, result.uncertainties.containsAll(result.hostLinkedUncertainties))
+        }
+    }
+
+    @Test fun chrootPolicy_printedAndHereDataPathsDoNotBecomeHostOperations() {
+        for (command in listOf(
+            "echo '/system'", "printf '%s' /system", "sh -c 'echo /system'", "cat <<'EOF'\ntouch /system/probe\nEOF",
+            "cat <<< 'touch /system/probe'", "echo /system >relative", "printf x >/dev/null",
+            "cat /dev/zero", "printf x >/dev/stdout", "cat /system/input", "ln -s /system/input /tmp/link"
+        )) assertFalse(command, asks(assess(command, Namespace.CHROOT_GUEST)))
+        for (tool in listOf("writeFile", "editFile")) {
+            val guest = HostSystemFileAccessClassifier.assessFileTool(tool, mapOf(
+                "path" to JsonPrimitive("relative"), "content" to JsonPrimitive("python3 -c 'open(\"/system/probe\", \"w\")'")
+            ), Namespace.CHROOT_GUEST)
+            assertFalse(tool, asks(guest))
+            assertEquals(setOf("unknown-write-directory"), guest.ordinaryGuestUncertainties)
+        }
+    }
+
+    @Test fun chrootPolicy_uncertaintyPartitionsAreFrozenAndDoNotLeakBetweenCommands() {
+        val result = assess("python3 -c 'f(\"/system/probe\")'; npm install", Namespace.CHROOT_GUEST)
+        assertEquals(setOf("opaque-code"), result.hostLinkedUncertainties)
+        assertEquals(setOf("unknown-executable"), result.ordinaryGuestUncertainties)
+        assertEquals(result.uncertainties, result.hostLinkedUncertainties + result.ordinaryGuestUncertainties)
+        assertEquals(result, result.copy())
+        assertThrows(UnsupportedOperationException::class.java) { (result.hostLinkedUncertainties as MutableSet<String>).clear() }
+        assertThrows(UnsupportedOperationException::class.java) { (result.ordinaryGuestUncertainties as MutableSet<String>).clear() }
+        val host = assess("npm install")
+        assertEquals(host.uncertainties, host.hostLinkedUncertainties)
+        assertTrue(host.ordinaryGuestUncertainties.isEmpty())
+        assertTrue(assess("npm install", Namespace.CHROOT_GUEST).hostLinkedUncertainties.isEmpty())
+    }
+
+    @Test fun reviewFix_terminalActionsNormalizeBeforeClassifyingInput() {
+        for (namespace in Namespace.values()) {
+            for (action in listOf("SEND", " send ", "\tSeNd\n")) {
+                val result = HostSystemFileAccessClassifier.assessFileTool("terminal", mapOf(
+                    "action" to JsonPrimitive(action), "input" to JsonPrimitive("touch /sys/probe"),
+                    "command" to JsonPrimitive("echo ignored")
+                ), namespace)
+                assertEquals("$namespace: $action", setOf("WRITE:/sys/probe"), result.targets)
+                assertTrue("$namespace: $action", asks(result))
+            }
+            val start = HostSystemFileAccessClassifier.assessFileTool("terminal", mapOf(
+                "action" to JsonPrimitive(" START "), "command" to JsonPrimitive("touch /sys/probe")
+            ), namespace)
+            assertTrue("$namespace: start", asks(start))
+        }
+        for (action in listOf("SEND", " send ")) {
+            val guest = HostSystemFileAccessClassifier.assessFileTool("terminal", mapOf(
+                "action" to JsonPrimitive(action), "input" to JsonPrimitive("npm install")
+            ), Namespace.CHROOT_GUEST)
+            assertFalse(action, asks(guest))
+            assertTrue(guest.ordinaryGuestUncertainties.contains("interactive-input"))
+        }
+    }
+
+    @Test fun reviewFix_leadingEnvironmentHostHintsReachExecutableCodeOnly() {
+        for (command in listOf(
+            "TARGET=/sys/probe sh -c 'echo x >\"\$TARGET\"'",
+            "TARGET=/system/probe python3 -c 'import os; open(os.environ[\"TARGET\"], \"w\").write(\"x\")'",
+            "TARGET=/vendor/probe sh /root/opaque.sh", "TARGET=/system/probe ./opaque-script",
+            "TARGET=/system/probe env sh -c 'echo x >\"\$TARGET\"'"
+        )) {
+            val guest = assess(command, Namespace.CHROOT_GUEST)
+            assertTrue(command, asks(guest))
+            assertTrue(command, guest.hostLinkedUncertainties.isNotEmpty())
+            assertTrue("environment values are hints, not resolved paths", guest.targets.isEmpty())
+            assertTrue(command, asks(assess(command, Namespace.HOST)))
+        }
+        for (command in listOf(
+            "TARGET=/system/probe echo ordinary", "TARGET=/system/probe echo /system",
+            "TARGET=/system/probe echo x >relative", "TARGET=/system/probe cat /etc/guest",
+            "TARGET=/tmp/probe sh -c 'echo x >\"\$TARGET\"'", "TARGET=/system/probe echo x; npm install"
+        )) assertFalse(command, asks(assess(command, Namespace.CHROOT_GUEST)))
+    }
+
+    @Test fun reviewFix_hereDocumentHintsStayWithTheirOwnCodeConsumer() {
+        val paired = "cat <<'TEXT'; python3 <<-'CODE'\ngit push /system/probe\nTEXT\n\tprint(1)\n\tCODE"
+        val analysis = ShellCommandParser.analyze(paired)
+        assertEquals(listOf(listOf("cat"), listOf("python3")), analysis.segments)
+        assertEquals(listOf(
+            ShellCommandParser.Redirection("<<", "TEXT", true, "git push /system/probe\n"),
+            ShellCommandParser.Redirection("<<-", "CODE", true, "\tprint(1)\n")
+        ), analysis.commandSegments.flatMap { it.redirections })
+        assertFalse(ShellCommandParser.executableSegments(paired).any { ShellCommandParser.matches("git push", it) })
+        assertEquals(null, ShellCommandParser.analyze("cat < /etc/guest").commandSegments.single().redirections.single().hereDocumentBody)
+        for (command in listOf(
+            "echo /system; python3 <<'EOF'\nprint(1)\nEOF",
+            "python3 <<'EOF'\nprint(1)\nEOF\necho /system",
+            "cat <<'TEXT'; python3 <<'CODE'\n/system/probe\nTEXT\nprint(1)\nCODE",
+            "python3 <<'CODE'; cat <<'TEXT'\nprint(1)\nCODE\n/system/probe\nTEXT",
+            "cat <<-'TEXT'; python3 <<-'CODE'\n\t/system/probe\n\tTEXT\n\tprint(1)\n\tCODE"
+        )) {
+            assertFalse(command, asks(assess(command, Namespace.CHROOT_GUEST)))
+            assertTrue("HOST opaque code remains strict: $command", asks(assess(command, Namespace.HOST)))
+        }
+        for (command in listOf(
+            "echo ordinary; python3 <<'EOF'\nopen('/system/probe', 'w')\nEOF",
+            "cat <<'TEXT'; sh <<'CODE'\nordinary data\nTEXT\necho x >/system/probe\nCODE",
+            "sh <<-'CODE'; cat <<'TEXT'\n\techo x >/sys/probe\n\tCODE\nordinary data\nTEXT"
+        )) {
+            val result = assess(command, Namespace.CHROOT_GUEST)
+            assertTrue(command, asks(result))
+            assertTrue(command, result.hostLinkedUncertainties.isNotEmpty())
+        }
     }
 
     @Test fun returnedTargetSetCannotBeMutatedAndSeparateClassificationsDoNotShareState() {

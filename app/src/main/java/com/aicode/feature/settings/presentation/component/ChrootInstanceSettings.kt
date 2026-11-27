@@ -27,12 +27,16 @@ import com.aicode.feature.agent.domain.root.RootAccessState
 import com.aicode.feature.settings.presentation.ChrootConfirmation
 import com.aicode.feature.settings.presentation.ChrootInstanceAction
 import com.aicode.feature.settings.presentation.ChrootSettingsUiState
+import com.aicode.feature.settings.presentation.isAvailable
 
 @StringRes
 internal fun chrootStatusResource(state: LocalRuntimeState?, action: ChrootInstanceAction?): Int = when {
-    state == null || state.recoveryRequired || !state.journalHealthy -> R.string.container_chroot_status_unknown
     action == ChrootInstanceAction.CREATE -> R.string.container_chroot_status_installing
-    action == ChrootInstanceAction.STOP || action == ChrootInstanceAction.REMOVE -> R.string.container_chroot_status_cleanup
+    action == ChrootInstanceAction.REPAIR_JOURNAL -> R.string.container_chroot_status_repairing
+    action == ChrootInstanceAction.STOP || action == ChrootInstanceAction.REMOVE ||
+        action == ChrootInstanceAction.RECOVER_REMOVE -> R.string.container_chroot_status_cleanup
+    state?.removalRebootRequired == true -> R.string.container_chroot_status_removal_reboot_required
+    state == null || state.recoveryRequired || !state.journalHealthy -> R.string.container_chroot_status_unknown
     state.busy -> R.string.container_chroot_status_busy
     state.instance == null -> R.string.container_chroot_status_not_installed
     state.activeLaunches > 0 -> R.string.container_chroot_status_active
@@ -50,7 +54,8 @@ internal fun ChrootProfileSettings(
 ) {
     val state = uiState.states[profile.id]
     val action = uiState.workingAction.takeIf { uiState.workingProfileId == profile.id }
-    val available = state != null && state.journalHealthy && !state.recoveryRequired && !state.busy && uiState.workingProfileId == null
+    fun available(action: ChrootInstanceAction) = uiState.workingProfileId == null &&
+        action.isAvailable(profile, state, uiState.rootState)
     val rootAvailable = uiState.rootState.enabled && state?.rootEnabled == true
     SettingsGroup {
         SettingsRow(
@@ -64,23 +69,39 @@ internal fun ChrootProfileSettings(
             SettingsDivider()
             SettingsRow(title = stringResource(R.string.container_chroot_root_disabled))
         }
+        if (state?.removalRebootRequired == true) {
+            SettingsDivider()
+            SettingsRow(title = stringResource(R.string.container_chroot_removal_reboot_required))
+        }
         SettingsDivider()
         SettingsRow(
             title = stringResource(R.string.container_chroot_create),
-            enabled = available && state?.instance == null && rootAvailable,
+            enabled = available(ChrootInstanceAction.CREATE),
             onClick = { onInstanceAction(profile.id, ChrootInstanceAction.CREATE) }
         )
         SettingsDivider()
         SettingsRow(
             title = stringResource(R.string.container_chroot_stop),
-            enabled = available && state?.instance != null,
+            enabled = available(ChrootInstanceAction.STOP),
             onClick = { onInstanceAction(profile.id, ChrootInstanceAction.STOP) }
         )
         SettingsDivider()
         SettingsRow(
-            title = stringResource(R.string.container_chroot_remove),
-            enabled = available && rootAvailable,
+            title = stringResource(if (profile.chrootInstance == null) R.string.container_chroot_remove_configuration else R.string.container_chroot_remove),
+            enabled = available(ChrootInstanceAction.REMOVE),
             onClick = { onInstanceAction(profile.id, ChrootInstanceAction.REMOVE) }
+        )
+        SettingsDivider()
+        SettingsRow(
+            title = stringResource(R.string.container_chroot_repair_journal),
+            enabled = available(ChrootInstanceAction.REPAIR_JOURNAL),
+            onClick = { onInstanceAction(profile.id, ChrootInstanceAction.REPAIR_JOURNAL) }
+        )
+        SettingsDivider()
+        SettingsRow(
+            title = stringResource(R.string.container_chroot_recover_remove),
+            enabled = available(ChrootInstanceAction.RECOVER_REMOVE),
+            onClick = { onInstanceAction(profile.id, ChrootInstanceAction.RECOVER_REMOVE) }
         )
     }
 }
@@ -96,14 +117,17 @@ internal fun ChrootSettingsDialogs(
         val profileId = confirmation.profile.id
         val state = uiState.states[profileId]
         val current = confirmation.rootState == uiState.rootState && uiState.workingProfileId == null &&
-            state != null && state.journalHealthy && !state.recoveryRequired && !state.busy
+            confirmation.action.isAvailable(confirmation.profile, state, uiState.rootState)
         AlertDialog(
             onDismissRequest = onCancel,
             title = {
                 Text(stringResource(when (confirmation.action) {
                     ChrootInstanceAction.CREATE -> R.string.container_chroot_create
                     ChrootInstanceAction.STOP -> R.string.container_chroot_stop
-                    ChrootInstanceAction.REMOVE -> R.string.container_chroot_remove
+                    ChrootInstanceAction.REMOVE -> if (confirmation.profile.chrootInstance == null)
+                        R.string.container_chroot_remove_configuration else R.string.container_chroot_remove
+                    ChrootInstanceAction.REPAIR_JOURNAL -> R.string.container_chroot_repair_journal
+                    ChrootInstanceAction.RECOVER_REMOVE -> R.string.container_chroot_recover_remove
                 }))
             },
             text = {
@@ -123,7 +147,10 @@ internal fun ChrootSettingsDialogs(
                     Text(stringResource(when (confirmation.action) {
                         ChrootInstanceAction.CREATE -> R.string.container_chroot_create_notice
                         ChrootInstanceAction.STOP -> R.string.container_chroot_stop_notice
-                        ChrootInstanceAction.REMOVE -> R.string.container_chroot_remove_notice
+                        ChrootInstanceAction.REMOVE -> if (confirmation.profile.chrootInstance == null)
+                            R.string.container_chroot_remove_configuration_notice else R.string.container_chroot_remove_notice
+                        ChrootInstanceAction.REPAIR_JOURNAL -> R.string.container_chroot_repair_journal_notice
+                        ChrootInstanceAction.RECOVER_REMOVE -> R.string.container_chroot_recover_remove_notice
                     }))
                     if (!current) Text(stringResource(R.string.container_chroot_summary_stale), color = MaterialTheme.colorScheme.error)
                 }
@@ -134,6 +161,14 @@ internal fun ChrootSettingsDialogs(
                 }
             },
             dismissButton = { TextButton(onClick = onCancel) { Text(stringResource(R.string.common_cancel)) } }
+        )
+    }
+    uiState.info?.let { info ->
+        AlertDialog(
+            onDismissRequest = onClearError,
+            title = { Text(stringResource(R.string.container_chroot_info_title)) },
+            text = { Text(stringResource(info)) },
+            confirmButton = { TextButton(onClick = onClearError) { Text(stringResource(R.string.common_confirm)) } }
         )
     }
     uiState.error?.let { error ->

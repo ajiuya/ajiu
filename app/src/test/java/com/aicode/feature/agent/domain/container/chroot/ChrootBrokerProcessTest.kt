@@ -1,6 +1,8 @@
 package com.aicode.feature.agent.domain.container.chroot
 
 import java.io.IOException
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.FutureTask
 import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -16,6 +18,7 @@ class ChrootBrokerProcessTest {
         val process = ChrootBrokerProcess { stops += it }
         try {
             assertTrue(process.isAlive)
+            assertFalse(process.wasCancelledBeforeDispatch)
             assertEquals(0L, process.requestId)
             assertFalse(process.waitFor(0, TimeUnit.NANOSECONDS))
             assertThrows(IllegalThreadStateException::class.java) { process.exitValue() }
@@ -36,6 +39,7 @@ class ChrootBrokerProcessTest {
         process.destroy()
         assertSame(process, process.destroyForcibly())
         assertTrue(process.cancelled.get())
+        assertTrue(process.wasCancelledBeforeDispatch)
         assertFalse(process.tryDispatch())
         assertFalse(process.tryDispatch())
         assertFalse(process.isAlive)
@@ -156,6 +160,65 @@ class ChrootBrokerProcessTest {
         }
         assertFalse(process.tryDispatch())
         assertTrue(stops.isEmpty())
+    }
+
+    @Test
+    fun onlyTheWinningCancellationProvesNoBirthInBothDispatchOrders() {
+        for (cancelFirst in listOf(true, false)) {
+            val process = ChrootBrokerProcess { throw AssertionError("Pending cancellation must not request STOP") }
+            val dispatchWaiting = CountDownLatch(1)
+            val releaseDispatch = CountDownLatch(1)
+            val dispatch = FutureTask<Boolean> {
+                dispatchWaiting.countDown()
+                check(releaseDispatch.await(5, TimeUnit.SECONDS))
+                process.tryDispatch()
+            }
+            val worker = Thread(dispatch, "broker-dispatch-order-test").apply { isDaemon = true; start() }
+            try {
+                assertTrue(dispatchWaiting.await(5, TimeUnit.SECONDS))
+                assertFalse(process.wasCancelledBeforeDispatch)
+                if (cancelFirst) process.cancelPendingLaunch()
+                releaseDispatch.countDown()
+                assertEquals(!cancelFirst, dispatch.get(5, TimeUnit.SECONDS))
+                // In the dispatch-first case cancellation arrives before requestId is assigned.
+                assertEquals(0L, process.requestId)
+                process.cancelPendingLaunch()
+                assertEquals(cancelFirst, process.wasCancelledBeforeDispatch)
+                assertEquals(cancelFirst, process.cancelled.get())
+                assertFalse(process.tryDispatch())
+                process.fail(IOException("Later descriptor failure cannot change dispatch history"))
+                process.cancelPendingLaunch()
+                assertFalse(process.isAlive)
+                assertEquals(cancelFirst, process.wasCancelledBeforeDispatch)
+            } finally {
+                releaseDispatch.countDown()
+                dispatch.cancel(true)
+                worker.join(5_000)
+                process.fail(IOException("fixture end"))
+                assertFalse("Dispatch worker must finish", worker.isAlive)
+            }
+        }
+    }
+
+    @Test
+    fun failureAloneCannotProveCancellationOrDispatchAnAlreadyFailedProxy() {
+        for (dispatched in listOf(false, true)) {
+            val process = ChrootBrokerProcess {}
+            if (dispatched) assertTrue(process.tryDispatch())
+            val failure = IOException("Descriptor channel failed")
+            process.fail(failure)
+            assertFalse(process.isAlive)
+            assertFalse(process.cancelled.get())
+            assertFalse(process.wasCancelledBeforeDispatch)
+            assertFalse(process.tryDispatch())
+            assertSame(failure, assertThrows(IllegalThreadStateException::class.java) { process.exitValue() }.cause)
+            if (dispatched) {
+                process.cancelPendingLaunch()
+                process.destroy()
+                assertTrue(process.cancelled.get())
+                assertFalse(process.wasCancelledBeforeDispatch)
+            }
+        }
     }
 
     @Test

@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import com.aicode.feature.agent.domain.container.ContainerProfile
 import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeAuthorization
 import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeCleanup
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeRemoval
 import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeState
 import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeUserActions
 import com.aicode.feature.agent.domain.root.RootAccessState
@@ -25,7 +26,31 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
-internal enum class ChrootInstanceAction { CREATE, STOP, REMOVE }
+internal enum class ChrootInstanceAction { CREATE, STOP, REMOVE, REPAIR_JOURNAL, RECOVER_REMOVE }
+
+/** Shared by the list, edit sheet and both stages of explicit user confirmation. */
+internal fun ChrootInstanceAction.isAvailable(
+    profile: ContainerProfile,
+    state: LocalRuntimeState?,
+    root: RootAccessState
+): Boolean {
+    if (!profile.isChroot || state == null || state.busy || state.instance != profile.chrootInstance) return false
+    val rootAvailable = root.enabled && state.rootEnabled
+    val healthy = state.journalHealthy && !state.recoveryRequired && !state.removalRebootRequired
+    return when (this) {
+        ChrootInstanceAction.CREATE -> rootAvailable && healthy && state.instance == null
+        ChrootInstanceAction.STOP -> healthy && state.instance != null
+        ChrootInstanceAction.REMOVE -> rootAvailable && healthy
+        ChrootInstanceAction.REPAIR_JOURNAL -> rootAvailable && state.journalRepairAvailable
+        ChrootInstanceAction.RECOVER_REMOVE -> rootAvailable && state.instance != null &&
+            (state.journalHealthy || state.journalRepairAvailable)
+    }
+}
+
+internal fun chrootRemovalAction(state: LocalRuntimeState?): ChrootInstanceAction =
+    if (state?.instance != null && (state.recoveryRequired || !state.journalHealthy || state.removalRebootRequired)) {
+        ChrootInstanceAction.RECOVER_REMOVE
+    } else ChrootInstanceAction.REMOVE
 
 internal sealed interface ChrootConfirmation {
     val rootState: RootAccessState
@@ -50,7 +75,8 @@ internal data class ChrootSettingsUiState(
     val workingProfileId: String? = null,
     val workingAction: ChrootInstanceAction? = null,
     val error: Int? = null,
-    val addition: ContainerProfileAdditionUiState? = null
+    val addition: ContainerProfileAdditionUiState? = null,
+    val info: Int? = null
 )
 
 @HiltViewModel
@@ -160,14 +186,10 @@ internal class ChrootSettingsViewModel @Inject constructor(
                 ?: error("CHROOT profile is no longer available")
             val root = rootSettings.snapshot()
             val state = runtime.state(profile)
-            require(!state.recoveryRequired && state.journalHealthy && !state.busy) { "CHROOT cleanup state is unknown or busy" }
-            when (action) {
-                ChrootInstanceAction.CREATE -> require(root.enabled && state.rootEnabled && profile.chrootInstance == null)
-                ChrootInstanceAction.STOP -> require(state.instance != null)
-                ChrootInstanceAction.REMOVE -> require(root.enabled && state.rootEnabled)
-            }
+            val reviewedAction = if (action == ChrootInstanceAction.REMOVE) chrootRemovalAction(state) else action
+            require(reviewedAction.isAvailable(profile, state, root)) { "CHROOT action is unavailable" }
             containers.checkProfileSnapshot(snapshot)
-            _uiState.update { it.copy(confirmation = ChrootConfirmation.Instance(action, profile, root, snapshot)) }
+            _uiState.update { it.copy(confirmation = ChrootConfirmation.Instance(reviewedAction, profile, root, snapshot)) }
         }
     }
 
@@ -179,7 +201,8 @@ internal class ChrootSettingsViewModel @Inject constructor(
         if (_uiState.value.workingProfileId == null) _uiState.update { it.copy(confirmation = null) }
     }
 
-    fun clearError() = _uiState.update { it.copy(error = null) }
+    // Both result dialogs use the existing settings dismissal callback.
+    fun clearError() = _uiState.update { it.copy(error = null, info = null) }
 
     fun confirm() {
         val confirmation = _uiState.value.confirmation ?: return
@@ -191,8 +214,7 @@ internal class ChrootSettingsViewModel @Inject constructor(
             containers.checkProfileSnapshot(confirmation.snapshot)
             val profile = confirmation.profile
             val state = runtime.state(profile)
-            require(!state.recoveryRequired && state.journalHealthy && !state.busy) { "CHROOT cleanup state is unknown or busy" }
-            if (confirmation.action != ChrootInstanceAction.STOP) require(state.rootEnabled)
+            require(confirmation.action.isAvailable(profile, state, confirmation.rootState)) { "CHROOT action is no longer available" }
             when (confirmation.action) {
                 ChrootInstanceAction.CREATE -> runtime.createInstanceFromUser(profile, confirmation.rootState)
                 ChrootInstanceAction.STOP -> {
@@ -201,6 +223,15 @@ internal class ChrootSettingsViewModel @Inject constructor(
                     }
                 }
                 ChrootInstanceAction.REMOVE -> runtime.removeInstanceFromUser(profile, confirmation.rootState)
+                ChrootInstanceAction.REPAIR_JOURNAL -> runtime.repairJournalFromUser(profile, confirmation.rootState)
+                ChrootInstanceAction.RECOVER_REMOVE -> {
+                    when (runtime.recoverAndRemoveInstanceFromUser(profile, confirmation.rootState)) {
+                        LocalRuntimeRemoval.REMOVED -> Unit
+                        LocalRuntimeRemoval.REBOOT_REQUIRED -> _uiState.update {
+                            it.copy(info = R.string.container_chroot_removal_reboot_required)
+                        }
+                    }
+                }
             }
         }
     }
@@ -215,7 +246,7 @@ internal class ChrootSettingsViewModel @Inject constructor(
         block: suspend () -> Unit
     ): Job? {
         if (_uiState.value.workingProfileId != null) return null
-        _uiState.update { it.copy(workingProfileId = profileId, workingAction = action, error = null) }
+        _uiState.update { it.copy(workingProfileId = profileId, workingAction = action, error = null, info = null) }
         return viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) {
             fun fail(reason: Int) {
                 if (onFailure != null) onFailure(reason) else _uiState.update { it.copy(error = reason) }

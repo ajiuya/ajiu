@@ -16,6 +16,7 @@
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <time.h>
 #include <unistd.h>
 
 static long guest_syscall(long number, ...);
@@ -31,6 +32,7 @@ static int guest_stat(const char *path, struct stat *st);
 static ssize_t guest_pread(int fd, void *bytes, size_t size, off_t offset);
 static int guest_close(int fd);
 static int guest_poll(struct pollfd *fds, nfds_t count, int timeout);
+static int guest_clock_gettime(clockid_t clock_id, struct timespec *value);
 #define main runtime_guest_production_main_not_called
 #define syscall guest_syscall
 #define prctl guest_prctl
@@ -45,7 +47,9 @@ static int guest_poll(struct pollfd *fds, nfds_t count, int timeout);
 #define pread guest_pread
 #define close guest_close
 #define poll guest_poll
+#define clock_gettime guest_clock_gettime
 #include "runtime_helper.c"
+#undef clock_gettime
 #undef poll
 #undef close
 #undef pread
@@ -82,6 +86,13 @@ static struct {
     struct stat ns;
     const char *failed_call;
     unsigned int opens, closes, signals, ns_reads;
+    bool fake_clock_enabled, pidfd_exit_after_wait, pidfd_budget_exceeded;
+    bool outer_pidfd_enabled, outer_after_wait, clock_failed, clock_fail_after_eintr;
+    int positive_poll_errno, thread_list_errno;
+    short positive_poll_revents, outer_pidfd_revents;
+    int64_t fake_clock_ms;
+    unsigned int zero_pidfd_polls, positive_pidfd_polls, pidfd_waited_ms, max_pidfd_timeout;
+    unsigned int outer_pidfd_polls, clock_failures;
 } mock;
 static char proc_name[96], proc_value[16384];
 
@@ -288,6 +299,7 @@ static ssize_t guest_pread(int fd, void *bytes, size_t size, off_t offset)
 {
     CHECK((fd == 900 || (mock.leader_ns_missing && fd == 902)) && offset >= 0);
     if (fd == 902 && offset == 0) ++mock.thread_lists;
+    if (fd == 902 && mock.thread_list_errno) { errno = mock.thread_list_errno; return -1; }
     const char *value = fd == 902 ? (mock.thread_values ? mock.thread_values : "334\n") : proc_value;
     size_t length = strlen(value), begin = (size_t)offset;
     if (begin >= length) return 0;
@@ -295,9 +307,44 @@ static ssize_t guest_pread(int fd, void *bytes, size_t size, off_t offset)
     memcpy(bytes, value + begin, size); return (ssize_t)size;
 }
 static int guest_close(int fd) { CHECK(fd == 900 || fd == 901 || fd == 902); if (fd == 901) ++mock.closes; return 0; }
+static int guest_clock_gettime(clockid_t clock_id, struct timespec *value)
+{
+    if (!mock.fake_clock_enabled) return clock_gettime(clock_id, value);
+    CHECK(clock_id == CLOCK_MONOTONIC);
+    if (mock.clock_failed || (mock.clock_fail_after_eintr && mock.positive_pidfd_polls)) {
+        ++mock.clock_failures; errno = EIO; return -1;
+    }
+    value->tv_sec = (time_t)(mock.fake_clock_ms / 1000);
+    value->tv_nsec = (long)(mock.fake_clock_ms % 1000) * 1000000;
+    return 0;
+}
+
 static int guest_poll(struct pollfd *fds, nfds_t count, int timeout)
 {
-    CHECK(count == 1 && fds[0].fd == 901 && timeout == 0);
+    CHECK(count == 1 && fds[0].events == POLLIN && timeout >= 0);
+    fds[0].revents = 0;
+    if (fds[0].fd == 903) {
+        CHECK(mock.outer_pidfd_enabled && timeout == 0);
+        ++mock.outer_pidfd_polls;
+        fds[0].revents = !mock.outer_after_wait || mock.positive_pidfd_polls ? mock.outer_pidfd_revents : 0;
+        return fds[0].revents ? 1 : 0;
+    }
+    CHECK(fds[0].fd == 901);
+    if (!timeout) ++mock.zero_pidfd_polls;
+    else {
+        CHECK(mock.fake_clock_enabled && ++mock.positive_pidfd_polls <= 64);
+        if ((unsigned int)timeout > mock.max_pidfd_timeout) mock.max_pidfd_timeout = (unsigned int)timeout;
+        if (mock.pidfd_waited_ms >= 20 || (unsigned int)timeout > 20 - mock.pidfd_waited_ms)
+            mock.pidfd_budget_exceeded = true;
+        /* Only a finite wait can observe natural death on this same pinned TGID pidfd.
+         * EINTR consumes one virtual ms to expose a restarted relative timeout. No real sleep. */
+        unsigned int elapsed = mock.pidfd_exit_after_wait || mock.positive_poll_errno == EINTR ? 1U : (unsigned int)timeout;
+        mock.fake_clock_ms += elapsed;
+        mock.pidfd_waited_ms += elapsed;
+        if (mock.positive_poll_errno) { errno = mock.positive_poll_errno; return -1; }
+        if (mock.positive_poll_revents) { fds[0].revents = mock.positive_poll_revents; return 1; }
+        if (mock.pidfd_exit_after_wait && mock.positive_pidfd_polls == 1) mock.exited = true;
+    }
     fds[0].revents = mock.exited ? POLLIN : 0; return mock.exited ? 1 : 0;
 }
 
@@ -375,7 +422,7 @@ static void check_membership_snapshot(void)
     store(&shared.guest_ns_ready, 1); store(&shared.dropped, 1);
     struct identity id;
     CHECK(member_snapshot(&runtime, mock.process, mock.start, false, &id) == 0);
-    CHECK(track(&runtime, mock.process, mock.start, false) == 0 && runtime.registry.count == 1);
+    CHECK(track(&runtime, mock.process, mock.start, false, member_exit_deadline()) == 0 && runtime.registry.count == 1);
     CHECK(guest_setresgid(42,42,42) == 0 && guest_setresuid(42,42,42) == 0);
     CHECK(member_snapshot(&runtime, mock.process, mock.start, false, &id) == 0 && id.uid[0] == 42);
     mock.bad_namespace = true; CHECK(member_snapshot(&runtime, mock.process, mock.start, false, &id) == -1); mock.bad_namespace = false;
@@ -387,7 +434,7 @@ static void check_membership_snapshot(void)
     for (size_t i = 0; i < runtime.registry.count; ++i) guest_close(runtime.registry.tasks[i].fd);
     free(runtime.registry.tasks); runtime.registry = (struct registry){0};
     mock.bad_namespace = true;
-    CHECK(track(&runtime, mock.process, mock.start, false) == -1 && runtime.registry.count == 0);
+    CHECK(track(&runtime, mock.process, mock.start, false, member_exit_deadline()) == -1 && runtime.registry.count == 0);
     CHECK(mock.opens == mock.closes && mock.signals == 0 && mock.ns_reads > 0);
     CHECK(guest_manifest_version(AJIU_MANIFEST_V1) == -1 && errno == ENOTSUP && !strcmp(stage, "legacy_readonly_instance"));
     CHECK(guest_manifest_version(AJIU_MANIFEST_V2) == 0);
@@ -418,7 +465,7 @@ static void check_review_regression_dead_leader_namespace(void)
     CHECK(mock.thread_lists > 0 && mock.thread_ns_reads > 0 && !load(&shared.unsafe));
     CHECK(id.start == original_start && pidfd_dead(901) == 0);
     struct task task = { .pid = mock.process, .start = original_start, .fd = 901 };
-    CHECK(signal_task(&runtime, &task, SIGTERM) == 0 && mock.signals == 1 && !load(&shared.unsafe));
+    CHECK(signal_task(&runtime, &task, SIGTERM, member_exit_deadline()) == 0 && mock.signals == 1 && !load(&shared.unsafe));
     mock.thread_bad_tgid = true;
     CHECK(member_snapshot(&runtime, mock.process, original_start, false, &id) == -1); mock.thread_bad_tgid = false;
     mock.thread_bad_group = true;
@@ -444,7 +491,7 @@ static void check_review_regression_dead_leader_namespace(void)
     mock.exited = true;
     CHECK(member_snapshot(&runtime, mock.process, original_start, false, &id) == -1); mock.exited = false;
     mock.thread_bad_group = true;
-    CHECK(signal_task(&runtime, &task, SIGKILL) == -1 && mock.signals == 1 && load(&shared.unsafe));
+    CHECK(signal_task(&runtime, &task, SIGKILL, member_exit_deadline()) == -1 && mock.signals == 1 && load(&shared.unsafe));
 }
 
 static void check_review_regression_transient_thread_exit(void)
@@ -471,7 +518,7 @@ static void check_review_regression_transient_thread_exit(void)
                 CHECK(mock.transient_events == 1 && mock.transient_gone && mock.tid_status_reads[1] > 0);
                 CHECK(id.tgid == mock.process && id.start == mock.start && !load(&shared.unsafe) && pidfd_dead(901) == 0);
                 struct task task = { .pid = mock.process, .fd = 901, .start = mock.start };
-                CHECK(signal_task(&runtime, &task, SIGTERM) == 0 && mock.signals == 1 && !load(&shared.unsafe));
+                CHECK(signal_task(&runtime, &task, SIGTERM, member_exit_deadline()) == 0 && mock.signals == 1 && !load(&shared.unsafe));
             }
     /* The leader can disappear between the two namespace samples, not only before sample one. */
     for (size_t error = 0; error < sizeof(errors) / sizeof(*errors); ++error) {
@@ -499,11 +546,12 @@ static void check_review_regression_transient_thread_exit(void)
         shared.guest_ns_dev = mock.ns.st_dev; shared.guest_ns_ino = mock.ns.st_ino;
         store(&shared.guest_ns_ready, 1); store(&shared.dropped, 1);
         mock.leader_ns_missing = true; mock.transient_at = "cgroup"; mock.thread_values = "334\n";
+        mock.fake_clock_enabled = true; mock.fake_clock_ms = 100000;
         struct identity id;
         CHECK(member_snapshot(&runtime, mock.process, mock.start, false, &id) == -1 && errno == EAGAIN);
         CHECK(mock.thread_lists == 3 && mock.transient_gone);
         struct task task = { .pid = mock.process, .fd = 901, .start = mock.start };
-        CHECK(signal_task(&runtime, &task, SIGTERM) == -1 && mock.signals == 0 && load(&shared.unsafe));
+        CHECK(signal_task(&runtime, &task, SIGTERM, member_exit_deadline()) == -1 && mock.signals == 0 && load(&shared.unsafe));
     }
     /* A live but wrong/unreadable candidate must never be treated as a naturally vanished TID. */
     for (unsigned int bad = 0; bad < 7; ++bad) {
@@ -529,10 +577,277 @@ static void check_review_regression_transient_thread_exit(void)
     }
 }
 
+static void prepare_exit_transition(struct ajiu_launch *launch, struct shared *shared, struct runtime *runtime)
+{
+    *launch = (struct ajiu_launch){ .uid = 10445, .gid = 10445 };
+    *shared = (struct shared){0};
+    *runtime = (struct runtime){ .launch = launch, .cap_last = 40, .shared = shared };
+    runtime->a[GROUP].fd = 1000;
+    runtime->a[THREADS].fd = 902; runtime->a[THREADS].valid = true;
+    (void)snprintf(runtime->group_name, sizeof(runtime->group_name), "%s", "ajiu_task_fixture");
+    reset_mock(); CHECK(guest_credentials(runtime, mock.parent) == 0);
+    shared->guest_ns_dev = mock.ns.st_dev; shared->guest_ns_ino = mock.ns.st_ino;
+    store(&shared->guest_ns_ready, 1); store(&shared->dropped, 1);
+    mock.leader_ns_missing = true; mock.thread_values = "333\n";
+    mock.fake_clock_enabled = true; mock.fake_clock_ms = 100000;
+}
+
+static void check_review_regression_exit_transition_pidfd_wait(void)
+{
+    /* Normal last-thread exit window: the leader namespace is ENOENT, the TGID pidfd is not
+     * ready yet, and cgroup.threads has only the leader. Three scans produce no stable witness.
+     * Only a finite wait on the pinned pidfd proves death; EAGAIN never supplies a valid id. */
+    struct ajiu_launch launch;
+    struct shared shared;
+    struct runtime runtime;
+    prepare_exit_transition(&launch, &shared, &runtime);
+    mock.pidfd_exit_after_wait = true;
+    struct task task = { .pid = mock.process, .fd = 901, .start = mock.start };
+    int64_t begin = now_ms();
+    int rc = signal_task(&runtime, &task, SIGTERM, member_exit_deadline());
+    int observed_errno = errno;
+    fprintf(stderr, "Exit transition: rc=%d errno=%d signals=%u unsafe=%u positive_polls=%u zero_polls=%u "
+        "waited_ms=%u max_timeout=%u scans=%u exited=%d\n", rc, observed_errno, mock.signals,
+        load(&shared.unsafe), mock.positive_pidfd_polls, mock.zero_pidfd_polls,
+        mock.pidfd_waited_ms, mock.max_pidfd_timeout, mock.thread_lists, mock.exited);
+    /* This is intentionally the first post-call assertion: old production must fail behavior,
+     * not compilation or a mock assertion about a newly introduced poll/API. */
+    CHECK(rc == 0);
+    CHECK(mock.signals == 0 && !load(&shared.unsafe));
+    CHECK(mock.thread_lists == 3 && mock.positive_pidfd_polls == 1 && mock.exited);
+    CHECK(mock.pidfd_waited_ms > 0 && mock.pidfd_waited_ms <= 20 && mock.max_pidfd_timeout <= 20);
+    CHECK(!mock.pidfd_budget_exceeded);
+    CHECK(now_ms() - begin == mock.pidfd_waited_ms && pidfd_dead(task.fd) == 1);
+    CHECK(mock.opens == mock.closes);
+}
+
+static void check_review_regression_exit_transition_controls(void)
+{
+    const char *const names[] = { "persistent-no-witness", "bad-group", "wrong-namespace", "other-tgid",
+        "unsafe-capabilities", "changing-thread-start", "cgroup-eacces", "live-missing-namespace",
+        "syscall-eagain-cgroup", "syscall-eagain-thread-list", "leader-namespace-eio", "bad-thread-group", "wrong-start" };
+    for (size_t bad = 0; bad < sizeof(names) / sizeof(*names); ++bad) {
+        struct ajiu_launch launch;
+        struct shared shared;
+        struct runtime runtime;
+        prepare_exit_transition(&launch, &shared, &runtime);
+        if (bad) {
+            mock.thread_values = "334\n";
+            if (bad == 1) mock.bad_group = true;
+            else if (bad == 2) mock.bad_namespace = true;
+            else if (bad == 3) mock.thread_bad_tgid = true;
+            else if (bad == 4) mock.caps[0] |= UINT64_C(1) << CAP_SYS_ADMIN;
+            else if (bad == 5) mock.thread_start_changes = true;
+            else if (bad == 6) { mock.transient_at = "cgroup"; mock.transient_errno = EACCES; }
+            else if (bad == 7) { mock.transient_at = "namespace"; mock.namespace_missing_live = true; }
+            else if (bad == 8) { mock.transient_at = "cgroup"; mock.transient_errno = EAGAIN; }
+            else if (bad == 9) mock.thread_list_errno = EAGAIN;
+            else if (bad == 10) mock.leader_ns_error = EIO;
+            else if (bad == 11) mock.thread_bad_group = true;
+            else mock.wrong_start = true;
+            /* Invalid ownership and actual syscall EAGAIN must not enter the no-witness wait.
+             * A mistaken wait would report natural death and make this rejection test fail. */
+            if (bad != 3) mock.pidfd_exit_after_wait = true;
+        }
+        struct task task = { .pid = mock.process, .fd = 901, .start = mock.start };
+        int64_t begin = now_ms();
+        int result = signal_task(&runtime, &task, SIGTERM, member_exit_deadline());
+        fprintf(stderr, "Exit control %s: rc=%d unsafe=%u signals=%u positive_polls=%u waited_ms=%u max_timeout=%u\n",
+            names[bad], result, load(&shared.unsafe), mock.signals, mock.positive_pidfd_polls,
+            mock.pidfd_waited_ms, mock.max_pidfd_timeout);
+        CHECK(result == -1 && mock.signals == 0 && load(&shared.unsafe));
+        CHECK(!mock.exited && mock.pidfd_waited_ms <= 20 && mock.max_pidfd_timeout <= 20);
+        CHECK(!mock.pidfd_budget_exceeded);
+        CHECK(now_ms() - begin == mock.pidfd_waited_ms && mock.opens == mock.closes);
+        if (!bad || bad == 3) CHECK(mock.thread_lists == 3);
+        else CHECK(mock.positive_pidfd_polls == 0);
+    }
+    /* Already-proven exit needs no signal and a stable live witness still permits one. */
+    for (unsigned int exited = 0; exited < 2; ++exited) {
+        struct ajiu_launch launch;
+        struct shared shared;
+        struct runtime runtime;
+        prepare_exit_transition(&launch, &shared, &runtime);
+        mock.thread_values = "334\n"; mock.exited = exited != 0;
+        struct task task = { .pid = mock.process, .fd = 901, .start = mock.start };
+        CHECK(signal_task(&runtime, &task, SIGTERM, member_exit_deadline()) == 0 && !load(&shared.unsafe));
+        CHECK(mock.signals == (exited ? 0U : 1U) && mock.positive_pidfd_polls == 0);
+        CHECK(mock.pidfd_waited_ms == 0 && mock.opens == mock.closes);
+    }
+    puts("Exit transition controls: persistent unknown, invalid identities and real syscall EAGAIN stay unsafe without signals; stable live witness and proven exit retain their behavior; virtual clock only.");
+}
+
+static void check_review_regression_exit_transition_wait_errors(void)
+{
+    /* These cases require the production finite-wait path. On the frozen baseline it is never
+     * reached; run this mode after the core red is fixed so EINTR cannot pass without a wait. */
+    const char *const names[] = { "continuous-eintr", "poll-eio", "poll-eacces", "pollerr", "pollnval", "pollhup" };
+    for (size_t bad = 0; bad < sizeof(names) / sizeof(*names); ++bad) {
+        struct ajiu_launch launch;
+        struct shared shared;
+        struct runtime runtime;
+        prepare_exit_transition(&launch, &shared, &runtime);
+        if (bad == 0) mock.positive_poll_errno = EINTR;
+        else if (bad == 1) mock.positive_poll_errno = EIO;
+        else if (bad == 2) mock.positive_poll_errno = EACCES;
+        else if (bad == 3) mock.positive_poll_revents = POLLERR;
+        else if (bad == 4) mock.positive_poll_revents = POLLNVAL;
+        else mock.positive_poll_revents = POLLHUP;
+        struct task task = { .pid = mock.process, .fd = 901, .start = mock.start };
+        int64_t begin = now_ms();
+        int rc = signal_task(&runtime, &task, SIGTERM, member_exit_deadline());
+        fprintf(stderr, "Exit wait control %s: rc=%d unsafe=%u signals=%u positive_polls=%u "
+            "waited_ms=%u max_timeout=%u\n", names[bad], rc, load(&shared.unsafe), mock.signals,
+            mock.positive_pidfd_polls, mock.pidfd_waited_ms, mock.max_pidfd_timeout);
+        CHECK(rc == -1 && load(&shared.unsafe) && mock.signals == 0 && !mock.exited);
+        CHECK(mock.positive_pidfd_polls > 0 && mock.positive_pidfd_polls <= 20);
+        CHECK(mock.pidfd_waited_ms > 0 && mock.pidfd_waited_ms <= 20 && mock.max_pidfd_timeout <= 20);
+        CHECK(!mock.pidfd_budget_exceeded && now_ms() - begin == mock.pidfd_waited_ms);
+        CHECK(mock.thread_lists == 3 && mock.opens == mock.closes);
+    }
+}
+
+static void check_review_regression_exit_transition_shared_deadline(void)
+{
+    /* Exit observation cannot turn an absent witness into a usable identity. The outer task
+     * owner must recheck its own pidfd even when the observed TGID has naturally exited. */
+    {
+        struct ajiu_launch launch;
+        struct shared shared;
+        struct runtime runtime;
+        prepare_exit_transition(&launch, &shared, &runtime);
+        mock.pidfd_exit_after_wait = true;
+        struct identity id;
+        memset(&id, 0x5a, sizeof(id));
+        unsigned char original[sizeof(id)]; memcpy(original, &id, sizeof(id));
+        int64_t deadline = member_exit_deadline();
+        int rc = member_snapshot_until(&runtime, mock.process, mock.start, false, &id, deadline);
+        CHECK(rc == -1 && errno == EAGAIN && !memcmp(original, &id, sizeof(id)));
+        CHECK(mock.exited && mock.positive_pidfd_polls == 1 && mock.signals == 0 && !load(&shared.unsafe));
+        struct task task = { .pid = mock.process, .fd = 901, .start = mock.start };
+        CHECK(signal_task(&runtime, &task, SIGTERM, deadline) == 0);
+        CHECK(mock.positive_pidfd_polls == 1 && mock.signals == 0 && mock.opens == mock.closes);
+    }
+    /* Two failed snapshots and their outer signal check share one absolute deadline. Repeated
+     * verification of the still-live pinned process must not grant another 20 ms per call. */
+    {
+        struct ajiu_launch launch;
+        struct shared shared;
+        struct runtime runtime;
+        prepare_exit_transition(&launch, &shared, &runtime);
+        int64_t begin = now_ms(), deadline = member_exit_deadline();
+        for (unsigned int attempt = 0; attempt < 2; ++attempt) {
+            struct identity id;
+            memset(&id, 0x5a, sizeof(id));
+            unsigned char original[sizeof(id)]; memcpy(original, &id, sizeof(id));
+            CHECK(member_snapshot_until(&runtime, mock.process, mock.start, false, &id, deadline) == -1 && errno == EAGAIN);
+            CHECK(!memcmp(original, &id, sizeof(id)) && !mock.exited && !load(&shared.unsafe));
+            CHECK(mock.positive_pidfd_polls == 1 && mock.pidfd_waited_ms == 20 && now_ms() == deadline);
+        }
+        struct task task = { .pid = mock.process, .fd = 901, .start = mock.start };
+        CHECK(signal_task(&runtime, &task, SIGTERM, deadline) == -1 && load(&shared.unsafe));
+        CHECK(mock.signals == 0 && mock.positive_pidfd_polls == 1 && mock.pidfd_waited_ms == 20);
+        CHECK(!mock.pidfd_budget_exceeded && now_ms() - begin == 20 && mock.opens == mock.closes);
+        fprintf(stderr, "Shared exit deadline: snapshots=2 outer_checks=1 positive_polls=%u waited_ms=%u unsafe=%u\n",
+            mock.positive_pidfd_polls, mock.pidfd_waited_ms, load(&shared.unsafe));
+    }
+    /* A caller may already have spent part or all of its budget before reaching this task. */
+    const unsigned int remaining[] = { 0, 1, 7, 20 };
+    for (size_t i = 0; i < sizeof(remaining) / sizeof(*remaining); ++i) {
+        struct ajiu_launch launch;
+        struct shared shared;
+        struct runtime runtime;
+        prepare_exit_transition(&launch, &shared, &runtime);
+        int64_t deadline = member_exit_deadline();
+        mock.fake_clock_ms += 20 - remaining[i];
+        struct task task = { .pid = mock.process, .fd = 901, .start = mock.start };
+        CHECK(signal_task(&runtime, &task, SIGTERM, deadline) == -1 && load(&shared.unsafe));
+        CHECK(mock.signals == 0 && !mock.exited && mock.pidfd_waited_ms == remaining[i]);
+        CHECK(mock.max_pidfd_timeout == remaining[i] && mock.positive_pidfd_polls == (remaining[i] ? 1U : 0U));
+        CHECK(now_ms() == deadline && !mock.pidfd_budget_exceeded && mock.opens == mock.closes);
+    }
+    /* No-witness snapshots cannot add a registry identity. Only the caller's pidfd death proof
+     * lets track ignore a naturally exited task; a still-live unknown task remains rejected. */
+    for (unsigned int exited = 0; exited < 2; ++exited) {
+        struct ajiu_launch launch;
+        struct shared shared;
+        struct runtime runtime;
+        prepare_exit_transition(&launch, &shared, &runtime);
+        mock.pidfd_exit_after_wait = exited != 0;
+        int rc = track(&runtime, mock.process, mock.start, false, member_exit_deadline());
+        CHECK(rc == (exited ? 0 : -1) && runtime.registry.count == 0 && mock.signals == 0);
+        CHECK(mock.exited == (exited != 0) && mock.positive_pidfd_polls == 1);
+        CHECK(!mock.pidfd_budget_exceeded && mock.pidfd_waited_ms <= 20 && mock.opens == mock.closes);
+        free(runtime.registry.tasks);
+    }
+}
+
+static void check_review_regression_exit_transition_outer_proof_and_clock(void)
+{
+    /* The observed inner descriptor cannot substitute for the caller's own pinned descriptor. */
+    const short outer_events[] = { 0, POLLERR, POLLNVAL, POLLHUP, POLLIN | POLLHUP };
+    for (size_t i = 0; i < sizeof(outer_events) / sizeof(*outer_events); ++i) {
+        struct ajiu_launch launch;
+        struct shared shared;
+        struct runtime runtime;
+        prepare_exit_transition(&launch, &shared, &runtime);
+        mock.outer_pidfd_enabled = true;
+        mock.outer_after_wait = true;
+        mock.outer_pidfd_revents = outer_events[i];
+        mock.pidfd_exit_after_wait = true;
+        struct task task = { .pid = mock.process, .fd = 903, .start = mock.start };
+        int rc = signal_task(&runtime, &task, SIGTERM, member_exit_deadline());
+        bool outer_dead = (outer_events[i] & POLLIN) != 0;
+        CHECK(rc == (outer_dead ? 0 : -1));
+        CHECK(load(&shared.unsafe) == (outer_dead ? 0U : 1U));
+        CHECK(mock.exited && mock.positive_pidfd_polls == 1 && mock.outer_pidfd_polls == 2);
+        CHECK(mock.signals == 0 && mock.opens == mock.closes && !mock.pidfd_budget_exceeded);
+    }
+    /* A failed clock cannot create a budget, and failure after EINTR cannot renew one. */
+    for (unsigned int after_eintr = 0; after_eintr < 2; ++after_eintr) {
+        struct ajiu_launch launch;
+        struct shared shared;
+        struct runtime runtime;
+        prepare_exit_transition(&launch, &shared, &runtime);
+        int64_t deadline;
+        if (after_eintr) {
+            deadline = member_exit_deadline();
+            mock.clock_fail_after_eintr = true;
+            mock.positive_poll_errno = EINTR;
+        } else {
+            mock.clock_failed = true;
+            deadline = member_exit_deadline();
+            CHECK(deadline == 0);
+        }
+        struct task task = { .pid = mock.process, .fd = 901, .start = mock.start };
+        CHECK(signal_task(&runtime, &task, SIGTERM, deadline) == -1 && load(&shared.unsafe));
+        CHECK(mock.signals == 0 && !mock.exited && mock.clock_failures > 0);
+        CHECK(mock.positive_pidfd_polls == after_eintr && mock.pidfd_waited_ms == after_eintr);
+        CHECK(!mock.pidfd_budget_exceeded && mock.opens == mock.closes);
+    }
+    /* Later natural exit is never permission to clear an earlier unsafe decision. */
+    {
+        struct ajiu_launch launch;
+        struct shared shared;
+        struct runtime runtime;
+        prepare_exit_transition(&launch, &shared, &runtime);
+        store(&shared.unsafe, 1);
+        mock.pidfd_exit_after_wait = true;
+        struct task task = { .pid = mock.process, .fd = 901, .start = mock.start };
+        CHECK(signal_task(&runtime, &task, SIGTERM, member_exit_deadline()) == 0);
+        CHECK(mock.exited && load(&shared.unsafe) && mock.signals == 0);
+    }
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2) {
-        if (!strcmp(argv[1], "reviewRegressionTransientThreadExit")) check_review_regression_transient_thread_exit();
+        if (!strcmp(argv[1], "reviewRegressionExitTransitionPidfdWait")) check_review_regression_exit_transition_pidfd_wait();
+        else if (!strcmp(argv[1], "reviewRegressionExitTransitionControls")) check_review_regression_exit_transition_controls();
+        else if (!strcmp(argv[1], "reviewRegressionExitTransitionWaitErrors")) check_review_regression_exit_transition_wait_errors();
+        else if (!strcmp(argv[1], "reviewRegressionExitTransitionSharedDeadline")) check_review_regression_exit_transition_shared_deadline();
+        else if (!strcmp(argv[1], "reviewRegressionExitTransitionOuterProofAndClock")) check_review_regression_exit_transition_outer_proof_and_clock();
+        else if (!strcmp(argv[1], "reviewRegressionTransientThreadExit")) check_review_regression_transient_thread_exit();
         else { CHECK(!strcmp(argv[1], "reviewRegressionDeadLeaderNamespace")); check_review_regression_dead_leader_namespace(); }
         printf("Dead leader namespace checks: %u; proc/cgroup.threads bounded model, not real kernel thread/stop proof.\n", checks);
         return 0;
@@ -542,6 +857,11 @@ int main(int argc, char **argv)
     check_membership_snapshot();
     check_review_regression_dead_leader_namespace();
     check_review_regression_transient_thread_exit();
+    check_review_regression_exit_transition_controls();
+    check_review_regression_exit_transition_pidfd_wait();
+    check_review_regression_exit_transition_wait_errors();
+    check_review_regression_exit_transition_shared_deadline();
+    check_review_regression_exit_transition_outer_proof_and_clock();
     printf("Root guest checks: %u; controlled capability/UID/proc/namespace mocks and explicit exec/setuid semantics model only. No production main, Root, exec, chroot, mount, device or kernel capability proof.\n", checks);
     return 0;
 }

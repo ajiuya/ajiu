@@ -1,22 +1,39 @@
 package com.aicode.feature.agent.domain.container.chroot
 
+import android.net.LocalSocket
 import com.aicode.feature.agent.domain.root.RootAccessState
 import com.aicode.feature.agent.domain.root.RootAuthorityCoordinator
 import com.aicode.feature.agent.domain.root.RootMemoryDataStore
 import com.aicode.feature.settings.data.repository.RootAccessSettingsRepository
 import io.mockk.coVerify
+import io.mockk.every
+import io.mockk.mockk
 import io.mockk.spyk
+import io.mockk.verify
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.io.IOException
+import java.nio.ByteBuffer
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -38,6 +55,69 @@ class ChrootRootBrokerTest {
         return Fixture(authority, root, broker)
     }
 
+    private class ExecutorGate(executor: ExecutorService) : AutoCloseable {
+        private val entered = CountDownLatch(1)
+        private val release = CountDownLatch(1)
+        init {
+            executor.execute {
+                entered.countDown()
+                check(release.await(5, TimeUnit.SECONDS)) { "Broker test queue gate was not released" }
+            }
+        }
+        fun awaitEntered() = assertTrue("Broker queue did not reach the gate", entered.await(5, TimeUnit.SECONDS))
+        override fun close() = release.countDown()
+    }
+
+    /** Uses the production Connection and executor; only the Android socket/bootstrap are replaced. */
+    private class ConnectedFixture(val fixture: Fixture, replyId: Long = 1L) : AutoCloseable {
+        val session = ChrootRuntimeSession("queue-test-session", fixture.root)
+        val socket = mockk<LocalSocket>(relaxed = true)
+        val bootstrap = mockk<Process>(relaxed = true)
+        val output = ByteArrayOutputStream()
+        val revocations = AtomicInteger()
+        val authorityGate: Any = field(fixture.authority, "gate")
+        private val connectionType = ChrootRootBroker::class.java.declaredClasses.single { it.simpleName == "Connection" }
+        private val connection: Any
+        val executor: ExecutorService
+        private val registration: AutoCloseable
+
+        init {
+            // A valid per-request FAILED reply avoids Android descriptor attachment while still
+            // exercising send/receive, request identity validation and normal request removal.
+            val reply = ChrootBrokerWire.frame(ChrootBrokerWire.FAILED,
+                ByteBuffer.allocate(16).putLong(replyId).putInt(1).putInt(5).array())
+            every { socket.outputStream } returns output
+            every { socket.inputStream } returns ByteArrayInputStream(reply)
+            every { socket.ancillaryFileDescriptors } returns null
+            every { bootstrap.isAlive } returns true
+            connection = connectionType.declaredConstructors.single().apply { isAccessible = true }
+                .newInstance(fixture.broker, session, socket, bootstrap)
+            executor = field(connection, "executor")
+            fixture.authority.withLock {
+                field<AtomicReference<Any?>>(fixture.broker, "connection").set(connection)
+                field<MutableStateFlow<ChrootRuntimeSession?>>(fixture.broker, "_currentSession").value = session
+            }
+            registration = fixture.broker.registerSessionRevocation { revocations.incrementAndGet() }
+        }
+
+        fun awaitQueue() { executor.submit {}.get(5, TimeUnit.SECONDS) }
+
+        override fun close() {
+            registration.close()
+            connectionType.let { type ->
+                ChrootRootBroker::class.java.getDeclaredMethod("invalidate", type).apply { isAccessible = true }
+                    .invoke(fixture.broker, connection)
+            }
+            assertTrue("Broker executor must terminate", executor.awaitTermination(5, TimeUnit.SECONDS))
+        }
+
+        companion object {
+            @Suppress("UNCHECKED_CAST")
+            private fun <T> field(target: Any, name: String): T =
+                target.javaClass.getDeclaredField(name).apply { isAccessible = true }.get(target) as T
+        }
+    }
+
     private suspend fun rejects(block: suspend () -> Unit): ChrootRuntimeUnavailable {
         try {
             withContext(Dispatchers.IO) { withTimeout(2_000) { block() } }
@@ -45,6 +125,144 @@ class ChrootRootBrokerTest {
         } catch (failure: ChrootRuntimeUnavailable) {
             return failure
         }
+    }
+
+    @Test
+    fun runtimeSourceExpiryInTheActualQueueCancelsOnlyThatRequestAndTheNextStillDispatches() = runTest {
+        for (throws in listOf(false, true)) {
+            val f = fixture(enabled = true)
+            ConnectedFixture(f).use { live ->
+                val current = AtomicBoolean(true)
+                val helperChecks = AtomicInteger()
+                val guardChecks = AtomicInteger()
+                val nextChecks = AtomicInteger()
+                val head = ExecutorGate(live.executor)
+                var afterTarget: ExecutorGate? = null
+                try {
+                    head.awaitEntered()
+                    val target = f.broker.startRuntimeChecked(checkHelper = { helperChecks.incrementAndGet() }, canDispatch = {
+                        assertTrue("Dispatch guard must hold the real authority monitor", Thread.holdsLock(live.authorityGate))
+                        assertEquals(1, helperChecks.get())
+                        guardChecks.incrementAndGet()
+                        if (!current.get() && throws) throw CancellationException("Queued source expired")
+                        current.get()
+                    }) as ChrootBrokerProcess
+                    val targetFinished = ExecutorGate(live.executor).also { afterTarget = it }
+                    val next = f.broker.startRuntimeChecked(checkHelper = {}, canDispatch = {
+                        assertTrue(Thread.holdsLock(live.authorityGate))
+                        nextChecks.incrementAndGet()
+                        true
+                    }) as ChrootBrokerProcess
+                    assertEquals(2, f.broker.registeredProcessCount.value)
+                    assertEquals(0, helperChecks.get())
+                    assertEquals(0, guardChecks.get())
+                    assertEquals(0, nextChecks.get())
+                    assertEquals(0, live.output.size())
+                    current.set(false)
+                    head.close()
+                    targetFinished.awaitEntered()
+
+                    assertEquals(1, guardChecks.get())
+                    assertTrue(target.wasCancelledBeforeDispatch)
+                    assertTrue(target.cancelled.get())
+                    assertFalse(target.isAlive)
+                    assertFalse(target.tryDispatch())
+                    assertEquals(0L, target.requestId)
+                    assertEquals(0, live.output.size())
+                    assertEquals(1, f.broker.registeredProcessCount.value)
+                    assertTrue(next.isAlive)
+                    assertFalse(next.cancelled.get())
+                    assertFalse(next.wasCancelledBeforeDispatch)
+                    assertEquals(0, nextChecks.get())
+                    assertSame(live.session, f.broker.currentSession.value)
+                    assertEquals(0, live.revocations.get())
+                    verify(exactly = 0) { live.socket.close() }
+
+                    targetFinished.close()
+                    live.awaitQueue()
+                    assertEquals(1, nextChecks.get())
+                    assertEquals(1L, next.requestId)
+                    assertFalse(next.wasCancelledBeforeDispatch)
+                    assertFalse(next.cancelled.get())
+                    assertFalse(next.isAlive) // The valid FAILED reply settles only this request.
+                    assertArrayEquals(ChrootBrokerWire.frame(ChrootBrokerWire.START,
+                        ChrootBrokerWire.start(1, ChrootBrokerWire.RUNTIME)), live.output.toByteArray())
+                    assertEquals(0, f.broker.registeredProcessCount.value)
+                    assertSame(live.session, f.broker.currentSession.value)
+                    f.broker.checkSession(live.session)
+                    assertTrue(live.bootstrap.isAlive)
+                    assertEquals(0, live.revocations.get())
+                    verify(exactly = 0) { live.socket.close() }
+                    verify(exactly = 0) { live.bootstrap.destroy() }
+                } finally {
+                    head.close()
+                    afterTarget?.close()
+                }
+            }
+        }
+    }
+
+    @Test
+    fun helperRecoveryCheckAndProtocolFailuresStillInvalidateTheSharedConnection() = runTest {
+        for (failureAt in listOf("helper", "recovery", "protocol")) {
+            val f = fixture(enabled = true)
+            ConnectedFixture(f, replyId = if (failureAt == "protocol") 99L else 1L).use { live ->
+                val closed = CountDownLatch(1)
+                val revoked = f.broker.registerSessionRevocation { closed.countDown() }
+                val head = ExecutorGate(live.executor)
+                try {
+                    head.awaitEntered()
+                    val target = (if (failureAt == "recovery") {
+                        f.broker.startChecked(ChrootBrokerWire.RECOVER_REMOVE, "0123456789abcdef01234567",
+                            ChrootFileIdentity(5, 19), live.session, {},
+                            { throw CancellationException("Recovery capture expired") })
+                    } else {
+                        f.broker.startRuntimeChecked(checkHelper = {
+                            if (failureAt == "helper") throw IOException("Helper capture expired")
+                        }, canDispatch = { true })
+                    }) as ChrootBrokerProcess
+                    val nextChecks = AtomicInteger()
+                    val next = f.broker.startRuntimeChecked(checkHelper = {}, canDispatch = {
+                        nextChecks.incrementAndGet()
+                        true
+                    }) as ChrootBrokerProcess
+                    head.close()
+                    assertTrue("Failure must revoke the shared session", closed.await(5, TimeUnit.SECONDS))
+                    assertTrue(live.executor.awaitTermination(5, TimeUnit.SECONDS))
+                    assertFalse(target.wasCancelledBeforeDispatch)
+                    assertFalse(next.wasCancelledBeforeDispatch)
+                    assertFalse(target.isAlive)
+                    assertFalse(next.isAlive)
+                    assertEquals(0, nextChecks.get())
+                    assertEquals(0L, next.requestId)
+                    assertNull(f.broker.currentSession.value)
+                    assertEquals(0, f.broker.registeredProcessCount.value)
+                    assertEquals(1, live.revocations.get())
+                    assertEquals(if (failureAt == "protocol") 1L else 0L, target.requestId)
+                    if (failureAt != "protocol") assertEquals(0, live.output.size())
+                    verify(exactly = 1) { live.socket.close() }
+                } finally {
+                    head.close()
+                    revoked.close()
+                }
+            }
+        }
+    }
+
+    @Test
+    fun checkedRuntimeWithoutAnIssuedSessionRunsNeitherCallback() = runTest {
+        val f = fixture(enabled = true)
+        val checks = AtomicInteger()
+        assertThrows(ChrootRuntimeUnavailable::class.java) {
+            f.broker.startRuntimeChecked(checkHelper = { checks.incrementAndGet() }, canDispatch = {
+                checks.incrementAndGet()
+                true
+            })
+        }
+        assertEquals(0, checks.get())
+        assertEquals(0, f.broker.bootstrapCount)
+        assertEquals(0, f.broker.registeredProcessCount.value)
+        assertNull(f.broker.currentSession.value)
     }
 
     @Test
@@ -68,6 +286,28 @@ class ChrootRootBrokerTest {
         assertEquals(0, helperChecks.get())
         assertNull(broker.currentSession.value)
         assertTrue(f.authority.accessSnapshot().enabled)
+    }
+
+    @Test
+    fun checkedRecoveryWithoutAnIssuedSessionCannotRunEitherCallbackOrBootstrap() = runTest {
+        for (enabled in listOf(false, true)) {
+            val f = fixture(enabled)
+            val expected = ChrootRuntimeSession("not-issued", f.root)
+            val helperChecks = AtomicInteger()
+            val sourceChecks = AtomicInteger()
+            assertThrows(ChrootRuntimeUnavailable::class.java) {
+                f.broker.startChecked(ChrootBrokerWire.RECOVER_REMOVE, "0123456789abcdef01234567",
+                    ChrootFileIdentity(5, 19), expected,
+                    checkHelper = { helperChecks.incrementAndGet() },
+                    checkCurrent = { sourceChecks.incrementAndGet() })
+            }
+            assertEquals(0, helperChecks.get())
+            assertEquals(0, sourceChecks.get())
+            assertEquals(0, f.broker.bootstrapCount)
+            assertEquals(0, f.broker.registeredProcessCount.value)
+            assertNull(f.broker.currentSession.value)
+            assertEquals(f.root, f.authority.accessSnapshot())
+        }
     }
 
     @Test

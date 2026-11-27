@@ -95,7 +95,10 @@ internal class ChrootBrokerProcess(
         }
     }
 
-    fun tryDispatch(): Boolean = !cancelled.get() && dispatch.compareAndSet(0, 1)
+    // Only a winning pending-launch cancellation proves that no START can be sent.
+    val wasCancelledBeforeDispatch: Boolean get() = dispatch.get() == 2
+
+    fun tryDispatch(): Boolean = result.get() == null && !cancelled.get() && dispatch.compareAndSet(0, 1)
 
     fun cancelPendingLaunch() {
         if (dispatch.compareAndSet(0, 2)) {

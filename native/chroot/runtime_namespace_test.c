@@ -19,6 +19,7 @@
 static int namespace_open(const char *path, int flags, ...);
 static int namespace_close(int fd);
 static int namespace_fstat(int fd, struct stat *st);
+static int namespace_fstatat(int fd, const char *name, struct stat *st, int flags);
 static int namespace_fcntl(int fd, int command, ...);
 static ssize_t namespace_pread(int fd, void *data, size_t size, off_t offset);
 static ssize_t namespace_readlink(const char *path, char *data, size_t size);
@@ -27,6 +28,7 @@ static long namespace_syscall(long number, ...);
 #define open namespace_open
 #define close namespace_close
 #define fstat namespace_fstat
+#define fstatat namespace_fstatat
 #define fcntl namespace_fcntl
 #define pread namespace_pread
 #define readlink namespace_readlink
@@ -36,6 +38,7 @@ static long namespace_syscall(long number, ...);
 #undef readlink
 #undef pread
 #undef fcntl
+#undef fstatat
 #undef fstat
 #undef close
 #undef open
@@ -44,7 +47,7 @@ static long namespace_syscall(long number, ...);
 #define CHECK(value) do { if (!(value)) { fprintf(stderr, "Native namespace mock check line %d\n", __LINE__); exit(1); } ++checks; } while (0)
 static unsigned int checks;
 enum { N_ROOT, N_DATA, N_APP, N_SESSION, N_PACKAGE, N_LIB, N_NATIVE, N_RUNTIME,
-    N_WORKER, N_RUNNING, N_DIRECTORY_SOURCE, N_FILE_SOURCE, N_TREE, NODES };
+    N_WORKER, N_RUNNING, N_DIRECTORY_SOURCE, N_FILE_SOURCE, N_TREE, N_LOCAL, N_BASE, NODES };
 struct mock_fd { bool issued, live; unsigned int node, namespace_id; struct stat st; };
 static struct mock_fd descriptors[256];
 static struct stat nodes[NODES];
@@ -55,6 +58,10 @@ static bool fail_attributes, fail_move;
 static unsigned int cloned, moved, last_tree;
 static struct mount_attr last_attributes;
 static char executable_path[256];
+static int receipt_error;
+static mode_t receipt_mode;
+static unsigned int receipt_checks, rootfs_opens;
+static bool recovery_fixture;
 
 static unsigned int live_fds(void)
 {
@@ -101,6 +108,7 @@ static void reset_world(void)
     fail_duplicate = invalid_worker_elf = invalid_runtime_elf = false;
     fail_attributes = fail_move = false;
     cloned = moved = last_tree = 0;
+    receipt_error = ENOENT; receipt_mode = 0; receipt_checks = rootfs_opens = 0; recovery_fixture = false;
     memset(&last_attributes, 0, sizeof(last_attributes));
     (void)snprintf(executable_path, sizeof(executable_path),
         "/data/app/~~session/com.ajiu.debug-install/lib/arm64/libajiu_chroot_runtime.so");
@@ -138,6 +146,17 @@ static int namespace_fstat(int fd, struct stat *st)
     ++stat_calls;
     if (fail_stat > 0 && stat_calls == (unsigned int)fail_stat) { errno = EACCES; return -1; }
     *st = entry->st;
+    return 0;
+}
+
+static int namespace_fstatat(int fd, const char *name, struct stat *st, int flags)
+{
+    CHECK(recovery_fixture && descriptor(fd)->node == N_BASE);
+    CHECK(!strcmp(name, "remove-after-reboot") && flags == AT_SYMLINK_NOFOLLOW);
+    ++receipt_checks;
+    if (receipt_error) { errno = receipt_error; return -1; }
+    /* Content, owner, size and type are deliberately untrusted: existence is enough. */
+    *st = (struct stat){ .st_mode = receipt_mode, .st_size = 0, .st_uid = 10000, .st_gid = 10000 };
     return 0;
 }
 
@@ -215,7 +234,16 @@ static long namespace_syscall(long number, ...)
             CHECK(parent->namespace_id == current_namespace);
             CHECK(how->resolve == (RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS));
             static const char *const components[] = { "data", "app", "~~session", "com.ajiu.debug-install", "lib", "arm64" };
-            if (parent->node < N_NATIVE) {
+            if (recovery_fixture) {
+                if (parent->node == N_ROOT) { CHECK(!strcmp(path, "data")); node = N_DATA; }
+                else if (parent->node == N_DATA) { CHECK(!strcmp(path, "local")); node = N_LOCAL; }
+                else if (parent->node == N_LOCAL) {
+                    CHECK(!strcmp(path, "ajiu-chroot-rootfs-0123456789abcdef01234567")); node = N_BASE;
+                } else {
+                    CHECK(parent->node == N_BASE && !strcmp(path, "root"));
+                    ++rootfs_opens; errno = ENOENT; va_end(args); return -1;
+                }
+            } else if (parent->node < N_NATIVE) {
                 bool package = parent->node == N_SESSION && !strcmp(path, "com.ajiu.beta-install");
                 CHECK(package || !strcmp(path, components[parent->node]));
                 CHECK(how->flags & O_DIRECTORY);
@@ -231,6 +259,15 @@ static long namespace_syscall(long number, ...)
             }
         }
         if (!opening_fails()) rc = allocate_fd(node, current_namespace);
+    } else if (number == SYS_statx) {
+        struct mock_fd *entry = descriptor(va_arg(args, int));
+        CHECK(recovery_fixture && entry->live);
+        CHECK(!strcmp(va_arg(args, const char *), ""));
+        CHECK(va_arg(args, int) == (AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW));
+        CHECK(va_arg(args, unsigned int) == STATX_MNT_ID);
+        struct statx *sx = va_arg(args, struct statx *);
+        memset(sx, 0, sizeof(*sx)); sx->stx_mask = STATX_MNT_ID; sx->stx_mnt_id = 1;
+        rc = 0;
     } else if (number == SYS_open_tree) {
         struct mock_fd *source = descriptor(va_arg(args, int));
         CHECK(!strcmp(va_arg(args, const char *), ""));
@@ -472,12 +509,38 @@ static void check_static_order(const char *path)
     free(text);
 }
 
+static void check_removal_receipt_startup(void)
+{
+    /* Exercise prepare -> instance, stopping before any view/cgroup creation. */
+    const mode_t modes[] = { S_IFREG | 0600, S_IFREG, S_IFLNK | 0777, S_IFDIR | 0700, S_IFIFO | 0600 };
+    for (size_t i = 0; i < sizeof(modes) / sizeof(*modes) + 2; ++i) {
+        reset_world(); recovery_fixture = true;
+        struct runtime r; empty_runtime(&r);
+        nodes[N_BASE].st_mode = S_IFDIR | 0700;
+        struct ajiu_launch launch = { .rootfs_dev = nodes[N_BASE].st_dev, .rootfs_ino = nodes[N_BASE].st_ino };
+        r.launch = &launch;
+        (void)snprintf(r.base_name, sizeof(r.base_name), "ajiu-chroot-rootfs-0123456789abcdef01234567");
+        receipt_error = i == 5 ? EACCES : i == 6 ? ENOENT : 0;
+        if (i < 5) receipt_mode = modes[i];
+        CHECK(prepare(&r) == -1);
+        CHECK(receipt_checks == 1 && !r.view_made && !r.group_made);
+        if (i == 6) CHECK(rootfs_opens == 1); /* Absence alone passes this gate. */
+        else {
+            CHECK(!strcmp(stage, "removal_receipt") && errno == (i == 5 ? EACCES : EBUSY));
+            CHECK(rootfs_opens == 0);
+        }
+        for (int n = 0; n < ANCHORS; ++n) if (r.a[n].fd >= 0) CHECK(namespace_close(r.a[n].fd) == 0);
+        CHECK(live_fds() == 0);
+    }
+}
+
 int main(int argc, char **argv)
 {
     CHECK(argc == 1 || argc == 2);
+    check_removal_receipt_startup();
     check_sources();
     check_worker();
     check_static_order(argc == 2 ? argv[1] : "native/chroot/runtime_helper.c");
-    printf("Runtime namespace mock checks passed: %u; production source/worker acquisition and attach_tree use controlled syscall mocks; call ordering is static; no real unshare, mount, chroot, root or device operations; not a kernel semantics proof.\n", checks);
+    printf("Runtime namespace mock checks passed: %u; production receipt startup barrier, source/worker acquisition and attach_tree use controlled syscall mocks; call ordering is static; no real unshare, mount, chroot, root or device operations; not a kernel semantics proof.\n", checks);
     return 0;
 }

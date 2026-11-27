@@ -9,9 +9,13 @@ import com.aicode.feature.agent.domain.container.LocalContainerRuntime
 import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeAuthorizationRequired
 import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeCapture
 import com.aicode.feature.agent.domain.container.runtime.RuntimeOwner
+import com.aicode.feature.agent.domain.container.runtime.RuntimeOwnerKind
 import com.aicode.feature.agent.presentation.FileBrowseState
 import com.aicode.feature.agent.presentation.SubAgentViewModelQueueFixture
+import com.aicode.feature.agent.presentation.SubAgentViewModelQueueFixture.Companion.CHILD
+import com.aicode.feature.agent.presentation.SubAgentViewModelQueueFixture.Companion.PARENT
 import com.aicode.feature.settings.data.repository.ContainerProfileSnapshot
+import com.aicode.feature.settings.data.repository.ExecutionMode
 import com.aicode.feature.workspace.domain.CapturedLocalFolderRoot
 import com.aicode.feature.workspace.domain.FileAccessProvider
 import com.aicode.feature.workspace.domain.FileEntry
@@ -50,6 +54,8 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Rule
@@ -93,6 +99,193 @@ class FileBrowseViewModelScopeTest {
         } finally {
             Dispatchers.resetMain()
         }
+    }
+
+    @Test
+    fun pendingPickerSelectionAndCameraUriRemainInViewModelUntilConsumedOnce() {
+        val viewModel = fixture.viewModel
+        viewModel.setWorkspace("/work")
+        viewModel.selectSession(PARENT)
+        val uri = android.net.Uri.parse("content://com.ajiu.fileprovider/camera.jpg")
+        viewModel.beginAttachmentSelection(uri)
+
+        // A recreated UI consumes the same ViewModel record instead of a new Compose lambda.
+        val selection = requireNotNull(viewModel.consumeAttachmentSelection())
+        assertEquals(uri, selection.cameraUri)
+        selection.checkCurrent()
+        assertNull(viewModel.consumeAttachmentSelection())
+        coVerify(exactly = 0) { fixture.executionFactory.freeze(any(), any(), any()) }
+        coVerify(exactly = 0) { fixture.executionFactory.freezeForPaths(any(), any(), any(), any()) }
+    }
+
+    @Test
+    fun pendingPickerResultRetainsItsOriginalGuardAndDoesNotRebindAfterSessionSwitch() {
+        val viewModel = fixture.viewModel
+        viewModel.setWorkspace("/work")
+        viewModel.selectSession(PARENT)
+        viewModel.beginAttachmentSelection()
+        viewModel.selectSession(CHILD)
+        val selection = requireNotNull(viewModel.consumeAttachmentSelection())
+        assertThrows(CancellationException::class.java) { selection.checkCurrent() }
+        assertNull(viewModel.consumeAttachmentSelection())
+    }
+
+    @Test
+    fun clearingViewModelDropsAnUnconsumedPickerResult() {
+        val viewModel = fixture.viewModel
+        viewModel.beginAttachmentSelection()
+        fixture.closeUi()
+        assertNull(viewModel.consumeAttachmentSelection())
+        assertNull(fixture.reopenUi().consumeAttachmentSelection())
+    }
+
+    @Test
+    fun attachmentSelectionDoesNotFreezeOrRequestApproval() = runTest(dispatcher) {
+        // Set up before constructing the ViewModel: init has already captured its flow once
+        // the fixture is started, so replacing that getter afterward cannot stop tree refresh.
+        fixture.close()
+        runCurrent()
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        fixture = SubAgentViewModelQueueFixture(context, configureBeforeStart = {
+            every { dependencies.containerSettingsRepository.activeProfileIdFlow } returns emptyFlow()
+        })
+        val viewModel = fixture.viewModel
+        viewModel.setWorkspace("/work")
+        viewModel.selectSession(PARENT)
+        runCurrent()
+
+        // CHROOT 捕获须经过 executionFactory；推进调度器也不应触达该边界。
+        val checkSelection = viewModel.captureAttachmentSelection()
+        checkSelection()
+        runCurrent()
+        checkSelection()
+
+        coVerify(exactly = 0) { fixture.executionFactory.freeze(any(), any(), any()) }
+        coVerify(exactly = 0) { fixture.executionFactory.freezeForPaths(any(), any(), any(), any()) }
+        coVerify(exactly = 0) { fixture.permissions.awaitApproval(any()) }
+    }
+
+    @Test
+    fun attachmentFileCaptureUsesFileOwnerAndRetainsTheSelectionGuard() = runTest(dispatcher) {
+        val viewModel = fixture.viewModel
+        viewModel.setWorkspace("/work")
+        viewModel.selectSession(PARENT)
+        val path = "/work/.chat-attachments/picked.txt"
+        val captures = recordAttachmentCaptures(path)
+        val checkSelection = viewModel.captureAttachmentSelection()
+        assertTrue(captures.isEmpty())
+
+        val captured = viewModel.captureAttachmentFile(path, checkSelection)
+
+        assertSame(captures.single(), captured)
+        assertEquals(RuntimeOwnerKind.FILE, captured.runtimeOwner?.kind)
+        assertTrue(checkNotNull(captured.runtimeOwner).scopeId.isNotBlank())
+        captured.checkCurrent()
+        coVerify(exactly = 1) { fixture.executionFactory.freezeForPaths(listOf(path), null, any(), any()) }
+        coVerify(exactly = 0) { fixture.executionFactory.freeze(any(), any(), any()) }
+        coVerify(exactly = 0) { fixture.permissions.awaitApproval(any()) }
+
+        // 工作区未变；必须由传入的选择 guard 拦住模式变化。
+        fixture.executionModeHolder.setMode(ExecutionMode.REMOTE_SSH)
+        assertThrows(CancellationException::class.java) { captured.checkCurrent() }
+    }
+
+    @Test
+    fun attachmentSelectionIsCancelledByWorkspaceChangeAndDoesNotReviveAfterReturning() {
+        val viewModel = fixture.viewModel
+        viewModel.setWorkspace("/work")
+        val checkSelection = viewModel.captureAttachmentSelection()
+        checkSelection()
+
+        viewModel.setWorkspace("/other-work")
+        assertThrows(CancellationException::class.java) { checkSelection() }
+        viewModel.captureAttachmentSelection().invoke()
+
+        viewModel.setWorkspace("/work")
+        assertThrows(CancellationException::class.java) { checkSelection() }
+        viewModel.captureAttachmentSelection().invoke()
+    }
+
+    @Test
+    fun attachmentSelectionIsCancelledByModeChangeAndDoesNotReviveAfterReturning() {
+        val viewModel = fixture.viewModel
+        viewModel.setWorkspace("/work")
+        val checkSelection = viewModel.captureAttachmentSelection()
+        checkSelection()
+
+        fixture.executionModeHolder.setMode(ExecutionMode.REMOTE_SSH)
+        assertThrows(CancellationException::class.java) { checkSelection() }
+        viewModel.captureAttachmentSelection().invoke()
+
+        fixture.executionModeHolder.setMode(ExecutionMode.LOCAL_PROOT)
+        assertThrows(CancellationException::class.java) { checkSelection() }
+        viewModel.captureAttachmentSelection().invoke()
+    }
+
+    @Test
+    fun attachmentSelectionRejectsContainerSelectionRevisionChangesBeforeFlowEmission() {
+        val viewModel = fixture.viewModel
+        viewModel.setWorkspace("/work")
+        val settings = fixture.dependencies.containerSettingsRepository
+        val publishedRevision = settings.activeProfileSelectionRevisions.value
+        val checkSelection = viewModel.captureAttachmentSelection()
+        checkSelection()
+
+        every { settings.activeProfileSelectionRevision } returns publishedRevision + 1
+        assertEquals(publishedRevision, settings.activeProfileSelectionRevisions.value)
+        assertThrows(CancellationException::class.java) { checkSelection() }
+        val nextSelection = viewModel.captureAttachmentSelection()
+        nextSelection()
+
+        // 同一 profile ID 的选择版本再次变化，也不能让旧 picker 恢复有效。
+        every { settings.activeProfileSelectionRevision } returns publishedRevision + 2
+        assertThrows(CancellationException::class.java) { checkSelection() }
+        assertThrows(CancellationException::class.java) { nextSelection() }
+        viewModel.captureAttachmentSelection().invoke()
+    }
+
+    @Test
+    fun clearingTheViewModelCancelsAttachmentSelectionEvenAfterReopeningTheSameDestination() {
+        val viewModel = fixture.viewModel
+        viewModel.setWorkspace("/work")
+        viewModel.selectSession(PARENT)
+        val checkSelection = viewModel.captureAttachmentSelection()
+        checkSelection()
+
+        fixture.closeUi()
+        assertThrows(CancellationException::class.java) { checkSelection() }
+
+        val reopened = fixture.reopenUi()
+        reopened.setWorkspace("/work")
+        reopened.selectSession(PARENT)
+        reopened.captureAttachmentSelection().invoke()
+        assertThrows(CancellationException::class.java) { checkSelection() }
+    }
+
+    @Test
+    fun sessionAbaRejectsTheOldPickerCaptureAndAllowsANewSelection() = runTest(dispatcher) {
+        val viewModel = fixture.viewModel
+        viewModel.setWorkspace("/work")
+        viewModel.selectSession(PARENT)
+        val path = "/work/.chat-attachments/picked.txt"
+        val captures = recordAttachmentCaptures(path)
+        val checkSelection = viewModel.captureAttachmentSelection()
+        checkSelection()
+
+        for (session in listOf(CHILD, PARENT)) {
+            viewModel.selectSession(session)
+            assertEquals(session, viewModel.currentSessionId.value)
+            assertThrows(CancellationException::class.java) { checkSelection() }
+            val failure = runCatching { viewModel.captureAttachmentFile(path, checkSelection) }.exceptionOrNull()
+            assertTrue("An old picker must not capture into session $session", failure is CancellationException)
+            assertTrue(captures.isEmpty())
+            viewModel.captureAttachmentSelection().invoke()
+        }
+
+        val captured = viewModel.captureAttachmentFile(path, viewModel.captureAttachmentSelection())
+        assertSame(captures.single(), captured)
+        captured.checkCurrent()
+        coVerify(exactly = 3) { fixture.executionFactory.freezeForPaths(listOf(path), null, any(), any()) }
     }
 
     @Test
@@ -288,6 +481,20 @@ class FileBrowseViewModelScopeTest {
         coVerify(exactly = 0) { fixture.executionFactory.freezeForPaths(any(), any(), any(), any()) }
         verify(exactly = 0) { fixture.fileChangeHub.watchWorkspace(any(), any(), any(), any(), any()) }
         verify(exactly = 0) { fixture.fileChangeHub.watchHostDir(any(), any(), any(), any(), any(), any(), any()) }
+    }
+
+    private fun recordAttachmentCaptures(path: String): List<WorkspaceExecutionContext> {
+        val captures = mutableListOf<WorkspaceExecutionContext>()
+        coEvery { fixture.executionFactory.freezeForPaths(listOf(path), null, any(), any()) } coAnswers {
+            val owner = arg<RuntimeOwner?>(2)
+            val checkSource = checkNotNull(arg<(() -> Unit)?>(3))
+            // 只记录工厂边界；失效判断完全执行真实 VM 传入的 guard。
+            checkSource()
+            WorkspaceExecutionContext(fixture.executionModeHolder.currentMode(), "attachment-fixture",
+                fixture.browseFileAccess, null, null, runtimeOwner = owner, checkSource = checkSource)
+                .also { captures.add(it) }
+        }
+        return captures
     }
 
     private inner class HostBrowseSource {

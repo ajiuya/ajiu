@@ -37,7 +37,12 @@ object ShellCommandParser {
     data class Blocker(val kind: BlockerKind, val detail: String? = null)
 
     /** Lexical evidence only: no expansion, filesystem access, or claim of sandboxing. */
-    data class Redirection(val operator: String, val target: String, val literal: Boolean)
+    data class Redirection(
+        val operator: String,
+        val target: String,
+        val literal: Boolean,
+        val hereDocumentBody: String? = null
+    )
     data class CommandSegment(val tokens: List<String>, val redirections: List<Redirection>)
 
     /**
@@ -65,7 +70,8 @@ object ShellCommandParser {
     fun analyze(command: String): Analysis = analyzeShell(command)
 
     private fun analyzeShell(commandText: String): Analysis {
-        val command = hereDocumentView(commandText).shell
+        val hereData = hereDocumentView(commandText)
+        val command = hereData.shell
         val segments = mutableListOf<List<String>>()
         var current = mutableListOf<String>()
         var redirects = mutableListOf<Redirection>()
@@ -85,6 +91,7 @@ object ShellCommandParser {
         var quote = NONE
         var redirectOperator: String? = null
         var redirectDescriptor: String? = null
+        var redirectOffset = -1
         var i = 0
         val n = command.length
 
@@ -93,7 +100,7 @@ object ShellCommandParser {
                 val t = token.toString()
                 val operator = redirectOperator
                 if (operator != null) {
-                    redirects.add(Redirection(operator, t, !tokenDynamic))
+                    redirects.add(Redirection(operator, t, !tokenDynamic, hereData.bodies[redirectOffset]))
                     if ('>' in operator) {
                         val descriptorTarget = t.removeSuffix("-")
                         val duplicatesDescriptor = operator == ">&" && !tokenDynamic && quote == NONE &&
@@ -147,6 +154,7 @@ object ShellCommandParser {
             finishRedirect()
             redirectOperator = operator
             redirectDescriptor = descriptor
+            redirectOffset = i
         }
         fun flushSegment() {
             flushToken()
@@ -362,14 +370,17 @@ object ShellCommandParser {
         return inlineCommandsInShell(view.shell) + view.expansions
     }
 
-    private data class HereDocument(val delimiter: String, val quoted: Boolean, val stripTabs: Boolean)
-    private data class HereDataView(val shell: String, val expansions: List<String>)
+    private data class HereDocument(val delimiter: String, val quoted: Boolean, val stripTabs: Boolean, val redirectOffset: Int)
+    // Masking preserves offsets, so each body stays attached to its own redirect even across
+    // multiple segments/documents. Bodies never become executable segments or DENY tokens.
+    private data class HereDataView(val shell: String, val expansions: List<String>, val bodies: Map<Int, String> = emptyMap())
 
     /** Mask data, not commands. No execution/expansion; unknown syntax remains best-effort. */
     private fun hereDocumentView(command: String): HereDataView {
         if (!command.contains("<<")) return HereDataView(command, emptyList())
         val shell = command.toCharArray()
         val expansions = mutableListOf<String>()
+        val bodies = linkedMapOf<Int, String>()
         val pending = ArrayDeque<HereDocument>()
         var quote = NONE
         var index = 0
@@ -421,7 +432,7 @@ object ShellCommandParser {
                     }
                     cursor++
                 }
-                if (started && delimiterQuote == NONE) pending.addLast(HereDocument(delimiter.toString(), quoted, stripTabs))
+                if (started && delimiterQuote == NONE) pending.addLast(HereDocument(delimiter.toString(), quoted, stripTabs, index))
                 index = maxOf(cursor, index + 2)
                 continue
             }
@@ -439,14 +450,16 @@ object ShellCommandParser {
                         if (delimiterLine == here.delimiter) { bodyEnd = index; index = next; break }
                         index = next
                     }
-                    if (!here.quoted) expansions.addAll(hereDataCommands(command.substring(bodyStart, bodyEnd)))
+                    val body = command.substring(bodyStart, bodyEnd)
+                    bodies[here.redirectOffset] = body
+                    if (!here.quoted) expansions.addAll(hereDataCommands(body))
                     for (position in bodyStart until index) if (shell[position] != '\n') shell[position] = ' '
                 }
                 continue
             }
             index++
         }
-        return HereDataView(String(shell), expansions)
+        return HereDataView(String(shell), expansions, bodies)
     }
 
     /** Quotes in an unquoted here-doc body are data; only backslash escapes suppress expansion. */

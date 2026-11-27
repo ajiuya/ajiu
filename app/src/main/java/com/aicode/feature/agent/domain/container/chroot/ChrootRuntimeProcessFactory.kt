@@ -28,6 +28,10 @@ internal class ChrootRuntimeUnavailable(message: String) : IOException(message)
 internal interface ChrootProcessFactory {
     fun captureHelper(): ChrootHelperIdentity
     fun start(helper: ChrootHelperIdentity): Process
+    fun startChecked(helper: ChrootHelperIdentity, canDispatch: () -> Boolean): Process {
+        if (!canDispatch()) throw ChrootRuntimeUnavailable("Runtime request is no longer current")
+        return start(helper)
+    }
 }
 
 @Singleton
@@ -122,12 +126,29 @@ internal class ChrootRuntimeProcessFactory @Inject constructor(
         return broker.start(ChrootBrokerWire.RUNTIME, checkHelper = { checkCaptured(helper, HELPER_NAME) })
     }
 
+    override fun startChecked(helper: ChrootHelperIdentity, canDispatch: () -> Boolean): Process {
+        return broker.startRuntimeChecked(checkHelper = { checkCaptured(helper, HELPER_NAME) }, canDispatch = canDispatch)
+    }
+
     fun startInstaller(instanceId: String, removeIdentity: ChrootFileIdentity?, expectedSession: ChrootRuntimeSession): Process {
         require(instanceId.matches(Regex("[0-9a-f]{24}")))
         return broker.start(if (removeIdentity == null) ChrootBrokerWire.INSTALL else ChrootBrokerWire.REMOVE, instanceId, removeIdentity, expectedSession) {
             val helper = capture(INSTALLER_NAME, "installer")
             checkCaptured(helper, INSTALLER_NAME)
         }
+    }
+
+    fun startRecoveryRemoval(
+        instanceId: String,
+        identity: ChrootFileIdentity,
+        expectedSession: ChrootRuntimeSession,
+        checkCurrent: () -> Unit = {}
+    ): Process {
+        require(instanceId.matches(Regex("[0-9a-f]{24}")))
+        return broker.startChecked(ChrootBrokerWire.RECOVER_REMOVE, instanceId, identity, expectedSession, checkHelper = {
+            val helper = capture(INSTALLER_NAME, "installer")
+            checkCaptured(helper, INSTALLER_NAME)
+        }, checkCurrent = checkCurrent)
     }
 
     private fun startBroker(helper: ChrootHelperIdentity, arguments: List<String>): Process {

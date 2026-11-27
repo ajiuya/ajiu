@@ -354,8 +354,10 @@ class ContainerSettingsRepository internal constructor(
     suspend fun publishChrootInstance(
         snapshot: ContainerProfileSnapshot,
         profile: ContainerProfile,
-        instance: ChrootInstance?
+        instance: ChrootInstance?,
+        checkCurrent: () -> Unit = {}
     ): Unit = mutateProfiles {
+        checkCurrent()
         checkProfileSnapshotRevision(snapshot)
         if (!profile.isChroot || profile.isBuiltin ||
             snapshot.profiles.singleOrNull { it.id == profile.id } != profile ||
@@ -365,6 +367,7 @@ class ContainerSettingsRepository internal constructor(
         }
         var selectionChanged = false
         dataStore.edit { prefs ->
+            checkCurrent()
             val current = prefs[CUSTOM_PROFILES_KEY]?.let { raw ->
                 runCatching { json.decodeFromString(profileSerializer, raw) }.getOrNull()
             } ?: emptyList()
@@ -386,6 +389,40 @@ class ContainerSettingsRepository internal constructor(
                 }
                 if (prefs[DEFAULT_CONTAINER_ID_KEY] == profile.id) prefs[DEFAULT_CONTAINER_ID_KEY] = fallback
             }
+        }
+        if (selectionChanged) {
+            val revision = profileSelectionRevision.incrementAndGet()
+            _profileSelectionRevisions.update { maxOf(it, revision) }
+        }
+        publishProfileConfigurationChange()
+    }
+
+    suspend fun removeUninstalledChrootProfile(
+        snapshot: ContainerProfileSnapshot,
+        profile: ContainerProfile,
+        checkCurrent: () -> Unit
+    ): Unit = mutateProfiles {
+        checkProfileSnapshotRevision(snapshot)
+        require(profile.isChroot && !profile.isBuiltin && profile.chrootInstance == null)
+        if (snapshot.profiles.singleOrNull { it.id == profile.id } != profile) {
+            throw CancellationException("CHROOT configuration removal source changed")
+        }
+        var selectionChanged = false
+        dataStore.edit { prefs ->
+            checkCurrent()
+            val current = prefs[CUSTOM_PROFILES_KEY]?.let { json.decodeFromString(profileSerializer, it) }.orEmpty()
+            if (current.singleOrNull { it.id == profile.id } != profile) {
+                throw CancellationException("CHROOT configuration removal source changed")
+            }
+            val next = current.filterNot { it.id == profile.id }
+            profileChangePending.set(true)
+            prefs[CUSTOM_PROFILES_KEY] = json.encodeToString(profileSerializer, next)
+            val fallback = next.firstOrNull()?.id ?: ContainerProfile.BUILTIN_ID
+            if (prefs[ACTIVE_PROFILE_ID_KEY] == profile.id) {
+                prefs[ACTIVE_PROFILE_ID_KEY] = fallback
+                selectionChanged = true
+            }
+            if (prefs[DEFAULT_CONTAINER_ID_KEY] == profile.id) prefs[DEFAULT_CONTAINER_ID_KEY] = fallback
         }
         if (selectionChanged) {
             val revision = profileSelectionRevision.incrementAndGet()

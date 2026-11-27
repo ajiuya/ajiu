@@ -8,20 +8,30 @@ import java.util.Collections
 /**
  * Conservative lexical evidence, not an execution-identity check or a sandbox. Never opens paths,
  * resolves symlinks or runs code. READ evidence alone needs no host-write approval; WRITE,
- * READ_WRITE or any uncertainty does. Guest /etc, /usr and /var are not Android host paths.
+ * READ_WRITE or host-linked uncertainty needs review in CHROOT; HOST reviews all uncertainty.
+ * Guest /etc, /usr and /var are not Android host paths. Android path hints do not prove mounts.
  */
 object HostSystemFileAccessClassifier {
     enum class Namespace { HOST, CHROOT_GUEST }
 
     /** Classifier results contain defensive, unmodifiable snapshots, with ordinary value equality. */
-    data class Assessment(val targets: Set<String>, val uncertainties: Set<String>)
+    data class Assessment(
+        val targets: Set<String>,
+        val uncertainties: Set<String>,
+        val hostLinkedUncertainties: Set<String>
+    ) {
+        val ordinaryGuestUncertainties: Set<String> get() = immutable(uncertainties - hostLinkedUncertainties)
+    }
 
     private enum class Access { READ, WRITE, READ_WRITE }
     private val hostRoots = setOf(
         "/system", "/system_ext", "/vendor", "/product", "/odm", "/oem", "/apex",
         "/etc", "/metadata", "/persist", "/data/system", "/data/misc", "/data/adb", "/data/property"
     )
+    private val androidHostHints = hostRoots - "/etc"
     private val interfaces = setOf("/proc", "/sys", "/dev")
+    // Only used for uncertain executable/code/path roles, never for ordinary printed text.
+    private val pathHints = Regex("""(?<![A-Za-z0-9_./-])/[^\s'";<>|&`()\[\]{}\\]+""")
     private val harmlessDevices = setOf("/dev/null", "/dev/zero", "/dev/stdin", "/dev/stdout", "/dev/stderr")
     // Only conventional lexical locations, not proof of the executable's actual identity or PATH.
     private val executableDirectories = setOf("/system/bin", "/system/xbin", "/bin", "/sbin", "/usr/bin", "/usr/sbin")
@@ -154,11 +164,16 @@ object HostSystemFileAccessClassifier {
             "list", "search" -> evidence.visit((if (toolName == "list") "ls " else "rg ") + text("args").orEmpty(), null, true, 0)
             "Bash", "Root", "Shizuku" -> text("command")?.let { evidence.visit(it, null, true, 0) }
                 ?: evidence.unknown("opaque-shell-input")
-            "terminal" -> when (text("action")) {
+            "terminal" -> when (text("action")?.trim()?.lowercase()) {
                 "start" -> text("command")?.let { evidence.visit(it, null, true, 0) }
                     ?: evidence.unknown("opaque-shell-input")
-                // Input may go to an interpreter, editor or an existing shell with unknown state.
-                "send" -> evidence.unknown("interactive-input")
+                // Input may go to an interpreter/editor. Retain that diagnostic without treating
+                // ordinary CHROOT interaction as host authority; inspect explicit command clues.
+                "send" -> {
+                    text("input")?.let { evidence.visit(it, null, true, 0) }
+                    evidence.unknown("interactive-input")
+                }
+                "key" -> evidence.unknown("interactive-input")
                 else -> Unit
             }
         }
@@ -171,26 +186,46 @@ object HostSystemFileAccessClassifier {
     private class Evidence(private val namespace: Namespace) {
         private val targets = linkedSetOf<String>()
         private val uncertainties = linkedSetOf<String>()
-        fun unknown(reason: String) { uncertainties.add(reason) }
-        fun snapshot() = Assessment(immutable(targets), immutable(uncertainties))
+        private val hostLinkedUncertainties = linkedSetOf<String>()
+        private var contextualHostHint = false
+        private var inheritedHostHint = false
+
+        fun unknown(reason: String, hostLinked: Boolean = contextualHostHint) {
+            uncertainties.add(reason)
+            if (namespace == Namespace.HOST || hostLinked) hostLinkedUncertainties.add(reason)
+        }
+
+        private inline fun withHostHints(values: List<String>, cwd: String?, inherit: Boolean = false, block: () -> Unit) {
+            val previous = contextualHostHint
+            val previousInherited = inheritedHostHint
+            contextualHostHint = previous || values.any(::hasHostHint) || cwd?.let(::hasHostHint) == true
+            if (inherit) inheritedHostHint = contextualHostHint
+            try { block() } finally {
+                contextualHostHint = previous
+                inheritedHostHint = previousInherited
+            }
+        }
+
+        fun snapshot() = Assessment(immutable(targets), immutable(uncertainties), immutable(hostLinkedUncertainties))
 
         fun record(raw: String, access: Access, cwd: String?, uncertainCwd: Boolean, typed: Boolean = false) {
             val writing = access != Access.READ
-            if (!typed && writing && dynamicPath(raw)) unknown("dynamic-write-path")
+            val hostLinked = inheritedHostHint || hasHostHint(raw) || (!raw.startsWith('/') && cwd?.let(::hasHostHint) == true)
+            if (!typed && writing && dynamicPath(raw)) unknown("dynamic-write-path", hostLinked)
             if (writing && !raw.startsWith('/') && (!typed || !workspacePath(raw))) {
-                if (cwd == null || uncertainCwd) unknown("unknown-write-directory")
+                if (cwd == null || uncertainCwd) unknown("unknown-write-directory", hostLinked)
             }
             val path = if (typed) raw.takeIf { it.startsWith('/') }?.let(::normalize) else literalPath(raw, cwd)
             if (path != null) {
-                if (writing && namespace == Namespace.CHROOT_GUEST && path in setOf("/", "/*")) unknown("guest-root-write")
+                if (writing && namespace == Namespace.CHROOT_GUEST && path in setOf("/", "/*")) unknown("guest-root-write", hostLinked = true)
                 target(path, access, namespace)?.let(targets::add)
             }
         }
 
         fun visit(command: String, initialDirectory: String?, initialUncertain: Boolean, depth: Int) {
-            if (depth > 32) { unknown("analysis-depth"); return }
+            if (depth > 32) { unknown("analysis-depth", hasHostHint(command)); return }
             val analysis = ShellCommandParser.analyze(command)
-            if (analysis.blockers.any { it.kind in syntaxBlockers }) unknown("unsupported-shell-syntax")
+            if (analysis.blockers.any { it.kind in syntaxBlockers }) unknown("unsupported-shell-syntax", hasHostHint(command))
             val dynamicWords = analysis.blockers.filter { it.kind == ShellCommandParser.BlockerKind.DYNAMIC_ARGUMENT }.mapNotNull { it.detail }.toSet()
             // The parser does not expose control-flow edges. Only a simple && cd chain proves cwd.
             val uncertainFlow = command.any { it == ';' || it == '\n' || it == '|' } || Regex("(?<!&)&(?!&)").containsMatchIn(command)
@@ -207,30 +242,57 @@ object HostSystemFileAccessClassifier {
                         '>' in redirect.operator -> Access.WRITE
                         else -> Access.READ
                     }
-                    if (!redirect.literal && access != Access.READ) unknown("dynamic-write-path")
+                    if (!redirect.literal && access != Access.READ) unknown("dynamic-write-path",
+                        inheritedHostHint || hasHostHint(redirect.target) || (!redirect.target.startsWith('/') && cwd?.let(::hasHostHint) == true))
                     record(redirect.target, access, cwd, uncertainCwd)
                 }
-                if (segment.tokens.takeWhile { assignment.matches(it) }.any { it.substringBefore('=') in startupVariables }) unknown("startup-environment")
+                val environment = segment.tokens.takeWhile { assignment.matches(it) }
+                val startup = environment.filter { it.substringBefore('=') in startupVariables }
+                if (startup.isNotEmpty()) unknown("startup-environment", startup.any(::hasHostHint))
                 val effective = ShellCommandParser.effectiveTokens(segment.tokens)
                 val executable = effective.firstOrNull() ?: continue
-                if (program(executable) == null) { unknown("untrusted-executable-path"); continue }
+                if (program(executable) == null) {
+                    withHostHints(effective + environment, cwd) { unknown("untrusted-executable-path") }
+                    continue
+                }
                 // Do not let legacy expansion run a queried name as a child of command -pv/-pV.
                 if (program(executable) == "command" && commandInfo(effective.drop(1))) continue
                 val expanded = ShellCommandParser.expandExecutableSegment(effective) { nested ->
-                    visit(nested, cwd, uncertainCwd, depth + 1)
+                    // A shell body can use host-valued environment/positional arguments.
+                    // Exclude the body itself so echo text cannot taint unrelated guest commands.
+                    withHostHints(environment + effective.drop(1).filterNot { it == nested }, cwd, inherit = true) {
+                        visit(nested, cwd, uncertainCwd, depth + 1)
+                    }
                     emptyList()
                 }
                 var childDirectory = cwd
                 var childUncertain = uncertainCwd
                 for (tokens in expanded) {
                     val name = tokens.firstOrNull()?.let(::program)
-                    if (name == null) { unknown("untrusted-executable-path"); break }
+                    if (name == null) {
+                        withHostHints(tokens + environment, childDirectory) { unknown("untrusted-executable-path") }
+                        break
+                    }
                     val args = tokens.drop(1)
+                    if (name == "command" && commandInfo(args)) break
+                    // Only code consumers inspect their own input. Here-doc delimiters and
+                    // another segment's printed paths are not code or filesystem operands.
+                    val codeInput = if (name in shells || name in codePrograms) {
+                        segment.redirections.mapNotNull {
+                            when {
+                                it.operator in setOf("<<", "<<-") -> it.hereDocumentBody
+                                it.operator.startsWith('<') -> it.target
+                                else -> null
+                            }
+                        }
+                    } else emptyList()
+                    // Environment values only influence uncertainty in executable/code roles;
+                    // known echo/read operands and ordinary relative writes keep their own roles.
+                    withHostHints(tokens + codeInput + environment, childDirectory) {
                     when {
                         name in wrappers -> {
                             if (name == "env" && environmentHasStartup(args)) unknown("startup-environment")
                             if (name == "command") {
-                                if (commandInfo(args)) break
                                 // Legacy expansion also mistakes child -v/-V for metadata options.
                                 if (args.any { it in setOf("-v", "-V") }) unknown("opaque-wrapper")
                             }
@@ -246,8 +308,10 @@ object HostSystemFileAccessClassifier {
                             // Only a shell builtin (possibly behind command) changes this shell's cwd.
                             if (tokens === expanded.first() || effective.firstOrNull()?.substringAfterLast('/') == "command") {
                                 val path = args.lastOrNull()?.takeUnless { it == "-" || it.startsWith("-") }
-                                cwd = path?.let { literalPath(it, cwd) }
-                                uncertainCwd = cwd == null || uncertainFlow || (path?.startsWith('/') != true && uncertainCwd)
+                                // Retain a dynamic host-prefixed directory only as a hint, never
+                                // as a literal target. literalPath refuses such a cwd below.
+                                cwd = path?.let { literalPath(it, cwd) ?: it.takeIf { namespace == Namespace.CHROOT_GUEST && hasHostHint(it) } }
+                                uncertainCwd = cwd == null || (namespace == Namespace.CHROOT_GUEST && dynamicPath(cwd.orEmpty())) || uncertainFlow || (path?.startsWith('/') != true && uncertainCwd)
                             }
                         }
                         name in ordinary -> Unit // Printed strings are not file operands.
@@ -283,6 +347,7 @@ object HostSystemFileAccessClassifier {
                             files.forEach { record(it, if (name in readers) Access.READ else Access.WRITE, childDirectory, childUncertain) }
                         }
                         else -> unknown("unknown-executable")
+                    }
                     }
                 }
             }
@@ -564,13 +629,23 @@ object HostSystemFileAccessClassifier {
     private fun target(path: String, access: Access, namespace: Namespace): String? {
         if (path in harmlessDevices) return null
         val special = interfaces.any { below(path, it) }
-        val system = namespace == Namespace.HOST && (hostRoots.any { below(path, it) } ||
-            (access != Access.READ && path in setOf("/", "/*", "/data", "/data/*")))
+        // CHROOT Android prefixes are explicit host hints, not claims about the mount table.
+        val roots = if (namespace == Namespace.HOST) hostRoots else androidHostHints
+        val system = roots.any { below(path, it) } ||
+            (access != Access.READ && path in setOf("/data", "/data/*")) ||
+            (namespace == Namespace.HOST && access != Access.READ && path in setOf("/", "/*"))
         return if (special || system) "${access.name}:$path" else null
     }
 
     private fun below(path: String, root: String): Boolean = path == root || path.startsWith("$root/") ||
         path.startsWith("$root*") || path.startsWith("$root?")
+
+    private fun hasHostHint(value: String): Boolean = pathHints.findAll(value).any { match ->
+        val path = normalize(match.value)
+        path !in harmlessDevices && (androidHostHints + interfaces).any {
+            below(path, it) || path.startsWith("$it\$")
+        }
+    }
 
     private fun dynamicPath(raw: String) = raw.any { it in "$`*?[{~" }
 
@@ -579,7 +654,7 @@ object HostSystemFileAccessClassifier {
 
     private fun literalPath(raw: String, cwd: String?): String? {
         if (raw.isBlank() || raw.any { it == '$' || it == '`' } || raw.startsWith('~')) return null
-        return normalize(if (raw.startsWith('/')) raw else cwd?.let { "$it/$raw" } ?: return null)
+        return normalize(if (raw.startsWith('/')) raw else cwd?.takeUnless { '$' in it || '`' in it }?.let { "$it/$raw" } ?: return null)
     }
 
     private fun normalize(path: String): String {

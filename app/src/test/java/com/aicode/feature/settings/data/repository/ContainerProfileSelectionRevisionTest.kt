@@ -23,6 +23,7 @@ import io.mockk.verify
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -40,6 +41,8 @@ import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import java.io.File
 import java.io.IOException
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 class ContainerProfileSelectionRevisionTest {
     @get:Rule val temporary = TemporaryFolder()
@@ -465,6 +468,357 @@ class ContainerProfileSelectionRevisionTest {
         assertEquals(snapshot.selectionRevision + 1, published.selectionRevision)
         assertEquals(snapshot.configurationRevision + 1, published.configurationRevision)
         assertEquals(1, revocations)
+    }
+
+    @Test fun removalPublicationRechecksAuthorityAfterWaitingForTheProfileMutationLock() = runBlocking {
+        val backing = newDataStore()
+        val pause = AtomicBoolean()
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val store = object : DataStore<Preferences> {
+            override val data = backing.data
+            override suspend fun updateData(transform: suspend (Preferences) -> Preferences): Preferences = backing.updateData { before ->
+                val next = transform(before)
+                if (pause.get()) {
+                    entered.complete(Unit)
+                    release.await()
+                }
+                next
+            }
+        }
+        val settings = ContainerSettingsRepository(store)
+        val original = profile("root").copy(localRuntime = LocalContainerRuntime.CHROOT,
+            chrootInstance = ChrootInstance("0123456789abcdef01234567", 7, 8, 9))
+        settings.upsertCustomProfile(original)
+        settings.setActiveProfile(original.id)
+        settings.setDefaultContainerId(original.id)
+        val snapshot = settings.captureProfileSnapshot()
+        val current = AtomicBoolean(true)
+        val checks = AtomicInteger()
+        val guard: () -> Unit = {
+            checks.incrementAndGet()
+            if (!current.get()) throw CancellationException("Root authority changed while publication was queued")
+        }
+        var revocations = 0
+        settings.registerConfigurationRevocation { revocations++ }
+        pause.set(true)
+        val blocker = async { settings.upsertCustomProfile(original) } // No semantic change, but holds profileMutation.
+        withTimeout(5_000) { entered.await() }
+        guard()
+        val publication = async(start = CoroutineStart.UNDISPATCHED) {
+            runCatching { settings.publishChrootInstance(snapshot, original, null, guard) }.exceptionOrNull()
+        }
+        try {
+            assertFalse(publication.isCompleted)
+            assertEquals(1, checks.get())
+            current.set(false)
+        } finally {
+            release.complete(Unit)
+        }
+        blocker.await()
+        assertTrue(withTimeout(5_000) { publication.await() } is CancellationException)
+        assertEquals(2, checks.get())
+        assertEquals(0, revocations)
+        val after = settings.captureProfileSnapshot()
+        assertEquals(snapshot.profiles, after.profiles)
+        assertEquals(snapshot.selectedProfileId, after.selectedProfileId)
+        assertEquals(snapshot.defaultContainerId, after.defaultContainerId)
+        assertEquals(snapshot.selectionRevision, after.selectionRevision)
+        assertEquals(snapshot.configurationRevision, after.configurationRevision)
+        settings.checkProfileSnapshot(snapshot)
+    }
+
+    @Test fun removalPublicationRechecksRootAndSessionInsideTheQueuedDataStoreEdit() = runBlocking {
+        for (change in listOf("root", "session")) {
+            val backing = newDataStore()
+            val settings = ContainerSettingsRepository(backing)
+            val original = profile("root").copy(localRuntime = LocalContainerRuntime.CHROOT,
+                chrootInstance = ChrootInstance("0123456789abcdef01234567", 7, 8, 9))
+            settings.upsertCustomProfile(original)
+            settings.setActiveProfile(original.id)
+            settings.setDefaultContainerId(original.id)
+            val snapshot = settings.captureProfileSnapshot()
+            val rootCurrent = AtomicBoolean(true)
+            val sessionCurrent = AtomicBoolean(true)
+            val checks = AtomicInteger()
+            val guard: () -> Unit = {
+                checks.incrementAndGet()
+                if (!rootCurrent.get() || !sessionCurrent.get()) throw CancellationException("$change changed while publication was queued")
+            }
+            val entered = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            var revocations = 0
+            settings.registerConfigurationRevocation { revocations++ }
+            // Occupy DataStore without holding the repository mutex or changing profile revisions.
+            val blocker = async(Dispatchers.IO) {
+                backing.updateData { before ->
+                    entered.complete(Unit)
+                    release.await()
+                    before
+                }
+            }
+            withTimeout(5_000) { entered.await() }
+            guard()
+            val publication = async(start = CoroutineStart.UNDISPATCHED) {
+                runCatching { settings.publishChrootInstance(snapshot, original, null, guard) }.exceptionOrNull()
+            }
+            try {
+                assertFalse(publication.isCompleted)
+                assertEquals(2, checks.get()) // Caller and mutateProfiles entry have both passed.
+                if (change == "root") rootCurrent.set(false) else sessionCurrent.set(false)
+            } finally {
+                release.complete(Unit)
+            }
+            blocker.await()
+            assertTrue("$change must reject the queued edit", withTimeout(5_000) { publication.await() } is CancellationException)
+            assertEquals(3, checks.get())
+            assertEquals(0, revocations)
+            val after = settings.captureProfileSnapshot()
+            assertEquals(snapshot.profiles, after.profiles)
+            assertEquals(snapshot.selectedProfileId, after.selectedProfileId)
+            assertEquals(snapshot.defaultContainerId, after.defaultContainerId)
+            assertEquals(snapshot.selectionRevision, after.selectionRevision)
+            assertEquals(snapshot.configurationRevision, after.configurationRevision)
+            settings.checkProfileSnapshot(snapshot)
+        }
+    }
+
+    @Test fun successfulGuardedRemovalAdvancesRevisionWithoutRecheckingItsOwnExpiredSnapshot() = runBlocking {
+        val settings = newSettings()
+        val original = profile("root").copy(localRuntime = LocalContainerRuntime.CHROOT,
+            chrootInstance = ChrootInstance("0123456789abcdef01234567", 7, 8, 9))
+        settings.upsertCustomProfile(original)
+        settings.setActiveProfile(original.id)
+        settings.setDefaultContainerId(original.id)
+        val snapshot = settings.captureProfileSnapshot()
+        val checks = AtomicInteger()
+
+        settings.publishChrootInstance(snapshot, original, null) {
+            settings.checkProfileSnapshot(snapshot)
+            checks.incrementAndGet()
+            Unit
+        }
+
+        val after = settings.captureProfileSnapshot()
+        assertEquals(2, checks.get())
+        assertTrue(after.profiles.isEmpty())
+        assertEquals(ContainerProfile.BUILTIN_ID, after.selectedProfileId)
+        assertEquals(ContainerProfile.BUILTIN_ID, after.defaultContainerId)
+        assertEquals(snapshot.configurationRevision + 1, after.configurationRevision)
+        assertEquals(snapshot.selectionRevision + 1, after.selectionRevision)
+        assertThrows(CancellationException::class.java) { settings.checkProfileSnapshot(snapshot) }
+        Unit
+    }
+
+    @Test fun uninstalledChrootRemovalAtomicallyUpdatesOnlyConfigurationAndItsActiveDefaultReferences() = runBlocking {
+        for (withFallback in listOf(false, true)) {
+            val settings = newSettings()
+            val original = profile("root").copy(localRuntime = LocalContainerRuntime.CHROOT)
+            val fallback = profile("fallback")
+            if (withFallback) settings.upsertCustomProfile(fallback)
+            settings.upsertCustomProfile(original)
+            settings.setActiveProfile(original.id)
+            settings.setDefaultContainerId(original.id)
+            val before = settings.captureProfileSnapshot()
+            var checks = 0
+            var revocations = 0
+            settings.registerConfigurationRevocation { revocations++ }
+
+            settings.removeUninstalledChrootProfile(before, original) {
+                settings.checkProfileSnapshot(before)
+                checks++
+            }
+
+            val after = settings.captureProfileSnapshot()
+            val fallbackId = if (withFallback) fallback.id else ContainerProfile.BUILTIN_ID
+            assertEquals(if (withFallback) listOf(fallback) else emptyList<ContainerProfile>(), after.profiles)
+            assertEquals(fallbackId, after.selectedProfileId)
+            assertEquals(fallbackId, after.defaultContainerId)
+            assertEquals(before.selectionRevision + 1, after.selectionRevision)
+            assertEquals(before.configurationRevision + 1, after.configurationRevision)
+            assertEquals(1, checks)
+            assertEquals(1, revocations)
+            assertThrows(CancellationException::class.java) { settings.checkProfileSnapshot(before) }
+        }
+    }
+
+    @Test fun removingAnInactiveUninstalledChrootProfilePreservesOtherSelectionAndDefault() = runBlocking {
+        val settings = newSettings()
+        val selected = profile("selected")
+        val default = profile("default")
+        val original = profile("root").copy(localRuntime = LocalContainerRuntime.CHROOT)
+        listOf(selected, default, original).forEach { settings.upsertCustomProfile(it) }
+        settings.setActiveProfile(selected.id)
+        settings.setDefaultContainerId(default.id)
+        val before = settings.captureProfileSnapshot()
+
+        settings.removeUninstalledChrootProfile(before, original) { settings.checkProfileSnapshot(before) }
+
+        val after = settings.captureProfileSnapshot()
+        assertEquals(before.profiles.filterNot { it.id == original.id }, after.profiles)
+        assertEquals(selected.id, after.selectedProfileId)
+        assertEquals(default.id, after.defaultContainerId)
+        assertEquals(before.selectionRevision, after.selectionRevision)
+        assertEquals(before.configurationRevision + 1, after.configurationRevision)
+    }
+
+    @Test fun uninstalledChrootRemovalRejectsStaleOrForeignSnapshotsBeforeCallingItsGuard() = runBlocking {
+        for (change in listOf("configuration", "selection-round-trip", "repository")) {
+            val settings = newSettings()
+            val original = profile("root").copy(localRuntime = LocalContainerRuntime.CHROOT)
+            settings.upsertCustomProfile(original)
+            settings.setActiveProfile(original.id)
+            val reviewed = settings.captureProfileSnapshot()
+            val stale = when (change) {
+                "configuration" -> {
+                    settings.upsertCustomProfile(profile("another"))
+                    reviewed
+                }
+                "selection-round-trip" -> {
+                    settings.setActiveProfile("another")
+                    settings.setActiveProfile(original.id)
+                    reviewed
+                }
+                else -> newSettings().let { other ->
+                    other.upsertCustomProfile(original)
+                    other.setActiveProfile(original.id)
+                    other.captureProfileSnapshot()
+                }
+            }
+            val current = settings.captureProfileSnapshot()
+            var checked = false
+            var revocations = 0
+            settings.registerConfigurationRevocation { revocations++ }
+
+            assertTrue("$change must reject removal", runCatching {
+                settings.removeUninstalledChrootProfile(stale, original) { checked = true }
+            }.exceptionOrNull() is CancellationException)
+
+            assertFalse(checked)
+            assertEquals(0, revocations)
+            assertEquals(current.profiles, settings.customProfilesFlow.first())
+            assertConfigurationRevision(settings, current.configurationRevision)
+            assertEquals(current.selectionRevision, settings.activeProfileSelectionRevision)
+            settings.checkProfileSnapshot(current)
+        }
+    }
+
+    @Test fun configurationOnlyRemovalRejectsInstalledBuiltinProotAndChangedProfileIdentities() = runBlocking {
+        val fresh = profile("root").copy(localRuntime = LocalContainerRuntime.CHROOT)
+        val installed = fresh.copy(chrootInstance = ChrootInstance("0123456789abcdef01234567", 7, 8, 9))
+        for (stored in listOf(installed, fresh.copy(isBuiltin = true), profile("proot"), fresh)) {
+            val settings = newSettings()
+            settings.upsertCustomProfile(stored)
+            val snapshot = settings.captureProfileSnapshot()
+            val requested = if (stored == fresh) fresh.copy(rootfsSource = RootfsSource.LocalFile("content://images/changed")) else stored
+            var checks = 0
+
+            val failure = runCatching { settings.removeUninstalledChrootProfile(snapshot, requested) { checks++ } }.exceptionOrNull()
+
+            assertTrue(failure is IllegalArgumentException || failure is CancellationException)
+            assertEquals(0, checks)
+            assertEquals(snapshot.profiles, settings.customProfilesFlow.first())
+            settings.checkProfileSnapshot(snapshot)
+            assertConfigurationRevision(settings, snapshot.configurationRevision)
+        }
+    }
+
+    @Test fun uninstalledRemovalRechecksAuthorityInsideDataStoreAndLeavesReferencesIntactOnRejection() = runBlocking {
+        val backing = newDataStore()
+        var invalidateAtWrite = false
+        var authorityCurrent = true
+        val store = object : DataStore<Preferences> {
+            override val data = backing.data
+            override suspend fun updateData(transform: suspend (Preferences) -> Preferences): Preferences = backing.updateData { before ->
+                if (invalidateAtWrite) authorityCurrent = false
+                transform(before)
+            }
+        }
+        val settings = ContainerSettingsRepository(store)
+        val original = profile("root").copy(localRuntime = LocalContainerRuntime.CHROOT)
+        settings.upsertCustomProfile(original)
+        settings.setActiveProfile(original.id)
+        settings.setDefaultContainerId(original.id)
+        val before = settings.captureProfileSnapshot()
+        var checks = 0
+        var revocations = 0
+        settings.registerConfigurationRevocation { revocations++ }
+        assertTrue(authorityCurrent)
+        invalidateAtWrite = true
+
+        assertTrue(runCatching {
+            settings.removeUninstalledChrootProfile(before, original) {
+                checks++
+                if (!authorityCurrent) throw CancellationException("Root or installation state changed")
+            }
+        }.exceptionOrNull() is CancellationException)
+
+        assertEquals(1, checks)
+        assertEquals(0, revocations)
+        val after = settings.captureProfileSnapshot()
+        assertEquals(before.profiles, after.profiles)
+        assertEquals(before.selectedProfileId, after.selectedProfileId)
+        assertEquals(before.defaultContainerId, after.defaultContainerId)
+        assertEquals(before.selectionRevision, after.selectionRevision)
+        assertEquals(before.configurationRevision, after.configurationRevision)
+        settings.checkProfileSnapshot(before)
+    }
+
+    @Test fun uninstalledRemovalChecksPersistedProfileAgainEvenWhenLocalRevisionHasNotChanged() = runBlocking {
+        val store = newDataStore()
+        val settings = ContainerSettingsRepository(store)
+        val original = profile("root").copy(localRuntime = LocalContainerRuntime.CHROOT)
+        settings.upsertCustomProfile(original)
+        val before = settings.captureProfileSnapshot()
+        val installed = original.copy(chrootInstance = ChrootInstance("0123456789abcdef01234567", 7, 8, 9))
+        ContainerSettingsRepository(store).upsertCustomProfile(installed)
+        settings.checkProfileSnapshot(before)
+        var checks = 0
+
+        assertTrue(runCatching {
+            settings.removeUninstalledChrootProfile(before, original) { checks++ }
+        }.exceptionOrNull() is CancellationException)
+
+        assertEquals(1, checks)
+        assertEquals(listOf(installed), settings.customProfilesFlow.first())
+        assertConfigurationRevision(settings, before.configurationRevision)
+    }
+
+    @Test fun failedUninstalledRemovalPersistenceDoesNotPublishDeletionOrAdvanceAnyRevision() = runBlocking {
+        val backing = newDataStore()
+        var failWrite = false
+        val store = object : DataStore<Preferences> {
+            override val data = backing.data
+            override suspend fun updateData(transform: suspend (Preferences) -> Preferences): Preferences = backing.updateData { before ->
+                val next = transform(before)
+                if (failWrite) throw IOException("Fixture persistence failed")
+                next
+            }
+        }
+        val settings = ContainerSettingsRepository(store)
+        val original = profile("root").copy(localRuntime = LocalContainerRuntime.CHROOT)
+        settings.upsertCustomProfile(original)
+        settings.setActiveProfile(original.id)
+        settings.setDefaultContainerId(original.id)
+        val before = settings.captureProfileSnapshot()
+        var checks = 0
+        var revocations = 0
+        settings.registerConfigurationRevocation { revocations++ }
+        failWrite = true
+
+        assertTrue(runCatching {
+            settings.removeUninstalledChrootProfile(before, original) { checks++ }
+        }.exceptionOrNull() is IOException)
+
+        assertEquals(1, checks)
+        assertEquals(0, revocations)
+        val after = settings.captureProfileSnapshot()
+        assertEquals(before.profiles, after.profiles)
+        assertEquals(before.selectedProfileId, after.selectedProfileId)
+        assertEquals(before.defaultContainerId, after.defaultContainerId)
+        assertEquals(before.selectionRevision, after.selectionRevision)
+        assertEquals(before.configurationRevision, after.configurationRevision)
+        settings.checkProfileSnapshot(before)
     }
 
     @Test fun profilePublicationRejectsStaleConfigurationAndCannotConvertProotIntoChroot() = runBlocking {

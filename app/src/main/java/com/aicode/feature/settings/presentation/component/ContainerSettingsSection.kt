@@ -101,6 +101,8 @@ import com.aicode.feature.settings.presentation.newContainerProfile
 import com.aicode.feature.agent.domain.root.RootAccessState
 import com.aicode.feature.settings.presentation.ChrootInstanceAction
 import com.aicode.feature.settings.presentation.ChrootSettingsUiState
+import com.aicode.feature.settings.presentation.chrootRemovalAction
+import com.aicode.feature.settings.presentation.isAvailable
 import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeAuthorization
 import com.aicode.feature.settings.data.repository.DownloadedImageRecord
 import com.aicode.feature.workspace.domain.model.RemoteConnection
@@ -228,6 +230,8 @@ internal fun ContainerSection(
                             animationSpec = tween(durationMillis = if (isDragging) 120 else 220),
                             label = "containerDragElevation"
                         )
+                        val chrootState = chrootUiState.states[profile.id]
+                        val removalAction = chrootRemovalAction(chrootState)
                         Surface(
                             shape = RoundedCornerShape(Radius.lg),
                             color = MaterialTheme.semanticColors.cardSurface,
@@ -246,17 +250,15 @@ internal fun ContainerSection(
                                 defaultContainerId = defaultContainerId,
                                 osId = osMap[profile.id],
                                 subtitle = if (profile.isChroot) context.getString(chrootStatusResource(
-                                    chrootUiState.states[profile.id],
+                                    chrootState,
                                     chrootUiState.workingAction.takeIf { chrootUiState.workingProfileId == profile.id }
                                 )) else profileSubtitle(context, profile, remoteConnections),
                                 deleteEnabled = chrootUiState.workingProfileId == null && (!profile.isChroot ||
-                                    chrootUiState.states[profile.id]?.let {
-                                        it.journalHealthy && !it.recoveryRequired && !it.busy && it.rootEnabled && chrootUiState.rootState.enabled
-                                    } == true),
+                                    removalAction.isAvailable(profile, chrootState, chrootUiState.rootState)),
                                 onSelect = { if (chrootUiState.workingProfileId == null && profile.id != activeProfileId) pendingSwitch = profile },
                                 onEdit = { if (chrootUiState.workingProfileId == null) editingProfile = profile },
                                 onDelete = {
-                                    if (profile.isChroot) onChrootInstanceAction(profile.id, ChrootInstanceAction.REMOVE)
+                                    if (profile.isChroot) onChrootInstanceAction(profile.id, removalAction)
                                     else deletingProfile = profile
                                 },
                                 dragModifier = Modifier.longPressDraggableHandle(
@@ -662,7 +664,7 @@ private fun ProfileEditSheet(
     val dismiss = { importJob?.cancel(); onDismiss() }
     val chrootState = initial?.takeIf { it.isChroot }?.let { chrootUiState.states[it.id] }
     val chrootEditable = initial?.isChroot != true || (chrootState != null && chrootState.journalHealthy &&
-        !chrootState.recoveryRequired && !chrootState.busy && chrootUiState.workingProfileId == null)
+        !chrootState.recoveryRequired && !chrootState.removalRebootRequired && !chrootState.busy && chrootUiState.workingProfileId == null)
     // SFTP 通道才适合 SSH exec（FTP/LOCAL 不走 sshj）
     val sshConnections = remoteConnections.filter { it.protocol == RemoteProtocol.SFTP }
     // 编辑内置 Alpine 时保持 Asset 来源（可选导入覆盖）

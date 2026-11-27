@@ -7,6 +7,7 @@ import com.aicode.feature.agent.domain.container.ChrootInstance
 import com.aicode.feature.agent.domain.container.ContainerInstaller
 import com.aicode.feature.agent.domain.container.ContainerProfile
 import com.aicode.feature.agent.domain.container.RootfsSource
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeRemoval
 import com.aicode.feature.agent.domain.root.RootAccessState
 import com.aicode.feature.agent.domain.root.RootAuthorityCoordinator
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -201,7 +202,9 @@ class ChrootInstanceInstaller internal constructor(
     private val newId: () -> String = ::randomId,
     private val transactionTimeoutMs: Long = 40_000L,
     private val rollbackTimeoutMs: Long = 5_000L,
-    private val startBound: ((String, ChrootFileIdentity?, ChrootRuntimeSession) -> Process)? = null
+    private val startBound: ((String, ChrootFileIdentity?, ChrootRuntimeSession) -> Process)? = null,
+    private val checkRecoverySession: ((ChrootRuntimeSession) -> Unit)? = null,
+    private val startRecoveryBound: ((String, ChrootFileIdentity, ChrootRuntimeSession, () -> Unit) -> Process)? = null
 ) {
     @Inject
     internal constructor(
@@ -230,10 +233,19 @@ class ChrootInstanceInstaller internal constructor(
         context.filesDir, File(context.noBackupFilesDir, "chroot/installer-pending.bin"),
         CoroutineScope(SupervisorJob() + Dispatchers.IO), Dispatchers.IO,
         System::currentTimeMillis, AndroidProcess::myUid,
-        startBound = { id, identity, session -> factory.startInstaller(id, identity, session) }
+        startBound = { id, identity, session -> factory.startInstaller(id, identity, session) },
+        checkRecoverySession = factory::checkSession,
+        startRecoveryBound = factory::startRecoveryRemoval
     )
 
-    private data class Pending(val id: String, val remove: Boolean, val generation: Long, val device: Long, val inode: Long)
+    private data class Pending(
+        val id: String,
+        val remove: Boolean,
+        val generation: Long,
+        val device: Long,
+        val inode: Long,
+        val recover: Boolean = false
+    )
 
     private data class NativeResult(
         val passed: Boolean,
@@ -259,6 +271,8 @@ class ChrootInstanceInstaller internal constructor(
         val stdin = AtomicReference<OutputStream?>()
         val sender = AtomicReference<Deferred<ChrootArchiveWriter.Result?>?>()
         @Volatile var cleanupVerified = false
+        // A verified receipt settles this helper transaction, not the unknown instance's cleanup.
+        @Volatile var recoveryReceiptVerified = false
         @Volatile var process: Process? = null
         @Volatile var startAttempted = false
 
@@ -285,11 +299,15 @@ class ChrootInstanceInstaller internal constructor(
     private var pending = linkedMapOf<String, Pending>()
     private val activeIds = HashSet<String>()
     private val usedIds = HashSet<String>()
+    private val verifiedRecoveryReceipts = HashSet<String>()
     private var lastGeneration = 0L
     private val _failedInstances = MutableStateFlow<Set<String>>(emptySet())
     val failedInstances: StateFlow<Set<String>> = _failedInstances.asStateFlow()
     private val _unpublishedInstalls = MutableStateFlow<Set<String>>(emptySet())
     val unpublishedInstalls: StateFlow<Set<String>> = _unpublishedInstalls.asStateFlow()
+    private val _removalRebootRequired = MutableStateFlow<Set<String>>(emptySet())
+    // UI hint for receipts verified in this process; pending op=2 alone never proves a receipt or reboot.
+    val removalRebootRequired: StateFlow<Set<String>> = _removalRebootRequired.asStateFlow()
     private val _isHealthy = MutableStateFlow(true)
     val isHealthy: StateFlow<Boolean> = _isHealthy.asStateFlow()
 
@@ -379,6 +397,39 @@ class ChrootInstanceInstaller internal constructor(
         }
     }
 
+    internal suspend fun recoverAndRemoveFromUser(
+        instance: ChrootInstance,
+        expectedRoot: RootAccessState,
+        expectedSession: ChrootRuntimeSession,
+        checkCurrent: () -> Unit = {},
+        publishRemoved: suspend () -> Unit = {}
+    ): LocalRuntimeRemoval = withContext(dispatcher) {
+        validateInstance(instance)
+        require(expectedRoot.enabled && expectedRoot.authorityId.isNotBlank() && expectedRoot.generation >= 0)
+        transactionMutex.withLock {
+            checkCurrent()
+            ensureCurrent(expectedRoot)
+            requireRecoverySession(expectedRoot, expectedSession)
+            val intent = Pending(instance.id, true, instance.installGeneration, instance.device, instance.inode, recover = true)
+            transact(intent, null, expectedRoot, expectedSession, { removal: LocalRuntimeRemoval ->
+                if (removal == LocalRuntimeRemoval.REMOVED) publishRemoved()
+            }, checkRecoveryCurrent = checkCurrent) { exchange ->
+                when {
+                    verifiedRecoveryReceipt(intent, exchange) -> LocalRuntimeRemoval.REBOOT_REQUIRED
+                    exchange.sendFailure == null && verifiedCleanup(intent, exchange) -> LocalRuntimeRemoval.REMOVED
+                    else -> throw IOException("Native recovery removal did not provide verified identity-bound evidence")
+                }
+            }
+        }
+    }
+
+    private fun requireRecoverySession(expectedRoot: RootAccessState, expectedSession: ChrootRuntimeSession?): ChrootRuntimeSession {
+        val session = expectedSession ?: throw ChrootRuntimeUnavailable("Recovery removal requires the user-authorized Root session")
+        if (session.rootState != expectedRoot) throw ChrootRuntimeUnavailable("Recovery removal Root session changed")
+        checkRecoverySession?.invoke(session)
+        return session
+    }
+
     fun prepareHome(instance: ChrootInstance): File {
         validateInstance(instance)
         if (appUid() < 10_000) throw IOException("Chroot home requires an application identity")
@@ -405,9 +456,10 @@ class ChrootInstanceInstaller internal constructor(
         expectedRoot: RootAccessState,
         expectedSession: ChrootRuntimeSession?,
         publish: suspend (T) -> Unit,
+        checkRecoveryCurrent: () -> Unit = {},
         accept: (Exchange) -> T
     ): T {
-        beginIntent(intent)
+        if (intent.recover) beginRecoveryIntent(intent) else beginIntent(intent)
         val tx = Transaction(intent.id)
         var registration: AutoCloseable? = null
         var settled = false
@@ -430,13 +482,20 @@ class ChrootInstanceInstaller internal constructor(
                     onRevoke = tx::stopOnly,
                     awaitStopped = {
                         withTimeout(rollbackTimeoutMs) { tx.done.await() }
-                        if (!tx.cleanupVerified) throw IOException("Installer cleanup remains unknown")
+                        if (!tx.cleanupVerified && !tx.recoveryReceiptVerified) throw IOException("Installer cleanup remains unknown")
                     }
                 )
                 tx.checkSending()
-                tx.startAttempted = true
+                if (!intent.recover) tx.startAttempted = true
                 val removeIdentity = if (intent.remove) ChrootFileIdentity(intent.device, intent.inode) else null
-                val spawned = if (startBound == null) start(intent.id, removeIdentity) else {
+                val spawned = if (intent.recover) {
+                    val starter = startRecoveryBound
+                        ?: throw ChrootRuntimeUnavailable("Recovery removal requires its dedicated native starter")
+                    val session = requireRecoverySession(expectedRoot, expectedSession)
+                    checkRecoveryCurrent()
+                    tx.startAttempted = true
+                    starter(intent.id, checkNotNull(removeIdentity), session, checkRecoveryCurrent)
+                } else if (startBound == null) start(intent.id, removeIdentity) else {
                     startBound.invoke(intent.id, removeIdentity, expectedSession
                         ?: throw ChrootRuntimeUnavailable("Installer requires the user-authorized Root session"))
                 }
@@ -452,7 +511,11 @@ class ChrootInstanceInstaller internal constructor(
                 try {
                     runInterruptible {
                         tx.checkSending()
-                        if (source == null) null else sendArchive(tx, source)
+                        if (source == null) {
+                            // Recovery evidence cannot hide an unsuccessful stdin/EOF exchange.
+                            if (intent.recover) tx.stdin.getAndSet(null)?.close()
+                            null
+                        } else sendArchive(tx, source)
                     }
                 } catch (e: Throwable) {
                     tx.stopOnly()
@@ -466,17 +529,29 @@ class ChrootInstanceInstaller internal constructor(
             if (tx.stopped.get()) tx.stopOnly()
             val exchange = withTimeout(transactionTimeoutMs) { collect() }
             tx.cleanupVerified = verifiedCleanup(intent, exchange)
+            tx.recoveryReceiptVerified = verifiedRecoveryReceipt(intent, exchange)
             if (intent.remove && tx.cleanupVerified) publicationPending = true
             if (tx.stopped.get()) throw IOException("Root authority was revoked during installation")
+            if (intent.recover) checkRecoveryCurrent()
             val accepted = accept(exchange)
             publicationPending = true
             ensureCurrent(expectedRoot)
+            if (intent.recover) {
+                requireRecoverySession(expectedRoot, expectedSession)
+                checkRecoveryCurrent()
+            }
             tx.checkSending()
-            withTimeout(transactionTimeoutMs) { publish(accepted) }
+            if (!tx.recoveryReceiptVerified) withTimeout(transactionTimeoutMs) { publish(accepted) }
             return authority.withCurrent(expectedRoot.authorityId, expectedRoot.generation) {
                 if (tx.stopped.get()) throw IOException("Root authority was revoked before publication")
-                finishIntent(intent.id, retain = false)
-                tx.cleanupVerified = true
+                if (intent.recover) {
+                    requireRecoverySession(expectedRoot, expectedSession)
+                    // Removal publication changes the profile revision itself; only the receipt
+                    // branch, which never published a profile change, still checks the old source.
+                    if (tx.recoveryReceiptVerified) checkRecoveryCurrent()
+                }
+                finishIntent(intent.id, retain = tx.recoveryReceiptVerified, receiptVerified = tx.recoveryReceiptVerified)
+                if (!tx.recoveryReceiptVerified) tx.cleanupVerified = true
                 settled = true
                 publicationPending = false
                 accepted
@@ -484,17 +559,18 @@ class ChrootInstanceInstaller internal constructor(
         } catch (failure: Throwable) {
             tx.stopOnly()
             withContext(NonCancellable) {
-                if (tx.startAttempted && !tx.cleanupVerified && tasks.isNotEmpty()) {
+                if (tx.startAttempted && !tx.cleanupVerified && !tx.recoveryReceiptVerified && tasks.isNotEmpty()) {
                     val rollback = withTimeoutOrNull(rollbackTimeoutMs) { runCatching { collect() }.getOrNull() }
                     if (rollback != null) {
                         tx.cleanupVerified = verifiedCleanup(intent, rollback)
+                        tx.recoveryReceiptVerified = verifiedRecoveryReceipt(intent, rollback)
                         if (intent.remove && tx.cleanupVerified) publicationPending = true
                     }
                 }
                 if (!tx.startAttempted) tx.cleanupVerified = true
                 if (!settled) {
                     try {
-                        finishIntent(intent.id, retain = publicationPending || !tx.cleanupVerified)
+                        finishIntent(intent.id, retain = intent.recover || publicationPending || !tx.cleanupVerified)
                     } catch (journalFailure: Exception) {
                         failure.addSuppressed(journalFailure)
                     }
@@ -609,6 +685,7 @@ class ChrootInstanceInstaller internal constructor(
 
     private fun verifiedCleanup(intent: Pending, exchange: Exchange): Boolean {
         val result = exchange.result
+        if (intent.recover && exchange.sendFailure != null) return false
         if (intent.remove) return exchange.exit == 0 && result.passed && result.cleanup == "removed" &&
             result.path == rootPath(intent.id) && result.device == intent.device && result.inode == intent.inode
         if (exchange.exit == 0 || result.passed) return false
@@ -617,6 +694,13 @@ class ChrootInstanceInstaller internal constructor(
             "removed" -> result.path == rootPath(intent.id) && result.device > 0 && result.inode > 0
             else -> false
         }
+    }
+
+    private fun verifiedRecoveryReceipt(intent: Pending, exchange: Exchange): Boolean {
+        val result = exchange.result
+        return intent.recover && exchange.exit == 0 && exchange.sendFailure == null && result.passed &&
+            result.cleanup == "reboot_required" && result.path == rootPath(intent.id) &&
+            result.device == intent.device && result.inode == intent.inode
     }
 
     private suspend fun ensureCurrent(expected: RootAccessState) {
@@ -629,6 +713,23 @@ class ChrootInstanceInstaller internal constructor(
     private fun beginIntent(intent: Pending) = synchronized(journalGate) {
         checkHealthy()
         if (intent.id in pending || pending.size >= MAX_PENDING) throw IOException("Instance requires explicit recovery")
+        recordActiveIntent(intent)
+    }
+
+    private fun beginRecoveryIntent(intent: Pending) = synchronized(journalGate) {
+        checkHealthy()
+        require(intent.recover && intent.remove)
+        val previous = pending[intent.id]
+        if (intent.id in activeIds || previous != null && previous != intent ||
+            previous == null && pending.size >= MAX_PENDING
+        ) throw IOException("Recovery removal requires the exact pending instance identity")
+        usedIds.add(intent.id)
+        verifiedRecoveryReceipts.remove(intent.id)
+        recordActiveIntent(intent)
+    }
+
+    // Called only under journalGate. Ordinary intents still cannot resume any pending transaction.
+    private fun recordActiveIntent(intent: Pending) {
         activeIds.add(intent.id)
         try {
             persist(LinkedHashMap(pending).apply { put(intent.id, intent) })
@@ -639,11 +740,14 @@ class ChrootInstanceInstaller internal constructor(
         }
     }
 
-    private fun finishIntent(id: String, retain: Boolean) = synchronized(journalGate) {
+    private fun finishIntent(id: String, retain: Boolean, receiptVerified: Boolean = false) = synchronized(journalGate) {
         activeIds.remove(id)
         val next = LinkedHashMap(pending)
         if (!retain) next.remove(id)
         persist(next)
+        if (!retain) verifiedRecoveryReceipts.remove(id)
+        else if (receiptVerified) verifiedRecoveryReceipts.add(id)
+        publishFailures()
     }
 
     private fun persist(next: LinkedHashMap<String, Pending>) {
@@ -661,8 +765,9 @@ class ChrootInstanceInstaller internal constructor(
     }
 
     private fun publishFailures() {
-        _failedInstances.value = pending.keys.filterTo(linkedSetOf()) { it !in activeIds }
+        _failedInstances.value = pending.values.filter { it.recover || it.id !in activeIds }.mapTo(linkedSetOf()) { it.id }
         _unpublishedInstalls.value = pending.values.filter { !it.remove && it.id !in activeIds }.mapTo(linkedSetOf()) { it.id }
+        _removalRebootRequired.value = pending.values.filter { it.recover && it.id in verifiedRecoveryReceipts }.mapTo(linkedSetOf()) { it.id }
     }
 
     private fun checkHealthy() {
@@ -673,7 +778,9 @@ class ChrootInstanceInstaller internal constructor(
         val attributes = Files.readAttributes(journalFile.toPath(), BasicFileAttributes::class.java, NOFOLLOW_LINKS)
         if (!attributes.isRegularFile || attributes.size() !in 12..MAX_JOURNAL_BYTES) throw IOException("Invalid installer journal")
         return DataInputStream(FileInputStream(journalFile)).use { input ->
-            if (input.readInt() != JOURNAL_MAGIC || input.readInt() != 1) throw IOException("Invalid installer journal version")
+            if (input.readInt() != JOURNAL_MAGIC) throw IOException("Invalid installer journal magic")
+            val version = input.readInt()
+            if (version !in 1..JOURNAL_VERSION) throw IOException("Invalid installer journal version")
             val count = input.readInt()
             if (count !in 0..MAX_PENDING) throw IOException("Invalid installer journal count")
             val loaded = linkedMapOf<String, Pending>()
@@ -683,10 +790,11 @@ class ChrootInstanceInstaller internal constructor(
                 val generation = input.readLong()
                 val device = input.readLong()
                 val inode = input.readLong()
-                if (!NONCE.matches(id) || id in loaded || operation !in 0..1 || generation <= 0 || device < 0 || inode < 0 ||
-                    operation == 1 && (device <= 0 || inode <= 0) || operation == 0 && ((device == 0L) != (inode == 0L))
+                val maximumOperation = if (version == 1) 1 else 2
+                if (!NONCE.matches(id) || id in loaded || operation !in 0..maximumOperation || generation <= 0 || device < 0 || inode < 0 ||
+                    operation != 0 && (device <= 0 || inode <= 0) || operation == 0 && ((device == 0L) != (inode == 0L))
                 ) throw IOException("Invalid installer journal entry")
-                loaded[id] = Pending(id, operation == 1, generation, device, inode)
+                loaded[id] = Pending(id, operation != 0, generation, device, inode, recover = operation == 2)
             }
             if (input.read() != -1) throw IOException("Trailing installer journal bytes")
             loaded
@@ -704,11 +812,11 @@ class ChrootInstanceInstaller internal constructor(
         FileOutputStream(temporary).use { stream ->
             val output = DataOutputStream(stream)
             output.writeInt(JOURNAL_MAGIC)
-            output.writeInt(1)
+            output.writeInt(JOURNAL_VERSION)
             output.writeInt(entries.size)
             entries.values.forEach {
                 output.writeUTF(it.id)
-                output.writeByte(if (it.remove) 1 else 0)
+                output.writeByte(if (it.recover) 2 else if (it.remove) 1 else 0)
                 output.writeLong(it.generation)
                 output.writeLong(it.device)
                 output.writeLong(it.inode)
@@ -765,6 +873,8 @@ class ChrootInstanceInstaller internal constructor(
         const val MAX_PENDING = 1024
         const val MAX_JOURNAL_BYTES = 128_000L
         const val JOURNAL_MAGIC = 0x414a4950
+        // v1 contains install/remove (0/1); v2 also retains recovery removal requests (2).
+        const val JOURNAL_VERSION = 2
         const val DNS = "nameserver 223.5.5.5\nnameserver 223.6.6.6\n"
         val NONCE = Regex("[0-9a-f]{24}")
         val PROFILE_ID = Regex("[A-Za-z0-9][A-Za-z0-9._-]{0,127}")

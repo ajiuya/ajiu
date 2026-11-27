@@ -24,7 +24,10 @@ data class RuntimeOwner(val kind: RuntimeOwnerKind, val scopeId: String) {
 
 enum class LocalRuntimeCleanup { VERIFIED, UNKNOWN }
 
-class LocalRuntimeAuthorizationRequired : IOException("CHROOT requires explicit authorization for this execution owner and source")
+enum class LocalRuntimeRemoval { REMOVED, REBOOT_REQUIRED }
+
+// The legacy type identifies a missing execution context, not a request for a user grant.
+class LocalRuntimeAuthorizationRequired : IOException("The current CHROOT workspace context is unavailable; retry from the current workspace")
 
 sealed interface LocalRuntimeTaskResult {
     data class Exited(val code: Int?, val signal: Int?) : LocalRuntimeTaskResult {
@@ -103,7 +106,9 @@ data class LocalRuntimeState(
     val recoveryRequired: Boolean,
     val activeLaunches: Int,
     val authorizedOwners: Int,
-    val busy: Boolean
+    val busy: Boolean,
+    val journalRepairAvailable: Boolean = false,
+    val removalRebootRequired: Boolean = false
 ) {
     val installed: Boolean get() = instance != null && !recoveryRequired && journalHealthy
 }
@@ -167,4 +172,10 @@ interface LocalRuntimeUserActions {
     suspend fun createInstanceFromUser(profile: ContainerProfile, expectedRoot: RootAccessState): ChrootInstance
     suspend fun stopInstance(instance: ChrootInstance): LocalRuntimeCleanup
     suspend fun removeInstanceFromUser(profile: ContainerProfile, expectedRoot: RootAccessState)
+    suspend fun repairJournalFromUser(profile: ContainerProfile, expectedRoot: RootAccessState) {
+        throw IOException("Runtime journal repair is unavailable")
+    }
+    suspend fun recoverAndRemoveInstanceFromUser(profile: ContainerProfile, expectedRoot: RootAccessState): LocalRuntimeRemoval {
+        throw IOException("Runtime recovery removal is unavailable")
+    }
 }

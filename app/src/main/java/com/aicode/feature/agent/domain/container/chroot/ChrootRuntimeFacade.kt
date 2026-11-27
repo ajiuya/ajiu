@@ -16,6 +16,7 @@ import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeCapture
 import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeCleanup
 import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeCommands
 import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeProcess
+import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeRemoval
 import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeState
 import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeTaskResult
 import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeUserActions
@@ -128,6 +129,7 @@ internal class ChrootRuntimeFacade internal constructor(
     private val bindings = ConcurrentHashMap<String, Binding>()
     private val busyInstances = ConcurrentHashMap.newKeySet<String>()
     private val busyProfiles = ConcurrentHashMap.newKeySet<String>()
+    private val journalRepairBusy = AtomicBoolean()
     private val _changes = MutableStateFlow(0L)
     override val changes = _changes.asStateFlow()
     private val pending = MutableStateFlow<List<LocalRuntimeAuthorization>>(emptyList())
@@ -147,7 +149,8 @@ internal class ChrootRuntimeFacade internal constructor(
             }
         }
         scope.launch {
-            combine(installer.failedInstances, installer.isHealthy, installer.unpublishedInstalls) { _, _, _ -> Unit }.collect { changed() }
+            combine(installer.failedInstances, installer.isHealthy, installer.unpublishedInstalls,
+                installer.removalRebootRequired, recovery.canRepairInterruptedWrite) { _, _, _, _, _ -> Unit }.collect { changed() }
         }
         scope.launch {
             while (true) {
@@ -301,7 +304,9 @@ internal class ChrootRuntimeFacade internal constructor(
             it.request.sources.profile.chrootInstance == instance && bindingCurrent(it)
         }.map { it.request.owner }.distinct().size
         return LocalRuntimeState(instance, authority.accessState.value.enabled, healthy, blocked,
-            active?.activeLaunches ?: 0, owners, profile.id in busyProfiles || (instance != null && instance.id in busyInstances))
+            active?.activeLaunches ?: 0, owners, journalRepairBusy.get() || profile.id in busyProfiles || (instance != null && instance.id in busyInstances),
+            journalRepairAvailable = recovery.canRepairInterruptedWrite.value && installer.isHealthy.value,
+            removalRebootRequired = instance?.id?.let { it in installer.removalRebootRequired.value } == true)
     }
 
     override suspend fun createInstanceFromUser(profile: ContainerProfile, expectedRoot: RootAccessState): ChrootInstance {
@@ -309,7 +314,7 @@ internal class ChrootRuntimeFacade internal constructor(
         if (!busyProfiles.add(profile.id)) throw IOException("CHROOT profile operation is already in progress")
         changed()
         try {
-            if (!recovery.isHealthy.value || !installer.isHealthy.value || installer.unpublishedInstalls.value.isNotEmpty()) {
+            if (journalRepairBusy.get() || !recovery.isHealthy.value || !installer.isHealthy.value || installer.unpublishedInstalls.value.isNotEmpty()) {
                 throw IOException("CHROOT recovery is required")
             }
             val snapshot = settings.captureProfileSnapshot()
@@ -321,7 +326,10 @@ internal class ChrootRuntimeFacade internal constructor(
             sessionFactory.checkSession(session)
             return installer.installFromUser(profile, expectedRoot, expectedSession = session) { instance ->
                 sessionFactory.checkSession(session)
-                settings.publishChrootInstance(snapshot, profile, instance)
+                settings.publishChrootInstance(snapshot, profile, instance) {
+                    sessionFactory.checkSession(session)
+                    if (authority.accessState.value != expectedRoot) throw CancellationException("Root authority changed before installation publication")
+                }
             }
         } finally {
             busyProfiles.remove(profile.id)
@@ -336,7 +344,11 @@ internal class ChrootRuntimeFacade internal constructor(
     }
 
     override suspend fun removeInstanceFromUser(profile: ContainerProfile, expectedRoot: RootAccessState) {
-        val instance = profile.chrootInstance ?: throw IOException("CHROOT instance is missing")
+        val instance = profile.chrootInstance
+        if (instance == null) {
+            removeUninstalledProfile(profile, expectedRoot)
+            return
+        }
         if (!profile.isChroot || !busyInstances.add(instance.id)) throw IOException("CHROOT instance operation is unavailable")
         changed()
         try {
@@ -354,7 +366,111 @@ internal class ChrootRuntimeFacade internal constructor(
             sessionFactory.checkSession(session)
             installer.removeFromUser(instance, expectedRoot, expectedSession = session) {
                 sessionFactory.checkSession(session)
-                settings.publishChrootInstance(snapshot, profile, null)
+                settings.publishChrootInstance(snapshot, profile, null) {
+                    sessionFactory.checkSession(session)
+                    if (authority.accessState.value != expectedRoot) throw CancellationException("Root authority changed before removal publication")
+                }
+            }
+        } finally {
+            busyInstances.remove(instance.id)
+            changed()
+        }
+    }
+
+    private suspend fun removeUninstalledProfile(profile: ContainerProfile, expectedRoot: RootAccessState) {
+        require(profile.isChroot && !profile.isBuiltin && profile.chrootInstance == null)
+        if (!busyProfiles.add(profile.id)) throw IOException("CHROOT profile operation is already in progress")
+        changed()
+        try {
+            val snapshot = settings.captureProfileSnapshot()
+            if (snapshot.profiles.singleOrNull { it.id == profile.id } != profile) {
+                throw CancellationException("CHROOT removal profile changed")
+            }
+            authority.accessSnapshot()
+            fun checkCurrent() {
+                if (authority.accessState.value != expectedRoot || !expectedRoot.enabled) {
+                    throw CancellationException("Root authority changed before configuration removal")
+                }
+                if (journalRepairBusy.get() || !recovery.isHealthy.value || !installer.isHealthy.value ||
+                    installer.unpublishedInstalls.value.isNotEmpty()) throw IOException("CHROOT recovery is required")
+                settings.checkProfileSnapshot(snapshot)
+            }
+            checkCurrent()
+            settings.removeUninstalledChrootProfile(snapshot, profile, ::checkCurrent)
+        } finally {
+            busyProfiles.remove(profile.id)
+            changed()
+        }
+    }
+
+    override suspend fun repairJournalFromUser(profile: ContainerProfile, expectedRoot: RootAccessState) = withContext(Dispatchers.IO) {
+        require(profile.isChroot && !profile.isBuiltin)
+        if (!journalRepairBusy.compareAndSet(false, true)) throw IOException("Runtime journal repair is already in progress")
+        changed()
+        try {
+            val snapshot = settings.captureProfileSnapshot()
+            if (snapshot.profiles.singleOrNull { it.id == profile.id } != profile) {
+                throw CancellationException("CHROOT repair profile changed")
+            }
+            if (!installer.isHealthy.value || !recovery.canRepairInterruptedWrite.value) {
+                throw IOException("Runtime journal cannot be repaired from its committed snapshot")
+            }
+            val session = sessionFactory.ensureFromUser(expectedRoot)
+            revokeAllBindings()
+            manager.withJournalMaintenance {
+                settings.checkProfileSnapshot(snapshot)
+                sessionFactory.checkSession(session)
+                if (authority.accessState.value != expectedRoot || !expectedRoot.enabled) {
+                    throw CancellationException("Root authority changed before journal repair")
+                }
+                recovery.repairInterruptedWriteFromUser()
+                sessionFactory.checkSession(session)
+                settings.checkProfileSnapshot(snapshot)
+            }
+        } finally {
+            journalRepairBusy.set(false)
+            changed()
+        }
+    }
+
+    override suspend fun recoverAndRemoveInstanceFromUser(
+        profile: ContainerProfile,
+        expectedRoot: RootAccessState
+    ): LocalRuntimeRemoval = withContext(Dispatchers.IO) {
+        val instance = profile.chrootInstance ?: throw IOException("CHROOT instance is missing")
+        require(profile.isChroot && !profile.isBuiltin)
+        if (recovery.canRepairInterruptedWrite.value) repairJournalFromUser(profile, expectedRoot)
+        if (!busyInstances.add(instance.id)) throw IOException("CHROOT instance operation is already in progress")
+        changed()
+        try {
+            if (journalRepairBusy.get() || !recovery.isHealthy.value || !installer.isHealthy.value) {
+                throw IOException("CHROOT journal requires repair before recovery removal")
+            }
+            val snapshot = settings.captureProfileSnapshot()
+            if (snapshot.profiles.singleOrNull { it.id == profile.id } != profile) {
+                throw CancellationException("CHROOT recovery removal profile changed")
+            }
+            val session = sessionFactory.ensureFromUser(expectedRoot)
+            // UNKNOWN stays recorded. Only the native reboot receipt may authorize this deletion.
+            authority.withLock {
+                invalidateIssuances { it.instanceId == instance.id }
+                bindings.values.toList().filter { it.request.sources.profile.chrootInstance?.id == instance.id }.forEach(::revokeBinding)
+            }
+            withTimeoutOrNull(10_000L) { manager.stopAndAwaitInstance(instance.id) }
+                ?: throw IOException("CHROOT launches have not settled for recovery removal")
+            if (manager.instanceState(instance.id).activeLaunches != 0) throw IOException("CHROOT instance is still active")
+            settings.checkProfileSnapshot(snapshot)
+            sessionFactory.checkSession(session)
+            installer.recoverAndRemoveFromUser(instance, expectedRoot, expectedSession = session, checkCurrent = {
+                settings.checkProfileSnapshot(snapshot)
+                sessionFactory.checkSession(session)
+                if (authority.accessState.value != expectedRoot) throw CancellationException("Root authority changed before recovery removal")
+            }) {
+                sessionFactory.checkSession(session)
+                settings.publishChrootInstance(snapshot, profile, null) {
+                    sessionFactory.checkSession(session)
+                    if (authority.accessState.value != expectedRoot) throw CancellationException("Root authority changed before removal publication")
+                }
             }
         } finally {
             busyInstances.remove(instance.id)
@@ -449,7 +565,9 @@ internal class ChrootRuntimeFacade internal constructor(
                 // A structured stderr failure can arrive just after STOP marks READY false.
                 withContext(NonCancellable) { handle.awaitCleanup() }
                 if (handle.nativeFailure.value?.nativeStage == "legacy_readonly_instance") throw IOException(legacyInstanceMessage())
-                throw IOException("CHROOT runtime could not start the requested task")
+                val detail = ChrootRuntimeDiagnostic(handle.instanceId, handle.launchId, handle.failure.value,
+                    handle.nativeFailure.value, handle.cleanupState.value).summary()
+                throw IOException("CHROOT runtime could not start the requested task ($detail)")
             }
             capture.checkCurrent()
             process
@@ -710,9 +828,16 @@ internal class ChrootRuntimeFacade internal constructor(
     }
 
     private fun ensureAvailable(instance: ChrootInstance, allowBusy: Boolean = false) {
-        if (!recovery.isHealthy.value || !installer.isHealthy.value || instance.id in recovery.blockedInstances.value ||
+        if (journalRepairBusy.get()) throw IOException("CHROOT runtime records are being repaired")
+        if (!recovery.isHealthy.value) {
+            throw IOException("CHROOT runtime journal is incomplete; open Containers & Images to repair runtime records or remove the affected instance")
+        }
+        if (!installer.isHealthy.value || instance.id in recovery.blockedInstances.value ||
             manager.instanceState(instance.id).blocked || instance.id in installer.failedInstances.value ||
-            !allowBusy && instance.id in busyInstances) throw IOException("CHROOT instance requires verified cleanup or recovery")
+            !allowBusy && instance.id in busyInstances) {
+            val detail = manager.failureSummary(instance.id)?.let { " ($it)" }.orEmpty()
+            throw IOException("CHROOT instance requires verified cleanup or recovery$detail")
+        }
     }
 
     private fun changed() = _changes.update { if (it == Long.MAX_VALUE) 0 else it + 1L }

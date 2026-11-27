@@ -327,7 +327,7 @@ static int parse_request(const struct ajiu_broker_header *h, const unsigned char
     if (!r->id || r->id > (uint64_t)AJIU_BROKER_MAX_REQUEST_ID || r->id != *next) { errno = EPROTO; return -1; }
     if (h->type == AJIU_BROKER_START) {
         r->operation = get32(b + 8); r->device = get64(b + 40); r->inode = get64(b + 48);
-        if (get32(b + 12) || r->operation < AJIU_BROKER_RUNTIME || r->operation > AJIU_BROKER_REMOVE) {
+        if (get32(b + 12) || r->operation < AJIU_BROKER_RUNTIME || r->operation > AJIU_BROKER_RECOVER_REMOVE) {
             errno = EPROTO; return -1;
         }
         if (r->operation == AJIU_BROKER_RUNTIME) {
@@ -338,7 +338,8 @@ static int parse_request(const struct ajiu_broker_header *h, const unsigned char
                 r->instance[i] = (char)b[16 + i];
             }
             if ((r->operation == AJIU_BROKER_INSTALL && (r->device || r->inode)) ||
-                (r->operation == AJIU_BROKER_REMOVE && (!r->device || !r->inode))) { errno = EPROTO; return -1; }
+                ((r->operation == AJIU_BROKER_REMOVE || r->operation == AJIU_BROKER_RECOVER_REMOVE) &&
+                 (!r->device || !r->inode))) { errno = EPROTO; return -1; }
         }
     } else if (h->type == AJIU_BROKER_STOP) {
         r->target = get64(b + 8);
@@ -636,8 +637,16 @@ static void child_exec(const struct broker_executable *e, const struct ajiu_brok
     char *runtime[] = { (char *)AJIU_BROKER_RUNTIME_NAME, (char *)"--runtime", NULL };
     char *install[] = { (char *)AJIU_BROKER_INSTALLER_NAME, (char *)"--install", (char *)r->instance, NULL };
     char *remove[] = { (char *)AJIU_BROKER_INSTALLER_NAME, (char *)"--remove", (char *)r->instance, device, inode, NULL };
+    char *recover_remove[] = { (char *)AJIU_BROKER_INSTALLER_NAME, (char *)"--recover-remove", (char *)r->instance, device, inode, NULL };
     char *environment[] = { (char *)"PATH=/system/bin", (char *)"LANG=C", NULL };
-    char **argv = r->operation == AJIU_BROKER_RUNTIME ? runtime : r->operation == AJIU_BROKER_INSTALL ? install : remove;
+    char **argv;
+    switch (r->operation) {
+        case AJIU_BROKER_RUNTIME: argv = runtime; break;
+        case AJIU_BROKER_INSTALL: argv = install; break;
+        case AJIU_BROKER_REMOVE: argv = remove; break;
+        case AJIU_BROKER_RECOVER_REMOVE: argv = recover_remove; break;
+        default: _exit(126);
+    }
 #ifdef SYS_execveat
     (void)syscall(SYS_execveat, executable, "", argv, environment, AT_EMPTY_PATH);
 #else

@@ -5,8 +5,11 @@ import com.aicode.feature.agent.domain.root.RootAuthorityCoordinator
 import com.aicode.feature.agent.domain.root.RootMemoryDataStore
 import com.aicode.feature.settings.data.repository.RootAccessSettingsRepository
 import com.aicode.testing.ChrootVerificationForeground
+import io.mockk.every
+import io.mockk.spyk
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -47,6 +50,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.coroutines.CoroutineContext
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ChrootRuntimeManagerTest {
@@ -55,17 +59,32 @@ class ChrootRuntimeManagerTest {
     private val rootfs = ChrootFileIdentity(5L, 19L)
     private val owner = "chat:session:call"
 
-    private class BytesPipe : InputStream() {
+    private class BytesPipe(private val onEof: () -> Unit = {}) : InputStream() {
         private val gate = java.lang.Object()
         private val bytes = ArrayDeque<Byte>()
         private var ended = false
-        fun offer(next: ByteArray) = synchronized(gate) {
-            if (!ended) next.forEach(bytes::addLast)
+        private var afterDrained: (() -> Unit)? = null
+        fun offer(next: ByteArray, observeNextRead: (() -> Unit)? = null) = synchronized(gate) {
+            if (!ended) {
+                next.forEach(bytes::addLast)
+                if (observeNextRead != null) {
+                    check(afterDrained == null)
+                    afterDrained = observeNextRead
+                }
+            }
             gate.notifyAll()
         }
         override fun read(): Int = synchronized(gate) {
-            while (bytes.isEmpty() && !ended) gate.wait()
-            if (bytes.isEmpty()) -1 else bytes.removeFirst().toInt() and 0xff
+            while (bytes.isEmpty() && !ended) {
+                val observation = afterDrained
+                afterDrained = null
+                observation?.invoke()
+                gate.wait()
+            }
+            if (bytes.isEmpty()) {
+                onEof()
+                -1
+            } else bytes.removeFirst().toInt() and 0xff
         }
         override fun read(target: ByteArray, offset: Int, count: Int): Int {
             if (count == 0) return 0
@@ -125,15 +144,19 @@ class ChrootRuntimeManagerTest {
     }
 
     private class FakeProcess : Process() {
-        val stdout = BytesPipe()
+        @Volatile var onStdoutEof: () -> Unit = {}
+        @Volatile var onWrapperExitValue: () -> Unit = {}
+        val stdout = BytesPipe { onStdoutEof() }
         val eofWritten = CompletableDeferred<Unit>()
         val launchWritten = CompletableDeferred<Unit>()
         @Volatile var inputFailure: IOException? = null
+        @Volatile var beforeInputWrite: () -> Unit = {}
         @Volatile var helperErrorStream: InputStream = ByteArrayInputStream(byteArrayOf())
         @Volatile var wrapperStatus: Int? = 0
         val stdin = object : ByteArrayOutputStream() {
             @Synchronized
             override fun write(bytes: ByteArray, offset: Int, count: Int) {
+                beforeInputWrite()
                 inputFailure?.let { throw it }
                 super.write(bytes, offset, count)
             }
@@ -152,8 +175,8 @@ class ChrootRuntimeManagerTest {
                 while (true) add((ChrootWireProtocol.read(input) ?: break).type)
             }
         }
-        fun frame(type: ChrootFrameType, body: ByteArray = byteArrayOf()) {
-            stdout.offer(ByteArrayOutputStream().also { ChrootWireProtocol.write(it, type, body) }.toByteArray())
+        fun frame(type: ChrootFrameType, body: ByteArray = byteArrayOf(), observeNextRead: (() -> Unit)? = null) {
+            stdout.offer(ByteArrayOutputStream().also { ChrootWireProtocol.write(it, type, body) }.toByteArray(), observeNextRead)
         }
         fun exit(code: Int = 37) = frame(ChrootFrameType.EXIT, ByteBuffer.allocate(8).putInt(0).putInt(code).array())
         fun finish() {
@@ -165,8 +188,12 @@ class ChrootRuntimeManagerTest {
         override fun getErrorStream(): InputStream = helperErrorStream
         override fun getOutputStream(): OutputStream = stdin
         override fun isAlive(): Boolean = alive.get()
-        override fun exitValue(): Int = if (alive.get()) throw IllegalThreadStateException() else
-            wrapperStatus ?: throw IllegalThreadStateException("Wrapper exit status is unknown")
+        override fun exitValue(): Int {
+            if (alive.get()) throw IllegalThreadStateException()
+            val status = wrapperStatus ?: throw IllegalThreadStateException("Wrapper exit status is unknown")
+            onWrapperExitValue()
+            return status
+        }
         override fun waitFor(): Int = throw AssertionError("Wrapper exit is never a guest task exit")
         override fun destroy() { destroys.incrementAndGet() }
     }
@@ -218,6 +245,72 @@ class ChrootRuntimeManagerTest {
         override fun close() { closed.set(true) }
     }
 
+    /** Observes a real IO runnable returning, rather than assuming a submitted STOP already ran. */
+    private class StartupIoDispatcher : CoroutineDispatcher() {
+        private val submitted = ThreadLocal<CompletableDeferred<Unit>?>()
+        private val returning = ThreadLocal<CompletableDeferred<Unit>?>()
+
+        fun observeSubmission(action: () -> Unit): CompletableDeferred<Unit> {
+            val completed = CompletableDeferred<Unit>()
+            check(submitted.get() == null)
+            submitted.set(completed)
+            try { action() } finally { submitted.remove() }
+            return completed
+        }
+
+        fun observeCurrentReturn(completed: CompletableDeferred<Unit>) {
+            check(returning.get() == null)
+            returning.set(completed)
+        }
+
+        override fun dispatch(context: CoroutineContext, block: Runnable) {
+            val completion = submitted.get()
+            Dispatchers.IO.dispatch(context, Runnable {
+                try { block.run() } finally {
+                    val returned = returning.get()
+                    returning.remove()
+                    returned?.complete(Unit)
+                    completion?.complete(Unit)
+                }
+            })
+        }
+    }
+
+    /** Matches the production transport: STOP cannot succeed before token authentication. */
+    private class StartupControl(private val dispatcher: StartupIoDispatcher) : ChrootControlTransport {
+        val authentication = CompletableDeferred<Unit>()
+        val awaiting = CompletableDeferred<Unit>()
+        val authenticationProcessed = CompletableDeferred<Unit>()
+        val closed = AtomicBoolean()
+        val connected = AtomicBoolean()
+        val attempts = Collections.synchronizedList(mutableListOf<ChrootFrameType>())
+        val sent = Collections.synchronizedList(mutableListOf<ChrootFrameType>())
+        var onStop: () -> Unit = {}
+
+        override suspend fun awaitHelper() {
+            if (closed.get()) throw IOException("Fixture listener is closed before connect")
+            dispatcher.observeCurrentReturn(awaiting)
+            authentication.await()
+            if (closed.get()) throw IOException("Fixture listener closed during authentication")
+            connected.set(true)
+            dispatcher.observeCurrentReturn(authenticationProcessed)
+        }
+
+        override fun trySend(type: ChrootFrameType, body: ByteArray): Boolean {
+            attempts.add(type)
+            if (closed.get() || !connected.get()) return false
+            sent.add(type)
+            if (type == ChrootFrameType.STOP) onStop()
+            return true
+        }
+
+        override fun close() {
+            if (closed.compareAndSet(false, true)) {
+                authentication.completeExceptionally(IOException("Fixture control connect was refused"))
+            }
+        }
+    }
+
     private data class Fixture(
         val authority: RootAuthorityCoordinator,
         val root: RootAccessState,
@@ -226,7 +319,9 @@ class ChrootRuntimeManagerTest {
         val control: FakeControl,
         val controls: ConcurrentHashMap<String, FakeControl>,
         val scope: CoroutineScope,
-        val manager: ChrootRuntimeManager
+        val manager: ChrootRuntimeManager,
+        val diagnostics: ChrootRuntimeDiagnostics,
+        val diagnosticFile: File
     ) : AutoCloseable {
         override fun close() {
             synchronized(factory.processes) { factory.processes.toList() }.forEach { it.finish() }
@@ -237,25 +332,27 @@ class ChrootRuntimeManagerTest {
 
     private suspend fun TestScope.fixture(
         recoveryFile: File = File(temporary.newFolder(), "journal.bin"),
+        authorityDecorate: (RootAuthorityCoordinator) -> RootAuthorityCoordinator = { it },
         configure: (FakeFactory, FakeControl) -> Unit = { _, _ -> }
     ): Fixture {
         val repository = RootAccessSettingsRepository(RootMemoryDataStore(), backgroundScope)
-        val authority = RootAuthorityCoordinator(repository, backgroundScope)
-        authority.setEnabled(true)
-        val root = authority.accessSnapshot()
+        val coordinator = RootAuthorityCoordinator(repository, backgroundScope)
+        coordinator.setEnabled(true)
+        val root = coordinator.accessSnapshot()
         runCurrent()
+        val authority = authorityDecorate(coordinator)
         val recovery = ChrootRecoveryRepository(recoveryFile)
         val factory = FakeFactory()
         val control = FakeControl()
         configure(factory, control)
         val controls = ConcurrentHashMap<String, FakeControl>().apply { put("89abcdef0123456789abcdef", control) }
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val diagnosticFile = File(temporary.newFolder(), "failures.bin")
+        val diagnostics = ChrootRuntimeDiagnostics(diagnosticFile)
         val manager = ChrootRuntimeManager(authority, factory, recovery, scope, Dispatchers.IO, {
             controls.getOrPut(it.launchId) { FakeControl() }.also { channel -> channel.listenerFailure?.let { throw it } }
-        }) {
-            System.nanoTime() / 1_000_000L
-        }
-        return Fixture(authority, root, recovery, factory, control, controls, scope, manager)
+        }, { System.nanoTime() / 1_000_000L }, diagnostics)
+        return Fixture(authority, root, recovery, factory, control, controls, scope, manager, diagnostics, diagnosticFile)
     }
 
     private fun spec(
@@ -298,6 +395,138 @@ class ChrootRuntimeManagerTest {
             assertFalse(fixture.manager.isLeaseCurrent(lease))
             assertNull(fixture.manager.launch(lease, permit, launch) {})
             assertNull(fixture.manager.launch(lease, permit, launch) {})
+            assertEquals(0, fixture.factory.starts.get())
+        }
+    }
+
+    @Test fun journalMaintenanceRejectsBindingAuthorizationAndLaunchThenRequiresANewLease() = runTest {
+        fixture().use { fixture ->
+            val lease = fixture.lease()
+            val launch = spec()
+            val permit = checkNotNull(fixture.manager.authorize(lease, launch, 1))
+            val entered = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            val maintenance = async(start = CoroutineStart.UNDISPATCHED) {
+                fixture.manager.withJournalMaintenance {
+                    entered.complete(Unit)
+                    release.await()
+                    "repaired"
+                }
+            }
+            try {
+                awaitSignal(entered)
+                assertTrue(fixture.manager.instanceState(instance).blocked)
+                assertEquals(0, fixture.manager.instanceState(instance).authorizedOwners)
+                assertFalse(fixture.manager.isLeaseCurrent(lease))
+                assertNull(fixture.manager.allowBinding(owner, "profile", 1, instance, rootfs, fixture.root))
+                assertNull(fixture.manager.authorize(lease, launch, 1))
+                assertNull(fixture.manager.launch(lease, permit, launch) {})
+                var nestedBlockRan = false
+                assertTrue(runCatching { fixture.manager.withJournalMaintenance { nestedBlockRan = true } }
+                    .exceptionOrNull() is IllegalStateException)
+                assertFalse(nestedBlockRan)
+                // A rejected second maintenance request must not lift the first request's guard.
+                assertNull(fixture.manager.allowBinding(owner, "profile", 1, instance, rootfs, fixture.root))
+                assertEquals(0, fixture.factory.starts.get())
+                assertEquals(0, fixture.factory.captures.get())
+            } finally {
+                release.complete(Unit)
+            }
+            assertEquals("repaired", maintenance.await())
+            assertFalse(fixture.manager.instanceState(instance).blocked)
+            assertFalse(fixture.manager.isLeaseCurrent(lease))
+            assertNull(fixture.manager.authorize(lease, launch, 1))
+            assertNull(fixture.manager.launch(lease, permit, launch) {})
+            val replacement = fixture.lease()
+            assertNotEquals(lease, replacement)
+            assertTrue(fixture.manager.isLeaseCurrent(replacement))
+            assertNotNull(fixture.manager.authorize(replacement, launch, 1))
+            assertEquals(0, fixture.factory.starts.get())
+            assertTrue(fixture.recovery.snapshot().isEmpty())
+        }
+    }
+
+    @Test fun failedJournalMaintenanceReleasesItsGuardWithoutClearingUnknownOrRevivingOldLeases() = runTest {
+        fixture().use { fixture ->
+            fixture.recovery.recordIntent(instance, "89abcdef0123456789abcdef", rootfs, owner, fixture.root.generation)
+            fixture.recovery.recordCleanup("89abcdef0123456789abcdef", ChrootCleanupResult.UNKNOWN)
+            val recorded = fixture.recovery.snapshot()
+            val cleanInstance = "abcdef0123456789abcdef01"
+            val cleanLease = checkNotNull(fixture.manager.allowBinding(owner, "clean-profile", 1, cleanInstance, rootfs, fixture.root))
+            val cleanLaunch = spec(id = cleanInstance, launch = "abcdefabcdefabcdefabcdef")
+            val permit = checkNotNull(fixture.manager.authorize(cleanLease, cleanLaunch, 1))
+            val failure = IOException("repair could not commit")
+
+            assertEquals(failure, runCatching {
+                fixture.manager.withJournalMaintenance<Unit> {
+                    assertNull(fixture.manager.allowBinding(owner, "clean-profile", 1, cleanInstance, rootfs, fixture.root))
+                    assertNull(fixture.manager.authorize(cleanLease, cleanLaunch, 1))
+                    throw failure
+                }
+            }.exceptionOrNull())
+
+            assertEquals(recorded, fixture.recovery.snapshot())
+            assertTrue(fixture.recovery.isHealthy.value)
+            assertFalse(fixture.recovery.canStart(instance))
+            assertTrue(fixture.manager.instanceState(instance).blocked)
+            assertNull(fixture.manager.allowBinding(owner, "profile", 1, instance, rootfs, fixture.root))
+            assertFalse(fixture.manager.isLeaseCurrent(cleanLease))
+            assertNull(fixture.manager.launch(cleanLease, permit, cleanLaunch) {})
+            val replacement = checkNotNull(fixture.manager.allowBinding(owner, "clean-profile", 1, cleanInstance, rootfs, fixture.root))
+            assertNotEquals(cleanLease, replacement)
+            assertTrue(fixture.manager.isLeaseCurrent(replacement))
+            assertNotNull(fixture.manager.authorize(replacement, cleanLaunch, 1))
+            assertFalse(fixture.manager.instanceState(cleanInstance).blocked)
+            assertEquals(0, fixture.factory.starts.get())
+        }
+    }
+
+    @Test fun journalMaintenanceWaitsForCleanupBeforeEnteringTheRepairBlock() = runTest {
+        fixture().use { fixture ->
+            val handle = fixture.start()
+            fixture.ready()
+            val entered = CompletableDeferred<Unit>()
+            val maintenance = async(Dispatchers.IO) {
+                fixture.manager.withJournalMaintenance {
+                    assertEquals(0, fixture.manager.instanceState(instance).activeLaunches)
+                    entered.complete(Unit)
+                }
+            }
+            eventually { fixture.control.sent.contains(ChrootFrameType.STOP) }
+            fixture.factory.process.exit(0)
+            eventually { handle.taskState.value != null }
+            assertFalse(entered.isCompleted)
+            assertFalse(maintenance.isCompleted)
+            assertNull(fixture.manager.allowBinding(owner, "profile", 1, instance, rootfs, fixture.root))
+            fixture.factory.process.frame(ChrootFrameType.CLEANUP, byteArrayOf(0))
+            fixture.factory.process.finish()
+            awaitSignal(entered)
+            maintenance.await()
+            assertEquals(ChrootCleanupResult.VERIFIED, cleanupResult(handle))
+            assertEquals(0, fixture.manager.instanceState(instance).activeLaunches)
+            assertTrue(fixture.manager.isLeaseCurrent(fixture.lease()))
+            assertEquals(1, fixture.factory.starts.get())
+        }
+    }
+
+    @Test fun cancellingJournalMaintenanceRestoresAvailabilityButNotTheOldLease() = runTest {
+        fixture().use { fixture ->
+            val lease = fixture.lease()
+            val entered = CompletableDeferred<Unit>()
+            val maintenance = async(start = CoroutineStart.UNDISPATCHED) {
+                fixture.manager.withJournalMaintenance {
+                    entered.complete(Unit)
+                    CompletableDeferred<Unit>().await()
+                }
+            }
+            awaitSignal(entered)
+            assertNull(fixture.manager.allowBinding(owner, "profile", 1, instance, rootfs, fixture.root))
+            maintenance.cancel()
+            maintenance.join()
+            assertFalse(fixture.manager.isLeaseCurrent(lease))
+            assertFalse(fixture.manager.instanceState(instance).blocked)
+            assertTrue(fixture.manager.isLeaseCurrent(fixture.lease()))
+            assertTrue(fixture.recovery.snapshot().isEmpty())
             assertEquals(0, fixture.factory.starts.get())
         }
     }
@@ -451,6 +680,7 @@ class ChrootRuntimeManagerTest {
             assertFalse(readyResult(handle))
             fixture.factory.process.frame(ChrootFrameType.READY, spec().token())
             fixture.control.authenticated.complete(Unit)
+            eventually { fixture.control.sent.contains(ChrootFrameType.STOP) }
             fixture.factory.process.frame(ChrootFrameType.CLEANUP, byteArrayOf(0))
             fixture.factory.process.finish()
             assertEquals(ChrootCleanupResult.VERIFIED, cleanupResult(handle))
@@ -573,10 +803,14 @@ class ChrootRuntimeManagerTest {
             handle.outputStream.close()
             val closing = async(Dispatchers.IO) { fixture.authority.setEnabled(false) }
             runCurrent()
-            eventually { fixture.control.sent.contains(ChrootFrameType.STOP) }
+            eventually { !fixture.authority.accessState.value.enabled }
             assertFalse(readyResult(handle))
+            assertFalse(fixture.control.sent.contains(ChrootFrameType.GO))
+            assertFalse(fixture.control.sent.contains(ChrootFrameType.STOP))
+            assertFalse(fixture.control.closed.get())
             fixture.factory.process.frame(ChrootFrameType.READY, spec().token())
             fixture.control.authenticated.complete(Unit)
+            eventually { fixture.control.sent.contains(ChrootFrameType.STOP) }
             fixture.factory.process.frame(ChrootFrameType.CLEANUP, byteArrayOf(0))
             fixture.factory.process.finish()
             eventually { handle.cleanupState.value != null }
@@ -697,7 +931,7 @@ class ChrootRuntimeManagerTest {
     }
 
     @Test
-    fun ownerRevocationCancelsAnUnconsumedBrokerLaunchWithoutClaimingVerifiedCleanup() = runTest {
+    fun ownerRevocationProvesUndispatchedBrokerLaunchAndClosesItsIntentWithoutInventingTaskExit() = runTest {
         fixture().use { fixture ->
             val created = CompletableDeferred<ChrootBrokerProcess>()
             val proxy = ChrootBrokerProcess {}
@@ -713,10 +947,334 @@ class ChrootRuntimeManagerTest {
             awaitSignal(created)
             manager.revokeOwner(owner)
             assertFalse(proxy.tryDispatch())
+            assertFalse(proxy.tryDispatch())
+            assertTrue(proxy.cancelled.get())
+            assertFalse(proxy.isAlive)
+            assertEquals(0L, proxy.requestId)
             assertEquals(0, manager.instanceState(instance).authorizedOwners)
-            assertEquals(ChrootCleanupResult.UNKNOWN, cleanupResult(handle))
-            assertTrue(manager.instanceState(instance).blocked)
+            assertEquals(ChrootCleanupResult.VERIFIED, cleanupResult(handle))
+            assertFalse(manager.instanceState(instance).blocked)
+            assertTrue(fixture.recovery.unknownLaunchIds(instance).isEmpty())
+            val recorded = fixture.recovery.snapshot().single()
+            assertEquals(spec().launchId, recorded.launchId)
+            assertEquals(ChrootRecoveryPhase.CLOSED, recorded.phase)
+            assertEquals(ChrootCleanupResult.VERIFIED, recorded.cleanup)
             assertEquals(ChrootTaskResult.Unknown, handle.awaitTaskExit())
+            assertFalse(proxy.tryDispatch())
+        }
+    }
+
+    @Test
+    fun stoppingABornHelperDuringLaunchWriteKeepsListenerUntilAuthenticationAndReadyThenStopsWithoutGo() = runTest {
+        fixture().use { fixture ->
+            val dispatcher = StartupIoDispatcher()
+            val control = StartupControl(dispatcher)
+            val launchWriteEntered = CompletableDeferred<Unit>()
+            val releaseLaunchWrite = CountDownLatch(1)
+            val firstWrite = AtomicBoolean(true)
+            val process = fixture.factory.process
+            process.beforeInputWrite = {
+                if (firstWrite.compareAndSet(true, false)) {
+                    launchWriteEntered.complete(Unit)
+                    check(releaseLaunchWrite.await(5L, TimeUnit.SECONDS))
+                }
+            }
+            control.onStop = {
+                // Native pre-GO cancellation still reports the bootstrap EXIT before CLEANUP.
+                process.frame(ChrootFrameType.EXIT, ByteBuffer.allocate(8).putInt(1).putInt(15).array())
+                process.frame(ChrootFrameType.CLEANUP, byteArrayOf(0))
+                process.finish()
+            }
+            val manager = ChrootRuntimeManager(fixture.authority, fixture.factory, fixture.recovery, fixture.scope,
+                dispatcher, { control }, { System.nanoTime() / 1_000_000L })
+            val lease = manager.activateFromUser(owner, "profile", 1, instance, rootfs, fixture.root)!!
+            val permit = manager.authorize(lease, spec(), 1)!!
+            val handle = manager.launch(lease, permit, spec()) {}!!
+            try {
+                awaitSignal(launchWriteEntered)
+                assertEquals(1, fixture.factory.starts.get())
+                assertTrue(process.isAlive)
+                awaitSignal(dispatcher.observeSubmission { handle.stop() })
+                assertFalse(readyResult(handle))
+                assertFalse("STOP before authentication must retain the listener for this already-born helper", control.closed.get())
+                assertTrue("Neither STOP nor GO can be sent before authentication", control.attempts.isEmpty())
+                assertNull(handle.cleanupState.value)
+
+                releaseLaunchWrite.countDown()
+                awaitSignal(control.awaiting)
+                control.authentication.complete(Unit)
+                // This fires after the startup continuation processed authentication and suspended for READY.
+                awaitSignal(control.authenticationProcessed)
+                assertTrue(control.connected.get())
+                assertFalse(control.closed.get())
+                assertTrue("Authentication alone must not send STOP before native READY", control.attempts.isEmpty())
+                assertNull(handle.cleanupState.value)
+
+                process.frame(ChrootFrameType.READY, spec().token())
+                assertEquals(ChrootCleanupResult.VERIFIED, cleanupResult(handle))
+                assertEquals(listOf(ChrootFrameType.STOP), control.sent.toList())
+                assertEquals(listOf(ChrootFrameType.LAUNCH), process.inputFrames())
+                assertEquals(ChrootTaskResult.Unknown, handle.awaitTaskExit())
+                assertNull(handle.failure.value)
+                assertTrue(control.closed.get())
+                assertFalse(manager.instanceState(instance).blocked)
+                assertTrue(fixture.recovery.unknownLaunchIds(instance).isEmpty())
+                assertEquals(ChrootRecoveryPhase.CLOSED, fixture.recovery.snapshot().single().phase)
+                assertEquals(0, process.destroys.get())
+            } finally {
+                releaseLaunchWrite.countDown()
+                control.close()
+            }
+        }
+    }
+
+    @Test
+    fun cancelledBornHelperWithoutAuthenticationStillReachesTheOriginalStopDeadlineUnknown() = runTest {
+        fixture().use { fixture ->
+            val dispatcher = StartupIoDispatcher()
+            val control = StartupControl(dispatcher)
+            val manager = ChrootRuntimeManager(fixture.authority, fixture.factory, fixture.recovery, fixture.scope,
+                dispatcher, { control }, { System.nanoTime() / 1_000_000L }, fixture.diagnostics)
+            val lease = manager.activateFromUser(owner, "profile", 1, instance, rootfs, fixture.root)!!
+            val permit = manager.authorize(lease, spec(), 1)!!
+            val handle = manager.launch(lease, permit, spec()) {}!!
+            try {
+                awaitSignal(control.awaiting)
+                awaitSignal(dispatcher.observeSubmission { handle.stop() })
+                assertFalse("An unexpired stop grace period must retain the listener", control.closed.get())
+                assertTrue(control.attempts.isEmpty())
+                assertNull(handle.cleanupState.value)
+                // The existing five-second observation budget must see the original four-second stop deadline.
+                assertEquals(ChrootCleanupResult.UNKNOWN, cleanupResult(handle))
+                assertEquals(ChrootRuntimeFailureKind.TIMEOUT, handle.failure.value?.kind)
+                assertEquals(ChrootRuntimeFailureStage.STOP_DEADLINE, handle.failure.value?.stage)
+                assertEquals(ChrootTaskResult.Unknown, handle.awaitTaskExit())
+                assertTrue(control.closed.get())
+                assertTrue(control.sent.isEmpty())
+                assertTrue(manager.instanceState(instance).blocked)
+                assertEquals(setOf(spec().launchId), fixture.recovery.unknownLaunchIds(instance))
+                assertEquals(0, fixture.factory.process.destroys.get())
+                eventually { fixture.diagnostics.latestUnknown(instance)?.completionEvidence != null }
+                assertEquals(ChrootStopTrigger.STOP, fixture.diagnostics.latestUnknown(instance)!!.completionEvidence!!.trigger)
+            } finally { control.close() }
+        }
+    }
+
+    @Test
+    fun cancelledAuthenticatedHelperWithoutNativeReadyStillReachesTheOriginalStopDeadlineUnknown() = runTest {
+        fixture().use { fixture ->
+            val dispatcher = StartupIoDispatcher()
+            val control = StartupControl(dispatcher)
+            val manager = ChrootRuntimeManager(fixture.authority, fixture.factory, fixture.recovery, fixture.scope,
+                dispatcher, { control }, { System.nanoTime() / 1_000_000L }, fixture.diagnostics)
+            val lease = manager.activateFromUser(owner, "profile", 1, instance, rootfs, fixture.root)!!
+            val permit = manager.authorize(lease, spec(), 1)!!
+            val handle = manager.launch(lease, permit, spec()) {}!!
+            try {
+                awaitSignal(control.awaiting)
+                control.authentication.complete(Unit)
+                awaitSignal(control.authenticationProcessed)
+                awaitSignal(dispatcher.observeSubmission { handle.stop() })
+                assertTrue(control.connected.get())
+                assertFalse(control.closed.get())
+                assertTrue("Authentication without native READY cannot send STOP", control.attempts.isEmpty())
+                assertFalse(readyResult(handle))
+                assertNull(handle.cleanupState.value)
+                assertEquals(ChrootCleanupResult.UNKNOWN, cleanupResult(handle))
+                assertEquals(ChrootRuntimeFailureKind.TIMEOUT, handle.failure.value?.kind)
+                assertEquals(ChrootRuntimeFailureStage.STOP_DEADLINE, handle.failure.value?.stage)
+                assertEquals(ChrootTaskResult.Unknown, handle.awaitTaskExit())
+                assertTrue(control.closed.get())
+                assertTrue(control.sent.isEmpty())
+                assertTrue(manager.instanceState(instance).blocked)
+                assertEquals(setOf(spec().launchId), fixture.recovery.unknownLaunchIds(instance))
+                assertEquals(0, fixture.factory.process.destroys.get())
+                eventually { fixture.diagnostics.latestUnknown(instance)?.completionEvidence != null }
+                val evidence = fixture.diagnostics.latestUnknown(instance)!!.completionEvidence!!
+                assertEquals(ChrootStopTrigger.STOP, evidence.trigger)
+                assertEquals(0, evidence.flags and (ChrootCompletionEvidence.READY or ChrootCompletionEvidence.GO))
+            } finally { control.close() }
+        }
+    }
+
+    @Test
+    fun cancelledHelperWithNativeReadyBeforeAuthenticationStopsOnlyAfterBothAndNeverGoes() = runTest {
+        fixture().use { fixture ->
+            val dispatcher = StartupIoDispatcher()
+            val control = StartupControl(dispatcher)
+            val process = fixture.factory.process
+            val nativeReadyProcessed = CompletableDeferred<Unit>()
+            control.onStop = {
+                process.exit(127)
+                process.frame(ChrootFrameType.CLEANUP, byteArrayOf(0))
+                process.finish()
+            }
+            val manager = ChrootRuntimeManager(fixture.authority, fixture.factory, fixture.recovery, fixture.scope,
+                dispatcher, { control }, { System.nanoTime() / 1_000_000L })
+            val lease = manager.activateFromUser(owner, "profile", 1, instance, rootfs, fixture.root)!!
+            val permit = manager.authorize(lease, spec(), 1)!!
+            val handle = manager.launch(lease, permit, spec()) {}!!
+            try {
+                awaitSignal(control.awaiting)
+                awaitSignal(dispatcher.observeSubmission { handle.stop() })
+                process.frame(ChrootFrameType.READY, spec().token()) { nativeReadyProcessed.complete(Unit) }
+                // The frame reader requests another header only after accepting this READY.
+                awaitSignal(nativeReadyProcessed)
+                assertFalse(control.connected.get())
+                assertFalse(control.closed.get())
+                assertTrue("Native READY without authentication cannot send STOP or GO", control.attempts.isEmpty())
+                assertFalse(readyResult(handle))
+                assertNull(handle.cleanupState.value)
+
+                control.authentication.complete(Unit)
+                awaitSignal(control.authenticationProcessed)
+                assertEquals(ChrootCleanupResult.VERIFIED, cleanupResult(handle))
+                assertEquals(listOf(ChrootFrameType.STOP), control.sent.toList())
+                assertEquals(listOf(ChrootFrameType.LAUNCH), process.inputFrames())
+                assertEquals(ChrootTaskResult.Unknown, handle.awaitTaskExit())
+                assertNull(handle.failure.value)
+                assertFalse(manager.instanceState(instance).blocked)
+                assertTrue(fixture.recovery.unknownLaunchIds(instance).isEmpty())
+                assertEquals(ChrootRecoveryPhase.CLOSED, fixture.recovery.snapshot().single().phase)
+                assertEquals(0, process.destroys.get())
+            } finally { control.close() }
+        }
+    }
+
+    @Test
+    fun preGoExitWithoutNativeReadyIsRejectedForBothActiveAndCancelledRequests() = runTest {
+        for (cancelled in listOf(false, true)) {
+            fixture().use { fixture ->
+                val dispatcher = StartupIoDispatcher()
+                val control = StartupControl(dispatcher)
+                val manager = ChrootRuntimeManager(fixture.authority, fixture.factory, fixture.recovery, fixture.scope,
+                    dispatcher, { control }, { System.nanoTime() / 1_000_000L })
+                val lease = manager.activateFromUser(owner, "profile", 1, instance, rootfs, fixture.root)!!
+                val permit = manager.authorize(lease, spec(), 1)!!
+                val handle = manager.launch(lease, permit, spec()) {}!!
+                try {
+                    awaitSignal(control.awaiting)
+                    control.authentication.complete(Unit)
+                    awaitSignal(control.authenticationProcessed)
+                    if (cancelled) awaitSignal(dispatcher.observeSubmission { handle.stop() })
+                    assertTrue(control.connected.get())
+                    assertTrue(control.attempts.isEmpty())
+                    assertNull(handle.taskState.value)
+                    fixture.factory.process.exit(127)
+                    assertEquals("cancelled=$cancelled", ChrootCleanupResult.UNKNOWN, cleanupResult(handle))
+                    assertEquals(ChrootTaskResult.Unknown, handle.awaitTaskExit())
+                    assertEquals(ChrootRuntimeFailureKind.PROTOCOL, handle.failure.value?.kind)
+                    assertEquals(ChrootRuntimeFailureStage.FRAME_SEQUENCE, handle.failure.value?.stage)
+                    assertTrue(control.sent.isEmpty())
+                    assertTrue(manager.instanceState(instance).blocked)
+                    assertEquals(setOf(spec().launchId), fixture.recovery.unknownLaunchIds(instance))
+                    assertEquals(ChrootRecoveryPhase.UNKNOWN, fixture.recovery.snapshot().single().phase)
+                } finally { control.close() }
+            }
+        }
+    }
+
+    @Test
+    fun authenticatedReadyCancellationKeepsItsStopBudgetAfterTheStartupWatchdogRuns() = runTest {
+        val dispatcher = StartupIoDispatcher()
+        val observeWatchdog = AtomicBoolean()
+        val watchdogProcessed = CompletableDeferred<Unit>()
+        fixture(authorityDecorate = { coordinator ->
+            spyk(coordinator).also { decorated ->
+                every { decorated.withLock(any<(RootAccessState) -> Any?>()) } answers {
+                    val result = callOriginal()
+                    // After authentication/READY/STOP settle, only the pending startup watchdog
+                    // enters this authority gate before the four-second stop deadline.
+                    if (observeWatchdog.compareAndSet(true, false)) {
+                        dispatcher.observeCurrentReturn(watchdogProcessed)
+                    }
+                    result
+                }
+            }
+        }).use { fixture ->
+            val control = StartupControl(dispatcher)
+            val process = fixture.factory.process
+            // Keep the stderr collector blocked until final cleanup, so it cannot consume the observation gate.
+            process.helperErrorStream = BytesPipe()
+            val manager = ChrootRuntimeManager(fixture.authority, fixture.factory, fixture.recovery, fixture.scope,
+                dispatcher, { control }, { System.nanoTime() / 1_000_000L })
+            val lease = manager.activateFromUser(owner, "profile", 1, instance, rootfs, fixture.root)!!
+            val permit = manager.authorize(lease, spec(), 1)!!
+            val handle = manager.launch(lease, permit, spec()) {}!!
+            suspend fun until(deadline: Long) = withContext(Dispatchers.IO) {
+                val remaining = deadline - System.nanoTime() / 1_000_000L
+                if (remaining > 0) delay(remaining)
+            }
+            try {
+                awaitSignal(control.awaiting)
+                val startupObservedAt = System.nanoTime() / 1_000_000L
+                until(startupObservedAt + 2_000L)
+                val stoppedAt = System.nanoTime() / 1_000_000L
+                awaitSignal(dispatcher.observeSubmission { handle.stop() })
+                control.authentication.complete(Unit)
+                awaitSignal(control.authenticationProcessed)
+                val startupSettled = CompletableDeferred<Unit>()
+                control.onStop = { dispatcher.observeCurrentReturn(startupSettled) }
+                process.frame(ChrootFrameType.READY, spec().token())
+                awaitSignal(startupSettled)
+                assertEquals(listOf(ChrootFrameType.STOP), control.sent.toList())
+                assertFalse(readyResult(handle))
+                assertNull(handle.cleanupState.value)
+                assertNull(handle.failure.value)
+                observeWatchdog.set(true)
+
+                until(startupObservedAt + 5_200L)
+                withContext(Dispatchers.IO) {
+                    val remainingStopBudget = stoppedAt + 4_000L - System.nanoTime() / 1_000_000L
+                    check(remainingStopBudget > 0) { "The original stop deadline expired before the watchdog observation" }
+                    withTimeout(remainingStopBudget) { watchdogProcessed.await() }
+                }
+                assertFalse("The watchdog must have actually executed", observeWatchdog.get())
+                assertTrue(System.nanoTime() / 1_000_000L - stoppedAt < 4_000L)
+                assertNull("Startup timeout must not replace an authenticated cancellation's stop deadline", handle.failure.value)
+                assertNull(handle.cleanupState.value)
+                assertFalse(control.closed.get())
+                assertEquals(listOf(ChrootFrameType.STOP), control.sent.toList())
+
+                process.exit(127)
+                process.frame(ChrootFrameType.CLEANUP, byteArrayOf(0))
+                process.finish()
+                assertEquals(ChrootCleanupResult.VERIFIED, cleanupResult(handle))
+                assertEquals(ChrootTaskResult.Unknown, handle.awaitTaskExit())
+                assertNull(handle.failure.value)
+                assertFalse(manager.instanceState(instance).blocked)
+                assertTrue(fixture.recovery.unknownLaunchIds(instance).isEmpty())
+                assertEquals(0, process.destroys.get())
+            } finally {
+                observeWatchdog.set(false)
+                control.close()
+            }
+        }
+    }
+
+    @Test
+    fun failedAlreadyDispatchedBrokerProxyCannotUseIsAliveFalseAsProofOfNoHelperBirth() = runTest {
+        fixture().use { fixture ->
+            val proxy = ChrootBrokerProcess {}
+            assertTrue(proxy.tryDispatch())
+            proxy.fail(IOException("Descriptor reply failed after dispatch commitment"))
+            assertFalse(proxy.isAlive)
+            assertFalse(proxy.cancelled.get())
+            val factory = object : ChrootProcessFactory {
+                override fun captureHelper() = ChrootHelperIdentity("/trusted/helper", 1, 2, 3, "a".repeat(64))
+                override fun start(helper: ChrootHelperIdentity): Process = proxy
+            }
+            val manager = ChrootRuntimeManager(fixture.authority, factory, fixture.recovery, fixture.scope,
+                Dispatchers.IO, { fixture.control }, { System.nanoTime() / 1_000_000L })
+            val lease = manager.activateFromUser(owner, "profile", 1, instance, rootfs, fixture.root)!!
+            val permit = manager.authorize(lease, spec(), 1)!!
+            val handle = manager.launch(lease, permit, spec()) {}!!
+            assertEquals(ChrootCleanupResult.UNKNOWN, cleanupResult(handle))
+            assertEquals(ChrootTaskResult.Unknown, handle.awaitTaskExit())
+            assertFalse(proxy.tryDispatch())
+            assertTrue(manager.instanceState(instance).blocked)
+            assertEquals(setOf(spec().launchId), fixture.recovery.unknownLaunchIds(instance))
+            assertEquals(ChrootRecoveryPhase.UNKNOWN, fixture.recovery.snapshot().single().phase)
         }
     }
 
@@ -894,6 +1452,201 @@ class ChrootRuntimeManagerTest {
     }
 
     @Test
+    fun stopDeadlineRechecksCompleteEvidenceWhileTheLastCollectorIsPausedOutsideTheRootGate() = runTest {
+        val observation = ThreadLocal<String>()
+        val stdoutCollectorIdle = CompletableDeferred<Boolean>()
+        val wrapperCollectorIdle = CompletableDeferred<Unit>()
+        val stdoutHadCleanup = AtomicBoolean()
+        val lastCollectorPaused = CompletableDeferred<Unit>()
+        val lastCollectorReleased = CompletableDeferred<Unit>()
+        val releaseLastCollector = CountDownLatch(1)
+        val pausedOnce = AtomicBoolean()
+        val helperErrors = BytesPipe { observation.set("stderr-eof") }
+        fixture(
+            authorityDecorate = { coordinator ->
+                spyk(coordinator).also { decorated ->
+                    every { decorated.withLock(any<(RootAccessState) -> Any?>()) } answers {
+                        // Run the real gate and protocol mutation first. The pause below must
+                        // happen after its monitor is released so the real deadline can enter.
+                        val result = callOriginal()
+                        when (observation.get()) {
+                            "stdout-eof" -> if (result is Boolean) {
+                                stdoutHadCleanup.set(result)
+                                observation.set("stdout-finalizer")
+                            }
+                            "stdout-finalizer" -> if (result == null) {
+                                observation.remove()
+                                stdoutCollectorIdle.complete(stdoutHadCleanup.get())
+                            }
+                            "wrapper-exit" -> if (result === Unit) observation.set("wrapper-finalizer")
+                            "wrapper-finalizer" -> if (result == null) {
+                                observation.remove()
+                                wrapperCollectorIdle.complete(Unit)
+                            }
+                            "stderr-eof" -> if (result === Unit && pausedOnce.compareAndSet(false, true)) {
+                                observation.remove()
+                                lastCollectorPaused.complete(Unit)
+                                try {
+                                    check(releaseLastCollector.await(10L, TimeUnit.SECONDS)) {
+                                        "The final stderr EOF collector was not released"
+                                    }
+                                } finally {
+                                    lastCollectorReleased.complete(Unit)
+                                }
+                            }
+                        }
+                        result
+                    }
+                }
+            },
+            configure = { factory, _ ->
+                factory.process.helperErrorStream = helperErrors
+                factory.process.onStdoutEof = { observation.set("stdout-eof") }
+                factory.process.onWrapperExitValue = { observation.set("wrapper-exit") }
+            }
+        ).use { fixture ->
+            try {
+                val handle = fixture.start()
+                fixture.ready()
+                assertTrue(readyResult(handle))
+                handle.stop()
+                eventually { fixture.control.sent.contains(ChrootFrameType.STOP) }
+                fixture.factory.process.exit(0)
+                fixture.factory.process.frame(ChrootFrameType.CLEANUP, byteArrayOf(0))
+
+                // Publish CLEANUP, stdout EOF and the real zero wrapper status, and
+                // let both collectors finish their incomplete tryFinish attempts before
+                // releasing the final stderr EOF. No Execution fields are fabricated.
+                fixture.factory.process.stdout.close()
+                assertTrue(awaitSignal(stdoutCollectorIdle))
+                fixture.factory.process.alive.set(false)
+                awaitSignal(wrapperCollectorIdle)
+                assertEquals(ChrootTaskResult.Exited(ChrootProcessExit(0, null)), handle.awaitTaskExit())
+                helperErrors.close()
+                awaitSignal(lastCollectorPaused)
+                assertEquals(1L, releaseLastCollector.count)
+                assertFalse(lastCollectorReleased.isCompleted)
+                assertTrue(fixture.authority.withCurrent(fixture.root.authorityId, fixture.root.generation) { true } == true)
+
+                // The unchanged four-second deadline must recheck all published proof
+                // while the last normal tryFinish callback is still paused outside the gate.
+                assertEquals(ChrootCleanupResult.VERIFIED, cleanupResult(handle))
+                assertNull(handle.failure.value)
+                assertEquals(ChrootRecoveryPhase.CLOSED, fixture.recovery.snapshot().single().phase)
+                assertFalse(fixture.manager.instanceState(instance).blocked)
+                assertTrue(fixture.recovery.canStart(instance))
+                assertEquals(0, fixture.factory.process.destroys.get())
+            } finally {
+                releaseLastCollector.countDown()
+                if (lastCollectorPaused.isCompleted) awaitSignal(lastCollectorReleased)
+                observation.remove()
+            }
+        }
+    }
+
+    @Test
+    fun deadlineFreezesMissingWrapperExitAndNeverAcceptsLateProofAsRecovery() = runTest {
+        val wrapperThread = ThreadLocal<Boolean>()
+        val wrapperRead = CompletableDeferred<Unit>()
+        val wrapperPublished = CompletableDeferred<Unit>()
+        val releaseWrapper = CountDownLatch(1)
+        fixture(
+            authorityDecorate = { coordinator ->
+                spyk(coordinator).also { decorated ->
+                    every { decorated.withLock(any<(RootAccessState) -> Any?>()) } answers {
+                        val result = callOriginal()
+                        if (wrapperThread.get() == true && result === Unit) {
+                            wrapperThread.set(false)
+                        } else if (wrapperThread.get() == false && result == null) {
+                            wrapperThread.remove()
+                            wrapperPublished.complete(Unit)
+                        }
+                        result
+                    }
+                }
+            },
+            configure = { factory, _ ->
+                factory.process.onWrapperExitValue = {
+                    wrapperRead.complete(Unit)
+                    check(releaseWrapper.await(10L, TimeUnit.SECONDS))
+                    wrapperThread.set(true)
+                }
+            }
+        ).use { fixture ->
+            try {
+                val handle = fixture.start()
+                fixture.ready()
+                assertTrue(readyResult(handle))
+                fixture.factory.process.exit(0)
+                fixture.factory.process.frame(ChrootFrameType.CLEANUP, byteArrayOf(0))
+                fixture.factory.process.stdout.close()
+                fixture.factory.process.alive.set(false)
+                awaitSignal(wrapperRead)
+                assertEquals(ChrootCleanupResult.UNKNOWN, cleanupResult(handle))
+                eventually { fixture.diagnostics.latestUnknown(instance)?.completionEvidence != null }
+                val frozen = fixture.diagnostics.latestUnknown(instance)!!.completionEvidence!!
+                assertEquals(ChrootStopTrigger.TASK_EXIT, frozen.trigger)
+                assertEquals("HELPER_EXIT", frozen.pending())
+                assertEquals(127, frozen.flags)
+                assertTrue(fixture.manager.instanceState(instance).blocked)
+                releaseWrapper.countDown()
+                awaitSignal(wrapperPublished)
+                assertEquals(ChrootCleanupResult.UNKNOWN, handle.awaitCleanup())
+                assertFalse(fixture.recovery.canStart(instance))
+                eventually {
+                    val reloaded = ChrootRuntimeDiagnostics(fixture.diagnosticFile)
+                    reloaded.isHealthy && reloaded.latestUnknown(instance)?.completionEvidence == frozen
+                }
+                assertEquals(0, fixture.factory.process.destroys.get())
+            } finally {
+                releaseWrapper.countDown()
+                if (wrapperRead.isCompleted) awaitSignal(wrapperPublished)
+            }
+        }
+    }
+
+    @Test
+    fun deadlineRequiresStdoutEofEvenAfterCleanupAndZeroHelperExitStatus() = runTest {
+        val wrapperThread = ThreadLocal<Boolean>()
+        val wrapperPublished = CompletableDeferred<Unit>()
+        fixture(
+            authorityDecorate = { coordinator ->
+                spyk(coordinator).also { decorated ->
+                    every { decorated.withLock(any<(RootAccessState) -> Any?>()) } answers {
+                        val result = callOriginal()
+                        if (wrapperThread.get() == true && result === Unit) {
+                            wrapperThread.set(false)
+                        } else if (wrapperThread.get() == false && result == null) {
+                            wrapperThread.remove()
+                            wrapperPublished.complete(Unit)
+                        }
+                        result
+                    }
+                }
+            },
+            configure = { factory, _ -> factory.process.onWrapperExitValue = { wrapperThread.set(true) } }
+        ).use { fixture ->
+            val handle = fixture.start()
+            fixture.ready()
+            assertTrue(readyResult(handle))
+            fixture.factory.process.exit(0)
+            fixture.factory.process.frame(ChrootFrameType.CLEANUP, byteArrayOf(0))
+            assertEquals(ChrootTaskResult.Exited(ChrootProcessExit(0, null)), handle.awaitTaskExit())
+            fixture.factory.process.alive.set(false)
+            awaitSignal(wrapperPublished)
+            assertEquals(ChrootCleanupResult.UNKNOWN, cleanupResult(handle))
+            eventually { fixture.diagnostics.latestUnknown(instance)?.completionEvidence != null }
+            val frozen = fixture.diagnostics.latestUnknown(instance)!!.completionEvidence!!
+            assertEquals("STDOUT_EOF", frozen.pending())
+            assertEquals(ChrootCompletionEvidence.ALL_FLAGS xor ChrootCompletionEvidence.STDOUT_ENDED, frozen.flags)
+            assertEquals(ChrootCleanupResult.UNKNOWN, handle.cleanupState.value)
+            assertEquals(ChrootRuntimeFailureStage.STOP_DEADLINE, handle.failure.value?.stage)
+            assertFalse(fixture.recovery.canStart(instance))
+            assertEquals(0, fixture.factory.process.destroys.get())
+        }
+    }
+
+    @Test
     fun stopWithoutNativeCleanupEvidenceTimesOutUnknownAndNeverKillsTheWrapper() = runTest {
         fixture().use { fixture ->
             val handle = fixture.start()
@@ -946,8 +1699,13 @@ class ChrootRuntimeManagerTest {
 
     @Test
     fun intentJournalFailureIsDistinguishedWithoutStartingAHelper() = runTest {
-        val parent = temporary.newFile()
+        val parent = temporary.newFolder()
         fixture(File(parent, "journal.bin")).use { fixture ->
+            assertTrue(fixture.recovery.isHealthy.value)
+            // Introduce the I/O failure after loading a healthy repository, so the failure
+            // occurs while recording intent rather than during the initial parent validation.
+            assertTrue(parent.delete())
+            parent.writeText("block journal creation")
             val handle = fixture.pendingLaunch()
             val failure = awaitFailure(handle)
             assertEquals(ChrootRuntimeFailureKind.STARTUP, failure.kind)
@@ -977,6 +1735,69 @@ class ChrootRuntimeManagerTest {
     }
 
     @Test
+    fun diagnosticDiskFailureDoesNotDelayUnknownStopOrHoldTheRootGate() = runTest {
+        fixture().use { fixture ->
+            val writeEntered = CountDownLatch(1)
+            val releaseWrite = CountDownLatch(1)
+            val file = File(temporary.newFolder(), "failures.bin")
+            val diagnostics = ChrootRuntimeDiagnostics(file) {
+                writeEntered.countDown()
+                check(releaseWrite.await(5, TimeUnit.SECONDS))
+                throw IOException("private disk failure")
+            }
+            val manager = ChrootRuntimeManager(fixture.authority, fixture.factory, fixture.recovery, fixture.scope,
+                Dispatchers.IO, { fixture.control }, { System.nanoTime() / 1_000_000L }, diagnostics)
+            val lease = manager.allowBinding(owner, "profile", 1, instance, rootfs, fixture.root)!!
+            val permit = manager.authorize(lease, spec(), 1)!!
+            val handle = manager.launch(lease, permit, spec()) {}!!
+            awaitSignal(fixture.control.awaiting)
+            try {
+                fixture.factory.process.frame(ChrootFrameType.ERROR,
+                    "code=prepare_failed;stage=file_worker_resource;errno=13".toByteArray())
+                assertTrue(withContext(Dispatchers.IO) { writeEntered.await(5, TimeUnit.SECONDS) })
+                assertEquals(ChrootCleanupResult.UNKNOWN, cleanupResult(handle))
+                assertTrue(fixture.authority.withCurrent(fixture.root.authorityId, fixture.root.generation) { true } == true)
+                assertTrue(manager.instanceState(instance).blocked)
+                assertFalse(fixture.control.sent.contains(ChrootFrameType.GO))
+                assertNull(manager.allowBinding(owner, "profile", 1, instance, rootfs, fixture.root))
+            } finally {
+                releaseWrite.countDown()
+            }
+            eventually { !diagnostics.isHealthy }
+            eventually { manager.failureSummary(instance)?.contains("diagnosticPersistence=UNAVAILABLE") == true }
+            assertEquals(ChrootCleanupResult.UNKNOWN, fixture.recovery.snapshot().single().cleanup)
+        }
+    }
+
+    @Test
+    fun cleanupJournalWriteFailurePreservesTheUnknownEntryAndDiagnostic() = runTest {
+        val journal = File(temporary.newFolder(), "runtime.bin")
+        fixture(journal).use { fixture ->
+            val handle = fixture.start()
+            fixture.ready()
+            assertTrue(readyResult(handle))
+            eventually { fixture.recovery.snapshot().single().phase == ChrootRecoveryPhase.RUNNING }
+            File(journal.path + ".pending").writeBytes(byteArrayOf(1))
+            fixture.factory.process.exit(0)
+            fixture.factory.process.frame(ChrootFrameType.CLEANUP, byteArrayOf(0))
+            fixture.factory.process.finish()
+
+            assertEquals(ChrootCleanupResult.UNKNOWN, cleanupResult(handle))
+            assertFalse(fixture.recovery.isHealthy.value)
+            assertEquals(setOf(spec().launchId), fixture.recovery.unknownLaunchIds(instance))
+            assertEquals(ChrootRecoveryPhase.UNKNOWN, fixture.recovery.snapshot().single().phase)
+            assertEquals(ChrootCleanupResult.UNKNOWN, fixture.recovery.snapshot().single().cleanup)
+            assertEquals(ChrootRuntimeFailureStage.CLEANUP_JOURNAL, handle.failure.value!!.stage)
+            eventually {
+                fixture.manager.failureSummary(instance)?.contains("failure=CLEANUP/CLEANUP_JOURNAL") == true
+            }
+            assertTrue(fixture.manager.instanceState(instance).blocked)
+            assertFalse(fixture.recovery.canStart(instance))
+            assertEquals(0, fixture.factory.process.destroys.get())
+        }
+    }
+
+    @Test
     fun nativeErrorFrameIsRecordedBeforeExistingFailClosedCleanup() = runTest {
         fixture().use { fixture ->
             val handle = fixture.start()
@@ -994,6 +1815,13 @@ class ChrootRuntimeManagerTest {
             assertFalse(fixture.recovery.canStart(instance))
             assertEquals(failure, handle.failure.value)
             assertFalse(fixture.control.sent.contains(ChrootFrameType.GO))
+            eventually { fixture.diagnostics.latestUnknown(instance)?.nativeFailure == failure }
+            eventually {
+                ChrootRuntimeDiagnostics(fixture.diagnosticFile).latestUnknown(instance)?.nativeFailure == failure
+            }
+            val restored = ChrootRuntimeDiagnostics(fixture.diagnosticFile).latestUnknown(instance)!!
+            assertEquals(failure, restored.failure)
+            assertTrue(fixture.manager.failureSummary(instance)!!.contains("prepare_failed/file_worker_resource;errno=13"))
         }
     }
 
@@ -1084,6 +1912,11 @@ class ChrootRuntimeManagerTest {
             assertEquals(ChrootRuntimeFailure.nativeError(body.toByteArray()), native)
             assertEquals(ChrootCleanupResult.UNKNOWN, cleanupResult(handle))
             assertEquals(first, handle.failure.value)
+            eventually {
+                ChrootRuntimeDiagnostics(fixture.diagnosticFile).latestUnknown(instance)?.let {
+                    it.failure == first && it.nativeFailure == native
+                } == true
+            }
             assertEquals(1, stderr.firstReads.get())
             assertEquals(1, stderr.snapshots.get())
             assertEquals(1, stderr.bulkReads.get())
