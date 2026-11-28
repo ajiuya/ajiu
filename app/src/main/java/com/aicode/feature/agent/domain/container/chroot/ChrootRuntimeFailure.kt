@@ -20,11 +20,13 @@ internal data class ChrootRuntimeFailure private constructor(
     val stage: ChrootRuntimeFailureStage,
     val nativeCode: String? = null,
     val nativeStage: String? = null,
-    val errno: Int? = null
+    val errno: Int? = null,
+    val journalFailure: ChrootJournalFailure? = null
 ) {
     val nativeFailureObserved: Boolean get() = nativeCode != null && nativeStage != null && errno != null
 
     init {
+        require(journalFailure?.errno == null || journalFailure.errno in 1..4095)
         if (kind == ChrootRuntimeFailureKind.NATIVE_ERROR) {
             require(stage == ChrootRuntimeFailureStage.NATIVE_ERROR && nativeCode in nativeCodes &&
                 nativeStage in nativeStages && errno != null && errno in 1..4095)
@@ -34,9 +36,16 @@ internal data class ChrootRuntimeFailure private constructor(
     }
 
     companion object {
-        fun local(kind: ChrootRuntimeFailureKind, stage: ChrootRuntimeFailureStage): ChrootRuntimeFailure {
+        fun local(
+            kind: ChrootRuntimeFailureKind,
+            stage: ChrootRuntimeFailureStage,
+            journal: ChrootJournalException? = null
+        ): ChrootRuntimeFailure {
             require(kind != ChrootRuntimeFailureKind.NATIVE_ERROR)
-            return ChrootRuntimeFailure(kind, stage)
+            val journalFailure = journal?.let { failure ->
+                ChrootJournalFailure(failure.reason, failure.systemErrno?.takeIf { it in 1..4095 })
+            }
+            return ChrootRuntimeFailure(kind, stage, journalFailure = journalFailure)
         }
 
         fun nativeError(body: ByteArray): ChrootRuntimeFailure {

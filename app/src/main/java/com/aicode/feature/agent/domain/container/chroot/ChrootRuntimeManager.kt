@@ -16,6 +16,7 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withContext
 import java.io.IOException
 import java.net.ProtocolException
 import java.security.MessageDigest
@@ -72,6 +73,7 @@ internal class ChrootRuntimeManager internal constructor(
         @Volatile var go = false
         @Volatile var finished = false
         @Volatile var startupStage = ChrootRuntimeFailureStage.HELPER_CAPTURE
+        @Volatile var journalFailure: ChrootJournalFailure? = null
         var intentReserved = false
         var journaled = false
         var birthAttempted = false
@@ -221,11 +223,12 @@ internal class ChrootRuntimeManager internal constructor(
 
     suspend fun authorize(leaseId: String, launch: ChrootLaunch, profileRevision: Long): String? {
         authority.accessSnapshot()
+        // Disk lookups must not delay Root revocation while the authority gate is held.
+        if (!recovery.isHealthy.value || withContext(Dispatchers.IO) { recovery.containsLaunchId(launch.launchId) }) return null
         return authority.withLock { current ->
             val lease = leases[leaseId] ?: return@withLock null
             if (!validLeaseLocked(lease, current) || !matches(lease, launch, profileRevision) ||
-                !availableLocked() || launch.launchId in active ||
-                launch.launchId in recovery.recordedLaunchIds.value) return@withLock null
+                !availableLocked() || launch.launchId in active) return@withLock null
             UUID.randomUUID().toString().also { permits[it] = Permit(lease, launch.digest, profileRevision) }
         }
     }
@@ -237,12 +240,13 @@ internal class ChrootRuntimeManager internal constructor(
         checkSource: () -> Unit
     ): ChrootLaunchHandle? {
         authority.accessSnapshot()
+        if (!recovery.isHealthy.value || withContext(Dispatchers.IO) { recovery.containsLaunchId(spec.launchId) }) return null
         val execution = authority.withLock { current ->
             val permit = permits.remove(permitId) ?: return@withLock null
             val lease = leases[leaseId] ?: return@withLock null
             if (permit.lease != lease || permit.digest != spec.digest || !validLeaseLocked(lease, current) ||
                 !matches(lease, spec, permit.revision) || !availableLocked() ||
-                spec.launchId in active || spec.launchId in recovery.recordedLaunchIds.value ||
+                spec.launchId in active ||
                 !sourceValid(checkSource)) return@withLock null
             Execution(lease, spec, checkSource).also { execution ->
                 execution.handle = ChrootLaunchHandle(
@@ -428,14 +432,14 @@ internal class ChrootRuntimeManager internal constructor(
         } catch (_: CancellationException) {
             recordFailure(execution, ChrootRuntimeFailureKind.CANCELLED, execution.startupStage)
             if (execution.process == null) finishUnstarted(execution) else failChannel(execution)
-        } catch (_: Exception) {
+        } catch (failure: Exception) {
             val kind = if (execution.startupStage in setOf(ChrootRuntimeFailureStage.LAUNCH_WRITE,
                     ChrootRuntimeFailureStage.CONTROL_HANDSHAKE, ChrootRuntimeFailureStage.GO)) {
                 ChrootRuntimeFailureKind.TRANSPORT
             } else {
                 ChrootRuntimeFailureKind.STARTUP
             }
-            recordFailure(execution, kind, execution.startupStage)
+            recordFailure(execution, ChrootRuntimeFailure.local(kind, execution.startupStage, failure as? ChrootJournalException))
             if (execution.process == null) finishUnstarted(execution) else failChannel(execution)
         }
     }
@@ -716,7 +720,15 @@ internal class ChrootRuntimeManager internal constructor(
         recordFailure(execution, ChrootRuntimeFailure.local(kind, stage))
 
     private fun recordFailure(execution: Execution, failure: ChrootRuntimeFailure) {
-        if (execution.handle.recordFailure(failure)) reportDiagnostic(execution)
+        val journalObserved = failure.journalFailure?.let { journal ->
+            synchronized(execution) {
+                if (execution.journalFailure == null) {
+                    execution.journalFailure = journal
+                    true
+                } else false
+            }
+        } == true
+        if (execution.handle.recordFailure(failure) || journalObserved) reportDiagnostic(execution)
     }
 
     private fun recordNativeFailure(execution: Execution, failure: ChrootRuntimeFailure) {
@@ -725,7 +737,9 @@ internal class ChrootRuntimeManager internal constructor(
 
     private fun reportDiagnostic(execution: Execution, cleanup: ChrootCleanupResult? = null) {
         val store = diagnostics ?: return
-        val failure = execution.handle.failure.value
+        val failure = execution.handle.failure.value?.let {
+            if (it.journalFailure == null) it.copy(journalFailure = execution.journalFailure) else it
+        }
         val nativeFailure = execution.handle.nativeFailure.value
         val cleanupEvidence = cleanup ?: execution.handle.cleanupState.value
         val completionEvidence = execution.completionEvidence
@@ -783,8 +797,9 @@ internal class ChrootRuntimeManager internal constructor(
             var result = proposed
             try {
                 if (execution.journaled) recovery.recordCleanup(execution.spec.launchId, result)
-            } catch (_: Exception) {
-                recordFailure(execution, ChrootRuntimeFailureKind.CLEANUP, ChrootRuntimeFailureStage.CLEANUP_JOURNAL)
+            } catch (failure: Exception) {
+                recordFailure(execution, ChrootRuntimeFailure.local(ChrootRuntimeFailureKind.CLEANUP,
+                    ChrootRuntimeFailureStage.CLEANUP_JOURNAL, failure as? ChrootJournalException))
                 result = ChrootCleanupResult.UNKNOWN
             }
             authority.withLock {

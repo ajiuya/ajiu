@@ -61,7 +61,10 @@ internal data class ChrootRuntimeDiagnostic(
 ) {
     fun summary(): String = buildString {
         append("launch=").append(launchId)
-        failure?.let { append(";failure=").append(it.kind.name).append('/').append(it.stage.name) }
+        failure?.let {
+            append(";failure=").append(it.kind.name).append('/').append(it.stage.name)
+            it.journalFailure?.let { journal -> append(';').append(journal.summary()) }
+        }
         nativeFailure?.let {
             append(";native=").append(it.nativeCode).append('/').append(it.nativeStage)
             append(";errno=").append(it.errno)
@@ -139,8 +142,11 @@ internal class ChrootRuntimeDiagnostics internal constructor(
         if (previous == null && failure == null && nativeFailure == null && cleanup != ChrootCleanupResult.UNKNOWN) {
             return@synchronized
         }
+        val firstFailure = previous?.failure?.let {
+            if (it.journalFailure == null && failure?.journalFailure != null) it.copy(journalFailure = failure.journalFailure) else it
+        } ?: failure
         val next = ChrootRuntimeDiagnostic(
-            instanceId, launchId, previous?.failure ?: failure, previous?.nativeFailure ?: nativeFailure,
+            instanceId, launchId, firstFailure, previous?.nativeFailure ?: nativeFailure,
             if (previous?.cleanup == ChrootCleanupResult.UNKNOWN) ChrootCleanupResult.UNKNOWN else cleanup ?: previous?.cleanup,
             previous?.completionEvidence ?: completionEvidence
         )
@@ -177,8 +183,8 @@ internal class ChrootRuntimeDiagnostics internal constructor(
             repeat(count) {
                 val instanceId = input.readUTF()
                 val launchId = input.readUTF()
-                val failure = input.readFailure()
-                val nativeFailure = input.readFailure()
+                val failure = input.readFailure(version)
+                val nativeFailure = input.readFailure(version)
                 val cleanup = input.readUTF().let { if (it.isEmpty()) null else ChrootCleanupResult.valueOf(it) }
                 val evidence = if (version >= 2 && input.readBoolean()) {
                     ChrootCompletionEvidence(ChrootStopTrigger.valueOf(input.readUTF()), input.readInt())
@@ -233,24 +239,34 @@ internal class ChrootRuntimeDiagnostics internal constructor(
         if (failure.nativeFailureObserved) {
             writeUTF("code=${failure.nativeCode};stage=${failure.nativeStage};errno=${failure.errno}")
         }
+        writeBoolean(failure.journalFailure != null)
+        failure.journalFailure?.let { journal ->
+            writeUTF(journal.reason.name)
+            writeBoolean(journal.errno != null)
+            journal.errno?.let { writeInt(it) }
+        }
     }
 
-    private fun DataInputStream.readFailure(): ChrootRuntimeFailure? {
+    private fun DataInputStream.readFailure(version: Int): ChrootRuntimeFailure? {
         if (!readBoolean()) return null
         val kind = ChrootRuntimeFailureKind.valueOf(readUTF())
         val stage = ChrootRuntimeFailureStage.valueOf(readUTF())
-        return if (kind == ChrootRuntimeFailureKind.NATIVE_ERROR) {
+        val failure = if (kind == ChrootRuntimeFailureKind.NATIVE_ERROR) {
             val parsed = ChrootRuntimeFailure.nativeError(readUTF().toByteArray(Charsets.UTF_8))
             if (!parsed.nativeFailureObserved || parsed.stage != stage) throw IOException("Invalid native diagnostic")
             parsed
         } else ChrootRuntimeFailure.local(kind, stage)
+        val journalFailure = if (version >= 3 && readBoolean()) {
+            ChrootJournalFailure(ChrootJournalFailureReason.valueOf(readUTF()), if (readBoolean()) readInt() else null)
+        } else null
+        return failure.copy(journalFailure = journalFailure)
     }
 
     internal companion object {
         const val MAX_ENTRIES = 64
         private const val MAX_FILE_BYTES = 65_536L
         private const val MAGIC = 0x414a4446
-        private const val VERSION = 2
+        private const val VERSION = 3
         private val NONCE = Regex("[0-9a-f]{24}")
     }
 }

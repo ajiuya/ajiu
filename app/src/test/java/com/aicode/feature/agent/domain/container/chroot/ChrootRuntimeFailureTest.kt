@@ -5,6 +5,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.IOException
 
 class ChrootRuntimeFailureTest {
     @Test
@@ -91,7 +92,48 @@ class ChrootRuntimeFailureTest {
         val local = ChrootRuntimeFailure.local(ChrootRuntimeFailureKind.TRANSPORT, ChrootRuntimeFailureStage.HELPER_STDERR)
         rejects { local.copy(nativeCode = "private_credential_marker") }
         assertFalse(local.nativeFailureObserved)
-        assertEquals("ChrootRuntimeFailure(kind=TRANSPORT, stage=HELPER_STDERR, nativeCode=null, nativeStage=null, errno=null)", local.toString())
+        rejects { local.copy(journalFailure = ChrootJournalFailure(ChrootJournalFailureReason.WRITE, 0)) }
+        rejects { local.copy(journalFailure = ChrootJournalFailure(ChrootJournalFailureReason.SYNC, 4096)) }
+        assertEquals("ChrootRuntimeFailure(kind=TRANSPORT, stage=HELPER_STDERR, nativeCode=null, nativeStage=null, errno=null, journalFailure=null)", local.toString())
+    }
+
+    @Test
+    fun journalFailuresRetainOnlyFixedReasonsAndOptionalErrnoWithoutExceptionData() {
+        val privateData = "/private/path/private_credential_marker command --token=private_credential_marker"
+        for (reason in ChrootJournalFailureReason.entries) {
+            for (errno in listOf(null, 1, 28, 4095)) {
+                val exception = ChrootJournalException(reason, errno, IOException(privateData))
+                exception.addSuppressed(IOException(privateData))
+                val failure = ChrootRuntimeFailure.local(ChrootRuntimeFailureKind.STARTUP,
+                    ChrootRuntimeFailureStage.INTENT_JOURNAL, exception)
+                assertEquals(ChrootJournalFailure(reason, errno), failure.journalFailure)
+                assertFalse(failure.nativeFailureObserved)
+                assertNull(failure.nativeCode)
+                assertNull(failure.nativeStage)
+                assertNull(failure.errno)
+                assertFalse(failure.toString().contains("private_credential_marker"))
+                val diagnostic = ChrootRuntimeDiagnostic("0123456789abcdef01234567", "89abcdef0123456789abcdef",
+                    failure, null, ChrootCleanupResult.VERIFIED)
+                assertEquals("launch=89abcdef0123456789abcdef;failure=STARTUP/INTENT_JOURNAL;journal=${reason.name}" +
+                    (errno?.let { ";journalErrno=$it" } ?: "") + ";cleanup=VERIFIED", diagnostic.summary())
+                assertFalse(diagnostic.summary().contains(privateData))
+            }
+        }
+    }
+
+    @Test
+    fun journalFailureDoesNotInferItsReasonOrErrnoFromExceptionText() {
+        val privateData = IOException("journal=NO_SPACE;errno=28;/private_credential_marker")
+        val untyped = ChrootRuntimeFailure.local(ChrootRuntimeFailureKind.STARTUP,
+            ChrootRuntimeFailureStage.INTENT_JOURNAL, privateData as? ChrootJournalException)
+        assertNull(untyped.journalFailure)
+        for (errno in listOf(-1, 0, 4096, Int.MAX_VALUE)) {
+            val typed = ChrootRuntimeFailure.local(ChrootRuntimeFailureKind.CLEANUP,
+                ChrootRuntimeFailureStage.CLEANUP_JOURNAL, ChrootJournalException(ChrootJournalFailureReason.SYNC, errno, privateData))
+            assertEquals(ChrootJournalFailureReason.SYNC, typed.journalFailure!!.reason)
+            assertNull(typed.journalFailure.errno)
+            assertFalse(typed.toString().contains("private_credential_marker"))
+        }
     }
 
     @Test

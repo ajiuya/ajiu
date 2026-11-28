@@ -5,6 +5,7 @@ import com.aicode.feature.agent.domain.root.RootAuthorityCoordinator
 import com.aicode.feature.agent.domain.root.RootMemoryDataStore
 import com.aicode.feature.settings.data.repository.RootAccessSettingsRepository
 import com.aicode.testing.ChrootVerificationForeground
+import io.mockk.coEvery
 import io.mockk.every
 import io.mockk.spyk
 import kotlinx.coroutines.CancellationException
@@ -39,6 +40,11 @@ import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
+import org.robolectric.annotation.ConscryptMode
+import org.robolectric.annotation.SQLiteMode
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -57,6 +63,10 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.CoroutineContext
 import kotlin.coroutines.resume
 
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [28], application = android.app.Application::class, manifest = Config.NONE)
+@ConscryptMode(ConscryptMode.Mode.OFF)
+@SQLiteMode(SQLiteMode.Mode.NATIVE)
 @OptIn(ExperimentalCoroutinesApi::class)
 class ChrootRuntimeManagerTest {
     @get:Rule val temporary = TemporaryFolder()
@@ -1174,7 +1184,7 @@ class ChrootRuntimeManagerTest {
                 assertFalse(readyResult(handle))
                 assertEquals(ChrootTaskResult.Unknown, handle.awaitTaskExit())
                 assertTrue(fixture.recovery.snapshot().isEmpty())
-                assertTrue(fixture.recovery.recordedLaunchIds.value.isEmpty())
+                assertTrue(fixture.recovery.recordedLaunchIds().isEmpty())
                 assertEquals(0, listenerCalls.get())
                 assertEquals(0, fixture.factory.starts.get())
                 assertEquals(0, manager.instanceState(instance).activeLaunches)
@@ -1186,7 +1196,7 @@ class ChrootRuntimeManagerTest {
                 assertEquals(ChrootCleanupResult.VERIFIED, handle.cleanupState.value)
                 assertNull(handle.failure.value)
                 assertTrue(fixture.recovery.snapshot().isEmpty())
-                assertTrue(fixture.recovery.recordedLaunchIds.value.isEmpty())
+                assertTrue(fixture.recovery.recordedLaunchIds().isEmpty())
                 assertEquals(0, listenerCalls.get())
                 assertEquals(0, fixture.factory.starts.get())
                 assertTrue(fixture.control.sent.isEmpty())
@@ -2143,10 +2153,12 @@ class ChrootRuntimeManagerTest {
         val parent = temporary.newFolder()
         fixture(File(parent, "journal.bin")).use { fixture ->
             assertTrue(fixture.recovery.isHealthy.value)
-            // Introduce the I/O failure after loading a healthy repository, so the failure
-            // occurs while recording intent rather than during the initial parent validation.
-            assertTrue(parent.delete())
-            parent.writeText("block journal creation")
+            // Historical ID lookups now happen before the helper capture. Break storage at
+            // capture so authorization succeeds and the real I/O failure still hits INTENT.
+            fixture.factory.onCapture = {
+                assertTrue(parent.delete())
+                parent.writeText("block journal creation")
+            }
             val handle = fixture.pendingLaunch()
             val failure = awaitFailure(handle)
             assertEquals(ChrootRuntimeFailureKind.STARTUP, failure.kind)
@@ -2161,8 +2173,92 @@ class ChrootRuntimeManagerTest {
     }
 
     @Test
+    fun typedIntentJournalFailuresRetainSafeReasonAndErrnoWithoutStartingAHelper() = runTest {
+        for (reason in ChrootJournalFailureReason.entries) {
+            fixture().use { fixture ->
+                val recovery = spyk(fixture.recovery)
+                coEvery { recovery.recordIntent(any(), any(), any(), any(), any()) } throws
+                    ChrootJournalException(reason, 28, IOException("/private/path/private_credential_marker --token=private_credential_marker"))
+                val manager = ChrootRuntimeManager(fixture.authority, fixture.factory, recovery, fixture.scope,
+                    Dispatchers.IO, { fixture.control }, { System.nanoTime() / 1_000_000L }, fixture.diagnostics, cleanupTimeoutMs = 4_000L)
+                val lease = checkNotNull(manager.allowBinding(owner, "profile", 1L, instance, rootfs, fixture.root))
+                val permit = checkNotNull(manager.authorize(lease, spec(), 1L))
+                val handle = checkNotNull(manager.launch(lease, permit, spec()) {})
+                val failure = awaitFailure(handle)
+                assertEquals(ChrootRuntimeFailureKind.STARTUP, failure.kind)
+                assertEquals(ChrootRuntimeFailureStage.INTENT_JOURNAL, failure.stage)
+                assertEquals(ChrootJournalFailure(reason, 28), failure.journalFailure)
+                assertFalse(failure.toString().contains("private_credential_marker"))
+                assertEquals(ChrootCleanupResult.VERIFIED, cleanupResult(handle))
+                assertEquals(0, fixture.factory.starts.get())
+                assertEquals(0, fixture.factory.process.destroys.get())
+                assertFalse(fixture.control.sent.contains(ChrootFrameType.GO))
+                eventually { fixture.diagnostics.latestForLaunches(instance, setOf(spec().launchId))?.cleanup == ChrootCleanupResult.VERIFIED }
+                val diagnostic = fixture.diagnostics.latestForLaunches(instance, setOf(spec().launchId))!!
+                assertEquals(failure, diagnostic.failure)
+                assertTrue(diagnostic.summary().contains("failure=STARTUP/INTENT_JOURNAL;journal=${reason.name};journalErrno=28"))
+                assertFalse(diagnostic.summary().contains("private_credential_marker"))
+                eventually {
+                    ChrootRuntimeDiagnostics(fixture.diagnosticFile).latestForLaunches(instance, setOf(spec().launchId))?.failure == failure
+                }
+                assertFalse(String(fixture.diagnosticFile.readBytes(), Charsets.ISO_8859_1).contains("private_credential_marker"))
+            }
+        }
+    }
+
+    @Test
+    fun typedCleanupJournalFailureRetainsSafeEvidenceWithoutReplacingFirstFailureOrUnknown() = runTest {
+        for (earlierNativeFailure in listOf(false, true)) {
+            fixture().use { fixture ->
+                val recovery = spyk(fixture.recovery)
+                coEvery { recovery.recordCleanup(any(), any()) } throws ChrootJournalException(ChrootJournalFailureReason.NO_SPACE,
+                    28, IOException("/private/path/private_credential_marker --token=private_credential_marker"))
+                val manager = ChrootRuntimeManager(fixture.authority, fixture.factory, recovery, fixture.scope,
+                    Dispatchers.IO, { fixture.control }, { System.nanoTime() / 1_000_000L }, fixture.diagnostics, cleanupTimeoutMs = 4_000L)
+                val lease = checkNotNull(manager.allowBinding(owner, "profile", 1L, instance, rootfs, fixture.root))
+                val permit = checkNotNull(manager.authorize(lease, spec(), 1L))
+                val handle = checkNotNull(manager.launch(lease, permit, spec()) {})
+                awaitSignal(fixture.control.awaiting)
+                fixture.ready()
+                assertTrue(readyResult(handle))
+                eventually { recovery.snapshot().single().phase == ChrootRecoveryPhase.RUNNING }
+                val nativeBody = "code=runtime_failed;stage=supervision;errno=5".toByteArray()
+                if (earlierNativeFailure) fixture.factory.process.frame(ChrootFrameType.ERROR, nativeBody)
+                else {
+                    fixture.factory.process.exit(0)
+                    fixture.factory.process.frame(ChrootFrameType.CLEANUP, byteArrayOf(0))
+                    fixture.factory.process.finish()
+                }
+                assertEquals(ChrootCleanupResult.UNKNOWN, cleanupResult(handle))
+                val failure = handle.failure.value!!
+                if (earlierNativeFailure) assertEquals(ChrootRuntimeFailure.nativeError(nativeBody), failure)
+                else {
+                    assertEquals(ChrootRuntimeFailureKind.CLEANUP, failure.kind)
+                    assertEquals(ChrootRuntimeFailureStage.CLEANUP_JOURNAL, failure.stage)
+                    assertEquals(ChrootJournalFailure(ChrootJournalFailureReason.NO_SPACE, 28), failure.journalFailure)
+                }
+                assertTrue(manager.hasUnverifiedCleanup(instance))
+                assertEquals(0, fixture.factory.process.destroys.get())
+                eventually { fixture.diagnostics.latestUnknown(instance)?.failure?.journalFailure?.reason == ChrootJournalFailureReason.NO_SPACE }
+                val diagnostic = fixture.diagnostics.latestUnknown(instance)!!
+                assertEquals(failure.copy(journalFailure = ChrootJournalFailure(ChrootJournalFailureReason.NO_SPACE, 28)), diagnostic.failure)
+                assertEquals(if (earlierNativeFailure) ChrootRuntimeFailure.nativeError(nativeBody) else null, diagnostic.nativeFailure)
+                assertTrue(diagnostic.summary().contains(";journal=NO_SPACE;journalErrno=28"))
+                assertFalse(diagnostic.summary().contains("private_credential_marker"))
+                eventually {
+                    ChrootRuntimeDiagnostics(fixture.diagnosticFile).latestUnknown(instance)?.failure == diagnostic.failure
+                }
+                assertFalse(String(fixture.diagnosticFile.readBytes(), Charsets.ISO_8859_1).contains("private_credential_marker"))
+            }
+        }
+    }
+
+    @Test
     fun failedGoUsesFixedDiagnosticsAndPreservesStopOnlyUnknownCleanup() = runTest {
-        fixture().use { fixture ->
+        fixture().use { original ->
+            val dispatcher = CleanupClockDispatcher()
+            val fixture = original.copy(manager = ChrootRuntimeManager(original.authority, original.factory, original.recovery,
+                original.scope, dispatcher, { original.control }, { dispatcher.now }, original.diagnostics, cleanupTimeoutMs = 4_000L))
             val handle = fixture.start()
             awaitSignal(fixture.control.awaiting)
             fixture.control.reject = true
@@ -2171,6 +2267,10 @@ class ChrootRuntimeManagerTest {
             val failure = awaitFailure(handle)
             assertEquals(ChrootRuntimeFailureStage.GO, failure.stage)
             assertFalse(fixture.control.sent.contains(ChrootFrameType.GO))
+            val budget = awaitSignal(dispatcher.cleanupScheduled)
+            dispatcher.advanceBy(budget - 1L)
+            assertNull(handle.cleanupState.value)
+            dispatcher.advanceBy(1L)
             assertFalse(readyResult(handle))
             assertEquals(ChrootCleanupResult.UNKNOWN, cleanupResult(handle))
             assertEquals(failure, handle.failure.value)
@@ -2565,7 +2665,7 @@ class ChrootRuntimeManagerTest {
                 assertEquals(ChrootRecoveryPhase.CLOSED, closed.phase)
                 assertEquals(ChrootCleanupResult.VERIFIED, closed.cleanup)
                 assertEquals(setOf(oldSpec.launchId), fixture.recovery.unknownLaunchIds(instance))
-                assertEquals(setOf(oldSpec.launchId, nextSpec.launchId), fixture.recovery.recordedLaunchIds.value)
+                assertEquals(setOf(oldSpec.launchId, nextSpec.launchId), fixture.recovery.recordedLaunchIds())
                 assertEquals(setOf(instance), fixture.manager.blockedInstances.value)
                 assertFalse(fixture.manager.instanceState(instance).blocked)
                 assertTrue(fixture.manager.hasUnverifiedCleanup(instance))

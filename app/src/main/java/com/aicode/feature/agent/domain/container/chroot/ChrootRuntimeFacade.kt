@@ -807,7 +807,8 @@ internal class ChrootRuntimeFacade internal constructor(
     private fun ensureAvailable(instance: ChrootInstance, allowBusy: Boolean = false) {
         if (journalRepairBusy.get()) throw IOException("CHROOT runtime records are being repaired")
         if (!recovery.isHealthy.value) {
-            throw IOException("CHROOT runtime journal is incomplete; open Containers & Images to repair runtime records or remove the affected instance")
+            val detail = recovery.lastFailure.value?.summary()?.let { " ($it)" }.orEmpty()
+            throw IOException("CHROOT runtime journal is incomplete; open Containers & Images to repair runtime records or remove the affected instance$detail")
         }
         if (!installer.isHealthy.value) {
             throw IOException("CHROOT installation records are incomplete; open Containers & Images to inspect the instance")

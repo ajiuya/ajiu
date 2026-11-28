@@ -7,6 +7,11 @@ import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
+import org.robolectric.annotation.ConscryptMode
+import org.robolectric.annotation.SQLiteMode
 import java.io.File
 import java.io.DataOutputStream
 import java.io.IOException
@@ -15,6 +20,10 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [28], application = android.app.Application::class, manifest = Config.NONE)
+@ConscryptMode(ConscryptMode.Mode.OFF)
+@SQLiteMode(SQLiteMode.Mode.NATIVE)
 class ChrootRuntimeDiagnosticsTest {
     @get:Rule val temporary = TemporaryFolder()
     private val instance = "0123456789abcdef01234567"
@@ -55,6 +64,7 @@ class ChrootRuntimeDiagnosticsTest {
         assertTrue(legacyBytes.contentEquals(file.readBytes()))
         val original = store.latestUnknown(instance)!!
         assertEquals(ChrootRuntimeFailureStage.STOP_DEADLINE, original.failure!!.stage)
+        assertNull(original.failure.journalFailure)
         assertNull(original.completionEvidence)
         assertEquals("launch=$launch;failure=TIMEOUT/STOP_DEADLINE;cleanup=UNKNOWN", original.summary())
         store.record(instance, launch, nativeFailure = native)
@@ -63,6 +73,97 @@ class ChrootRuntimeDiagnosticsTest {
         assertEquals(original.failure, upgraded.latestUnknown(instance)!!.failure)
         assertEquals(native, upgraded.latestUnknown(instance)!!.nativeFailure)
         assertNull(upgraded.latestUnknown(instance)!!.completionEvidence)
+    }
+
+    @Test fun legacyVersionTwoNativeAndCompletionEvidenceSurviveJournalEvidenceUpgrade() {
+        val file = File(temporary.newFolder(), "failures.bin")
+        val evidence = ChrootCompletionEvidence(ChrootStopTrigger.TASK_EXIT, ChrootCompletionEvidence.ALL_FLAGS)
+        DataOutputStream(file.outputStream()).use {
+            it.writeInt(0x414a4446); it.writeInt(2); it.writeInt(1)
+            it.writeUTF(instance); it.writeUTF(launch)
+            it.writeBoolean(true); it.writeUTF(first.kind.name); it.writeUTF(first.stage.name)
+            it.writeBoolean(true); it.writeUTF("NATIVE_ERROR"); it.writeUTF("NATIVE_ERROR")
+            it.writeUTF("code=runtime_failed;stage=supervision;errno=22")
+            it.writeUTF("UNKNOWN")
+            it.writeBoolean(true); it.writeUTF(evidence.trigger.name); it.writeInt(evidence.flags)
+        }
+        val legacyBytes = file.readBytes()
+        val store = ChrootRuntimeDiagnostics(file)
+        assertTrue(store.isHealthy)
+        assertTrue(legacyBytes.contentEquals(file.readBytes()))
+        val original = store.latestUnknown(instance)!!
+        assertEquals(first, original.failure)
+        assertEquals(native, original.nativeFailure)
+        assertEquals(evidence, original.completionEvidence)
+        val journal = ChrootRuntimeFailure.local(ChrootRuntimeFailureKind.CLEANUP,
+            ChrootRuntimeFailureStage.CLEANUP_JOURNAL, ChrootJournalException(ChrootJournalFailureReason.SYNC, 5))
+        store.record(instance, launch, journal)
+        val upgraded = ChrootRuntimeDiagnostics(file)
+        assertTrue(upgraded.isHealthy)
+        assertEquals(3, file.readBytes()[7].toInt())
+        assertEquals(original.copy(failure = first.copy(journalFailure = journal.journalFailure)), upgraded.latestUnknown(instance))
+        assertTrue(upgraded.latestUnknown(instance)!!.summary().contains("failure=TRANSPORT/HELPER_STDERR;journal=SYNC;journalErrno=5"))
+    }
+
+    @Test fun journalReasonsAndOptionalErrnoRoundTripWithoutSavingPrivateExceptionData() {
+        val file = File(temporary.newFolder(), "failures.bin")
+        val privateData = "/private/path/private_credential_marker command --token=private_credential_marker"
+        val store = ChrootRuntimeDiagnostics(file)
+        for ((index, reason) in ChrootJournalFailureReason.entries.withIndex()) {
+            for ((offset, errno) in listOf(null, 28).withIndex()) {
+                val failure = ChrootRuntimeFailure.local(ChrootRuntimeFailureKind.STARTUP,
+                    ChrootRuntimeFailureStage.INTENT_JOURNAL, ChrootJournalException(reason, errno, IOException(privateData)))
+                store.record(instance, "%024x".format(index * 2 + offset), failure, cleanup = ChrootCleanupResult.VERIFIED)
+            }
+        }
+        val restored = ChrootRuntimeDiagnostics(file)
+        assertTrue(restored.isHealthy)
+        assertEquals(store.snapshot(), restored.snapshot())
+        assertEquals(ChrootJournalFailureReason.entries.size * 2, restored.snapshot().size)
+        assertFalse(String(file.readBytes(), Charsets.ISO_8859_1).contains("private_credential_marker"))
+        restored.snapshot().forEach {
+            assertTrue(it.summary().contains("failure=STARTUP/INTENT_JOURNAL;journal=${it.failure!!.journalFailure!!.reason.name}"))
+            assertFalse(it.summary().contains("private_credential_marker"))
+        }
+    }
+
+    @Test fun cleanupJournalEvidencePreservesFirstNativeFailureAndFirstJournalReason() {
+        val file = File(temporary.newFolder(), "failures.bin")
+        val store = ChrootRuntimeDiagnostics(file)
+        val firstJournal = ChrootRuntimeFailure.local(ChrootRuntimeFailureKind.CLEANUP,
+            ChrootRuntimeFailureStage.CLEANUP_JOURNAL, ChrootJournalException(ChrootJournalFailureReason.NO_SPACE, 28))
+        val laterJournal = ChrootRuntimeFailure.local(ChrootRuntimeFailureKind.STARTUP,
+            ChrootRuntimeFailureStage.INTENT_JOURNAL, ChrootJournalException(ChrootJournalFailureReason.OPEN, 5))
+        store.record(instance, launch, native, native)
+        store.record(instance, launch, firstJournal, cleanup = ChrootCleanupResult.UNKNOWN)
+        store.record(instance, launch, laterJournal, cleanup = ChrootCleanupResult.VERIFIED)
+        val restored = ChrootRuntimeDiagnostics(file)
+        assertTrue(restored.isHealthy)
+        val diagnostic = restored.latestUnknown(instance)!!
+        assertEquals(native.copy(journalFailure = firstJournal.journalFailure), diagnostic.failure)
+        assertEquals(native, diagnostic.nativeFailure)
+        assertEquals(ChrootCleanupResult.UNKNOWN, diagnostic.cleanup)
+        assertTrue(diagnostic.summary().contains("failure=NATIVE_ERROR/NATIVE_ERROR;journal=NO_SPACE;journalErrno=28"))
+    }
+
+    @Test fun invalidJournalReasonsAndErrnoRejectTheWholeFileWithoutSavingUntrustedFields() {
+        for ((reason, errno) in listOf("private_credential_marker" to 5, "WRITE" to 0, "WRITE" to 4096)) {
+            val file = File(temporary.newFolder(), "failures.bin")
+            DataOutputStream(file.outputStream()).use {
+                it.writeInt(0x414a4446); it.writeInt(3); it.writeInt(1)
+                it.writeUTF(instance); it.writeUTF(launch)
+                it.writeBoolean(true); it.writeUTF("STARTUP"); it.writeUTF("INTENT_JOURNAL")
+                it.writeBoolean(true); it.writeUTF(reason); it.writeBoolean(true); it.writeInt(errno)
+                it.writeBoolean(false); it.writeUTF("UNKNOWN"); it.writeBoolean(false)
+            }
+            val original = file.readBytes()
+            val restored = ChrootRuntimeDiagnostics(file)
+            assertFalse(restored.isHealthy)
+            assertTrue(restored.snapshot().isEmpty())
+            restored.record(instance, launch, first, cleanup = ChrootCleanupResult.UNKNOWN)
+            assertTrue(original.contentEquals(file.readBytes()))
+            assertFalse(restored.latestUnknown(instance)!!.summary().contains("private_credential_marker"))
+        }
     }
 
     @Test fun deadlineEvidenceFreezesMissingProofWithoutLateUpdatesInventingCompletion() {
@@ -141,7 +242,7 @@ class ChrootRuntimeDiagnosticsTest {
             ChrootRuntimeDiagnostics(file).record(instance, launch, first, native, ChrootCleanupResult.UNKNOWN)
             when (corruption) {
                 "trailing" -> file.appendBytes(byteArrayOf(0))
-                "version" -> file.writeBytes(file.readBytes().also { it[7] = 3 })
+                "version" -> file.writeBytes(file.readBytes().also { it[7] = 4 })
                 "oversized" -> file.writeBytes(ByteArray(65_537))
                 "native" -> file.writeBytes(String(file.readBytes(), Charsets.ISO_8859_1)
                     .replace("supervision", "SECRETVALUE!").toByteArray(Charsets.ISO_8859_1))

@@ -1,9 +1,5 @@
 package com.aicode.feature.agent.domain.container.chroot
 
-import android.content.Context
-import android.system.Os
-import android.system.OsConstants
-import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -28,8 +24,6 @@ import java.nio.file.attribute.FileTime
 import java.nio.file.attribute.PosixFilePermissions
 import java.security.MessageDigest
 import java.util.Collections
-import javax.inject.Inject
-import javax.inject.Singleton
 
 internal enum class ChrootRecoveryPhase { INTENT, STARTING, RUNNING, CLOSED, UNKNOWN }
 
@@ -44,27 +38,15 @@ internal data class ChrootRecoveryEntry(
     val cleanup: ChrootCleanupResult?
 )
 
-@Singleton
-internal class ChrootRecoveryRepository internal constructor(
+// Retained only to read/migrate version-one journals and explicitly repair their interrupted writes.
+// New runtime launches use the indexed ChrootRecoveryRepository in ChrootJournalRepository.kt.
+internal class ChrootLegacyRecoveryJournal internal constructor(
     private val file: File,
+    private val rewriteOnLoad: Boolean = true,
     private val syncDirectory: (File) -> Unit = { directory ->
         FileChannel.open(directory.toPath(), StandardOpenOption.READ, NOFOLLOW_LINKS).use { it.force(true) }
     }
 ) {
-    @Inject
-    constructor(@ApplicationContext context: Context) : this(
-        File(context.noBackupFilesDir, "chroot/runtime-journal.bin"),
-        { directory ->
-            val fd = Os.open(directory.path, OsConstants.O_RDONLY or OsConstants.O_CLOEXEC or OsConstants.O_NOFOLLOW, 0)
-            try {
-                if (!OsConstants.S_ISDIR(Os.fstat(fd).st_mode)) throw IOException("Runtime journal parent is not a directory")
-                Os.fsync(fd)
-            } finally {
-                Os.close(fd)
-            }
-        }
-    )
-
     private data class Fingerprint(val sha256: String, val size: Long, val fileKey: String, val modified: FileTime)
     private data class FileImage(val bytes: ByteArray, val fingerprint: Fingerprint)
     private data class JournalImage(val image: FileImage, val entries: LinkedHashMap<String, ChrootRecoveryEntry>)
@@ -98,9 +80,12 @@ internal class ChrootRecoveryRepository internal constructor(
                     mainFingerprint = loaded.image.fingerprint
                     entries = conservativeEntries(loaded.entries)
                     if (attributesOrNull(pending.toPath()) != null) {
+                        // Version one has no per-transaction ID. Even CLOSED may be a cleanup
+                        // rename whose directory sync failed; none of these rows proves success.
+                        entries.replaceAll { _, entry -> entry.copy(phase = ChrootRecoveryPhase.UNKNOWN, cleanup = ChrootCleanupResult.UNKNOWN) }
                         throw IOException("Runtime journal has an unfinished write")
                     }
-                    if (entries != loaded.entries) writeLocked(entries)
+                    if (entries != loaded.entries && rewriteOnLoad) writeLocked(entries)
                 } else if (attributesOrNull(pending.toPath()) != null) {
                     throw IOException("Runtime journal has no valid main file")
                 }
@@ -495,7 +480,9 @@ internal class ChrootRecoveryRepository internal constructor(
     private companion object {
         const val MAGIC = 0x414a434a
         const val VERSION = 1
-        const val MAX_ENTRIES = 4096
+        // Keep the complete nonce history for replay rejection while using the existing bounded
+        // journal format. 10,000 worst-case entries remain below MAX_FILE_BYTES.
+        const val MAX_ENTRIES = 10_000
         const val MAX_FILE_BYTES = 2_000_000L
         // No automatic pruning: reaching this bound refuses further repair and retains evidence.
         // Each attempt creates at most two main-sized files plus two pending-sized files.

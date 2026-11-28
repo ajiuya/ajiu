@@ -45,6 +45,11 @@ import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
+import org.robolectric.annotation.ConscryptMode
+import org.robolectric.annotation.SQLiteMode
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
@@ -58,6 +63,10 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [28], application = android.app.Application::class, manifest = Config.NONE)
+@ConscryptMode(ConscryptMode.Mode.OFF)
+@SQLiteMode(SQLiteMode.Mode.NATIVE)
 @OptIn(ExperimentalCoroutinesApi::class)
 class ChrootRuntimeFacadeTest {
     @get:Rule val temporary = TemporaryFolder()
@@ -902,7 +911,7 @@ class ChrootRuntimeFacadeTest {
 
     private fun interruptedJournal(): File {
         val file = File(temporary.newFolder(), "runtime.bin")
-        val committed = ChrootRecoveryRepository(file)
+        val committed = ChrootLegacyRecoveryJournal(file)
         committed.recordIntent(instance.id, "89abcdef0123456789abcdef", ChrootFileIdentity(instance.device, instance.inode),
             owner.identity, 7)
         committed.recordCleanup("89abcdef0123456789abcdef", ChrootCleanupResult.UNKNOWN)

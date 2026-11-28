@@ -22,7 +22,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
-class ChrootRecoveryRepositoryTest {
+class ChrootLegacyRecoveryJournalTest {
     @get:Rule val temporary = TemporaryFolder()
     private val instance = "0123456789abcdef01234567"
     private val launch = "89abcdef0123456789abcdef"
@@ -33,11 +33,11 @@ class ChrootRecoveryRepositoryTest {
     @Test
     fun unfinishedIntentBecomesUnknownOnRestartAndAllowsNewNonceWithoutRewritingHistory() {
         val file = file()
-        val first = ChrootRecoveryRepository(file)
+        val first = ChrootLegacyRecoveryJournal(file)
         first.recordIntent(instance, launch, rootfs, "chat:private-owner", 9L)
         assertTrue(first.canStart(instance))
         assertTrue(first.blockedInstances.value.isEmpty())
-        val recovered = ChrootRecoveryRepository(file)
+        val recovered = ChrootLegacyRecoveryJournal(file)
         assertTrue(recovered.isHealthy.value)
         assertEquals(setOf(instance), recovered.blockedInstances.value)
         assertEquals(ChrootRecoveryPhase.UNKNOWN, recovered.snapshot().single().phase)
@@ -58,19 +58,19 @@ class ChrootRecoveryRepositoryTest {
         assertEquals(setOf(launch), recovered.unknownLaunchIds(instance))
         assertEquals(setOf(launch, nextLaunch), recovered.recordedLaunchIds.value)
         assertEquals(setOf(instance), recovered.blockedInstances.value)
-        assertEquals(recovered.snapshot(), ChrootRecoveryRepository(file).snapshot())
+        assertEquals(recovered.snapshot(), ChrootLegacyRecoveryJournal(file).snapshot())
     }
 
     @Test
     fun verifiedClosedRecordAllowsAnotherLaunchButNeverReplaysLaunchId() {
         val file = file()
-        val repository = ChrootRecoveryRepository(file)
+        val repository = ChrootLegacyRecoveryJournal(file)
         repository.recordIntent(instance, launch, rootfs, "terminal:user", 3L)
         repository.recordPhase(launch, ChrootRecoveryPhase.STARTING)
         repository.recordPhase(launch, ChrootRecoveryPhase.RUNNING)
         repository.recordCleanup(launch, ChrootCleanupResult.VERIFIED)
         assertTrue(repository.canStart(instance))
-        val restarted = ChrootRecoveryRepository(file)
+        val restarted = ChrootLegacyRecoveryJournal(file)
         assertTrue(restarted.canStart(instance))
         assertEquals(ChrootRecoveryPhase.CLOSED, restarted.snapshot().single().phase)
         try {
@@ -83,8 +83,89 @@ class ChrootRecoveryRepositoryTest {
     }
 
     @Test
+    fun existingFourThousandNinetySixClosedRecordsStillAllowTheNextLaunch() {
+        val journal = file()
+        val entries = List(4_096) { index ->
+            ChrootRecoveryEntry(
+                instance, "%024x".format(index + 1000), rootfs, "chat", "%064x".format(index + 1),
+                3L, ChrootRecoveryPhase.CLOSED, ChrootCleanupResult.VERIFIED
+            )
+        }
+        journal.writeBytes(legacyBytes(entries))
+
+        val repository = ChrootLegacyRecoveryJournal(journal)
+        val nextLaunch = "abcdefabcdefabcdefabcdef"
+        repository.recordIntent(instance, nextLaunch, rootfs, "chat:next", 3L)
+
+        assertEquals(4_097, repository.snapshot().size)
+        assertEquals(entries, repository.snapshot().dropLast(1))
+        assertEquals(ChrootRecoveryPhase.INTENT, repository.snapshot().last().phase)
+        assertTrue(repository.isHealthy.value)
+        assertEquals(entries.mapTo(linkedSetOf()) { it.launchId } + nextLaunch, repository.recordedLaunchIds.value)
+        repository.recordCleanup(nextLaunch, ChrootCleanupResult.VERIFIED)
+
+        val restarted = ChrootLegacyRecoveryJournal(journal)
+        assertTrue(restarted.isHealthy.value)
+        assertEquals(repository.snapshot(), restarted.snapshot())
+        val committed = journal.readBytes()
+        for (usedLaunch in listOf(entries.first().launchId, nextLaunch)) {
+            expectIo { restarted.recordIntent(instance, usedLaunch, rootfs, "chat:replay", 4L) }
+        }
+        assertArrayEquals(committed, journal.readBytes())
+    }
+
+    @Test
+    fun expandingJournalPreservesEveryUnknownRecordAcrossRestart() {
+        val journal = file()
+        val original = legacyEntries(4_096)
+        journal.writeBytes(legacyBytes(original))
+        val expected = conservativeEntries(original)
+        val repository = ChrootLegacyRecoveryJournal(journal)
+        assertTrue(repository.isHealthy.value)
+        assertEquals(expected, repository.snapshot())
+        val unknownInstances = repository.blockedInstances.value
+        val nextLaunch = "abcdefabcdefabcdefabcdef"
+        repository.recordIntent(instance, nextLaunch, rootfs, "chat:next", 3L)
+        repository.recordCleanup(nextLaunch, ChrootCleanupResult.VERIFIED)
+
+        val restarted = ChrootLegacyRecoveryJournal(journal)
+        assertTrue(restarted.isHealthy.value)
+        assertEquals(expected, restarted.snapshot().dropLast(1))
+        assertEquals(repository.snapshot(), restarted.snapshot())
+        assertEquals(unknownInstances, restarted.blockedInstances.value)
+        assertEquals(expected.mapTo(linkedSetOf()) { it.launchId } + nextLaunch, restarted.recordedLaunchIds.value)
+        assertTrue(restarted.canStart(instance))
+    }
+
+    @Test
+    fun expandedJournalStaysWithinTheByteLimitAndRefusesOverflowWithoutLosingHistory() {
+        val journal = file()
+        val entries = legacyEntries(9_999).map { entry ->
+            entry.copy(ownerKind = "a".repeat(24), phase = ChrootRecoveryPhase.CLOSED, cleanup = ChrootCleanupResult.VERIFIED)
+        }
+        journal.writeBytes(legacyBytes(entries))
+        val repository = ChrootLegacyRecoveryJournal(journal)
+        val nextLaunch = "abcdefabcdefabcdefabcdef"
+        repository.recordIntent(instance, nextLaunch, rootfs, "chat:last", 3L)
+        repository.recordCleanup(nextLaunch, ChrootCleanupResult.VERIFIED)
+        assertEquals(10_000, repository.snapshot().size)
+        assertTrue(journal.length() <= 2_000_000L)
+        assertEquals(entries, repository.snapshot().dropLast(1))
+
+        val restarted = ChrootLegacyRecoveryJournal(journal)
+        assertTrue(restarted.isHealthy.value)
+        assertEquals(repository.snapshot(), restarted.snapshot())
+        val committed = journal.readBytes()
+        expectIo { restarted.recordIntent(instance, "fedcbafedcbafedcbafedcba", rootfs, "chat:overflow", 4L) }
+        assertTrue(restarted.isHealthy.value)
+        assertEquals(repository.snapshot(), restarted.snapshot())
+        assertArrayEquals(committed, journal.readBytes())
+        assertFalse(File(journal.path + ".pending").exists())
+    }
+
+    @Test
     fun concurrentLaunchesKeepIndependentCleanupAndAllowNewNonceAfterUnknown() {
-        val repository = ChrootRecoveryRepository(file())
+        val repository = ChrootLegacyRecoveryJournal(file())
         val second = "abcdef0123456789abcdef01"
         repository.recordIntent(instance, launch, rootfs, "terminal:first", 3L)
         repository.recordPhase(launch, ChrootRecoveryPhase.RUNNING)
@@ -114,7 +195,7 @@ class ChrootRecoveryRepositoryTest {
         val pauseSync = AtomicBoolean()
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
-        val repository = ChrootRecoveryRepository(file()) {
+        val repository = ChrootLegacyRecoveryJournal(file()) {
             if (pauseSync.get()) {
                 entered.countDown()
                 check(release.await(5, TimeUnit.SECONDS))
@@ -145,7 +226,7 @@ class ChrootRecoveryRepositoryTest {
     @Test
     fun directorySyncFailureKeepsTheRepositoryFailClosedAndPreservesJournal() {
         val file = file()
-        val repository = ChrootRecoveryRepository(file) { throw IOException("sync unavailable") }
+        val repository = ChrootLegacyRecoveryJournal(file) { throw IOException("sync unavailable") }
         try {
             repository.recordIntent(instance, launch, rootfs, "user:owner", 1L)
             throw AssertionError("Directory sync failure must be reported")
@@ -155,7 +236,7 @@ class ChrootRecoveryRepositoryTest {
         assertFalse(repository.canStart(instance))
         expectIo { repository.recordIntent(instance, "abcdef0123456789abcdef01", rootfs, "user:next", 1L) }
         assertTrue(file.exists())
-        val recovered = ChrootRecoveryRepository(file)
+        val recovered = ChrootLegacyRecoveryJournal(file)
         assertFalse(recovered.canStart(instance))
         assertEquals(ChrootRecoveryPhase.UNKNOWN, recovered.snapshot().single().phase)
     }
@@ -163,7 +244,7 @@ class ChrootRecoveryRepositoryTest {
     @Test
     fun journalContainsOnlyOwnerDigestAndNoReusableApprovalOrBusinessPayload() {
         val file = file()
-        val repository = ChrootRecoveryRepository(file)
+        val repository = ChrootLegacyRecoveryJournal(file)
         val owner = "chat:private-owner-credential-placeholder"
         repository.recordIntent(instance, launch, rootfs, owner, 13L)
         val entry = repository.snapshot().single()
@@ -181,14 +262,14 @@ class ChrootRecoveryRepositoryTest {
     fun truncatedOrInterruptedJournalFailsClosedWithoutDeletingEvidence() {
         val corrupt = file()
         corrupt.writeBytes(byteArrayOf(1, 2, 3))
-        val repository = ChrootRecoveryRepository(corrupt)
+        val repository = ChrootLegacyRecoveryJournal(corrupt)
         assertFalse(repository.isHealthy.value)
         assertFalse(repository.canStart(instance))
         expectIo { repository.recordIntent(instance, launch, rootfs, "user:owner", 1L) }
         assertEquals(3L, corrupt.length())
         val unfinished = file()
         File(unfinished.path + ".pending").writeBytes(byteArrayOf(9))
-        val pending = ChrootRecoveryRepository(unfinished)
+        val pending = ChrootLegacyRecoveryJournal(unfinished)
         assertFalse(pending.isHealthy.value)
         assertFalse(pending.canStart(instance))
         expectIo { pending.recordIntent(instance, launch, rootfs, "user:owner", 1L) }
@@ -205,11 +286,11 @@ class ChrootRecoveryRepositoryTest {
         journal.writeBytes(mainBytes)
         val pending = File(journal.path + ".pending").apply { writeBytes(pendingBytes) }
 
-        val repository = ChrootRecoveryRepository(journal)
+        val repository = ChrootLegacyRecoveryJournal(journal)
 
         assertFalse(repository.isHealthy.value)
         assertEquals(876, repository.snapshot().size)
-        assertEquals(conservativeEntries(originalEntries), repository.snapshot())
+        assertEquals(interruptedEntries(originalEntries), repository.snapshot())
         assertEquals(originalEntries.mapTo(linkedSetOf()) { it.launchId }, repository.recordedLaunchIds.value)
         assertArrayEquals(mainBytes, journal.readBytes())
         assertArrayEquals(pendingBytes, pending.readBytes())
@@ -225,7 +306,7 @@ class ChrootRecoveryRepositoryTest {
         journal.writeBytes(mainBytes)
         val pending = File(journal.path + ".pending").apply { writeBytes(pendingBytes) }
         val pendingKey = Files.readAttributes(pending.toPath(), BasicFileAttributes::class.java).fileKey()
-        val repository = ChrootRecoveryRepository(journal)
+        val repository = ChrootLegacyRecoveryJournal(journal)
         assertTrue(repository.canRepairInterruptedWrite.value)
 
         repository.repairInterruptedWriteFromUser()
@@ -233,13 +314,13 @@ class ChrootRecoveryRepositoryTest {
         assertTrue(repository.isHealthy.value)
         assertFalse(repository.canRepairInterruptedWrite.value)
         assertFalse(pending.exists())
-        assertEquals(conservativeEntries(original), repository.snapshot())
+        assertEquals(interruptedEntries(original), repository.snapshot())
         assertTrue(repository.canStart(original.first().instanceId))
         original.filter { it.phase != ChrootRecoveryPhase.CLOSED }.forEach {
             assertTrue(repository.canStart(it.instanceId))
             assertTrue(repository.unknownLaunchIds(it.instanceId).contains(it.launchId))
         }
-        assertArrayEquals(legacyBytes(conservativeEntries(original)), journal.readBytes())
+        assertArrayEquals(legacyBytes(interruptedEntries(original)), journal.readBytes())
         val archive = archives(journal).single()
         assertArrayEquals(mainBytes, File(archive, "main.bin").readBytes())
         assertArrayEquals(pendingBytes, File(archive, "pending.bin").readBytes())
@@ -250,7 +331,7 @@ class ChrootRecoveryRepositoryTest {
         listOf(journal, File(archive, "main.bin"), File(archive, "pending.bin"), File(archive, "sha256.txt")).forEach {
             assertEquals(PosixFilePermissions.fromString("rw-------"), Files.getPosixFilePermissions(it.toPath()))
         }
-        val restarted = ChrootRecoveryRepository(journal)
+        val restarted = ChrootLegacyRecoveryJournal(journal)
         assertTrue(restarted.isHealthy.value)
         assertEquals(repository.snapshot(), restarted.snapshot())
     }
@@ -267,7 +348,7 @@ class ChrootRecoveryRepositoryTest {
             mainBytes?.let(journal::writeBytes)
             val pending = File(journal.path + ".pending").apply { writeBytes(legacyBytes(legacyEntries())) }
             val pendingBytes = pending.readBytes()
-            val repository = ChrootRecoveryRepository(journal)
+            val repository = ChrootLegacyRecoveryJournal(journal)
             assertFalse(repository.isHealthy.value)
             assertFalse(repository.canRepairInterruptedWrite.value)
             expectIo { repository.repairInterruptedWriteFromUser() }
@@ -285,7 +366,7 @@ class ChrootRecoveryRepositoryTest {
         val original = legacyEntries()
         journal.writeBytes(legacyBytes(original))
         File(journal.path + ".pending").writeBytes(byteArrayOf(1))
-        val repository = ChrootRecoveryRepository(journal)
+        val repository = ChrootLegacyRecoveryJournal(journal)
         repository.repairInterruptedWriteFromUser()
         val canonical = journal.readBytes()
         original.drop(1).forEach { entry ->
@@ -293,7 +374,7 @@ class ChrootRecoveryRepositoryTest {
             repository.recordCleanup(entry.launchId, ChrootCleanupResult.VERIFIED)
             assertEquals(setOf(entry.launchId), repository.unknownLaunchIds(entry.instanceId))
         }
-        assertEquals(conservativeEntries(original), repository.snapshot())
+        assertEquals(interruptedEntries(original), repository.snapshot())
         assertArrayEquals(canonical, journal.readBytes())
     }
 
@@ -304,7 +385,7 @@ class ChrootRecoveryRepositoryTest {
             val original = legacyBytes(legacyEntries())
             journal.writeBytes(original)
             val pending = File(journal.path + ".pending").apply { writeBytes(byteArrayOf(1, 2)) }
-            val repository = ChrootRecoveryRepository(journal)
+            val repository = ChrootLegacyRecoveryJournal(journal)
             assertTrue(repository.canRepairInterruptedWrite.value)
             val replacement = if (sameBytes) original else legacyBytes(legacyEntries().map { it.copy(rootGeneration = 99) })
             if (sameBytes) {
@@ -327,7 +408,7 @@ class ChrootRecoveryRepositoryTest {
         val changed = legacyBytes(legacyEntries().map { it.copy(rootGeneration = 99) })
         journal.writeBytes(original)
         val pending = File(journal.path + ".pending").apply { writeBytes(byteArrayOf(1)) }
-        val repository = ChrootRecoveryRepository(journal) { directory ->
+        val repository = ChrootLegacyRecoveryJournal(journal) { directory ->
             if (directory.name.startsWith("${journal.name}.recovery-")) journal.writeBytes(changed)
         }
         expectIo { repository.repairInterruptedWriteFromUser() }
@@ -344,14 +425,14 @@ class ChrootRecoveryRepositoryTest {
         journal.writeBytes(legacyBytes(legacyEntries()))
         val pending = File(journal.path + ".pending").apply { writeBytes(byteArrayOf(1)) }
         val changed = legacyBytes(legacyEntries().map { it.copy(rootGeneration = 99) })
-        val repository = ChrootRecoveryRepository(journal) { directory ->
+        val repository = ChrootLegacyRecoveryJournal(journal) { directory ->
             if (directory == journal.parentFile && !pending.exists()) journal.writeBytes(changed)
         }
         expectIo { repository.repairInterruptedWriteFromUser() }
         assertFalse(repository.isHealthy.value)
         assertFalse(repository.canRepairInterruptedWrite.value)
         assertArrayEquals(changed, journal.readBytes())
-        assertEquals(conservativeEntries(legacyEntries()), repository.snapshot())
+        assertEquals(interruptedEntries(legacyEntries()), repository.snapshot())
         assertArrayEquals(byteArrayOf(1), File(archives(journal).single(), "pending-original.bin").readBytes())
     }
 
@@ -362,7 +443,7 @@ class ChrootRecoveryRepositoryTest {
         journal.writeBytes(mainBytes)
         val pending = File(journal.path + ".pending").apply { writeBytes(byteArrayOf(1)) }
         val fail = AtomicBoolean(true)
-        val repository = ChrootRecoveryRepository(journal) { if (fail.get()) throw IOException("evidence sync unavailable") }
+        val repository = ChrootLegacyRecoveryJournal(journal) { if (fail.get()) throw IOException("evidence sync unavailable") }
         expectIo { repository.repairInterruptedWriteFromUser() }
         assertFalse(repository.isHealthy.value)
         assertTrue(repository.canRepairInterruptedWrite.value)
@@ -385,7 +466,7 @@ class ChrootRecoveryRepositoryTest {
         journal.writeBytes(mainBytes)
         val pending = File(journal.path + ".pending").apply { writeBytes(byteArrayOf(1, 2)) }
         val fail = AtomicBoolean(true)
-        val repository = ChrootRecoveryRepository(journal) { directory ->
+        val repository = ChrootLegacyRecoveryJournal(journal) { directory ->
             if (directory == journal.parentFile && !journal.readBytes().contentEquals(mainBytes) && fail.get()) {
                 throw IOException("canonical directory sync unavailable")
             }
@@ -393,14 +474,14 @@ class ChrootRecoveryRepositoryTest {
         expectIo { repository.repairInterruptedWriteFromUser() }
         assertFalse(repository.isHealthy.value)
         assertTrue(repository.canRepairInterruptedWrite.value)
-        assertEquals(conservativeEntries(original), repository.snapshot())
+        assertEquals(interruptedEntries(original), repository.snapshot())
         assertArrayEquals(byteArrayOf(1, 2), pending.readBytes())
         assertArrayEquals(mainBytes, File(archives(journal).single(), "main.bin").readBytes())
         fail.set(false)
         repository.repairInterruptedWriteFromUser()
         assertTrue(repository.isHealthy.value)
         assertFalse(pending.exists())
-        assertEquals(conservativeEntries(original), repository.snapshot())
+        assertEquals(interruptedEntries(original), repository.snapshot())
     }
 
     @Test
@@ -409,7 +490,7 @@ class ChrootRecoveryRepositoryTest {
         journal.writeBytes(legacyBytes(legacyEntries()))
         val pending = File(journal.path + ".pending").apply { writeBytes(byteArrayOf(1, 2)) }
         val fail = AtomicBoolean(true)
-        val repository = ChrootRecoveryRepository(journal) {
+        val repository = ChrootLegacyRecoveryJournal(journal) {
             if (!pending.exists() && fail.get()) throw IOException("archive sync unavailable")
         }
         expectIo { repository.repairInterruptedWriteFromUser() }
@@ -427,7 +508,7 @@ class ChrootRecoveryRepositoryTest {
     fun sameProcessFailedCleanupReloadsMainWithoutPromotingRunningLaunchToVerified() {
         val journal = file()
         val fail = AtomicBoolean(false)
-        val repository = ChrootRecoveryRepository(journal) { if (fail.get()) throw IOException("sync unavailable") }
+        val repository = ChrootLegacyRecoveryJournal(journal) { if (fail.get()) throw IOException("sync unavailable") }
         repository.recordIntent(instance, launch, rootfs, "chat:owner", 3)
         repository.recordPhase(launch, ChrootRecoveryPhase.RUNNING)
         fail.set(true)
@@ -447,7 +528,7 @@ class ChrootRecoveryRepositoryTest {
     @Test
     fun sameProcessPendingCollisionCanRecoverWithoutReconstructingRepository() {
         val journal = file()
-        val repository = ChrootRecoveryRepository(journal)
+        val repository = ChrootLegacyRecoveryJournal(journal)
         repository.recordIntent(instance, launch, rootfs, "user:owner", 3)
         val mainBytes = journal.readBytes()
         File(journal.path + ".pending").writeBytes(mainBytes.copyOf(20))
@@ -484,7 +565,7 @@ class ChrootRecoveryRepositoryTest {
                     Files.createSymbolicLink(journal.parentFile.toPath(), real.toPath())
                 }
             }
-            val repository = ChrootRecoveryRepository(journal)
+            val repository = ChrootLegacyRecoveryJournal(journal)
             assertFalse(repository.isHealthy.value)
             assertFalse(repository.canRepairInterruptedWrite.value)
             expectIo { repository.repairInterruptedWriteFromUser() }
@@ -506,7 +587,7 @@ class ChrootRecoveryRepositoryTest {
             }
             val mainBefore = journal.readBytes()
             val pendingBefore = pending.readBytes()
-            val repository = ChrootRecoveryRepository(journal)
+            val repository = ChrootLegacyRecoveryJournal(journal)
             assertFalse(repository.isHealthy.value)
             assertFalse(repository.canRepairInterruptedWrite.value)
             expectIo { repository.repairInterruptedWriteFromUser() }
@@ -525,7 +606,7 @@ class ChrootRecoveryRepositoryTest {
         val release = CountDownLatch(1)
         val writerStarted = CountDownLatch(1)
         val pauseOnce = AtomicBoolean(true)
-        val repository = ChrootRecoveryRepository(journal) {
+        val repository = ChrootLegacyRecoveryJournal(journal) {
             if (pauseOnce.compareAndSet(true, false)) {
                 entered.countDown()
                 check(release.await(5, TimeUnit.SECONDS))
@@ -557,7 +638,7 @@ class ChrootRecoveryRepositoryTest {
     @Test
     fun bufferedNewWritesKeepTheVersionOneWireFormatAndPrivateMode() {
         val journal = file()
-        val repository = ChrootRecoveryRepository(journal)
+        val repository = ChrootLegacyRecoveryJournal(journal)
         repository.recordIntent(instance, launch, rootfs, "terminal:fixture", 17)
         assertArrayEquals(legacyBytes(repository.snapshot()), journal.readBytes())
         repository.recordPhase(launch, ChrootRecoveryPhase.RUNNING)
@@ -565,7 +646,7 @@ class ChrootRecoveryRepositoryTest {
         repository.recordCleanup(launch, ChrootCleanupResult.VERIFIED)
         assertArrayEquals(legacyBytes(repository.snapshot()), journal.readBytes())
         assertEquals(PosixFilePermissions.fromString("rw-------"), Files.getPosixFilePermissions(journal.toPath(), NOFOLLOW_LINKS))
-        val restarted = ChrootRecoveryRepository(journal)
+        val restarted = ChrootLegacyRecoveryJournal(journal)
         assertTrue(restarted.isHealthy.value)
         assertEquals(repository.snapshot(), restarted.snapshot())
     }
@@ -598,6 +679,10 @@ class ChrootRecoveryRepositoryTest {
             ChrootFileIdentity(5L + index, 19L + index), "user", "%064x".format(index + 1),
             9L + index, phase, if (phase == ChrootRecoveryPhase.CLOSED) ChrootCleanupResult.VERIFIED else null
         )
+    }
+
+    private fun interruptedEntries(source: List<ChrootRecoveryEntry>) = source.map {
+        it.copy(phase = ChrootRecoveryPhase.UNKNOWN, cleanup = ChrootCleanupResult.UNKNOWN)
     }
 
     private fun conservativeEntries(source: List<ChrootRecoveryEntry>) = source.map { entry ->
@@ -634,7 +719,7 @@ class ChrootRecoveryRepositoryTest {
     fun persistenceFailureRemainsFailClosedAfterStorageBecomesWritable() {
         val parent = temporary.newFile()
         val file = File(parent, "journal.bin")
-        val repository = ChrootRecoveryRepository(file)
+        val repository = ChrootLegacyRecoveryJournal(file)
         try {
             repository.recordIntent(instance, launch, rootfs, "user:owner", 1L)
             throw AssertionError("The write failure must be reported")
