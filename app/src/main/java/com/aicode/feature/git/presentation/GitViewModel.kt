@@ -16,6 +16,7 @@ import com.aicode.feature.git.domain.GitRepository
 import com.aicode.feature.git.domain.FrozenGitOperation
 import com.aicode.feature.git.domain.GitOperationExpiredException
 import com.aicode.feature.git.domain.GitWorkspaceRequiredException
+import com.aicode.feature.git.domain.GitUnavailableException
 import com.aicode.feature.agent.domain.container.runtime.LocalRuntimeAuthorizationRequired
 import com.aicode.feature.git.domain.model.GitBranch
 import com.aicode.feature.git.domain.model.GitCommit
@@ -79,6 +80,8 @@ class GitViewModel @Inject constructor(
     data class GitUiState(
         val loading: Boolean = true,
         val notARepo: Boolean = false,
+        val repositoryError: String? = null,
+        val gitUnavailable: Boolean = false,
         val status: GitStatus? = null,
         val branches: List<GitBranch> = emptyList(),
         val commits: List<GitCommit> = emptyList(),
@@ -159,6 +162,12 @@ class GitViewModel @Inject constructor(
             generatingCommitMessage = false, diffVisible = false,
             toast = message) }
     }
+
+    private fun repositoryFailureReason(failure: Exception): String =
+        // Repository probes do not contact a remote. The generic action formatter treats
+        // any Permission denied as authentication and can mistake path text for an error.
+        ((failure as? GitCommandFailureException)?.output ?: failure.message.orEmpty())
+            .ifBlank { context.getString(R.string.git_repository_error) }
 
     private fun launchOperation(operation: FrozenGitOperation, block: suspend () -> Unit) {
         viewModelScope.launch {
@@ -272,6 +281,7 @@ class GitViewModel @Inject constructor(
 
     fun refresh() {
         if (_state.value.busy) return
+        _state.update { it.copy(repositoryError = null, gitUnavailable = false) }
         var operation = try { repository.captureOperation() } catch (failure: Exception) {
             showOperationFailure(failure)
             return
@@ -296,21 +306,23 @@ class GitViewModel @Inject constructor(
                 operation = repository.captureOperation()
                 displayedOperation = operation
                 if (effectiveRepo == null) {
-                    publish(operation) { it.copy(loading = false, notARepo = true, repos = repos, subdirs = subdirs, workspaceRoot = workspaceRoot, currentRepo = null) }
+                    publish(operation) { it.copy(loading = false, notARepo = true, repositoryError = null, gitUnavailable = false, repos = repos, subdirs = subdirs, workspaceRoot = workspaceRoot, currentRepo = null) }
                     return@launchOperation
                 }
                 val snap = loadSnapshot(operation, includeIdentity = true)
                 val commits = snap.graph.toGitCommits()
                 publish(operation) {
                     it.copy(commitFiles = emptyMap(), commitDetailHash = null, stashes = emptyList(),
-                        diffVisible = false, diffPath = null, diffData = null, loading = false, notARepo = false, status = snap.status, commits = commits, graph = snap.graph, hasRemote = snap.hasRemote, hasIdentity = snap.hasIdentity, untrackedDirFiles = snap.untrackedDirFiles, branchesLoaded = false, branchesLoading = false, branches = emptyList(), tags = emptyList(), repos = repos, subdirs = subdirs, workspaceRoot = workspaceRoot, currentRepo = effectiveRepo)
+                        diffVisible = false, diffPath = null, diffData = null, loading = false, notARepo = false, repositoryError = null, gitUnavailable = false, status = snap.status, commits = commits, graph = snap.graph, hasRemote = snap.hasRemote, hasIdentity = snap.hasIdentity, untrackedDirFiles = snap.untrackedDirFiles, branchesLoaded = false, branchesLoading = false, branches = emptyList(), tags = emptyList(), repos = repos, subdirs = subdirs, workspaceRoot = workspaceRoot, currentRepo = effectiveRepo)
                 }
                 // 页面已打开：后台拉取全量分支/标签，用户切到 BRANCHES tab 时无需再等。
                 loadBranches(operation)
             } catch (e: Exception) {
                 if (e is CancellationException || e is GitOperationExpiredException || e is LocalRuntimeAuthorizationRequired) throw e
                 FileLogger.e(TAG, "刷新失败", e)
-                publish(operation) { it.copy(loading = false, toast = context.getString(R.string.git_toast_refresh_failed, e.message)) }
+                val reason = repositoryFailureReason(e)
+                publish(operation) { it.copy(loading = false, notARepo = false, repositoryError = reason,
+                    gitUnavailable = e is GitUnavailableException, toast = context.getString(R.string.git_toast_refresh_failed, reason)) }
             }
         }
     }
@@ -342,15 +354,16 @@ class GitViewModel @Inject constructor(
                 if (repository.isRepo(operation)) {
                     val snap = loadSnapshot(operation, includeIdentity = false)
                     val commits = snap.graph.toGitCommits()
-                    publish(operation) { it.copy(busy = false, status = snap.status, commits = commits, graph = snap.graph, hasRemote = snap.hasRemote, untrackedDirFiles = snap.untrackedDirFiles, notARepo = false, toast = msg) }
+                    publish(operation) { it.copy(busy = false, status = snap.status, commits = commits, graph = snap.graph, hasRemote = snap.hasRemote, untrackedDirFiles = snap.untrackedDirFiles, notARepo = false, repositoryError = null, gitUnavailable = false, toast = msg) }
                     refreshBranchesIfLoaded(operation)
                     onComplete?.invoke(operation)
                 } else {
-                    publish(operation) { it.copy(busy = false, notARepo = true, toast = msg) }
+                    publish(operation) { it.copy(busy = false, notARepo = true, repositoryError = null, gitUnavailable = false, toast = msg) }
                 }
             } catch (e: Exception) {
                 if (e is CancellationException || e is GitOperationExpiredException || e is LocalRuntimeAuthorizationRequired) throw e
-                publish(operation) { it.copy(busy = false, toast = context.getString(R.string.git_toast_action_refresh_failed, msg)) }
+                publish(operation) { it.copy(busy = false, notARepo = false, repositoryError = repositoryFailureReason(e),
+                    gitUnavailable = e is GitUnavailableException, toast = context.getString(R.string.git_toast_action_refresh_failed, msg)) }
             }
         }
     }
@@ -579,15 +592,16 @@ class GitViewModel @Inject constructor(
                 if (repository.isRepo(operation)) {
                     val snap = loadSnapshot(operation, includeIdentity = false)
                     val commits = snap.graph.toGitCommits()
-                    publish(operation) { it.copy(checkoutLoading = null, status = snap.status, commits = commits, graph = snap.graph, hasRemote = snap.hasRemote, notARepo = false, toast = msg) }
+                    publish(operation) { it.copy(checkoutLoading = null, status = snap.status, commits = commits, graph = snap.graph, hasRemote = snap.hasRemote, notARepo = false, repositoryError = null, gitUnavailable = false, toast = msg) }
                     // 切换分支后分支列表可能变化，若已加载过则刷新。
                     refreshBranchesIfLoaded(operation)
                 } else {
-                    publish(operation) { it.copy(checkoutLoading = null, notARepo = true, toast = msg) }
+                    publish(operation) { it.copy(checkoutLoading = null, notARepo = true, repositoryError = null, gitUnavailable = false, toast = msg) }
                 }
             } catch (e: Exception) {
                 if (e is CancellationException || e is GitOperationExpiredException || e is LocalRuntimeAuthorizationRequired) throw e
-                publish(operation) { it.copy(checkoutLoading = null, toast = context.getString(R.string.git_toast_action_refresh_failed, msg)) }
+                publish(operation) { it.copy(checkoutLoading = null, notARepo = false, repositoryError = repositoryFailureReason(e),
+                    gitUnavailable = e is GitUnavailableException, toast = context.getString(R.string.git_toast_action_refresh_failed, msg)) }
             }
         }
     }

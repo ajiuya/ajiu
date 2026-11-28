@@ -12,6 +12,7 @@ import io.mockk.every
 import io.mockk.mockk
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Rule
@@ -54,7 +55,7 @@ class GitRepositoryDiscoveryTest {
         assertEquals(listOf(root.absolutePath), repo.discoverRepos())
 
         coVerify(exactly = 1) {
-            engine.runCommandSyncUnbounded("git rev-parse --is-inside-work-tree", root.absolutePath, any())
+            engine.runCommandSyncUnbounded("/bin/sh -c 'LC_ALL=C git rev-parse --is-inside-work-tree'", root.absolutePath, any())
         }
         coVerify(exactly = 1) { engine.runCommandSyncUnbounded(any(), any(), any()) }
         coVerify(exactly = 0) {
@@ -76,13 +77,16 @@ class GitRepositoryDiscoveryTest {
     }
 
     @Test
-    fun remoteDiscoveryFailureReturnsEmptyWithoutProbingLocalChildren() = runTest {
+    fun remoteDiscoveryPreservesFailureWithoutProbingLocalChildren() = runTest {
         holder.setMode(ExecutionMode.REMOTE_SSH)
+        val failure = IllegalStateException("Remote unavailable")
         coEvery {
             engine.runCommandSyncUnbounded(any(), root.absolutePath, any())
-        } throws IllegalStateException("Remote unavailable")
+        } throws failure
 
-        assertTrue(repo.discoverRepos().isEmpty())
+        val observed = runCatching { repo.discoverRepos() }.exceptionOrNull()
+        assertEquals(failure.message, observed?.message)
+        assertSame(failure, generateSequence(observed) { it.cause }.lastOrNull())
 
         coVerify(exactly = 1) { engine.runCommandSyncUnbounded(any(), root.absolutePath, any()) }
         coVerify(exactly = 1) { engine.runCommandSyncUnbounded(any(), any(), any()) }
@@ -104,10 +108,10 @@ class GitRepositoryDiscoveryTest {
         assertEquals(listOf(root.absolutePath, alpha.absolutePath, beta.absolutePath), repo.discoverRepos())
 
         coVerifyOrder {
-            engine.runCommandSyncUnbounded("git rev-parse --is-inside-work-tree", root.absolutePath, any())
-            engine.runCommandSyncUnbounded("git rev-parse --is-inside-work-tree", alpha.absolutePath, any())
-            engine.runCommandSyncUnbounded("git rev-parse --is-inside-work-tree", beta.absolutePath, any())
-            engine.runCommandSyncUnbounded("git rev-parse --is-inside-work-tree", nonRepo.absolutePath, any())
+            engine.runCommandSyncUnbounded("/bin/sh -c 'LC_ALL=C git rev-parse --is-inside-work-tree'", root.absolutePath, any())
+            engine.runCommandSyncUnbounded("/bin/sh -c 'LC_ALL=C git rev-parse --is-inside-work-tree'", alpha.absolutePath, any())
+            engine.runCommandSyncUnbounded("/bin/sh -c 'LC_ALL=C git rev-parse --is-inside-work-tree'", beta.absolutePath, any())
+            engine.runCommandSyncUnbounded("/bin/sh -c 'LC_ALL=C git rev-parse --is-inside-work-tree'", nonRepo.absolutePath, any())
         }
         coVerify(exactly = 4) { engine.runCommandSyncUnbounded(any(), any(), any()) }
         coVerify(exactly = 0) { engine.runCommandSyncUnbounded(any(), nested.absolutePath, any()) }

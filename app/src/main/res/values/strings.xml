@@ -1541,6 +1541,8 @@
     <string name="git_no_files_changed">该提交无文件改动</string>
     <string name="git_loading_files">正在加载改动文件…</string>
     <string name="git_not_a_repo">当前工作区还不是 Git 仓库</string>
+    <string name="git_repository_error">无法读取 Git 仓库</string>
+    <string name="git_unavailable_hint">当前执行环境未安装 Git。CHROOT 可点击初始化或克隆自动准备；其它环境请先安装 Git。</string>
     <string name="git_init_desc_primary">可在此初始化新仓库，开始版本管理</string>
     <string name="git_init_desc_secondary">若子目录已有 Git 仓库，也可直接选择使用</string>
     <string name="git_init_repo">初始化新仓库</string>

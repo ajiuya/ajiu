@@ -73,7 +73,12 @@ internal fun chrootEnvironment(
     "PATH" to "/root/.aicode/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
     "TMPDIR" to "/tmp",
     "LANG" to "C.UTF-8",
-    "TERM" to "xterm-256color"
+    "TERM" to "xterm-256color",
+    // The bind-mounted workspace can be App/FUSE-owned while the guest is root.
+    // Trust only this guest path; Git-panel subrepositories add their exact cwd per command.
+    "GIT_CONFIG_COUNT" to "1",
+    "GIT_CONFIG_KEY_0" to "safe.directory",
+    "GIT_CONFIG_VALUE_0" to "/root/workspace"
 ) + ChrootNetworkConfig.proxyEnvironment(proxyEnvironment) + profileEnvironment + extraEnvironment +
     mapOf("APT_CONFIG" to "/root/.aicode/apt-runtime.conf"))
     .toSortedMap()

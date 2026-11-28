@@ -73,6 +73,24 @@ class ChrootNetworkConfigTest {
     }
 
     @Test
+    fun gitTrustDefaultsToTheGuestWorkspaceWithoutChangingUserConfiguration() {
+        val defaults = chrootEnvironment(emptyMap(), emptyMap(), emptyMap()).associate {
+            it.substringBefore('=') to it.substringAfter('=')
+        }
+        assertEquals("1", defaults["GIT_CONFIG_COUNT"])
+        assertEquals("safe.directory", defaults["GIT_CONFIG_KEY_0"])
+        assertEquals("/root/workspace", defaults["GIT_CONFIG_VALUE_0"])
+        assertTrue(defaults.values.none { it == "*" })
+        assertTrue("GIT_CONFIG_GLOBAL" !in defaults)
+        val custom = chrootEnvironment(
+            mapOf("GIT_CONFIG_COUNT" to "0"),
+            mapOf("GIT_CONFIG_GLOBAL" to "/root/user.gitconfig"), emptyMap()
+        ).associate { it.substringBefore('=') to it.substringAfter('=') }
+        assertEquals("0", custom["GIT_CONFIG_COUNT"])
+        assertEquals("/root/user.gitconfig", custom["GIT_CONFIG_GLOBAL"])
+    }
+
+    @Test
     fun httpProxyIsAvailableToCommonClientsAndApt() {
         val raw = mapOf(
             "HTTP_PROXY" to "http://user:secret@proxy.example:3128",

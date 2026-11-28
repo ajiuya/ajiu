@@ -34,6 +34,7 @@ private const val TAG = "GitRepository"
 
 class GitOperationExpiredException : IllegalStateException("Git operation source changed; refresh the selected repository and retry")
 class GitWorkspaceRequiredException : IllegalStateException("Select an available workspace before running Git")
+class GitUnavailableException(output: String) : GitCommandFailureException(output)
 
 class FrozenGitOperation internal constructor(
     val workspacePath: String,
@@ -105,6 +106,11 @@ class GitRepository @Inject constructor(
 
         /** diff 允许读取的单侧文件字节上限：超过则不拉内容，直接降级为「文件过大」。 */
         const val MAX_DIFF_FILE_BYTES = 2L * 1024 * 1024
+
+        val GIT_NOT_FOUND = Regex(
+            """^(?:[^:\r\n]+:\s*)*git(?::|\s)\s*(?:command\s+)?not found\.?\s*$""",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.MULTILINE)
+        )
 
         val INSTALL_CHROOT_GIT = """
             set -e;
@@ -178,14 +184,30 @@ class GitRepository @Inject constructor(
         command: String,
         cwd: String = operation.repoRoot,
         timeoutMs: Long = CommandEngine.DEFAULT_TIMEOUT_MS
+    ): CommandResult = execute(operation, { command }, cwd, timeoutMs)
+
+    private suspend fun execute(
+        operation: FrozenGitOperation,
+        command: (WorkspaceExecutionContext) -> String,
+        cwd: String,
+        timeoutMs: Long
     ): CommandResult {
         operation.checkCurrent()
         val execution = operation.execution()
         return withContext(execution) {
             operation.checkCurrent()
-            engine.runCommandSyncUnbounded(command, cwd, timeoutMs).also { operation.checkCurrent() }
+            engine.runCommandSyncUnbounded(command(execution), cwd, timeoutMs).also { operation.checkCurrent() }
         }
     }
+
+    private suspend fun executeGit(
+        operation: FrozenGitOperation,
+        args: Array<out String>,
+        cwd: String = operation.repoRoot,
+        timeoutMs: Long = CommandEngine.DEFAULT_TIMEOUT_MS,
+        probe: Boolean = false,
+        legacyProbe: Boolean = false
+    ): CommandResult = execute(operation, { buildGitCommand(it, args, probe, legacyProbe) }, cwd, timeoutMs)
 
     /**
      * 发现工作区里的 git 仓库：工作区根 + 一层直接子目录。
@@ -207,11 +229,8 @@ class GitRepository @Inject constructor(
     }
 
     /** 指定路径是否处于 git 工作树内（用于仓库发现与手动指定校验）。 */
-    suspend fun isGitRepo(path: String, operation: FrozenGitOperation = captureOperation()): Boolean {
-        return gitAttempt {
-            execute(operation, "git rev-parse --is-inside-work-tree", path).output.trim() == "true"
-        }.getOrElse { false }
-    }
+    suspend fun isGitRepo(path: String, operation: FrozenGitOperation = captureOperation()): Boolean =
+        probeRepository(operation, path, legacyProbe = true)
 
     /**
      * 列出工作区根的一层直接子目录（供仓库选择弹窗展示扫描范围）。
@@ -251,7 +270,7 @@ class GitRepository @Inject constructor(
     ): String {
         // 用不限幅执行：diff 内容/文件内容可能远超 AI 工具链路的 4 万字符限幅，
         // 截断占位符会混入 diff 数据流被 UI 渲染成伪 diff 行。
-        val result = execute(operation, buildGitCommand(args), timeoutMs = timeoutMs)
+        val result = executeGit(operation, args, timeoutMs = timeoutMs)
         if (result.outputTruncated) throw GitOutputTooLargeException()
         if (result.exitCode == 0) return result.output
         throw GitCommandFailureException(result.output.ifBlank { "git 退出码 ${result.exitCode}" })
@@ -259,21 +278,63 @@ class GitRepository @Inject constructor(
 
     /** 拼命令并跑（不判退出码），[git] 与 [gitChecked] 复用。 */
     private suspend fun gitRaw(operation: FrozenGitOperation, args: Array<out String>): String {
-        val result = execute(operation, buildGitCommand(args))
+        val result = executeGit(operation, args)
         if (result.outputTruncated) throw GitOutputTooLargeException()
         return result.output
     }
 
     /** 拼成交给 `/bin/sh -c` 的单条命令字符串，逐参数 [shellQuote] 转义。 */
-    private fun buildGitCommand(args: Array<out String>): String = buildString {
-        append("git -c core.quotepath=false")
-        args.forEach { append(' '); append(shellQuote(it)) }
+    private fun buildGitCommand(
+        execution: WorkspaceExecutionContext,
+        args: Array<out String>,
+        probe: Boolean,
+        legacyProbe: Boolean
+    ): String {
+        val profile = execution.profileSnapshot?.activeProfile ?: execution.localMapping?.profile
+        val chroot = execution.mode == ExecutionMode.LOCAL_PROOT && profile?.isChroot == true
+        val command = buildString {
+            if (chroot) append("git_worktree=$(pwd -P) && test -n \"\$git_worktree\" && ")
+            if (probe) append("LC_ALL=C ")
+            append("git")
+            if (chroot) append(" -c \"safe.directory=\$git_worktree\"")
+            if (chroot || !legacyProbe) append(" -c core.quotepath=false")
+            args.forEach { append(' '); append(shellQuote(it)) }
+        }
+        if (!chroot && !probe) return command
+        val quotedScript = if (execution.mode == ExecutionMode.LOCAL_PROOT && profile?.shellPath?.substringAfterLast('/') == "fish") {
+            "'" + command.replace("\\", "\\\\").replace("'", "\\'") + "'"
+        } else {
+            shellQuote(command)
+        }
+        return "/bin/sh -c $quotedScript"
     }
 
-    /** 当前工作区是否处于一个 git 工作树内。SSH 未连接等异常时返回 false 而非抛出，避免 UI 崩溃。 */
-    suspend fun isRepo(operation: FrozenGitOperation = captureOperation()): Boolean {
-        return gitAttempt { git(operation, "rev-parse", "--is-inside-work-tree").trim() == "true" }
-            .getOrElse { false }
+    /** 当前工作区是否处于一个 git 工作树内，探测失败时保留原始错误。 */
+    suspend fun isRepo(operation: FrozenGitOperation = captureOperation()): Boolean =
+        probeRepository(operation, operation.repoRoot)
+
+    private suspend fun probeRepository(
+        operation: FrozenGitOperation,
+        cwd: String,
+        legacyProbe: Boolean = false
+    ): Boolean {
+        val result = executeGit(operation, arrayOf("rev-parse", "--is-inside-work-tree"), cwd, probe = true, legacyProbe = legacyProbe)
+        if (result.outputTruncated) throw GitOutputTooLargeException()
+        val output = result.output.trim()
+        if (result.exitCode == 0) {
+            when (output) {
+                "true" -> return true
+                "false" -> return false
+            }
+        }
+        if (result.exitCode == 128 &&
+            (output.startsWith("fatal: not a git repository", ignoreCase = true) ||
+                output.startsWith("fatal: not a git worktree", ignoreCase = true))
+        ) return false
+        if (result.exitCode == 127 && GIT_NOT_FOUND.containsMatchIn(output)) {
+            throw GitUnavailableException(result.output)
+        }
+        throw GitCommandFailureException(result.output.ifBlank { "git 退出码 ${result.exitCode}" })
     }
 
     /** 容器是否就绪可执行 git 命令；未就绪时返回引导文案（供 Git 页在刷新前提示用户去终端页初始化）。 */

@@ -1541,6 +1541,8 @@
     <string name="git_no_files_changed">No files changed in this commit</string>
     <string name="git_loading_files">Loading changed files...</string>
     <string name="git_not_a_repo">Current workspace is not a Git repository yet</string>
+    <string name="git_repository_error">Unable to read the Git repository</string>
+    <string name="git_unavailable_hint">Git is not installed in the current execution environment. In CHROOT, select Initialize or Clone to prepare it automatically; in other environments, install Git first.</string>
     <string name="git_init_desc_primary">Initialize a new repository here to start version control</string>
     <string name="git_init_desc_secondary">Or pick an existing repository from a subdirectory</string>
     <string name="git_init_repo">Initialize New Repository</string>

@@ -1,9 +1,11 @@
 package com.aicode.feature.git.presentation
 
 import android.app.Application
+import com.aicode.R
 import com.aicode.feature.agent.domain.container.CommandEngine
 import com.aicode.feature.agent.domain.container.CommandResult
 import com.aicode.feature.agent.domain.workflow.AgentWorkflow
+import com.aicode.feature.git.domain.GitErrorMessage
 import com.aicode.feature.git.domain.GitRepository
 import com.aicode.feature.settings.data.repository.ContainerSettingsRepository
 import com.aicode.feature.settings.data.repository.ExecutionModeHolder
@@ -59,6 +61,8 @@ class GitViewModelFrozenOperationTest {
     private lateinit var repository: GitRepository
     private lateinit var viewModel: GitViewModel
     private lateinit var root: String
+    @Volatile private var probeResult = CommandResult("true", 0)
+    @Volatile private var refsOutput = ""
     private val commands = java.util.Collections.synchronizedList(mutableListOf<Pair<String, String?>>())
 
     @Before fun setup() {
@@ -79,9 +83,11 @@ class GitViewModelFrozenOperationTest {
         }
         coEvery { engine.runCommandSyncUnbounded(any(), any(), any()) } answers {
             commands += firstArg<String>() to secondArg<String?>()
-            CommandResult(when {
-                firstArg<String>().contains("--is-inside-work-tree") -> "true"
-                firstArg<String>().contains("status") -> "## main"
+            val command = firstArg<String>()
+            if (command.contains("--is-inside-work-tree")) probeResult
+            else CommandResult(when {
+                command.contains("status") -> "## main"
+                command.contains("for-each-ref") -> refsOutput
                 else -> ""
             }, 0)
         }
@@ -108,6 +114,159 @@ class GitViewModelFrozenOperationTest {
         assertTrue(commands.isNotEmpty())
         assertTrue(commands.all { it.second == root })
         assertTrue(viewModel.state.value.toast.isNullOrBlank())
+    }
+
+    @Test fun refreshReportsDubiousOwnershipInsteadOfNonRepository() = testScope.runTest {
+        val output = "fatal: detected dubious ownership in repository at '$root'"
+        probeResult = CommandResult(output, 128)
+        createViewModel()
+        advanceUntilIdle()
+
+        val state = viewModel.state.value
+        assertFalse(state.loading)
+        assertFalse(state.notARepo)
+        assertFalse(state.gitUnavailable)
+        assertEquals(output, state.repositoryError)
+        assertFalse(state.branchesLoaded)
+        assertTrue(commands.none { it.first.contains("for-each-ref") })
+        viewModel.consumeToast()
+        assertEquals(output, viewModel.state.value.repositoryError)
+    }
+
+    @Test fun refreshPreservesLocalPermissionErrorsWithoutCallingThemRemoteAuthenticationFailures() = testScope.runTest {
+        val output = "fatal: cannot open '.git/config': Permission denied"
+        probeResult = CommandResult(output, 128)
+        createViewModel()
+        advanceUntilIdle()
+        assertFalse(viewModel.state.value.notARepo)
+        assertEquals(output, viewModel.state.value.repositoryError)
+        assertFalse(viewModel.state.value.gitUnavailable)
+    }
+
+    @Test fun refreshDoesNotClassifyWordsInsideAPathAsTheRepositoryProbeResult() = testScope.runTest {
+        val output = "fatal: detected dubious ownership in repository at '/work/not a git repository'"
+        probeResult = CommandResult(output, 128)
+        createViewModel()
+        advanceUntilIdle()
+        assertFalse(viewModel.state.value.notARepo)
+        assertEquals(output, viewModel.state.value.repositoryError)
+    }
+
+    @Test fun refreshReportsUnknownProbeExitInsteadOfNonRepository() = testScope.runTest {
+        val output = "fatal: unexpected repository probe failure"
+        probeResult = CommandResult(output, 42)
+        createViewModel()
+        advanceUntilIdle()
+
+        val state = viewModel.state.value
+        assertFalse(state.loading)
+        assertFalse(state.notARepo)
+        assertFalse(state.gitUnavailable)
+        assertEquals(output, state.repositoryError)
+        assertFalse(state.branchesLoaded)
+    }
+
+    @Test fun refreshClearsProbeErrorAndLoadsBranchesAfterRetry() = testScope.runTest {
+        probeResult = CommandResult("/bin/sh: git: not found", 127)
+        createViewModel()
+        advanceUntilIdle()
+        assertNotNull(viewModel.state.value.repositoryError)
+        assertTrue(viewModel.state.value.gitUnavailable)
+
+        probeResult = CommandResult("true", 0)
+        refsOutput = "main\u001f0123456789abcdef\u001f*\u001frefs/heads/main"
+        viewModel.refresh()
+        assertTrue(viewModel.state.value.loading)
+        assertNull(viewModel.state.value.repositoryError)
+        assertFalse(viewModel.state.value.gitUnavailable)
+        advanceUntilIdle()
+        awaitSnapshot()
+
+        val state = viewModel.state.value
+        assertFalse(state.loading)
+        assertFalse(state.notARepo)
+        assertFalse(state.gitUnavailable)
+        assertNull(state.repositoryError)
+        assertTrue(state.branchesLoaded)
+        assertEquals("main", state.branches.single().name)
+        assertTrue(state.branches.single().current)
+        assertEquals(root, state.currentRepo)
+        assertTrue(state.toast.isNullOrBlank())
+    }
+
+    @Test fun refreshRecognizesExplicitNonRepositoryWithoutError() = testScope.runTest {
+        probeResult = CommandResult("fatal: not a git repository (or any of the parent directories): .git", 128)
+        createViewModel()
+        advanceUntilIdle()
+
+        val state = viewModel.state.value
+        assertFalse(state.loading)
+        assertTrue(state.notARepo)
+        assertNull(state.repositoryError)
+        assertFalse(state.gitUnavailable)
+        assertNull(state.currentRepo)
+        assertTrue(state.toast.isNullOrBlank())
+    }
+
+    @Test fun refreshDoesNotKeepPreviousNonRepositoryStateWhenProbeFails() = testScope.runTest {
+        probeResult = CommandResult("fatal: not a git repository", 128)
+        createViewModel()
+        advanceUntilIdle()
+        assertTrue(viewModel.state.value.notARepo)
+
+        val output = "fatal: detected dubious ownership in repository at '$root'"
+        probeResult = CommandResult(output, 128)
+        viewModel.refresh()
+        advanceUntilIdle()
+
+        assertFalse(viewModel.state.value.loading)
+        assertFalse(viewModel.state.value.notARepo)
+        assertFalse(viewModel.state.value.gitUnavailable)
+        assertEquals(output, viewModel.state.value.repositoryError)
+    }
+
+    @Test fun refreshMarksMissingGitForPreparationAndStillAllowsInitialization() = testScope.runTest {
+        val output = "/bin/sh: git: not found"
+        probeResult = CommandResult(output, 127)
+        createViewModel()
+        advanceUntilIdle()
+
+        val state = viewModel.state.value
+        assertFalse(state.loading)
+        assertFalse(state.notARepo)
+        assertTrue(state.gitUnavailable)
+        assertEquals(output, state.repositoryError)
+
+        viewModel.initRepo()
+        advanceUntilIdle()
+        assertTrue(commands.any { it.first == "git -c core.quotepath=false init -b main" })
+        assertFalse(viewModel.state.value.busy)
+        assertFalse(viewModel.state.value.notARepo)
+        assertTrue(viewModel.state.value.gitUnavailable)
+        assertEquals(output, viewModel.state.value.repositoryError)
+    }
+
+    @Test fun successfulActionKeepsActualProbeFailureInsteadOfNonRepository() = testScope.runTest {
+        createViewModel()
+        advanceUntilIdle()
+        awaitSnapshot()
+        val output = "fatal: detected dubious ownership in repository at '$root'"
+        probeResult = CommandResult(output, 128)
+
+        viewModel.stageAll()
+        advanceUntilIdle()
+
+        val state = viewModel.state.value
+        assertTrue(commands.any { it.first == "git -c core.quotepath=false add -A" })
+        assertFalse(state.busy)
+        assertFalse(state.notARepo)
+        assertFalse(state.gitUnavailable)
+        assertEquals(output, state.repositoryError)
+        val context = RuntimeEnvironment.getApplication()
+        val success = context.getString(R.string.git_toast_action_success, context.getString(R.string.git_action_stage_all))
+        assertEquals(context.getString(R.string.git_toast_action_refresh_failed, success), state.toast)
+        viewModel.consumeToast()
+        assertEquals(output, viewModel.state.value.repositoryError)
     }
 
     @Test fun repositoryRoundTripAfterDisplayedSnapshotRejectsLaterDetailAndDiffLoads() = testScope.runTest {

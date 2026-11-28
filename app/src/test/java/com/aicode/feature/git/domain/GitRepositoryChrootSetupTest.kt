@@ -60,7 +60,7 @@ class GitRepositoryChrootSetupTest {
         assertTrue(fixture.calls[1].isInstall)
         assertEquals(600_000L, fixture.calls[1].timeoutMs)
         assertEquals(VERSION, fixture.calls[2].command)
-        assertEquals("git -c core.quotepath=false clone 'https://example.com/team/repo'\\''with space.git' .", fixture.calls[3].command)
+        assertEquals(trustedGit("clone 'https://example.com/team/repo'\\''with space.git' .", fish = true), fixture.calls[3].command)
         assertEquals(600_000L, fixture.calls[3].timeoutMs)
         assertEquals(operation.owner, fixture.contexts.single().runtimeOwner)
         assertEquals("/usr/bin/fish", operation.runtimeProfile?.shellPath)
@@ -78,6 +78,29 @@ class GitRepositoryChrootSetupTest {
         assertTrue(fixture.calls[1].isInstall)
         assertEquals(VERSION, fixture.calls[2].command)
         assertEquals(writeCommand(clone = false), fixture.calls[3].command)
+        fixture.assertSingleExecution()
+    }
+
+    @Test
+    fun olderGitStillFallsBackToInitAndSymbolicRefInTheSameTrustedOperation() = runTest {
+        val fixture = Fixture()
+        fixture.probeResult = CommandResult("/usr/bin/git", 0)
+        fixture.onCommand = { call ->
+            fixture.gitResult = if (call.command == writeCommand(clone = false)) {
+                CommandResult("error: unknown switch 'b'", 129)
+            } else {
+                CommandResult("write completed", 0)
+            }
+        }
+
+        assertEquals("write completed", fixture.repository.initRepo())
+        assertEquals(listOf(
+            PROBE,
+            VERSION,
+            writeCommand(clone = false),
+            trustedGit("init"),
+            trustedGit("symbolic-ref HEAD refs/heads/main")
+        ), fixture.calls.map { it.command })
         fixture.assertSingleExecution()
     }
 
@@ -186,7 +209,7 @@ class GitRepositoryChrootSetupTest {
 
                 fixture.runWrite(clone)
 
-                assertEquals(listOf(writeCommand(clone)), fixture.calls.map { it.command })
+                assertEquals(listOf(writeCommand(clone, chroot = false)), fixture.calls.map { it.command })
                 fixture.assertSingleExecution()
             }
         }
@@ -198,9 +221,15 @@ class GitRepositoryChrootSetupTest {
         fixture.gitResult = CommandResult("/bin/sh: 1: git: not found", 127)
         val operation = fixture.repository.captureOperation()
 
-        assertFalse(fixture.repository.isRepo(operation))
-        assertFalse(fixture.repository.isGitRepo(WORKSPACE, operation))
-        assertTrue(fixture.repository.discoverRepos(operation).isEmpty())
+        for (probe in listOf<suspend () -> Any>(
+            { fixture.repository.isRepo(operation) },
+            { fixture.repository.isGitRepo(WORKSPACE, operation) },
+            { fixture.repository.discoverRepos(operation) }
+        )) {
+            val failure = runCatching { probe() }.exceptionOrNull()
+            assertTrue(failure is GitUnavailableException)
+            assertEquals(fixture.gitResult.output, (failure as GitUnavailableException).output)
+        }
         fixture.repository.status(operation)
 
         assertTrue(fixture.calls.isNotEmpty())
@@ -291,10 +320,15 @@ class GitRepositoryChrootSetupTest {
         const val PROBE = "/bin/sh -c 'command -v git'"
         const val VERSION = "/bin/sh -c 'git --version'"
 
-        fun writeCommand(clone: Boolean): String = if (clone) {
-            "git -c core.quotepath=false clone $URL ."
-        } else {
-            "git -c core.quotepath=false init -b main"
+        fun writeCommand(clone: Boolean, chroot: Boolean = true): String {
+            val args = if (clone) "clone $URL ." else "init -b main"
+            return if (chroot) trustedGit(args) else "git -c core.quotepath=false $args"
+        }
+
+        fun trustedGit(args: String, fish: Boolean = false): String {
+            val script = "git_worktree=$(pwd -P) && test -n \"\$git_worktree\" && git -c \"safe.directory=\$git_worktree\" -c core.quotepath=false $args"
+            val quoted = if (fish) script.replace("\\", "\\\\").replace("'", "\\'") else script.replace("'", "'\\''")
+            return "/bin/sh -c '$quoted'"
         }
     }
 }

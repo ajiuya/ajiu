@@ -10,6 +10,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -205,6 +206,18 @@ fun GitScreen(
                 state.loading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     CircularProgressIndicator()
                 }
+                state.gitUnavailable -> NotARepoState(
+                    busy = state.busy,
+                    onInit = viewModel::initRepo,
+                    onClone = viewModel::cloneRepo,
+                    onPickExisting = viewModel::showRepoPicker,
+                    hint = stringResource(R.string.git_unavailable_hint)
+                )
+                state.repositoryError != null -> RepositoryErrorState(
+                    error = state.repositoryError.orEmpty(),
+                    busy = state.busy,
+                    onRetry = viewModel::refresh
+                )
                 state.notARepo -> NotARepoState(
                     busy = state.busy,
                     onInit = viewModel::initRepo,
@@ -296,7 +309,7 @@ fun GitScreen(
 
         // 底部渐变蒙版 + 悬浮 tab 组：内容可滚动到屏幕底部穿过 tab 栏，被渐变遮罩（同主页输入框）。
         // 仅仓库态显示：加载中/非仓库态时 HorizontalPager 未组合，点击 tab 无内容可切换。
-        if (!state.loading && !state.notARepo) {
+        if (!state.loading && !state.notARepo && !state.gitUnavailable && state.repositoryError == null) {
             FloatingTabBar(
                 pagerState = pagerState,
                 items = listOf(
@@ -469,13 +482,39 @@ internal fun EmptyState(text: String) {
     }
 }
 
+@Composable
+private fun RepositoryErrorState(error: String, busy: Boolean, onRetry: () -> Unit) {
+    Column(
+        modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(Spacing.lg),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(Spacing.md, Alignment.CenterVertically)
+    ) {
+        Text(
+            text = stringResource(R.string.git_repository_error),
+            style = MaterialTheme.typography.titleMedium,
+            color = MaterialTheme.colorScheme.error
+        )
+        Text(
+            text = error,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        FilledTonalButton(onClick = onRetry, enabled = !busy) {
+            Icon(FeatherIcons.RefreshCw, contentDescription = null, modifier = Modifier.size(Spacing.md))
+            Spacer(Modifier.width(Spacing.xs))
+            Text(stringResource(R.string.common_retry))
+        }
+    }
+}
+
 /** 非仓库态：文案 + 「初始化 Git 仓库」/「克隆远程仓库」/「选择已有仓库」按钮（成功后自动刷新进仓库态）。 */
 @Composable
 private fun NotARepoState(
     busy: Boolean,
     onInit: () -> Unit,
     onClone: (String) -> Unit,
-    onPickExisting: () -> Unit
+    onPickExisting: () -> Unit,
+    hint: String? = null
 ) {
     var showCloneDialog by remember { mutableStateOf(false) }
 
@@ -486,20 +525,22 @@ private fun NotARepoState(
             modifier = Modifier.padding(horizontal = Spacing.lg)
         ) {
             Text(
-                stringResource(R.string.git_not_a_repo),
+                hint ?: stringResource(R.string.git_not_a_repo),
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-            Text(
-                stringResource(R.string.git_init_desc_primary),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            Text(
-                stringResource(R.string.git_init_desc_secondary),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
+            if (hint == null) {
+                Text(
+                    stringResource(R.string.git_init_desc_primary),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text(
+                    stringResource(R.string.git_init_desc_secondary),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
             if (busy) {
                 Spacer(Modifier.height(Spacing.sm))
                 CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
