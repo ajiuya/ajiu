@@ -39,6 +39,7 @@
 #define FW_MOUNTINFO (4U * 1024U * 1024U)
 #define FW_WRITE_LIMIT (UINT64_C(512) * 1024U * 1024U)
 #define FW_WAIT_MS 30000
+#define FW_SDCARDFS_MAGIC 0x5dca2df5L
 #define FW_DF (O_PATH | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
 #define FW_PF (O_PATH | O_CLOEXEC | O_NOFOLLOW)
 #define FW_RESOLVE (RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)
@@ -55,7 +56,7 @@ struct fw_identity { struct statx st; };
 struct fw_mount {
     uint64_t id;
     char path[FW_PATH + 1];
-    bool writable;
+    bool writable, shared_metadata;
     int fd;
     struct fw_identity identity;
 };
@@ -73,7 +74,7 @@ struct fw_handle {
     mode_t commit_mode;
     int fd, parent, original;
     uint64_t total;
-    struct fw_identity identity, parent_identity, original_identity;
+    struct fw_identity identity, parent_identity, original_identity, content_identity;
     char path[FW_PATH + 1], name[FW_NAME + 1], temporary[64];
 };
 struct fw_boundary { uint64_t id; char *path; };
@@ -286,7 +287,7 @@ static int fw_identify(int fd, struct fw_identity *id)
     if (syscall(SYS_statx, fd, "", AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW,
                 STATX_BASIC_STATS | STATX_MNT_ID, &id->st) < 0) return -1;
     uint32_t required = STATX_TYPE | STATX_MODE | STATX_NLINK | STATX_UID | STATX_GID |
-        STATX_INO | STATX_SIZE | STATX_MTIME | STATX_MNT_ID;
+        STATX_INO | STATX_SIZE | STATX_MTIME | STATX_CTIME | STATX_MNT_ID;
     if ((id->st.stx_mask & required) != required) return fw_fail(EOPNOTSUPP);
     return 0;
 }
@@ -517,8 +518,15 @@ static int fw_load_mounts(struct fw_context *ctx)
             fw_find_mount(ctx, id) || ctx->mount_count == FW_MOUNTS) {
             error = EACCES; close(anchor); break;
         }
+        bool shared_metadata = false;
+        if (!strcmp(path, "/root/workspace")) {
+            struct statfs type;
+            if (fstatfs(anchor, &type) < 0) { error = errno; close(anchor); break; }
+            shared_metadata = type.f_type == FUSE_SUPER_MAGIC || type.f_type == FW_SDCARDFS_MAGIC;
+        }
         struct fw_mount *mount = &ctx->mounts[ctx->mount_count++];
         mount->id = id; mount->fd = anchor; mount->identity = identity; mount->writable = !ro;
+        mount->shared_metadata = shared_metadata;
         memcpy(mount->path, path, strlen(path) + 1);
         if (!strcmp(path, "/")) have_root = true;
         if (!strcmp(path, "/root")) have_home = true;
@@ -894,6 +902,76 @@ static int fw_creation_owner(const struct fw_context *ctx, uint64_t mount_id, ui
     return 0;
 }
 
+static bool fw_shared_metadata(const struct fw_context *ctx, uint64_t mount_id)
+{
+    const struct fw_mount *mount = fw_find_mount(ctx, mount_id);
+    return mount && mount->shared_metadata && !strcmp(mount->path, "/root/workspace");
+}
+
+static bool fw_same_metadata(const struct fw_identity *a, const struct fw_identity *b)
+{
+    return a->st.stx_uid == b->st.stx_uid && a->st.stx_gid == b->st.stx_gid &&
+        a->st.stx_mode == b->st.stx_mode;
+}
+
+static int fw_metadata_current(int fd, const struct fw_identity *expected, bool links)
+{
+    struct fw_identity current;
+    if (fw_identify(fd, &current) < 0) return -1;
+    if (!fw_same(&current, expected) || !fw_same_metadata(&current, expected) ||
+        (links && current.st.stx_nlink != expected->st.stx_nlink)) return fw_fail(ESTALE);
+    return 0;
+}
+
+static bool fw_same_time(const struct statx_timestamp *a, const struct statx_timestamp *b)
+{
+    return a->tv_sec == b->tv_sec && a->tv_nsec == b->tv_nsec;
+}
+
+static bool fw_same_epoch(const struct fw_identity *a, const struct fw_identity *b, bool ctime)
+{
+    return fw_same_time(&a->st.stx_mtime, &b->st.stx_mtime) &&
+        (!ctime || fw_same_time(&a->st.stx_ctime, &b->st.stx_ctime));
+}
+
+static int fw_epoch_current(int fd, const struct fw_identity *expected, bool ctime)
+{
+    struct fw_identity current;
+    if (fw_identify(fd, &current) < 0) return -1;
+    return fw_same(&current, expected) && fw_same_epoch(&current, expected, ctime) ? 0 : fw_fail(ESTALE);
+}
+
+static int fw_shared_created(const struct fw_identity *created, const struct fw_identity *parent, bool directory)
+{
+    mode_t mode = created->st.stx_mode, allowed = parent->st.stx_mode & (directory ? 03777U : 0777U);
+    if ((directory ? !S_ISDIR(mode) : !S_ISREG(mode)) || !S_ISDIR(parent->st.stx_mode) ||
+        created->st.stx_mnt_id != parent->st.stx_mnt_id || created->st.stx_uid != parent->st.stx_uid ||
+        created->st.stx_gid != parent->st.stx_gid || ((mode & 07777U) & ~allowed) ||
+        (directory ? created->st.stx_nlink < 1 || created->st.stx_nlink > 2 :
+            created->st.stx_nlink != 1 || created->st.stx_size != 0)) return fw_fail(ESTALE);
+    return 0;
+}
+
+static int fw_empty_directory(const struct fw_context *ctx, int directory, const struct fw_identity *identity)
+{
+    if (fw_epoch_current(directory, identity, true) < 0) return -1;
+    int fd = fw_directory_read(directory, identity);
+    if (fd < 0) return -1;
+    DIR *dir = fdopendir(fd);
+    if (!dir) { int saved = errno; close(fd); return fw_fail(saved); }
+    int error = 0;
+    for (;;) {
+        if (fw_check(ctx) < 0) { error = errno; break; }
+        errno = 0; struct dirent *entry = readdir(dir);
+        if (!entry) { error = errno; break; }
+        if (strcmp(entry->d_name, ".") && strcmp(entry->d_name, "..")) { error = ESTALE; break; }
+    }
+    if (!error && (fw_metadata_current(directory, identity, true) < 0 ||
+        fw_epoch_current(directory, identity, true) < 0)) error = errno;
+    if (closedir(dir) < 0 && !error) error = errno;
+    return error ? fw_fail(error) : 0;
+}
+
 static int fw_begin_write_request(struct fw_context *ctx, struct fw_input *in, struct fw_output *out)
 {
     char path[FW_PATH + 1]; uint32_t overwrite;
@@ -914,11 +992,12 @@ static int fw_begin_write_request(struct fw_context *ctx, struct fw_input *in, s
             h->parent = fw_directory_read(r.parent, &h->parent_identity);
             if (h->parent < 0) error = errno;
         }
+        bool shared = fw_shared_metadata(ctx, h->parent_identity.st.stx_mnt_id);
         if (!r.missing) {
             h->original = r.fd; r.fd = -1; h->original_identity = r.identity;
             h->commit_uid = (uid_t)r.identity.st.stx_uid; h->commit_gid = (gid_t)r.identity.st.stx_gid;
             h->commit_mode = (mode_t)(r.identity.st.stx_mode & 07777U);
-        } else {
+        } else if (!shared) {
             h->commit_mode = 0600;
             if (fw_creation_owner(ctx, r.identity.st.stx_mnt_id, &h->commit_uid, &h->commit_gid) < 0) error = errno;
         }
@@ -930,7 +1009,18 @@ static int fw_begin_write_request(struct fw_context *ctx, struct fw_input *in, s
             if (fd < 0) { if (errno == EEXIST) continue; error = errno; break; }
             h->fd = fd; strcpy(h->temporary, name);
             if (fw_identify(fd, &h->identity) < 0) { error = errno; break; }
-            if (!S_ISREG(h->identity.st.stx_mode) || h->identity.st.stx_uid != (uint32_t)geteuid() ||
+            if (shared) {
+                h->content_identity = h->identity;
+                if (fw_shared_created(&h->identity, &h->parent_identity, false) < 0 ||
+                    fw_metadata_current(h->parent, &h->parent_identity, false) < 0 ||
+                    fw_named_same(h->parent, h->temporary, &h->identity) < 0 ||
+                    fw_authorize(ctx, h->fd, &h->identity, h->path, true) < 0) error = errno;
+                if (!error && !r.missing && !fw_same_metadata(&h->identity, &h->original_identity)) error = ESTALE;
+                if (!error && r.missing) {
+                    h->commit_uid = (uid_t)h->identity.st.stx_uid; h->commit_gid = (gid_t)h->identity.st.stx_gid;
+                    h->commit_mode = (mode_t)(h->identity.st.stx_mode & 07777U);
+                }
+            } else if (!S_ISREG(h->identity.st.stx_mode) || h->identity.st.stx_uid != (uint32_t)geteuid() ||
                 h->identity.st.stx_nlink != 1 || (h->identity.st.stx_mode & 0777U) != 0600 ||
                 h->identity.st.stx_mnt_id != h->parent_identity.st.stx_mnt_id) error = ESTALE;
         }
@@ -943,23 +1033,32 @@ static int fw_begin_write_request(struct fw_context *ctx, struct fw_input *in, s
     }
     return fw_out32(out, h->number);
 }
-static int fw_write_handle_current(struct fw_context *ctx, struct fw_handle *h)
+static int fw_write_handle_current(struct fw_context *ctx, struct fw_handle *h, bool wrote)
 {
     if (!h->writing || h->committed || h->poisoned) return fw_fail(h->poisoned ? EIO : EBADF);
     char parent_path[FW_PATH + 1]; strcpy(parent_path, h->path);
     char *slash = strrchr(parent_path, '/'); if (slash == parent_path) slash[1] = 0; else *slash = 0;
     if (fw_current(ctx, h->parent, &h->parent_identity, parent_path, true) < 0 ||
         fw_named_same(h->parent, h->temporary, &h->identity) < 0) return -1;
+    bool shared = fw_shared_metadata(ctx, h->identity.st.stx_mnt_id);
+    if (shared && fw_metadata_current(h->parent, &h->parent_identity, false) < 0) return -1;
     struct fw_identity current;
     if (fw_identify(h->fd, &current) < 0) return -1;
     if (!fw_same(&current, &h->identity) || current.st.stx_size != h->total || current.st.stx_nlink != 1)
         return fw_fail(ESTALE);
     uid_t uid = h->metadata_applied ? h->commit_uid : (uid_t)h->identity.st.stx_uid;
     gid_t gid = h->metadata_applied ? h->commit_gid : (gid_t)h->identity.st.stx_gid;
-    mode_t mode = h->metadata_applied ? h->commit_mode : 0600;
+    mode_t mode = h->metadata_applied ? h->commit_mode : shared ? (mode_t)(h->identity.st.stx_mode & 07777U) : 0600;
     if (current.st.stx_uid != (uint32_t)uid || current.st.stx_gid != (uint32_t)gid ||
         (current.st.stx_mode & 07777U) != mode) return fw_fail(ESTALE);
-    return fw_authorize(ctx, h->fd, &current, h->path, true);
+    if (fw_authorize(ctx, h->fd, &current, h->path, true) < 0) return -1;
+    if (shared) {
+        /* A successful local write establishes the next expected content epoch. Other
+         * requests must still observe it, even when another writer preserves the size. */
+        if (!wrote && !fw_same_epoch(&current, &h->content_identity, true)) return fw_fail(ESTALE);
+        if (wrote) h->content_identity = current;
+    }
+    return 0;
 }
 static int fw_write_chunk_request(struct fw_context *ctx, struct fw_input *in)
 {
@@ -969,7 +1068,7 @@ static int fw_write_chunk_request(struct fw_context *ctx, struct fw_input *in)
     struct fw_handle *h = fw_find_handle(ctx, number);
     if (!h) return -1;
     if (h->metadata_applied) return fw_fail(EBADF);
-    if (fw_write_handle_current(ctx, h) < 0) return -1;
+    if (fw_write_handle_current(ctx, h, false) < 0) return -1;
     if (h->total > FW_WRITE_LIMIT - length) return fw_fail(EFBIG);
     size_t used = 0;
     while (used < length) {
@@ -980,7 +1079,7 @@ static int fw_write_chunk_request(struct fw_context *ctx, struct fw_input *in)
         used += (size_t)n;
     }
     h->total += length;
-    if (fw_write_handle_current(ctx, h) < 0) { h->poisoned = true; return -1; }
+    if (fw_write_handle_current(ctx, h, true) < 0) { h->poisoned = true; return -1; }
     return 0;
 }
 static int fw_destination_current(const struct fw_handle *h)
@@ -1003,23 +1102,32 @@ static int fw_commit_write_request(struct fw_context *ctx, struct fw_input *in, 
     uint32_t number;
     if (fw_take32(in, &number) < 0 || fw_end(in) < 0) return -1;
     struct fw_handle *h = fw_find_handle(ctx, number);
-    if (!h || fw_write_handle_current(ctx, h) < 0 || fw_destination_current(h) < 0) return -1;
+    if (!h || fw_write_handle_current(ctx, h, false) < 0 || fw_destination_current(h) < 0) return -1;
     if (!h->metadata_applied) {
-        /* chown may clear setid bits: restore ownership first, then the complete permission mode.
-         * All changes affect only the owned, pinned 0600 temporary inode, never the old target. */
-        if ((h->identity.st.stx_uid != (uint32_t)h->commit_uid || h->identity.st.stx_gid != (uint32_t)h->commit_gid) &&
-            fchown(h->fd, h->commit_uid, h->commit_gid) < 0) { h->poisoned = true; return -1; }
-        if (fchmod(h->fd, h->commit_mode) < 0) { h->poisoned = true; return -1; }
+        if (fw_shared_metadata(ctx, h->identity.st.stx_mnt_id)) {
+            if (h->identity.st.stx_uid != (uint32_t)h->commit_uid || h->identity.st.stx_gid != (uint32_t)h->commit_gid ||
+                (h->identity.st.stx_mode & 07777U) != h->commit_mode) { h->poisoned = true; return fw_fail(ESTALE); }
+        } else {
+            /* chown may clear setid bits: restore ownership first, then the complete permission mode.
+             * All changes affect only the owned, pinned 0600 temporary inode, never the old target. */
+            if ((h->identity.st.stx_uid != (uint32_t)h->commit_uid || h->identity.st.stx_gid != (uint32_t)h->commit_gid) &&
+                fchown(h->fd, h->commit_uid, h->commit_gid) < 0) { h->poisoned = true; return -1; }
+            if (fchmod(h->fd, h->commit_mode) < 0) { h->poisoned = true; return -1; }
+        }
         h->metadata_applied = true;
     }
-    if (fsync(h->fd) < 0 || fw_check(ctx) < 0 || fw_write_handle_current(ctx, h) < 0 ||
+    if (fsync(h->fd) < 0 || fw_check(ctx) < 0 || fw_write_handle_current(ctx, h, false) < 0 ||
         fw_destination_current(h) < 0) return -1;
     unsigned int flags = h->overwrite && h->original >= 0 ? 0U : RENAME_NOREPLACE;
     if (syscall(SYS_renameat2, h->parent, h->temporary, h->parent, h->name, flags) < 0) return -1;
     h->committed = true;
     uint64_t size = h->total;
     int error = 0;
-    if (fw_named_same(h->parent, h->name, &h->identity) < 0 || fsync(h->parent) < 0) error = errno;
+    if (fw_named_same(h->parent, h->name, &h->identity) < 0 ||
+        (fw_shared_metadata(ctx, h->identity.st.stx_mnt_id) &&
+            (fw_metadata_current(h->fd, &h->identity, true) < 0 ||
+             fw_epoch_current(h->fd, &h->content_identity, false) < 0)) ||
+        fsync(h->parent) < 0) error = errno;
     if (fw_drop_handle(ctx, h, false) < 0 && !error) error = errno;
     if (error) return fw_fail(error);
     return fw_out64(out, size);
@@ -1028,9 +1136,10 @@ static int fw_commit_write_request(struct fw_context *ctx, struct fw_input *in, 
 static int fw_publish_directory(struct fw_context *ctx, const struct fw_resolved *target)
 {
     struct fw_identity parent_identity, created_identity = {0};
-    uid_t uid; gid_t gid;
-    if (fw_write_target(ctx, target) < 0 || fw_identify(target->parent, &parent_identity) < 0 ||
-        fw_creation_owner(ctx, parent_identity.st.stx_mnt_id, &uid, &gid) < 0) return -1;
+    if (fw_write_target(ctx, target) < 0 || fw_identify(target->parent, &parent_identity) < 0) return -1;
+    bool shared = fw_shared_metadata(ctx, parent_identity.st.stx_mnt_id);
+    uid_t uid = (uid_t)parent_identity.st.stx_uid; gid_t gid = (gid_t)parent_identity.st.stx_gid;
+    if (!shared && fw_creation_owner(ctx, parent_identity.st.stx_mnt_id, &uid, &gid) < 0) return -1;
     int parent = fw_directory_read(target->parent, &parent_identity);
     if (parent < 0) return -1;
     char parent_path[FW_PATH + 1]; strcpy(parent_path, target->path);
@@ -1047,7 +1156,11 @@ static int fw_publish_directory(struct fw_context *ctx, const struct fw_resolved
     if (!error) {
         directory = fw_open(parent, temporary, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK, 0, FW_RESOLVE);
         if (directory < 0 || fw_identify(directory, &created_identity) < 0) error = errno;
-        else if (!S_ISDIR(created_identity.st.stx_mode) || created_identity.st.stx_uid != (uint32_t)geteuid() ||
+        else if (shared) {
+            if (fw_shared_created(&created_identity, &parent_identity, true) < 0 ||
+                fw_empty_directory(ctx, directory, &created_identity) < 0) error = errno;
+            else owned = true;
+        } else if (!S_ISDIR(created_identity.st.stx_mode) || created_identity.st.stx_uid != (uint32_t)geteuid() ||
             (created_identity.st.stx_mode & 0777U) != 0700 || created_identity.st.stx_nlink != 2 ||
             created_identity.st.stx_mnt_id != parent_identity.st.stx_mnt_id) error = ESTALE;
         else owned = true;
@@ -1055,24 +1168,30 @@ static int fw_publish_directory(struct fw_context *ctx, const struct fw_resolved
     if (!error && (fw_current(ctx, parent, &parent_identity, parent_path, true) < 0 ||
         fw_named_same(parent, temporary, &created_identity) < 0 ||
         fw_authorize(ctx, directory, &created_identity, target->path, true) < 0)) error = errno;
-    /* Never follow/re-resolve the published name for metadata changes. Only this private, pinned
-     * 0700 inode receives ownership; competing existing directories/symlinks are read-only inputs. */
-    if (!error && (created_identity.st.stx_uid != (uint32_t)uid || created_identity.st.stx_gid != (uint32_t)gid) &&
-        fchown(directory, uid, gid) < 0) error = errno;
-    if (!error && fchmod(directory, 0700) < 0) error = errno;
-    struct fw_identity current;
-    if (!error && (fw_identify(directory, &current) < 0 || !fw_same(&current, &created_identity) ||
-        current.st.stx_uid != (uint32_t)uid || current.st.stx_gid != (uint32_t)gid ||
-        (current.st.stx_mode & 07777U) != 0700 || current.st.stx_nlink != 2)) error = ESTALE;
+    if (!shared) {
+        /* Never follow/re-resolve the published name for metadata changes. Only this private, pinned
+         * 0700 inode receives ownership; competing existing directories/symlinks are read-only inputs. */
+        if (!error && (created_identity.st.stx_uid != (uint32_t)uid || created_identity.st.stx_gid != (uint32_t)gid) &&
+            fchown(directory, uid, gid) < 0) error = errno;
+        if (!error && fchmod(directory, 0700) < 0) error = errno;
+        struct fw_identity current;
+        if (!error && (fw_identify(directory, &current) < 0 || !fw_same(&current, &created_identity) ||
+            current.st.stx_uid != (uint32_t)uid || current.st.stx_gid != (uint32_t)gid ||
+            (current.st.stx_mode & 07777U) != 0700 || current.st.stx_nlink != 2)) error = ESTALE;
+    }
     if (!error && (fsync(directory) < 0 || fw_check(ctx) < 0 ||
         fw_current(ctx, parent, &parent_identity, parent_path, true) < 0 ||
         fw_named_same(parent, temporary, &created_identity) < 0 || fw_protected(ctx, target->path) < 0)) error = errno;
+    if (!error && shared && (fw_metadata_current(parent, &parent_identity, false) < 0 ||
+        fw_empty_directory(ctx, directory, &created_identity) < 0)) error = errno;
     if (!error) {
         if (syscall(SYS_renameat2, parent, temporary, parent, target->name, RENAME_NOREPLACE) < 0) {
             if (errno == EEXIST) result = 1; else error = errno;
         } else published = true;
     }
-    if (published && (fw_current(ctx, directory, &created_identity, target->path, true) < 0 || fsync(parent) < 0)) {
+    if (published && (fw_current(ctx, directory, &created_identity, target->path, true) < 0 ||
+        (shared && (fw_metadata_current(directory, &created_identity, true) < 0 ||
+            fw_epoch_current(directory, &created_identity, false) < 0)) || fsync(parent) < 0)) {
         error = errno; ctx->cleanup_failed = true;
     }
     if (created && !published) {

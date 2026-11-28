@@ -36,7 +36,7 @@
 #define REMOVE_MAGIC UINT64_C(0x414a525200000001)
 #define MAX_RECOVERY_VIEWS 4096U
 #define MAX_PROC_TASKS 65536U
-#define MAX_PROC_ENTRIES 1048576U
+#define MAX_PROC_ENTRIES (8U * 1024U * 1024U)
 #define RECOVERY_STOP_WAIT 7500
 
 struct removal_receipt {
@@ -1127,22 +1127,25 @@ static bool proc_number(const char *name)
     return true;
 }
 
+enum proc_task_state { PROC_ACTIVE, PROC_EXITED, PROC_KERNEL, PROC_MISSING };
+
 static int proc_task_state(int task, uint64_t mount, uint64_t *start_time)
 {
     int fd = proc_open(task, "stat", O_RDONLY | O_NONBLOCK, mount);
-    if (fd < 0) return -1;
+    if (fd < 0) return errno == ENOENT || errno == ESRCH ? PROC_MISSING : -1;
     char text[4096];
     ssize_t n = pread(fd, text, sizeof(text) - 1, 0);
     int saved = errno;
     close(fd);
-    if (n < 0) { errno = saved; return -1; }
+    if (n < 0) { errno = saved; return saved == ENOENT || saved == ESRCH ? PROC_MISSING : -1; }
     if (!n || n == (ssize_t)sizeof(text) - 1 || memchr(text, 0, (size_t)n)) { errno = EPROTO; return -1; }
     text[n] = 0;
     const char *tail = strrchr(text, ')');
     if (!tail) { errno = EPROTO; return -1; }
     char *cursor = (char *)tail + 1;
     while (*cursor == ' ' || *cursor == '\t') ++cursor;
-    if (!*cursor || !cursor[1] || cursor[1] != ' ' || cursor[0] == 'Z' || cursor[0] == 'X') return 1;
+    if (!*cursor || cursor[1] != ' ') { errno = EPROTO; return -1; }
+    if (cursor[0] == 'Z' || cursor[0] == 'X') return PROC_EXITED;
     cursor += 2;
     uint64_t flags = 0;
     for (unsigned int field = 4; field <= 9; ++field) {
@@ -1163,7 +1166,7 @@ static int proc_task_state(int task, uint64_t mount, uint64_t *start_time)
         }
         if (field == 9) flags = number;
     }
-    if (flags & UINT64_C(0x00200000)) return 2;
+    if (flags & UINT64_C(0x00200000)) return PROC_KERNEL;
     for (unsigned int field = 10; field < 22; ++field) {
         while (*cursor == ' ' || *cursor == '\t') ++cursor;
         if (!*cursor) { errno = EPROTO; return -1; }
@@ -1201,10 +1204,27 @@ static int proc_task_disappeared(int task, uint64_t mount)
 {
     uint64_t start;
     int state = proc_task_state(task, mount, &start);
-    if (state == 1) return 1;
+    if (state == PROC_EXITED || state == PROC_MISSING) return 1;
     if (state < 0) return -1;
     errno = EBUSY;
     return -1;
+}
+
+static int proc_reference_failure(int task, uint64_t mount, int error)
+{
+    if (error == ENOENT || error == ESRCH) return proc_task_disappeared(task, mount) == 1 ? 0 : -1;
+    errno = error;
+    return -1;
+}
+
+static int proc_scan_finish(int task, uint64_t mount, uint64_t start_time, int error)
+{
+    if (error) return proc_reference_failure(task, mount, error);
+    uint64_t current;
+    int state = proc_task_state(task, mount, &current);
+    if (state < 0) return -1;
+    if (state == PROC_ACTIVE && current != start_time) { errno = ESTALE; return -1; }
+    return 0;
 }
 
 static int proc_task(struct install *s, int task, uint64_t mount, struct proc_scan *scan)
@@ -1213,22 +1233,14 @@ static int proc_task(struct install *s, int task, uint64_t mount, struct proc_sc
     if (proc_budget(scan) < 0 || scan->tasks == MAX_PROC_TASKS) { if (scan->tasks == MAX_PROC_TASKS) errno = EOVERFLOW; return -1; }
     ++scan->tasks;
     int inactive = proc_task_state(task, mount, &start_time);
-    if (inactive == 1 || inactive == 2) return 0;
+    if (inactive > PROC_ACTIVE) return 0;
     if (inactive < 0) return -1;
     const char *const refs[] = { "root", "cwd" };
     for (size_t i = 0; i < 2; ++i) {
-        if (proc_reference(s, task, refs[i], mount) < 0) {
-            int saved = errno;
-            if ((saved == ENOENT || saved == ESRCH) && proc_task_disappeared(task, mount) == 1) return 0;
-            errno = saved == ENOENT || saved == ESRCH ? EBUSY : saved; return -1;
-        }
+        if (proc_reference(s, task, refs[i], mount) < 0) return proc_reference_failure(task, mount, errno);
     }
     int fd = proc_open(task, "fd", DIR_FLAGS, mount);
-    if (fd < 0) {
-        int saved = errno;
-        if ((saved == ENOENT || saved == ESRCH) && proc_task_disappeared(task, mount) == 1) return 0;
-        errno = saved == ENOENT || saved == ESRCH ? EBUSY : saved; return -1;
-    }
+    if (fd < 0) return proc_reference_failure(task, mount, errno);
     DIR *dir = fdopendir(fd);
     if (!dir) { close(fd); return -1; }
     int error = 0;
@@ -1243,13 +1255,7 @@ static int proc_task(struct install *s, int task, uint64_t mount, struct proc_sc
         }
     }
     if (closedir(dir) < 0 && !error) error = errno;
-    if (!error) {
-        uint64_t current;
-        int state = proc_task_state(task, mount, &current);
-        if (state < 0) error = errno;
-        else if (!state && current != start_time) error = ESTALE;
-    }
-    return error ? (errno = error, -1) : 0;
+    return proc_scan_finish(task, mount, start_time, error);
 }
 
 static bool proc_mapfile_name(const char *name)
@@ -1268,21 +1274,11 @@ static int proc_process_references(struct install *s, int process, uint64_t moun
 {
     uint64_t start_time;
     int state = proc_task_state(process, mount, &start_time);
-    if (state == 1 || state == 2) return 0;
+    if (state > PROC_ACTIVE) return 0;
     if (state < 0) return -1;
-    if (proc_reference(s, process, "exe", mount) < 0) {
-        int saved = errno;
-        if ((saved == ENOENT || saved == ESRCH) && proc_task_disappeared(process, mount) == 1) return 0;
-        errno = saved == ENOENT || saved == ESRCH ? EBUSY : saved;
-        return -1;
-    }
+    if (proc_reference(s, process, "exe", mount) < 0) return proc_reference_failure(process, mount, errno);
     int fd = proc_open(process, "map_files", DIR_FLAGS, mount);
-    if (fd < 0) {
-        int saved = errno;
-        if ((saved == ENOENT || saved == ESRCH) && proc_task_disappeared(process, mount) == 1) return 0;
-        errno = saved == ENOENT || saved == ESRCH ? EBUSY : saved;
-        return -1;
-    }
+    if (fd < 0) return proc_reference_failure(process, mount, errno);
     DIR *dir = fdopendir(fd);
     if (!dir) { close(fd); return -1; }
     int error = 0;
@@ -1297,30 +1293,17 @@ static int proc_process_references(struct install *s, int process, uint64_t moun
         }
     }
     if (closedir(dir) < 0 && !error) error = errno;
-    if (!error) {
-        uint64_t current;
-        state = proc_task_state(process, mount, &current);
-        if (state < 0) error = errno;
-        else if (!state && current != start_time) error = ESTALE;
-    }
-    return error ? (errno = error, -1) : 0;
+    return proc_scan_finish(process, mount, start_time, error);
 }
 
 static int proc_threads(struct install *s, int process, uint64_t mount, struct proc_scan *scan)
 {
     uint64_t process_start;
     int process_state = proc_task_state(process, mount, &process_start);
-    if (process_state == 1 || process_state == 2) return 0;
+    if (process_state > PROC_ACTIVE) return 0;
     if (process_state < 0) return -1;
     int fd = proc_open(process, "task", DIR_FLAGS, mount);
-    if (fd < 0) {
-        if (errno == ENOENT || errno == ESRCH) {
-            uint64_t start;
-            int state = proc_task_state(process, mount, &start);
-            if (state == 1 || state == 2) return 0;
-        }
-        return -1;
-    }
+    if (fd < 0) return proc_reference_failure(process, mount, errno);
     stage = "recovery_proc_process_references";
     if (proc_process_references(s, process, mount, scan) < 0) { close(fd); return -1; }
     DIR *dir = fdopendir(fd);
@@ -1343,7 +1326,7 @@ static int proc_threads(struct install *s, int process, uint64_t mount, struct p
         if (error) break;
     }
     if (closedir(dir) < 0 && !error) error = errno;
-    return error ? (errno = error, -1) : 0;
+    return proc_scan_finish(process, mount, process_start, error);
 }
 
 static int proc_snapshot(struct install *s, int proc, uint64_t mount, pid_t own, struct proc_scan *scan)
@@ -1497,7 +1480,7 @@ int main(int argc, char **argv)
     sigemptyset(&timeout_action.sa_mask);
     int64_t now = monotonic_ms();
     bool ready = now >= 0 && sigaction(SIGALRM, &timeout_action, NULL) == 0;
-    deadline = now + 30000;
+    deadline = now + (remove ? 90000 : 30000);
     if (ready && !remove) {
         int input_flags = fcntl(STDIN_FILENO, F_GETFL);
         ready = input_flags >= 0 && fcntl(STDIN_FILENO, F_SETFL, input_flags | O_NONBLOCK) == 0;

@@ -206,7 +206,8 @@ class ChrootInstanceInstaller internal constructor(
     private val rollbackTimeoutMs: Long = 5_000L,
     private val startBound: ((String, ChrootFileIdentity?, ChrootRuntimeSession) -> Process)? = null,
     private val checkRecoverySession: ((ChrootRuntimeSession) -> Unit)? = null,
-    private val startRecoveryBound: ((String, ChrootFileIdentity, ChrootRuntimeSession, () -> Unit) -> Process)? = null
+    private val startRecoveryBound: ((String, ChrootFileIdentity, ChrootRuntimeSession, () -> Unit) -> Process)? = null,
+    private val recoveryTimeoutMs: Long = transactionTimeoutMs
 ) {
     @Inject
     internal constructor(
@@ -237,7 +238,10 @@ class ChrootInstanceInstaller internal constructor(
         System::currentTimeMillis, AndroidProcess::myUid,
         startBound = { id, identity, session -> factory.startInstaller(id, identity, session) },
         checkRecoverySession = factory::checkSession,
-        startRecoveryBound = factory::startRecoveryRemoval
+        startRecoveryBound = factory::startRecoveryRemoval,
+        // Removal inspects every host process twice before unlinking. Its native deadline is
+        // longer than installation's; leave time to collect the final evidence and exit status.
+        recoveryTimeoutMs = 100_000L
     )
 
     private data class Pending(
@@ -315,7 +319,7 @@ class ChrootInstanceInstaller internal constructor(
     val isHealthy: StateFlow<Boolean> = _isHealthy.asStateFlow()
 
     init {
-        require(transactionTimeoutMs in 1..40_000L && rollbackTimeoutMs in 1..5_000L)
+        require(transactionTimeoutMs in 1..40_000L && rollbackTimeoutMs in 1..5_000L && recoveryTimeoutMs in 1..100_000L)
         synchronized(journalGate) {
             try {
                 if (Files.exists(File(journalFile.path + ".pending").toPath(), NOFOLLOW_LINKS)) {
@@ -425,7 +429,8 @@ class ChrootInstanceInstaller internal constructor(
                         exchange.result.cleanup == "cleanup_unknown" && exchange.result.path == rootPath(instance.id) &&
                         exchange.result.device == instance.device && exchange.result.inode == instance.inode ->
                         throw ChrootRemovalBusyException()
-                    else -> throw IOException("Native recovery removal did not provide verified identity-bound evidence")
+                    else -> throw IOException("Native recovery removal did not provide verified identity-bound evidence; " +
+                        "stage=${exchange.result.stage}; errno=${exchange.result.error}; exit=${exchange.exit}")
                 }
             }
         }
@@ -535,7 +540,7 @@ class ChrootInstanceInstaller internal constructor(
             tx.sender.set(sender)
             tasks = listOfNotNull(stdout, stderr, exited, sender)
             if (tx.stopped.get()) tx.stopOnly()
-            val exchange = withTimeout(transactionTimeoutMs) { collect() }
+            val exchange = withTimeout(if (intent.remove) recoveryTimeoutMs else transactionTimeoutMs) { collect() }
             tx.cleanupVerified = verifiedCleanup(intent, exchange)
             tx.recoveryReceiptVerified = verifiedRecoveryReceipt(intent, exchange)
             if (intent.remove && tx.cleanupVerified) publicationPending = true

@@ -155,7 +155,8 @@ class ChrootInstanceInstallerTest {
         enabled: Boolean = true,
         startBound: ((String, ChrootFileIdentity?, ChrootRuntimeSession) -> Process)? = null,
         checkRecoverySession: ((ChrootRuntimeSession) -> Unit)? = null,
-        startRecoveryBound: ((String, ChrootFileIdentity, ChrootRuntimeSession, () -> Unit) -> Process)? = null
+        startRecoveryBound: ((String, ChrootFileIdentity, ChrootRuntimeSession, () -> Unit) -> Process)? = null,
+        recoveryTimeout: Long = timeout
     ): Fixture {
         val repository = RootAccessSettingsRepository(RootMemoryDataStore(), backgroundScope)
         val authority = RootAuthorityCoordinator(repository, backgroundScope)
@@ -173,7 +174,8 @@ class ChrootInstanceInstallerTest {
             }, { inputs.incrementAndGet(); input() }, files, journal, scope, Dispatchers.IO, { 1234 }, { 10445 }, newId, timeout, rollback,
             startBound = startBound,
             checkRecoverySession = checkRecoverySession,
-            startRecoveryBound = startRecoveryBound
+            startRecoveryBound = startRecoveryBound,
+            recoveryTimeoutMs = recoveryTimeout
         )
         return Fixture(installer, authority, root, scope, files, journal, process, starts, inputs, calls)
     }
@@ -989,6 +991,34 @@ class ChrootInstanceInstallerTest {
                 assertEquals(setOf(id), f.installer.failedInstances.value)
                 assertEquals(setOf(id), f.installer.removalPending.value)
                 assertEquals(0, f.starts.get())
+            }
+        }
+    }
+
+    @Test
+    fun recoveryInspectionCanOutliveTheInstallationBudgetBeforeVerifiedRemoval() = runTest {
+        val process = FakeProcess({ native(cleanup = "removed") }, finishOnClose = false)
+        fixture(process, timeout = 100, recoveryTimeout = 3000,
+            startRecoveryBound = { _, _, _, _ -> process }).use { f ->
+            val publications = AtomicInteger()
+            val removal = async(Dispatchers.IO) {
+                f.installer.recoverAndRemoveFromUser(instance, f.root, ChrootRuntimeSession("reviewed", f.root)) {
+                    publications.incrementAndGet()
+                }
+            }
+            try {
+                eventually { process.closed.get() }
+                withContext(Dispatchers.IO) { delay(250) }
+                assertFalse(removal.isCompleted)
+                assertEquals(0, publications.get())
+                assertRecoveryIntent(f.journal)
+                process.ended.countDown()
+                assertEquals(LocalRuntimeRemoval.REMOVED, removal.await())
+                assertEquals(1, publications.get())
+                assertEquals(12L, f.journal.length())
+                assertTrue(f.installer.removalPending.value.isEmpty())
+            } finally {
+                process.ended.countDown()
             }
         }
     }

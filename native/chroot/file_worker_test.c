@@ -2,6 +2,8 @@
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <dirent.h>
+#include <sys/vfs.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -18,7 +20,11 @@ static int test_prctl(int option, ...);
 static int test_fchown(int fd, uid_t uid, gid_t gid);
 static int test_fchmod(int fd, mode_t mode);
 static int test_mkdirat(int parent, const char *name, mode_t mode);
+static int test_fstatfs(int fd, struct statfs *fs);
+static struct dirent *test_readdir(DIR *dir);
 
+#define fstatfs test_fstatfs
+#define readdir test_readdir
 #define mkdirat test_mkdirat
 #define geteuid test_geteuid
 #define getegid test_getegid
@@ -33,6 +39,8 @@ static int test_mkdirat(int parent, const char *name, mode_t mode);
 #define main ajfw_production_main_not_called
 #include "file_worker.c"
 #undef main
+#undef readdir
+#undef fstatfs
 #undef mkdirat
 #undef unlinkat
 #undef syscall
@@ -58,7 +66,14 @@ struct test_faults {
 };
 static struct test_faults faults;
 static int synthetic_root = -1;
-static struct { char path[FW_PATH + 1]; uint64_t id; } config_mounts[4];
+static struct {
+    char path[FW_PATH + 1];
+    uint64_t id;
+    long fs_type;
+    bool synthetic_metadata;
+    int fs_error;
+    size_t fs_queries;
+} config_mounts[4];
 static size_t config_mount_count;
 
 static uint64_t test_config_mount_id(int fd)
@@ -99,10 +114,84 @@ static struct {
     char temporary[64];
     dev_t issued_dev[4]; ino_t issued_ino[4]; size_t issued;
 } mkdir_race;
+static struct {
+    bool active, nonempty_directory, swap_directory, compete_directory, mutate_on_empty, replaced_temporary;
+    bool insert_on_empty;
+    size_t empty_scans;
+    unsigned int directory_nlink;
+    int readdir_error;
+    size_t directory_reads, publishes, replacements;
+    char temporary[64];
+    dev_t created_dev, changed_dev;
+    ino_t created_ino, changed_ino;
+    uint32_t changed_mask, creation_mask;
+    uint32_t uid, gid, nlink;
+    uint16_t mode;
+    uint64_t size, mount;
+} shared_mock;
+
+static int test_fstatfs(int fd, struct statfs *fs)
+{
+    uint64_t id = test_config_mount_id(fd);
+    for (size_t i = 0; i < config_mount_count; ++i) if (id == config_mounts[i].id) {
+        ++config_mounts[i].fs_queries;
+        if (config_mounts[i].fs_error) return fw_fail(config_mounts[i].fs_error);
+        if (config_mounts[i].fs_type) {
+            memset(fs, 0, sizeof(*fs)); fs->f_type = config_mounts[i].fs_type; return 0;
+        }
+    }
+    return fstatfs(fd, fs);
+}
+
+static struct dirent *test_readdir(DIR *dir)
+{
+    struct stat st;
+    if (shared_mock.active && fstat(dirfd(dir), &st) == 0 &&
+        st.st_dev == shared_mock.created_dev && st.st_ino == shared_mock.created_ino) {
+        ++shared_mock.directory_reads;
+        if (shared_mock.readdir_error) { errno = shared_mock.readdir_error; return NULL; }
+        struct dirent *entry = readdir(dir);
+        if (!entry && !errno) {
+            ++shared_mock.empty_scans;
+            if (shared_mock.mutate_on_empty) {
+                shared_mock.changed_dev = st.st_dev; shared_mock.changed_ino = st.st_ino;
+                shared_mock.changed_mask = STATX_MODE; shared_mock.mode = S_IFDIR | 02750;
+            }
+            if (shared_mock.insert_on_empty && shared_mock.empty_scans == 2) {
+                int child = openat(dirfd(dir), "late-child", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+                CHECK(child >= 0 && write(child, "preserved", 9) == 9 && close(child) == 0);
+                struct timespec times[2] = { st.st_atim, st.st_mtim }; ++times[1].tv_sec;
+                CHECK(futimens(dirfd(dir), times) == 0); errno = 0;
+            }
+        }
+        return entry;
+    }
+    return readdir(dir);
+}
 
 static int test_mkdirat(int parent, const char *name, mode_t mode)
 {
     int rc = mkdirat(parent, name, mode);
+    if (!rc && shared_mock.active && test_config_mount_id(parent) && !strncmp(name, ".ajfw-", 6)) {
+        struct stat created;
+        CHECK(fstatat(parent, name, &created, AT_SYMLINK_NOFOLLOW) == 0);
+        shared_mock.created_dev = created.st_dev; shared_mock.created_ino = created.st_ino;
+        if (shared_mock.creation_mask) {
+            shared_mock.changed_dev = created.st_dev; shared_mock.changed_ino = created.st_ino;
+            shared_mock.changed_mask = shared_mock.creation_mask;
+        }
+        strcpy(shared_mock.temporary, name);
+        if (shared_mock.nonempty_directory) {
+            int directory = openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            CHECK(directory >= 0);
+            int child = openat(directory, "foreign-child", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+            CHECK(child >= 0 && write(child, "preserved", 9) == 9 && close(child) == 0 && close(directory) == 0);
+        }
+        if (shared_mock.swap_directory) {
+            CHECK(renameat(parent, name, parent, "saved-created") == 0 && symlinkat("/", parent, name) == 0);
+            ++shared_mock.replacements;
+        }
+    }
     if (rc || !mkdir_race.active) return rc;
     ++mkdir_race.mkdir_calls;
     if (!strncmp(name, ".ajfw-", 6)) { CHECK(strlen(name) < sizeof(mkdir_race.temporary)); strcpy(mkdir_race.temporary, name); }
@@ -244,6 +333,12 @@ static long test_syscall(long number, ...)
             if (faults.stat_error) faults.stat_fd = (int)result;
             if (faults.special) faults.special_fd = (int)result;
         }
+        if (result >= 0 && shared_mock.active && shared_mock.creation_mask &&
+            (how->flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)) {
+            struct stat created; CHECK(fstat((int)result, &created) == 0);
+            shared_mock.changed_dev = created.st_dev; shared_mock.changed_ino = created.st_ino;
+            shared_mock.changed_mask = shared_mock.creation_mask;
+        }
         if (result >= 0 && faults.begin_swap && (how->flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)) {
             CHECK(strlen(name) < sizeof(faults.created));
             strcpy(faults.created, name); faults.stat_fd = (int)result;
@@ -278,6 +373,23 @@ static long test_syscall(long number, ...)
         }
         if (!result && config_mount_count) {
             identity->stx_uid = identity->stx_gid = 10445;
+            for (size_t i = 0; i < config_mount_count; ++i)
+                if (identity->stx_mnt_id == config_mounts[i].id && config_mounts[i].synthetic_metadata) {
+                    identity->stx_uid = identity->stx_gid = 1023;
+                    if (S_ISDIR(identity->stx_mode)) {
+                        identity->stx_mode = S_IFDIR | 02770;
+                        identity->stx_nlink = shared_mock.directory_nlink;
+                    } else if (S_ISREG(identity->stx_mode)) identity->stx_mode = S_IFREG | 0660;
+                }
+        }
+        if (!result && shared_mock.active && identity->stx_ino == (uint64_t)shared_mock.changed_ino &&
+            makedev(identity->stx_dev_major, identity->stx_dev_minor) == shared_mock.changed_dev) {
+            if (shared_mock.changed_mask & STATX_UID) identity->stx_uid = shared_mock.uid;
+            if (shared_mock.changed_mask & STATX_GID) identity->stx_gid = shared_mock.gid;
+            if (shared_mock.changed_mask & STATX_MODE) identity->stx_mode = shared_mock.mode;
+            if (shared_mock.changed_mask & STATX_NLINK) identity->stx_nlink = shared_mock.nlink;
+            if (shared_mock.changed_mask & STATX_SIZE) identity->stx_size = shared_mock.size;
+            if (shared_mock.mount) identity->stx_mnt_id = shared_mock.mount;
         }
         if (!result && mkdir_race.active) {
             dev_t dev = makedev(identity->stx_dev_major, identity->stx_dev_minor);
@@ -324,6 +436,13 @@ static long test_syscall(long number, ...)
             }
         } else if (config_mount_count) {
             CHECK(test_config_mount_id(source) != 0 && test_config_mount_id(source) == test_config_mount_id(target));
+            if (shared_mock.active) {
+                ++shared_mock.publishes;
+                if (shared_mock.compete_directory) {
+                    CHECK(flags == RENAME_NOREPLACE && symlinkat("/", target, target_name) == 0);
+                    ++shared_mock.replacements;
+                }
+            }
         } else CHECK(root.st_dev == src.st_dev && root.st_ino == src.st_ino && root.st_dev == dst.st_dev && root.st_ino == dst.st_ino);
         CHECK(fw_entry_name(source_name) == 0 && fw_entry_name(target_name) == 0 && (flags == 0 || flags == RENAME_NOREPLACE));
         return syscall(number, source, source_name, target, target_name, flags);
@@ -1403,6 +1522,7 @@ static void test_config_mount(struct fw_context *ctx, int fd, const char *target
 {
     CHECK(config_mount_count < sizeof(config_mounts) / sizeof(*config_mounts));
     size_t index = config_mount_count++;
+    memset(&config_mounts[index], 0, sizeof(config_mounts[index]));
     char number[64]; CHECK(snprintf(number, sizeof(number), "/proc/self/fd/%d", fd) > 0);
     ssize_t size = readlink(number, config_mounts[index].path, FW_PATH);
     CHECK(size > 0 && size < FW_PATH); config_mounts[index].path[size] = 0;
@@ -1494,6 +1614,319 @@ static int test_private_home_config(int temporary)
     return 0;
 }
 
+struct test_shared_fixture {
+    struct fw_context *ctx;
+    int directory, home, workspace, output;
+};
+
+static int test_shared_reload(struct fw_context *ctx)
+{
+    for (size_t i = 0; i < ctx->mount_count; ++i) CHECK(close(ctx->mounts[i].fd) == 0);
+    ctx->mount_count = 0;
+    for (size_t i = 0; i < ctx->boundary_count; ++i) free(ctx->boundaries[i].path);
+    free(ctx->boundaries); ctx->boundaries = NULL; ctx->boundary_count = ctx->boundary_capacity = 0;
+    return fw_load_mounts(ctx);
+}
+
+static struct test_shared_fixture test_shared_fixture(int temporary, long fs_type, unsigned int nlink)
+{
+    static unsigned int serial;
+    char name[64]; CHECK(snprintf(name, sizeof(name), "external-upload-%u", serial++) > 0);
+    struct test_shared_fixture f;
+    f.directory = test_directory(temporary, name);
+    f.home = test_directory(f.directory, "root"); f.workspace = test_directory(f.home, "workspace");
+    int config = test_directory(f.home, ".aicode");
+    f.output = test_directory(config, "tool-output"); CHECK(close(config) == 0);
+    f.ctx = test_context(f.directory); test_reset_faults();
+    memset(&root_mock, 0, sizeof(root_mock)); root_mock.active = root_mock.all_chowns_mocked = true;
+    root_mock.fchown_error = EPERM; root_mock.fchmod_error = EIO;
+    memset(&shared_mock, 0, sizeof(shared_mock)); shared_mock.active = true; shared_mock.directory_nlink = nlink;
+    CHECK(config_mount_count == 0);
+    test_config_mount(f.ctx, f.home, "/root", true, true);
+    test_config_mount(f.ctx, f.workspace, "/root/workspace", true, true);
+    test_config_mount(f.ctx, f.output, "/root/.aicode/tool-output", true, true);
+    for (size_t i = 0; i < config_mount_count; ++i) config_mounts[i].fs_type = fs_type;
+    config_mounts[1].synthetic_metadata = true;
+    char mountinfo[1024];
+    int length = snprintf(mountinfo, sizeof(mountinfo),
+        "%llu 1 0:1 / / rw - ext4 none rw\n%llu 1 0:1 / /root rw - fuse none rw\n"
+        "%llu 1 0:1 / /root/workspace rw - ext4 none rw\n"
+        "%llu 1 0:1 / /root/.aicode/tool-output rw - fuse none rw\n",
+        (unsigned long long)f.ctx->mounts[0].id, (unsigned long long)config_mounts[0].id,
+        (unsigned long long)config_mounts[1].id, (unsigned long long)config_mounts[2].id);
+    CHECK(length > 0 && (size_t)length < sizeof(mountinfo));
+    int fd = openat(f.directory, "mountinfo", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    CHECK(fd >= 0 && write(fd, mountinfo, (size_t)length) == length && close(fd) == 0);
+    f.ctx->proc_self = fw_dup(f.directory);
+    f.ctx->proc_fds = open("/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    CHECK(f.ctx->proc_self >= 0 && f.ctx->proc_fds >= 0 && test_shared_reload(f.ctx) == 0);
+    return f;
+}
+
+static void test_shared_finish(struct test_shared_fixture *f)
+{
+    shared_mock.changed_mask = 0; shared_mock.mount = 0;
+    bool failed = f->ctx->cleanup_failed || shared_mock.replaced_temporary;
+    int rc = fw_cleanup(f->ctx);
+    CHECK(failed ? rc == -1 && errno == EUCLEAN : rc == 0);
+    synthetic_root = -1; free(f->ctx); config_mount_count = 0;
+    memset(&root_mock, 0, sizeof(root_mock)); memset(&shared_mock, 0, sizeof(shared_mock)); test_reset_faults();
+    CHECK(close(f->output) == 0 && close(f->workspace) == 0 && close(f->home) == 0 && close(f->directory) == 0);
+}
+
+static uint32_t test_shared_begin(struct fw_context *ctx, const char *path, bool overwrite)
+{
+    unsigned char bytes[64];
+    CHECK(test_path_response(ctx, FW_BEGIN_WRITE, path, true, overwrite ? 1U : 0U, bytes) == 8 && fw_be32(bytes) == 0);
+    return fw_be32(bytes + 4);
+}
+
+static int test_shared_commit(struct fw_context *ctx, uint32_t number)
+{
+    unsigned char request[4], bytes[16]; fw_put32(request, number);
+    struct fw_input input = { .bytes = request, .size = sizeof(request) };
+    struct fw_output output = { .bytes = bytes, .size = 4 };
+    return fw_commit_write_request(ctx, &input, &output);
+}
+
+static void test_shared_read(struct fw_context *ctx, const char *path)
+{
+    unsigned char bytes[64], request[8];
+    CHECK(test_path_response(ctx, FW_OPEN_READ, path, false, 0, bytes) == 8 && fw_be32(bytes) == 0);
+    fw_put32(request, fw_be32(bytes + 4)); fw_put32(request + 4, 32);
+    struct fw_input input = { .bytes = request, .size = sizeof(request) };
+    struct fw_output output = { .bytes = bytes, .size = 4 };
+    CHECK(fw_read_chunk_request(ctx, &input, &output) == 0 && output.size == 25 && fw_be32(bytes + 4) == 17 &&
+        !memcmp(bytes + 8, "foreign-preserved", 17));
+    input = (struct fw_input){ .bytes = request, .size = 4 }; CHECK(fw_close_request(ctx, &input, false) == 0);
+}
+
+static void test_shared_change(int fd, uint32_t mask)
+{
+    struct stat st; CHECK(fstat(fd, &st) == 0);
+    shared_mock.changed_dev = st.st_dev; shared_mock.changed_ino = st.st_ino; shared_mock.changed_mask = mask;
+}
+
+static int test_external_upload_success(int temporary, bool directories)
+{
+    static const long types[] = { FUSE_SUPER_MAGIC, 0x5dca2df5L };
+    for (size_t type = 0; type < sizeof(types) / sizeof(*types); ++type) for (unsigned int nlink = 1; nlink <= 2; ++nlink) {
+        struct test_shared_fixture f = test_shared_fixture(temporary, types[type], nlink);
+        const char *path = directories ? "/root/workspace/.aicode/attachments/item.bin" : "/root/workspace/item.bin";
+        if (directories) {
+            unsigned char bytes[16];
+            CHECK(test_path_response(f.ctx, FW_MKDIRS, "/root/workspace/.aicode/attachments", false, 0, bytes) == 4 &&
+                fw_be32(bytes) == 0);
+            CHECK(shared_mock.directory_reads > 0);
+            struct fw_resolved r;
+            CHECK(fw_resolve(f.ctx, "/root/workspace/.aicode/attachments", false, 0, &r) == 0);
+            CHECK(r.identity.st.stx_uid == 1023 && r.identity.st.stx_gid == 1023 &&
+                (r.identity.st.stx_mode & 07777U) == 02770 && r.identity.st.stx_nlink == nlink);
+            fw_resolved_close(&r);
+        }
+        test_config_write(f.ctx, path, false); test_shared_read(f.ctx, path);
+        struct fw_resolved before, after;
+        CHECK(fw_resolve(f.ctx, path, false, 0, &before) == 0);
+        test_path_error(f.ctx, FW_BEGIN_WRITE, path, true, 0, EEXIST);
+        test_config_write(f.ctx, path, true); test_shared_read(f.ctx, path);
+        CHECK(fw_resolve(f.ctx, path, false, 0, &after) == 0);
+        CHECK(!fw_same(&before.identity, &after.identity) && before.identity.st.stx_mode == after.identity.st.stx_mode &&
+            after.identity.st.stx_uid == 1023 && after.identity.st.stx_gid == 1023 && after.identity.st.stx_nlink == 1);
+        fw_resolved_close(&before); fw_resolved_close(&after);
+        CHECK(root_mock.chowns == 0 && root_mock.chmods == 0);
+        CHECK(config_mounts[0].fs_queries == 0 && config_mounts[1].fs_queries == 1 && config_mounts[2].fs_queries == 0);
+        test_shared_finish(&f);
+    }
+    return 0;
+}
+
+static int test_external_upload_rejections(int temporary)
+{
+    for (unsigned int scenario = 0; scenario < 6; ++scenario) {
+        struct test_shared_fixture f = test_shared_fixture(temporary, FUSE_SUPER_MAGIC, 1);
+        shared_mock.nonempty_directory = scenario == 0; shared_mock.readdir_error = scenario == 1 ? EIO : 0;
+        shared_mock.swap_directory = scenario == 2; shared_mock.compete_directory = scenario == 3;
+        shared_mock.mutate_on_empty = scenario == 4;
+        if (scenario == 5) shared_mock.directory_nlink = 3;
+        unsigned char bytes[16];
+        CHECK(test_path_response(f.ctx, FW_MKDIRS, "/root/workspace/new", false, 0, bytes) == 4 && fw_be32(bytes) != 0);
+        CHECK(shared_mock.publishes == (scenario == 3 ? 1U : 0U));
+        if (scenario == 1) CHECK(fw_be32(bytes) == EIO);
+        CHECK(root_mock.chowns == 0 && root_mock.chmods == 0);
+        if (scenario == 3) {
+            struct stat st;
+            CHECK(fstatat(f.workspace, "new", &st, AT_SYMLINK_NOFOLLOW) == 0 && S_ISLNK(st.st_mode));
+        } else test_missing_entry(f.workspace, "new");
+        if (scenario == 0) {
+            int directory = openat(f.workspace, shared_mock.temporary, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            CHECK(directory >= 0);
+            int child = openat(directory, "foreign-child", O_RDONLY | O_NOFOLLOW | O_CLOEXEC); char content[9];
+            CHECK(child >= 0 && read(child, content, sizeof(content)) == 9 && !memcmp(content, "preserved", 9));
+            CHECK(close(child) == 0 && close(directory) == 0);
+        }
+        test_shared_finish(&f);
+    }
+    static const uint32_t masks[] = { STATX_UID, STATX_GID, STATX_MODE, STATX_NLINK, STATX_SIZE, 0 };
+    for (size_t field = 0; field < sizeof(masks) / sizeof(*masks); ++field) {
+        struct test_shared_fixture f = test_shared_fixture(temporary, FUSE_SUPER_MAGIC, 2);
+        uint32_t number = test_shared_begin(f.ctx, "/root/workspace/new.bin", false);
+        struct fw_handle *h = fw_find_handle(f.ctx, number); CHECK(h != NULL);
+        test_shared_change(h->fd, masks[field]); shared_mock.uid = shared_mock.gid = 1024;
+        shared_mock.mode = S_IFREG | 0640; shared_mock.nlink = 2; shared_mock.size = 1;
+        if (!masks[field]) shared_mock.mount = config_mounts[0].id;
+        CHECK(test_shared_commit(f.ctx, number) == -1 && errno == ESTALE && shared_mock.publishes == 0);
+        shared_mock.changed_mask = 0; shared_mock.mount = 0;
+        test_missing_entry(f.workspace, "new.bin");
+        CHECK(root_mock.chowns == 0 && root_mock.chmods == 0); test_shared_finish(&f);
+    }
+    for (unsigned int scenario = 0; scenario < 7; ++scenario) {
+        struct test_shared_fixture f = test_shared_fixture(temporary, FUSE_SUPER_MAGIC, 2);
+        test_file(f.workspace, "target");
+        uint32_t number = test_shared_begin(f.ctx, "/root/workspace/target", true);
+        struct fw_handle *h = fw_find_handle(f.ctx, number); CHECK(h != NULL);
+        if (scenario < 3) {
+            test_shared_change(h->original, scenario == 0 ? STATX_UID : scenario == 1 ? STATX_GID : STATX_MODE);
+            shared_mock.uid = shared_mock.gid = 1024; shared_mock.mode = S_IFREG | 0640;
+        } else if (scenario == 3) {
+            CHECK(renameat(f.workspace, "target", f.workspace, "saved-target") == 0 &&
+                symlinkat("/", f.workspace, "target") == 0);
+        } else if (scenario == 4 || scenario == 5) {
+            shared_mock.replaced_temporary = true;
+            CHECK(renameat(f.workspace, h->temporary, f.workspace, "saved-temporary") == 0);
+            if (scenario == 4) CHECK(symlinkat("/", f.workspace, h->temporary) == 0);
+            else test_file(f.workspace, h->temporary);
+        } else {
+            test_shared_change(h->parent, STATX_MODE); shared_mock.mode = S_IFDIR | 02750;
+        }
+        CHECK(test_shared_commit(f.ctx, number) == -1 && errno == ESTALE && shared_mock.publishes == 0);
+        test_foreign_preserved(f.workspace, scenario == 3 ? "saved-target" : "target");
+        if (scenario == 4 || scenario == 5) {
+            char name[64]; strcpy(name, h->temporary);
+            unsigned char request[4]; fw_put32(request, number);
+            struct fw_input input = { .bytes = request, .size = sizeof(request) };
+            CHECK(fw_close_request(f.ctx, &input, true) == -1 && errno == ESTALE && f.ctx->cleanup_failed);
+            if (scenario == 4) {
+                struct stat st;
+                CHECK(fstatat(f.workspace, name, &st, AT_SYMLINK_NOFOLLOW) == 0 && S_ISLNK(st.st_mode));
+            } else test_foreign_preserved(f.workspace, name);
+        }
+        CHECK(root_mock.chowns == 0 && root_mock.chmods == 0); test_shared_finish(&f);
+    }
+    for (unsigned int scenario = 0; scenario < 3; ++scenario) {
+        struct test_shared_fixture f = test_shared_fixture(temporary, FUSE_SUPER_MAGIC, 2);
+        test_file(f.workspace, "target");
+        int original = openat(f.workspace, "target", O_PATH | O_NOFOLLOW | O_CLOEXEC); CHECK(original >= 0);
+        test_shared_change(original, scenario == 0 ? STATX_UID : scenario == 1 ? STATX_GID : STATX_MODE);
+        shared_mock.uid = shared_mock.gid = 1024; shared_mock.mode = S_IFREG | 0640;
+        unsigned char bytes[64];
+        CHECK(test_path_response(f.ctx, FW_BEGIN_WRITE, "/root/workspace/target", true, 1, bytes) == 4 && fw_be32(bytes) != 0);
+        CHECK(close(original) == 0 && shared_mock.publishes == 0 && root_mock.chowns == 0 && root_mock.chmods == 0);
+        test_foreign_preserved(f.workspace, "target"); test_shared_finish(&f);
+    }
+    struct test_shared_fixture f = test_shared_fixture(temporary, FUSE_SUPER_MAGIC, 2);
+    uint32_t number = test_shared_begin(f.ctx, "/root/workspace/new.bin", false);
+    test_file(f.workspace, "new.bin");
+    CHECK(test_shared_commit(f.ctx, number) == -1 && errno == EEXIST && shared_mock.publishes == 0);
+    test_foreign_preserved(f.workspace, "new.bin"); test_shared_finish(&f);
+    return 0;
+}
+
+static int test_external_upload_write_epoch(int temporary)
+{
+    struct test_shared_fixture f = test_shared_fixture(temporary, FUSE_SUPER_MAGIC, 2);
+    test_file(f.workspace, "target");
+    uint32_t number = test_shared_begin(f.ctx, "/root/workspace/target", true);
+    struct fw_handle *h = fw_find_handle(f.ctx, number); CHECK(h != NULL);
+    unsigned char request[64]; struct fw_output payload = { .bytes = request };
+    CHECK(fw_out32(&payload, number) == 0 && fw_out32(&payload, 8) == 0 && fw_append(&payload, "intended", 8) == 0);
+    struct fw_input input = { .bytes = request, .size = payload.size };
+    CHECK(fw_write_chunk_request(f.ctx, &input) == 0);
+    struct stat before; CHECK(fstat(h->fd, &before) == 0);
+    int writer = openat(h->parent, h->temporary, O_WRONLY | O_CLOEXEC | O_NOFOLLOW); CHECK(writer >= 0);
+    CHECK(pwrite(writer, "tampered", 8, 0) == 8);
+    struct timespec times[2] = { before.st_atim, before.st_mtim }; ++times[1].tv_sec;
+    CHECK(futimens(writer, times) == 0 && close(writer) == 0);
+    CHECK(test_shared_commit(f.ctx, number) == -1 && errno == ESTALE && shared_mock.publishes == 0);
+    test_foreign_preserved(f.workspace, "target"); test_shared_finish(&f); return 0;
+}
+
+static int test_external_upload_directory_epoch(int temporary)
+{
+    struct test_shared_fixture f = test_shared_fixture(temporary, FUSE_SUPER_MAGIC, 1);
+    shared_mock.insert_on_empty = true;
+    unsigned char bytes[16];
+    CHECK(test_path_response(f.ctx, FW_MKDIRS, "/root/workspace/new", false, 0, bytes) == 4 && fw_be32(bytes) == ESTALE);
+    CHECK(shared_mock.empty_scans == 2 && shared_mock.publishes == 0);
+    test_missing_entry(f.workspace, "new");
+    int dir = openat(f.workspace, shared_mock.temporary, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    CHECK(dir >= 0);
+    int child = openat(dir, "late-child", O_RDONLY | O_CLOEXEC | O_NOFOLLOW); char content[9];
+    CHECK(child >= 0 && read(child, content, sizeof(content)) == 9 && !memcmp(content, "preserved", 9));
+    CHECK(close(child) == 0 && close(dir) == 0); test_shared_finish(&f); return 0;
+}
+
+static int test_external_upload_creation(int temporary)
+{
+    for (unsigned int directory = 0; directory <= 1; ++directory) for (unsigned int scenario = 0; scenario < 7; ++scenario) {
+        struct test_shared_fixture f = test_shared_fixture(temporary, FUSE_SUPER_MAGIC, 2);
+        shared_mock.uid = shared_mock.gid = 1024; shared_mock.nlink = directory ? 3 : 2;
+        shared_mock.size = 1;
+        if (scenario == 0) shared_mock.creation_mask = STATX_UID;
+        if (scenario == 1) shared_mock.creation_mask = STATX_GID;
+        if (scenario == 2 || scenario == 3) {
+            shared_mock.creation_mask = STATX_MODE;
+            shared_mock.mode = directory ? (scenario == 2 ? S_IFDIR | 02771 : S_IFDIR | 06770) :
+                (scenario == 2 ? S_IFREG | 0661 : S_IFREG | 02660);
+        }
+        if (scenario == 4) shared_mock.creation_mask = STATX_NLINK;
+        if (scenario == 5) {
+            shared_mock.creation_mask = directory ? STATX_MODE : STATX_SIZE;
+            shared_mock.mode = S_IFDIR | 03770;
+        }
+        if (scenario == 6) {
+            shared_mock.creation_mask = STATX_TYPE; shared_mock.mount = config_mounts[0].id;
+        }
+        test_path_error(f.ctx, directory ? FW_MKDIRS : FW_BEGIN_WRITE, "/root/workspace/new", directory == 0, 0, ESTALE);
+        CHECK(shared_mock.publishes == 0 && root_mock.chowns == 0 && root_mock.chmods == 0);
+        test_missing_entry(f.workspace, "new"); test_shared_finish(&f);
+    }
+    return 0;
+}
+
+static int test_external_upload_scope(int temporary)
+{
+    static const long ordinary[] = { EXT4_SUPER_MAGIC, TMPFS_MAGIC };
+    for (size_t i = 0; i < sizeof(ordinary) / sizeof(*ordinary); ++i) {
+        struct test_shared_fixture f = test_shared_fixture(temporary, ordinary[i], 2);
+        test_path_error(f.ctx, FW_MKDIRS, "/root/workspace/new", false, 0, ESTALE);
+        test_path_error(f.ctx, FW_BEGIN_WRITE, "/root/workspace/new.bin", true, 0, ESTALE);
+        CHECK(root_mock.chowns == 0 && root_mock.chmods == 0); test_shared_finish(&f);
+    }
+    struct test_shared_fixture f = test_shared_fixture(temporary, FUSE_SUPER_MAGIC, 2);
+    config_mounts[2].synthetic_metadata = true;
+    test_path_error(f.ctx, FW_MKDIRS, "/root/.aicode/tool-output/new", false, 0, ESTALE);
+    test_path_error(f.ctx, FW_BEGIN_WRITE, "/root/.aicode/tool-output/new.bin", true, 0, ESTALE);
+    int nested = test_directory(f.workspace, "other-mount");
+    test_config_mount(f.ctx, nested, "/root/workspace/other-mount", true, true);
+    config_mounts[3].synthetic_metadata = true; config_mounts[3].fs_type = FUSE_SUPER_MAGIC;
+    test_path_error(f.ctx, FW_MKDIRS, "/root/workspace/other-mount/new", false, 0, ESTALE);
+    test_path_error(f.ctx, FW_BEGIN_WRITE, "/root/workspace/other-mount/new.bin", true, 0, ESTALE);
+    CHECK(close(nested) == 0 && config_mounts[0].fs_queries == 0 && config_mounts[1].fs_queries == 1 &&
+        config_mounts[2].fs_queries == 0 && config_mounts[3].fs_queries == 0);
+    test_shared_finish(&f);
+    for (unsigned int scenario = 0; scenario < 2; ++scenario) {
+        f = test_shared_fixture(temporary, FUSE_SUPER_MAGIC, 2);
+        size_t queries = config_mounts[1].fs_queries;
+        if (!scenario) config_mounts[1].fs_error = EIO;
+        else config_mounts[1].id += 200;
+        CHECK(test_shared_reload(f.ctx) == -1 && errno == (!scenario ? EIO : EACCES));
+        CHECK(fw_find_mount(f.ctx, config_mounts[1].id) == NULL &&
+            config_mounts[1].fs_queries == queries + (!scenario ? 1U : 0U));
+        test_shared_finish(&f);
+    }
+    return 0;
+}
+
 static unsigned int test_real_in_root(int directory)
 {
     struct fw_identity expected, actual;
@@ -1525,7 +1958,14 @@ int main(int argc, char **argv)
     test_reset_faults();
     if (argc == 3) {
         int focused;
-        if (!strcmp(argv[2], "privateHomeConfig")) focused = test_private_home_config(dir);
+        if (!strcmp(argv[2], "externalUploadDirectories")) focused = test_external_upload_success(dir, true);
+        else if (!strcmp(argv[2], "externalUploadFiles")) focused = test_external_upload_success(dir, false);
+        else if (!strcmp(argv[2], "externalUploadRejections")) focused = test_external_upload_rejections(dir);
+        else if (!strcmp(argv[2], "externalUploadCreation")) focused = test_external_upload_creation(dir);
+        else if (!strcmp(argv[2], "externalUploadWriteEpoch")) focused = test_external_upload_write_epoch(dir);
+        else if (!strcmp(argv[2], "externalUploadDirectoryEpoch")) focused = test_external_upload_directory_epoch(dir);
+        else if (!strcmp(argv[2], "externalUploadScope")) focused = test_external_upload_scope(dir);
+        else if (!strcmp(argv[2], "privateHomeConfig")) focused = test_private_home_config(dir);
         else if (!strcmp(argv[2], "nonrootCredentialsControl")) focused = test_nonroot_credentials_control();
         else if (!strcmp(argv[2], "reviewRegressionMkdirRace")) focused = test_review_regression_mkdir_race(dir);
         else if (!strcmp(argv[2], "rootGuestGuard")) focused = test_root_guard_and_app_control();
@@ -1552,12 +1992,14 @@ int main(int argc, char **argv)
     unsigned long real_probe_checks = checks - pure_checks - ordinary_checks;
     if (test_list_handler(dir) || test_cleanup_handlers(dir) || test_path_handlers(dir) || test_nofollow_mutations(dir) ||
         test_default_allow_root_guest_atomic_overwrite_metadata(dir) || test_root_creation_owner_and_metadata_failure(dir) ||
-        test_review_regression_mkdir_race(dir) || test_private_home_config(dir)) {
+        test_review_regression_mkdir_race(dir) || test_private_home_config(dir) || test_external_upload_success(dir, true) ||
+        test_external_upload_success(dir, false) || test_external_upload_rejections(dir) || test_external_upload_creation(dir) ||
+        test_external_upload_scope(dir) || test_external_upload_write_epoch(dir) || test_external_upload_directory_epoch(dir)) {
         close(dir); return 1;
     }
     unsigned long mocked_checks = checks - pure_checks - ordinary_checks - real_probe_checks;
     close(dir);
-    printf("AJFW offline checks passed: total=%lu pure=%lu ordinary_temp=%lu real_probe_checks=%lu real_probe_skips=%u mocked_handler=%lu; STAT/RESOLVE/LIST/BEGIN_WRITE/ABORT/DELETE/RENAME/cleanup use synthetic-context openat2 mocks and owned TemporaryDirectory files/dirs/symlinks only; production main, guard, mount discovery and service not run.\n",
+    printf("AJFW offline checks passed: total=%lu pure=%lu ordinary_temp=%lu real_probe_checks=%lu real_probe_skips=%u mocked_handler=%lu; file operations and mount discovery use synthetic-context mocks and owned TemporaryDirectory files/dirs/symlinks only; production main/guard/service and real mounts not run.\n",
         checks, pure_checks, ordinary_checks, real_probe_checks, real_probe_skips, mocked_checks);
     return 0;
 }

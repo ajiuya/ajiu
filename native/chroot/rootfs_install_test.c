@@ -35,6 +35,9 @@ struct test_node {
     struct stat ref, next_ref;
     bool replace_ref_on_follow;
     unsigned int ref_reads;
+    size_t stat_reads, stat_fault_at;
+    int stat_error, directory_error, open_error;
+    bool stat_read_error, change_stat_start, stat_start_changed, malform_stat, stat_malformed;
 };
 struct test_seam {
     int root, proc, boot, base, local, rootfs_root, views;
@@ -57,6 +60,10 @@ struct test_seam {
     int64_t clock_offset;
     bool no_ptrace, deny_proc_task, churn_proc, proc_submount, change_base_on_scan;
     bool lock_busy, unsafe_lock;
+    bool fixed_clock;
+    int64_t clock_origin, scan_clock_step;
+    size_t proc_padding, padding_left, padding_emitted, stat_faults, directory_faults;
+    DIR *padding_stream;
 };
 static struct test_seam seam;
 static int checks;
@@ -80,6 +87,9 @@ static ssize_t synthetic_write(int fd, const void *bytes, size_t size);
 static ssize_t synthetic_readlinkat(int fd, const char *path, char *bytes, size_t size);
 static int synthetic_flock(int fd, int operation);
 static int synthetic_clock_gettime(clockid_t clock, struct timespec *ts);
+static DIR *synthetic_fdopendir(int fd);
+static struct dirent *synthetic_readdir(DIR *dir);
+static ssize_t synthetic_pread(int fd, void *bytes, size_t size, off_t offset);
 static pid_t synthetic_getpid(void);
 static uid_t synthetic_getuid(void) { return seam.uid; }
 static uid_t synthetic_geteuid(void) { return seam.euid; }
@@ -109,6 +119,9 @@ static gid_t synthetic_getegid(void) { return seam.egid; }
 #define flock synthetic_flock
 #define clock_gettime synthetic_clock_gettime
 #define getpid synthetic_getpid
+#define fdopendir synthetic_fdopendir
+#define readdir synthetic_readdir
+#define pread synthetic_pread
 #include "rootfs_install.c"
 #undef main
 #undef open
@@ -131,6 +144,9 @@ static gid_t synthetic_getegid(void) { return seam.egid; }
 #undef flock
 #undef clock_gettime
 #undef getpid
+#undef fdopendir
+#undef readdir
+#undef pread
 
 #define CHECK(condition) do { \
     ++checks; \
@@ -328,6 +344,7 @@ static int synthetic_openat2(int fd, const char *path, const struct open_how *ho
         }
         if (!strcmp(path, ".") && node_fd(fd) == node_fd(seam.proc)) {
             ++seam.process_scans;
+            seam.clock_offset += seam.scan_clock_step;
             if (seam.change_base_on_scan) node_fd(seam.base)->uid = 10000;
         }
         if (seam.churn_proc && node_fd(fd) == node_fd(seam.proc) && !strcmp(path, "5151") && seam.process_scans == 1) {
@@ -335,9 +352,22 @@ static int synthetic_openat2(int fd, const char *path, const struct open_how *ho
         }
         if (seam.deny_proc_task && !strcmp(path, "task")) { errno = EACCES; return -1; }
         if (seam.proc_submount && !strcmp(path, "task")) { errno = EXDEV; return -1; }
+        struct test_node *parent = node_fd(fd);
+        bool stat_fault = !strcmp(path, "stat") && ++parent->stat_reads >= parent->stat_fault_at && parent->stat_fault_at;
+        if (stat_fault && !parent->stat_read_error && !parent->change_stat_start && !parent->malform_stat) {
+            ++seam.stat_faults; errno = parent->stat_error; return -1;
+        }
         int result = openat(fd, path, (int)how->flags);
         if (result >= 0 && (!node_fd(result) || node_fd(result)->mount_id != PROC_MOUNT)) {
             close(result); errno = EXDEV; return -1;
+        }
+        if (result >= 0 && node_fd(result)->open_error) {
+            int saved = node_fd(result)->open_error; close(result); errno = saved; return -1;
+        }
+        if (result >= 0 && stat_fault) {
+            node_fd(result)->stat_error = parent->stat_error;
+            node_fd(result)->stat_start_changed = parent->change_stat_start;
+            node_fd(result)->stat_malformed = parent->malform_stat;
         }
         remember_named_open(fd, path, result);
         return result;
@@ -501,8 +531,53 @@ static int synthetic_flock(int fd, int operation)
     return flock(fd, operation);
 }
 
+static DIR *synthetic_fdopendir(int fd)
+{
+    bool pad = seam.proc_padding && node_fd(fd) == node_fd(seam.proc);
+    DIR *dir = fdopendir(fd);
+    if (dir && pad) { seam.padding_stream = dir; seam.padding_left = seam.proc_padding; }
+    return dir;
+}
+
+static struct dirent *synthetic_readdir(DIR *dir)
+{
+    if (dir == seam.padding_stream && seam.padding_left) {
+        static struct dirent padding = { .d_name = "." };
+        --seam.padding_left; ++seam.padding_emitted;
+        return &padding;
+    }
+    struct test_node *node = node_fd(dirfd(dir));
+    if (node && node->directory_error) {
+        ++seam.directory_faults; errno = node->directory_error; return NULL;
+    }
+    return readdir(dir);
+}
+
+static ssize_t synthetic_pread(int fd, void *bytes, size_t size, off_t offset)
+{
+    struct test_node *node = node_fd(fd);
+    if (node && node->mount_id == PROC_MOUNT && node->stat_error) {
+        ++seam.stat_faults; errno = node->stat_error; return -1;
+    }
+    if (node && node->stat_malformed) {
+        const char malformed[] = "4242 (fixture)\n";
+        size_t n = sizeof(malformed) - 1;
+        if (size < n) n = size;
+        memcpy(bytes, malformed, n);
+        return (ssize_t)n;
+    }
+    ssize_t n = pread(fd, bytes, size, offset);
+    if (node && node->stat_start_changed && n >= 5) memcpy((char *)bytes + n - 5, "4243\n", 5);
+    return n;
+}
+
 static int synthetic_clock_gettime(clockid_t clock, struct timespec *ts)
 {
+    if (seam.fixed_clock) {
+        int64_t now = seam.clock_origin + seam.clock_offset;
+        ts->tv_sec = (time_t)(now / 1000); ts->tv_nsec = (long)(now % 1000) * 1000000;
+        return 0;
+    }
     int rc = clock_gettime(clock, ts);
     if (!rc) {
         ts->tv_sec += seam.clock_offset / 1000;
@@ -513,7 +588,7 @@ static int synthetic_clock_gettime(clockid_t clock, struct timespec *ts)
 }
 
 struct fixture {
-    char temp[64];
+    char temp[4096];
     int sandbox, data, local, base, root, views, proc_process, proc_thread, churn_process, proc_self;
     struct stat base_stat, root_stat, views_stat, entries[2];
     uint64_t header[6], records[2][5];
@@ -573,7 +648,10 @@ static int fixture_open(struct fixture *f)
     f->loaded = (struct install){ .local = -1, .base = -1, .root = -1, .views = -1, .manifest = -1, .receipt = -1 };
     memset(&seam, 0, sizeof(seam)); seam.root = seam.proc = seam.boot = seam.base = seam.local = -1;
     seam.rootfs_root = seam.views = -1;
-    (void)snprintf(f->temp, sizeof(f->temp), "/tmp/ajiu-rootfs-install-test-XXXXXX");
+    const char *temp_parent = getenv("TMPDIR");
+    if (!temp_parent || !*temp_parent) temp_parent = "/tmp";
+    int length = snprintf(f->temp, sizeof(f->temp), "%s/ajiu-rootfs-install-test-XXXXXX", temp_parent);
+    if (length < 0 || (size_t)length >= sizeof(f->temp)) { *f->temp = 0; errno = ENAMETOOLONG; return -1; }
     if (!mkdtemp(f->temp)) return -1;
     f->sandbox = open(f->temp, DIR_FLAGS);
     struct stat st;
@@ -758,7 +836,7 @@ static int run_case(enum test_case test)
         CHECK(renameat(f.root, "etc", f.root, "saved-etc") == 0);
         foreign_parent = mkdir_open(f.sandbox, "foreign", 0700); CHECK(foreign_parent >= 0);
         CHECK(make_file(foreign_parent, "payload", "foreign symlink target", &foreign) == 0);
-        char target[128]; CHECK(snprintf(target, sizeof(target), "%s/foreign", f.temp) > 0);
+        char target[sizeof(f.temp) + sizeof("/foreign")]; CHECK(snprintf(target, sizeof(target), "%s/foreign", f.temp) > 0);
         CHECK(symlinkat(target, f.root, "etc") == 0); break;
     default: break;
     }
@@ -1005,7 +1083,8 @@ struct cli_result {
     char json[2048];
     int status;
     struct { size_t unlinks, rejected, receipt_syncs, base_syncs, local_syncs, boot_opens, boot_mount_rejections;
-        size_t process_scans, reference_checks, lock_calls; bool unsafe; } calls;
+        size_t process_scans, reference_checks, lock_calls, padding_emitted, stat_faults, directory_faults, process_stat_reads;
+        int64_t deadline_ms; bool unsafe; } calls;
 };
 
 static int proc_mark(int fd)
@@ -1151,13 +1230,20 @@ static int recovery_cli(struct fixture *f, const char *operation, bool wrong_ide
         (void)snprintf(dev, sizeof(dev), "%ju", (uintmax_t)f->base_stat.st_dev);
         (void)snprintf(ino, sizeof(ino), "%ju", (uintmax_t)f->base_stat.st_ino + (wrong_identity ? 1U : 0U));
         char *args[] = { "installer-fixture", (char *)operation, f->loaded.name + strlen(PREFIX), dev, ino, NULL };
-        int rc = rootfs_install_production_main_not_called(!strcmp(operation, "--install") ? 3 : 5, args);
+        seam.clock_origin = monotonic_ms(); seam.fixed_clock = true;
+        int argc = !strcmp(operation, "--install") ? 3 : !strcmp(operation, "--validate") ? 2 : 5;
+        int rc = rootfs_install_production_main_not_called(argc, args);
         out->calls.unlinks = seam.unlink_calls; out->calls.rejected = seam.rejected_calls;
         out->calls.receipt_syncs = seam.receipt_syncs; out->calls.base_syncs = seam.base_syncs;
         out->calls.local_syncs = seam.local_syncs;
         out->calls.boot_opens = seam.boot_opens; out->calls.boot_mount_rejections = seam.boot_mount_rejections;
         out->calls.process_scans = seam.process_scans; out->calls.reference_checks = seam.reference_checks;
         out->calls.lock_calls = seam.lock_calls;
+        out->calls.padding_emitted = seam.padding_emitted;
+        out->calls.stat_faults = seam.stat_faults; out->calls.directory_faults = seam.directory_faults;
+        struct test_node *process = node_fd(f->proc_process);
+        out->calls.process_stat_reads = process ? process->stat_reads : 0;
+        out->calls.deadline_ms = deadline - seam.clock_origin;
         out->calls.unsafe = seam.unsafe_unlink || seam.unsafe_lock;
         if (write_all(report[1], &out->calls, sizeof(out->calls)) < 0 || fflush(stdout) != 0) _exit(98);
         close(report[1]); _exit(rc);
@@ -1182,6 +1268,225 @@ static int recovery_cli(struct fixture *f, const char *operation, bool wrong_ide
     struct stat st;
     if (!error && fstatat(f->base, REMOVE_RECEIPT, &st, AT_SYMLINK_NOFOLLOW) == 0 && remember(&st) < 0) error = errno;
     return error ? (errno = error, -1) : 0;
+}
+
+static int test_removal_scan_budget(void)
+{
+    enum { ABOVE_OLD_LIMIT, ENTRY_LIMIT, AFTER_THIRTY_SECONDS, AFTER_NINETY_SECONDS,
+        INSTALL_DEADLINE, VALIDATE_DEADLINE, BUDGET_CASES };
+    const char *const names[] = { "scan_above_old_limit_two_passes", "scan_new_entry_limit",
+        "remove_after_thirty_seconds", "remove_ninety_second_deadline", "install_thirty_second_deadline",
+        "validate_thirty_second_deadline" };
+    for (int scenario = 0; scenario < BUDGET_CASES; ++scenario) {
+        const char *test_name = names[scenario];
+        int result = 0; struct fixture f; struct cli_result out = {0};
+        CHECK(fixture_open(&f) == 0); f.header[0] = AJIU_MANIFEST_V2;
+        CHECK(manifest_write(&f) == 0 && recovery_boot(&f, false) == 0);
+        seam.enforce_receipt = true;
+        if (scenario == ABOVE_OLD_LIMIT) seam.proc_padding = 5U * 1024U * 1024U;
+        if (scenario == ENTRY_LIMIT) seam.proc_padding = 8U * 1024U * 1024U;
+        if (scenario == AFTER_THIRTY_SECONDS) seam.scan_clock_step = 35000;
+        if (scenario == AFTER_NINETY_SECONDS) seam.scan_clock_step = 50000;
+        unsigned char stream[32] = {0};
+        memcpy(stream, "AJIF\0\1\0\0", 8); stream[8] = 255;
+        if (scenario == VALIDATE_DEADLINE) {
+            archive_input.bytes = stream; archive_input.size = sizeof(stream);
+        }
+        const char *operation = scenario == INSTALL_DEADLINE ? "--install" :
+            scenario == VALIDATE_DEADLINE ? "--validate" : scenario == AFTER_THIRTY_SECONDS ? "--recover-remove" : "--remove";
+        CHECK(recovery_cli(&f, operation, false, &out) == 0);
+        if (scenario == ABOVE_OLD_LIMIT || scenario == AFTER_THIRTY_SECONDS) {
+            if (out.status) fprintf(stderr, "%s returned %d: %s", test_name, out.status, out.json);
+            CHECK(out.status == 0 && strstr(out.json, "\"passed\":true") && strstr(out.json, "\"cleanup_state\":\"removed\""));
+            CHECK(out.calls.process_scans == 2 && out.calls.unlinks == 7 && out.calls.local_syncs == 1);
+            CHECK(out.calls.padding_emitted == seam.proc_padding * 2 && out.calls.deadline_ms == 90000);
+            CHECK(faccessat(f.local, f.loaded.name, F_OK, AT_SYMLINK_NOFOLLOW) < 0 && errno == ENOENT);
+        } else if (scenario == INSTALL_DEADLINE || scenario == VALIDATE_DEADLINE) {
+            CHECK(out.calls.deadline_ms == 30000 && !out.calls.unlinks && entry_present(&f));
+            CHECK(scenario == INSTALL_DEADLINE ? out.status != 0 : out.status == 0);
+        } else {
+            CHECK(out.status == 5 && strstr(out.json, "\"passed\":false") && strstr(out.json, "cleanup_unknown"));
+            char error[32];
+            CHECK(snprintf(error, sizeof(error), "\"errno\":%d", scenario == AFTER_NINETY_SECONDS ? ETIMEDOUT : EOVERFLOW) > 0);
+            CHECK(strstr(out.json, error) && !out.calls.unlinks && entry_present(&f));
+            CHECK(faccessat(f.base, REMOVE_RECEIPT, F_OK, AT_SYMLINK_NOFOLLOW) == 0);
+            CHECK(out.calls.deadline_ms == 90000);
+            if (scenario == ENTRY_LIMIT) CHECK(out.calls.padding_emitted == 8U * 1024U * 1024U && out.calls.process_scans == 1);
+            if (scenario == AFTER_NINETY_SECONDS) CHECK(out.calls.process_scans == 2);
+        }
+        CHECK(!out.calls.unsafe && !out.calls.rejected);
+    done:
+        memset(&archive_input, 0, sizeof(archive_input));
+        if (fixture_close(&f) < 0) result = -1;
+        if (result) return -1;
+    }
+    return 0;
+}
+
+static int test_removal_proc_churn(void)
+{
+    const int errors[] = { ENOENT, ESRCH, EACCES, EPERM };
+    enum { INITIAL_STAT, FINAL_STAT, MISSING_REFERENCE, MISSING_DIRECTORY, DIRECTORY_TEARDOWN, CHURN_PHASES };
+    for (unsigned int thread = 0; thread < 2; ++thread) {
+        for (unsigned int phase = 0; phase < CHURN_PHASES; ++phase) {
+            for (unsigned int read_error = 0; read_error < 2; ++read_error) {
+                for (size_t e = 0; e < sizeof(errors) / sizeof(*errors); ++e) {
+                    char name[96];
+                    (void)snprintf(name, sizeof(name), "pinned_%s_phase_%u_%s_error_%d", thread ? "thread" : "process",
+                        phase, read_error ? "read" : "open", errors[e]);
+                    const char *test_name = name;
+                    int result = 0, directory = -1; struct fixture f; struct cli_result out = {0};
+                    CHECK(fixture_open(&f) == 0); f.header[0] = AJIU_MANIFEST_V2;
+                    CHECK(manifest_write(&f) == 0 && recovery_boot(&f, false) == 0);
+                    seam.enforce_receipt = true;
+                    int target = thread ? f.proc_thread : f.proc_process;
+                    struct test_node *node = node_fd(target); CHECK(node != NULL);
+                    node->stat_fault_at = phase == INITIAL_STAT ? 1U : thread ? 2U : 3U;
+                    node->stat_error = errors[e]; node->stat_read_error = read_error != 0;
+                    if (phase == MISSING_REFERENCE) {
+                        struct stat link;
+                        CHECK(fstatat(target, thread ? "root" : "exe", &link, AT_SYMLINK_NOFOLLOW) == 0);
+                        node_for(&link)->ref_error = ENOENT;
+                    }
+                    if (phase == MISSING_DIRECTORY || phase == DIRECTORY_TEARDOWN) {
+                        directory = openat(target, thread ? "fd" : "map_files", DIR_FLAGS); CHECK(directory >= 0);
+                        if (phase == MISSING_DIRECTORY) node_fd(directory)->open_error = ENOENT;
+                        else node_fd(directory)->directory_error = ESRCH;
+                    }
+                    CHECK(recovery_cli(&f, thread ? "--recover-remove" : "--remove", false, &out) == 0);
+                    CHECK(out.calls.stat_faults > 0);
+                    if (errors[e] == ENOENT || errors[e] == ESRCH) {
+                        if (out.status) fprintf(stderr, "%s returned %d: %s", test_name, out.status, out.json);
+                        CHECK(out.status == 0 && strstr(out.json, "\"passed\":true") && strstr(out.json, "\"cleanup_state\":\"removed\""));
+                        CHECK(out.calls.process_scans == 2 && out.calls.unlinks == 7 && out.calls.local_syncs == 1);
+                        CHECK(faccessat(f.local, f.loaded.name, F_OK, AT_SYMLINK_NOFOLLOW) < 0 && errno == ENOENT);
+                    } else {
+                        CHECK(out.status == 5 && strstr(out.json, "\"passed\":false") && strstr(out.json, "cleanup_unknown"));
+                        CHECK(!out.calls.unlinks && entry_present(&f));
+                        CHECK(faccessat(f.base, REMOVE_RECEIPT, F_OK, AT_SYMLINK_NOFOLLOW) == 0);
+                    }
+                    CHECK(!out.calls.unsafe && !out.calls.rejected);
+                done:
+                    if (directory >= 0) close(directory);
+                    if (fixture_close(&f) < 0) result = -1;
+                    if (result) return -1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+static int test_removal_proc_guards(void)
+{
+    const char *const refs[] = { "root", "cwd", "exe", "0", "1000-2000" };
+    const int errors[] = { 0, ENOENT, ESRCH, EACCES, EPERM, EBUSY };
+    for (size_t ref = 0; ref < sizeof(refs) / sizeof(*refs); ++ref) {
+        for (size_t e = 0; e < sizeof(errors) / sizeof(*errors); ++e) {
+            char name[96]; (void)snprintf(name, sizeof(name), "active_reference_%s_error_%d", refs[ref], errors[e]);
+            const char *test_name = name;
+            int result = 0, directory = -1; struct fixture f; struct cli_result out = {0};
+            CHECK(fixture_open(&f) == 0); f.header[0] = AJIU_MANIFEST_V2;
+            CHECK(manifest_write(&f) == 0 && recovery_boot(&f, false) == 0);
+            int target = ref < 2 ? f.proc_thread : f.proc_process;
+            if (ref >= 3) {
+                directory = openat(ref == 3 ? f.proc_thread : f.proc_process, ref == 3 ? "fd" : "map_files", DIR_FLAGS);
+                CHECK(directory >= 0); target = directory;
+            }
+            struct stat link; CHECK(fstatat(target, refs[ref], &link, AT_SYMLINK_NOFOLLOW) == 0);
+            struct test_node *node = node_for(&link); CHECK(node != NULL);
+            node->ref_error = errors[e];
+            if (!errors[e]) node->ref = f.entries[1];
+            if (errors[e] == EBUSY) {
+                node->ref_error = 0; node->replace_ref_on_follow = true; node->next_ref = f.entries[1];
+            }
+            bool allowed = ref >= 3 && (errors[e] == ENOENT || errors[e] == ESRCH);
+            CHECK(recovery_cli(&f, "--remove", false, &out) == 0);
+            if (allowed) CHECK(out.status == 0 && out.calls.process_scans == 2 && out.calls.unlinks == 7);
+            else {
+                CHECK(out.status == 5 && strstr(out.json, "cleanup_unknown") && !out.calls.unlinks && entry_present(&f));
+                CHECK(faccessat(f.base, REMOVE_RECEIPT, F_OK, AT_SYMLINK_NOFOLLOW) == 0);
+            }
+            CHECK(!out.calls.unsafe && !out.calls.rejected);
+        done:
+            if (directory >= 0) close(directory);
+            if (fixture_close(&f) < 0) result = -1;
+            if (result) return -1;
+        }
+    }
+    return 0;
+}
+
+static int test_removal_stat_guards(void)
+{
+    for (unsigned int thread = 0; thread < 2; ++thread) {
+        for (unsigned int malformed = 0; malformed < 4; ++malformed) {
+            const char *test_name = malformed ? "malformed_stat_refused" : "changed_start_time_refused";
+            int result = 0, fd = -1; struct fixture f; struct cli_result out = {0};
+            CHECK(fixture_open(&f) == 0); f.header[0] = AJIU_MANIFEST_V2;
+            CHECK(manifest_write(&f) == 0 && recovery_boot(&f, false) == 0);
+            int target = thread ? f.proc_thread : f.proc_process;
+            if (malformed) {
+                fd = openat(target, "stat", O_WRONLY | O_NOFOLLOW | O_CLOEXEC); CHECK(fd >= 0);
+                const char *text = malformed == 1 ? "no stat fields\n" : malformed == 2 ? "4242 (fixture)\n" : "4242 (fixture) S bad\n";
+                size_t length = strlen(text);
+                CHECK(pwrite(fd, text, length, 0) == (ssize_t)length && ftruncate(fd, (off_t)length) == 0);
+            } else {
+                node_fd(target)->stat_fault_at = thread ? 2U : 3U; node_fd(target)->change_stat_start = true;
+            }
+            CHECK(recovery_cli(&f, "--recover-remove", false, &out) == 0);
+            CHECK(out.status == 5 && strstr(out.json, "cleanup_unknown") && !out.calls.unlinks && entry_present(&f));
+            CHECK(faccessat(f.base, REMOVE_RECEIPT, F_OK, AT_SYMLINK_NOFOLLOW) == 0);
+            CHECK(!out.calls.unsafe && !out.calls.rejected);
+        done:
+            if (fd >= 0) close(fd);
+            if (fixture_close(&f) < 0) result = -1;
+            if (result) return -1;
+        }
+    }
+    return 0;
+}
+
+static int test_removal_process_finish(void)
+{
+    enum { MISSING_OPEN, MISSING_READ, ESRCH_OPEN, ESRCH_READ, PERM_OPEN, PERM_READ,
+        ACCESS_OPEN, ACCESS_READ, CHANGED_START, MALFORMED, PROCESS_FINISH_CASES };
+    const char *const names[] = { "process_fourth_stat_missing_open", "process_fourth_stat_missing_read",
+        "process_fourth_stat_esrch_open", "process_fourth_stat_esrch_read", "process_fourth_stat_perm_open",
+        "process_fourth_stat_perm_read", "process_fourth_stat_access_open", "process_fourth_stat_access_read",
+        "process_fourth_stat_changed_start", "process_fourth_stat_malformed" };
+    for (unsigned int scenario = 0; scenario < PROCESS_FINISH_CASES; ++scenario) {
+        const char *test_name = names[scenario];
+        int result = 0; struct fixture f; struct cli_result out = {0};
+        CHECK(fixture_open(&f) == 0); f.header[0] = AJIU_MANIFEST_V2;
+        CHECK(manifest_write(&f) == 0 && recovery_boot(&f, false) == 0);
+        seam.enforce_receipt = true;
+        struct test_node *node = node_fd(f.proc_process); CHECK(node != NULL);
+        node->stat_fault_at = 4;
+        node->stat_read_error = scenario < CHANGED_START && (scenario % 2 != 0);
+        node->stat_error = scenario <= MISSING_READ ? ENOENT : scenario <= ESRCH_READ ? ESRCH :
+            scenario <= PERM_READ ? EPERM : scenario <= ACCESS_READ ? EACCES : 0;
+        node->change_stat_start = scenario == CHANGED_START; node->malform_stat = scenario == MALFORMED;
+        CHECK(recovery_cli(&f, "--remove", false, &out) == 0);
+        if (scenario <= ESRCH_READ) {
+            CHECK(out.status == 0 && strstr(out.json, "\"passed\":true") && strstr(out.json, "\"cleanup_state\":\"removed\""));
+            CHECK(out.calls.process_stat_reads == 5 && out.calls.stat_faults == 2);
+            CHECK(out.calls.process_scans == 2 && out.calls.unlinks == 7 && out.calls.local_syncs == 1);
+            CHECK(faccessat(f.local, f.loaded.name, F_OK, AT_SYMLINK_NOFOLLOW) < 0 && errno == ENOENT);
+        } else {
+            CHECK(out.status == 5 && strstr(out.json, "\"passed\":false") && strstr(out.json, "cleanup_unknown"));
+            int expected_error = scenario == CHANGED_START ? ESTALE : scenario == MALFORMED ? EPROTO : node->stat_error;
+            char error[32]; CHECK(snprintf(error, sizeof(error), "\"errno\":%d", expected_error) > 0 && strstr(out.json, error));
+            CHECK(out.calls.process_stat_reads == 4 && out.calls.process_scans == 1);
+            CHECK(!out.calls.unlinks && entry_present(&f));
+            CHECK(faccessat(f.base, REMOVE_RECEIPT, F_OK, AT_SYMLINK_NOFOLLOW) == 0);
+        }
+        CHECK(!out.calls.unsafe && !out.calls.rejected);
+    done:
+        if (fixture_close(&f) < 0) result = -1;
+        if (result) return -1;
+    }
+    return 0;
 }
 
 enum recovery_case {
@@ -1586,7 +1891,9 @@ static int test_recover_remove(void)
     for (int i = 0; i < REC_CASES; ++i) if (test_recovery_case((enum recovery_case)i) < 0) return -1;
     if (test_recovery_first_phase_rejection() < 0 || test_legacy_receipt_same_boot() < 0 ||
         test_recovery_live_process() < 0 || test_incomplete_install_rollback() < 0 ||
-        test_boot_source() < 0 || test_partial_internal_retry() < 0) return -1;
+        test_boot_source() < 0 || test_partial_internal_retry() < 0 || test_removal_scan_budget() < 0 ||
+        test_removal_proc_churn() < 0 || test_removal_proc_guards() < 0 || test_removal_stat_guards() < 0 ||
+        test_removal_process_finish() < 0) return -1;
     puts("Recovery coverage: same-boot receipt retries after lock release; old receipt identities, active process references, lock contention, proc mount boundaries, view replacement/budgets, finalization failures and strict missing-identity retries.");
     return 0;
 }
@@ -1595,7 +1902,11 @@ int main(int argc, char **argv)
 {
     if (argc == 2) {
         int rc;
-        if (!strcmp(argv[1], "recoverRemove")) rc = test_recover_remove();
+        if (!strcmp(argv[1], "removalScanBudget")) rc = test_removal_scan_budget();
+        else if (!strcmp(argv[1], "removalProcChurn")) rc = test_removal_proc_churn();
+        else if (!strcmp(argv[1], "removalProcessFinish")) rc = test_removal_process_finish();
+        else if (!strcmp(argv[1], "removalProcGuards")) rc = test_removal_proc_guards() || test_removal_stat_guards();
+        else if (!strcmp(argv[1], "recoverRemove")) rc = test_recover_remove();
         else if (!strcmp(argv[1], "bootSource")) rc = test_boot_source();
         else if (!strcmp(argv[1], "partialInternalRetry")) rc = test_partial_internal_retry();
         else if (!strcmp(argv[1], "reviewRegressionNamedAnchorMount")) rc = test_review_regression_named_anchor_mount();
