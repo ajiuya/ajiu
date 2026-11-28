@@ -690,11 +690,31 @@ class ChrootRuntimeFacadeTest {
                     output.writeInt(10445); output.writeInt(10445); output.writeInt(3003); output.writeInt(-1)
                     profile.env.toSortedMap().forEach { (key, value) -> text(key); text(value) }
                     output.writeInt(-1)
+                    output.writeInt(-1)
                 }
                 return MessageDigest.getInstance("SHA-256").digest(bytes.toByteArray()).joinToString("") { "%02x".format(it.toInt() and 255) }
             }
             assertEquals(expected("root-guest-rw-v1"), capture.digest)
             assertNotEquals(expected(null), capture.digest)
+        }
+    }
+
+    @Test fun proxyChangesAlterTheDigestAndRejectOldCapturesBeforeHelperStart() = runTest {
+        fixture().use { fixture ->
+            val original = fixture.sources.capture(profile, workspace)
+            every { fixture.sources.capture(profile, workspace) } returns original.copy(
+                proxyEnvironment = mapOf("HTTP_PROXY" to "http://first.example:3128", "NO_PROXY" to "localhost")
+            )
+            val first = fixture.facade.capture(profile, 7, workspace, owner, "source-1") {}
+            every { fixture.sources.capture(profile, workspace) } returns original.copy(
+                proxyEnvironment = mapOf("HTTP_PROXY" to "http://second.example:3128", "NO_PROXY" to "localhost")
+            )
+            val second = fixture.facade.capture(profile, 7, workspace, owner, "source-1") {}
+            assertNotEquals(first.digest, second.digest)
+            val failure = runCatching { fixture.facade.startStdio(first, "/bin/true", emptyList()) }.exceptionOrNull()
+            assertTrue(failure is CancellationException)
+            second.checkCurrent()
+            verify(exactly = 0) { fixture.factory.start(any()) }
         }
     }
 

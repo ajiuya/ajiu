@@ -528,7 +528,7 @@ internal class ChrootRuntimeFacade internal constructor(
             instance.id, nonce(), request.owner.identity, ByteArray(32).also(random::nextBytes),
             ChrootFileIdentity(instance.device, instance.inode), request.sources.appIdentity, mode, 15_000,
             if (timeoutMs == 0L) 0 else timeoutMs.coerceIn(1L, CommandEngine.MAX_TIMEOUT_MS).toInt(),
-            cwd(capture, cwd), argv, environment(request.sources.profile, extraEnv), request.sources.mounts
+            cwd(capture, cwd), argv, environment(request.sources.profile, extraEnv, request.sources.proxyEnvironment), request.sources.mounts
         )
         val permit = manager.authorize(binding.leaseId, launch, request.revision)
             ?: throw IOException("CHROOT runtime launch authorization is unavailable")
@@ -756,6 +756,8 @@ internal class ChrootRuntimeFacade internal constructor(
             output.writeInt(-1)
             request.sources.profile.env.toSortedMap().forEach { (key, value) -> text(key); text(value) }
             output.writeInt(-1)
+            request.sources.proxyEnvironment.toSortedMap().forEach { (key, value) -> text(key); text(value) }
+            output.writeInt(-1)
             request.sources.mounts.sortedBy { it.target }.forEach {
                 text(it.source); text(it.target); output.writeBoolean(it.readOnly); output.writeInt(it.kind.ordinal)
                 output.writeLong(it.identity.device); output.writeLong(it.identity.inode)
@@ -833,10 +835,11 @@ internal class ChrootRuntimeFacade internal constructor(
     private fun cwd(capture: LocalRuntimeCapture, path: String?): String =
         if (path.isNullOrBlank()) "/root/workspace" else mapPath(capture, path)
 
-    private fun environment(profile: ContainerProfile, extraEnv: Map<String, String>): List<String> =
-        (mapOf("HOME" to "/root", "PATH" to "/root/.aicode/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-            "TMPDIR" to "/tmp", "LANG" to "C.UTF-8", "TERM" to "xterm-256color") + profile.env + extraEnv)
-            .toSortedMap().map { "${it.key}=${it.value}" }
+    private fun environment(
+        profile: ContainerProfile,
+        extraEnv: Map<String, String>,
+        proxyEnvironment: Map<String, String>
+    ): List<String> = chrootEnvironment(profile.env, extraEnv, proxyEnvironment)
 
     private companion object {
         const val GUEST_POLICY = "root-guest-rw-v1"

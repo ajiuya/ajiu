@@ -42,6 +42,9 @@ import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.nio.file.Files
+import java.nio.file.LinkOption.NOFOLLOW_LINKS
+import java.nio.file.StandardCopyOption
+import java.nio.file.attribute.PosixFilePermissions
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -1265,6 +1268,136 @@ class ChrootInstanceInstallerTest {
             assertRecoveryIntent(f.journal)
             assertEquals(setOf(id), f.installer.failedInstances.value)
             assertEquals(setOf(id), f.installer.removalPending.value)
+        }
+    }
+
+    @Test
+    fun prepareHomePreservesAtomicallyRefreshedIpv4AndIpv6DnsContentAndInode() = runTest {
+        fixture().use { f ->
+            val home = f.installer.prepareHome(instance)
+            val conf = File(f.files, "chroot-dns/$id/resolv.conf")
+            val permissions = PosixFilePermissions.fromString("rw-------")
+            assertEquals("nameserver 223.5.5.5\nnameserver 223.6.6.6\n", conf.readText())
+            assertEquals(permissions, Files.getPosixFilePermissions(conf.toPath(), NOFOLLOW_LINKS))
+            val prefix = "nameserver 192.0.2.53"
+            val contents = listOf(
+                "nameserver 192.0.2.53\nnameserver 198.51.100.53\n",
+                "nameserver 2001:db8::53\n",
+                "nameserver 2001:0DB8:0000:0000:0000:0000:0000:0053\nnameserver ::ffff:192.0.2.53\nnameserver 203.0.113.53\n",
+                "nameserver\t2001:db8::54\r\nnameserver 192.0.2.54",
+                prefix + " ".repeat(4096 - prefix.length - 1) + "\n"
+            )
+            for (content in contents) {
+                val replacement = File(conf.parentFile, "resolver-next")
+                Files.createFile(replacement.toPath(), PosixFilePermissions.asFileAttribute(permissions))
+                replacement.writeText(content, Charsets.US_ASCII)
+                Files.move(replacement.toPath(), conf.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+                val inode = Files.getAttribute(conf.toPath(), "unix:ino", NOFOLLOW_LINKS)
+                repeat(2) {
+                    assertEquals(home, f.installer.prepareHome(instance))
+                    assertEquals(content, conf.readText())
+                    assertEquals(inode, Files.getAttribute(conf.toPath(), "unix:ino", NOFOLLOW_LINKS))
+                    assertEquals(permissions, Files.getPosixFilePermissions(conf.toPath(), NOFOLLOW_LINKS))
+                }
+            }
+            assertEquals(0, f.starts.get())
+            assertEquals(0, f.inputs.get())
+        }
+    }
+
+    @Test
+    fun prepareHomeRejectsInvalidEmptyOversizedOrExcessiveDnsWithoutReplacingIt() = runTest {
+        val prefix = "nameserver 192.0.2.53"
+        val contents = listOf(
+            "", "\n", " \n", "nameserver\n", "nameserver \n",
+            "nameserver resolver.invalid\n", "nameserver deadbeef\n", "nameserver 0x7f000001\n",
+            "nameserver 192.0.2\n", "nameserver 192.0.2.256\n", "nameserver 192.0.2.53.1\n",
+            "nameserver 2001:db8:::53\n", "nameserver 2001:db8::gg\n", "nameserver [2001:db8::53]\n",
+            "nameserver fe80::53%wlan0\n", "nameserver 192.0.2.53:53\n",
+            "nameserver 0.0.0.0\n", "nameserver 127.0.0.1\n", "nameserver 169.254.1.1\n", "nameserver 224.0.0.1\n",
+            "nameserver ::\n", "nameserver ::1\n", "nameserver fe80::53\n", "nameserver ff02::53\n",
+            "nameserver 192.0.2.53\nnameserver 198.51.100.53\nnameserver 203.0.113.53\nnameserver 2001:db8::53\n",
+            "nameserver 192.0.2.53\n\nnameserver 198.51.100.53\n",
+            "nameserver 192.0.2.53\nnameserver \n", "nameserver 192.0.2.53\nsearch example.invalid\n",
+            "nameserver 192.0.2.53\noptions rotate\n", "nameserver 192.0.2.53; injected\n",
+            "nameserver 192.0.2.53\u0000\n", "nameserver 192.0.2.53\u00ff\n",
+            prefix + " ".repeat(4097 - prefix.length - 1) + "\n"
+        )
+        fixture().use { f ->
+            f.installer.prepareHome(instance)
+            val conf = File(f.files, "chroot-dns/$id/resolv.conf")
+            val inode = Files.getAttribute(conf.toPath(), "unix:ino", NOFOLLOW_LINKS)
+            for (content in contents) {
+                conf.writeText(content)
+                val failure = fails { f.installer.prepareHome(instance) }
+                assertTrue(failure is IOException)
+                assertEquals(content, conf.readText())
+                assertEquals(inode, Files.getAttribute(conf.toPath(), "unix:ino", NOFOLLOW_LINKS))
+            }
+        }
+    }
+
+    @Test
+    fun prepareHomeRejectsDnsSymlinksDirectoriesAndNonPrivateModesWithoutChangingThem() = runTest {
+        fixture().use { f ->
+            f.installer.prepareHome(instance)
+            val conf = File(f.files, "chroot-dns/$id/resolv.conf")
+            val target = File(conf.parentFile, "resolver-target")
+            Files.move(conf.toPath(), target.toPath())
+            val content = "nameserver 192.0.2.53\n"
+            target.writeText(content)
+            Files.createSymbolicLink(conf.toPath(), target.toPath())
+            val inode = Files.getAttribute(conf.toPath(), "unix:ino", NOFOLLOW_LINKS)
+            val failure = fails { f.installer.prepareHome(instance) }
+            assertTrue(failure is IOException)
+            assertTrue(Files.isSymbolicLink(conf.toPath()))
+            assertEquals(target.toPath(), Files.readSymbolicLink(conf.toPath()))
+            assertEquals(inode, Files.getAttribute(conf.toPath(), "unix:ino", NOFOLLOW_LINKS))
+            assertEquals(content, target.readText())
+        }
+        fixture().use { f ->
+            f.installer.prepareHome(instance)
+            val conf = File(f.files, "chroot-dns/$id/resolv.conf")
+            Files.move(conf.toPath(), File(conf.parentFile, "resolver-saved").toPath())
+            Files.createDirectory(conf.toPath())
+            val inode = Files.getAttribute(conf.toPath(), "unix:ino", NOFOLLOW_LINKS)
+            val failure = fails { f.installer.prepareHome(instance) }
+            assertTrue(failure is IOException)
+            assertTrue(Files.isDirectory(conf.toPath(), NOFOLLOW_LINKS))
+            assertEquals(inode, Files.getAttribute(conf.toPath(), "unix:ino", NOFOLLOW_LINKS))
+            assertTrue(conf.listFiles()!!.isEmpty())
+        }
+        fixture().use { f ->
+            f.installer.prepareHome(instance)
+            val conf = File(f.files, "chroot-dns/$id/resolv.conf")
+            val content = "nameserver 2001:db8::53\n"
+            conf.writeText(content)
+            val inode = Files.getAttribute(conf.toPath(), "unix:ino", NOFOLLOW_LINKS)
+            for (mode in listOf(0x1a4, 0x1b0, 0x1c0, 0x980)) {
+                Files.setAttribute(conf.toPath(), "unix:mode", mode, NOFOLLOW_LINKS)
+                val failure = fails { f.installer.prepareHome(instance) }
+                assertTrue(failure is IOException)
+                assertEquals(mode, (Files.getAttribute(conf.toPath(), "unix:mode", NOFOLLOW_LINKS) as Number).toInt() and 0xfff)
+                assertEquals(content, conf.readText())
+                assertEquals(inode, Files.getAttribute(conf.toPath(), "unix:ino", NOFOLLOW_LINKS))
+            }
+        }
+    }
+
+    @Test
+    fun prepareHomeStillRequiresExactHomeAndDnsInstanceMarkers() = runTest {
+        for (base in listOf("chroot-home", "chroot-dns")) {
+            fixture().use { f ->
+                f.installer.prepareHome(instance)
+                val marker = File(f.files, "$base/$id/.instance")
+                val content = "nameserver 192.0.2.53\n"
+                marker.writeText(content)
+                val inode = Files.getAttribute(marker.toPath(), "unix:ino", NOFOLLOW_LINKS)
+                val failure = fails { f.installer.prepareHome(instance) }
+                assertTrue(failure is IOException)
+                assertEquals(content, marker.readText())
+                assertEquals(inode, Files.getAttribute(marker.toPath(), "unix:ino", NOFOLLOW_LINKS))
+            }
         }
     }
 

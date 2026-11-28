@@ -47,6 +47,7 @@ import java.io.InputStream
 import java.io.InterruptedIOException
 import java.io.OutputStream
 import java.io.PushbackInputStream
+import java.net.InetAddress
 import java.net.URI
 import java.nio.ByteBuffer
 import java.nio.channels.Channels
@@ -459,7 +460,7 @@ class ChrootInstanceInstaller internal constructor(
         requireDirectory(File(home, "workspace"), filesDir)
         val config = requireDirectory(File(home, ".aicode"), filesDir)
         CONFIG_DIRECTORIES.forEach { requireDirectory(File(config, it), filesDir) }
-        fixedFile(File(dns, "resolv.conf"), DNS.toByteArray(Charsets.US_ASCII))
+        prepareDns(File(dns, "resolv.conf"))
         return home
     }
 
@@ -863,6 +864,48 @@ class ChrootInstanceInstaller internal constructor(
         return file
     }
 
+    private fun prepareDns(file: File) {
+        val path = file.toPath()
+        if (!Files.exists(path, NOFOLLOW_LINKS)) {
+            fixedFile(file, DNS.toByteArray(Charsets.US_ASCII))
+        }
+        val attributes = Files.readAttributes(path, BasicFileAttributes::class.java, NOFOLLOW_LINKS)
+        if (!attributes.isRegularFile || attributes.size() !in 1..MAX_DNS_BYTES.toLong() ||
+            Files.getOwner(path, NOFOLLOW_LINKS) != Files.getOwner(filesDir.toPath(), NOFOLLOW_LINKS) ||
+            (Files.getAttribute(path, "unix:mode", NOFOLLOW_LINKS) as Number).toInt() and 0xfff != 0x180
+        ) throw IOException("Existing App DNS file is unsafe; it was not replaced")
+        val text = Files.newByteChannel(path, setOf(READ, NOFOLLOW_LINKS)).use { channel ->
+            val buffer = ByteBuffer.allocate(MAX_DNS_BYTES + 1)
+            while (buffer.hasRemaining()) {
+                val count = channel.read(buffer)
+                if (count < 0) break
+                if (count == 0) throw IOException("Incomplete App DNS file read")
+            }
+            if (buffer.position() !in 1..MAX_DNS_BYTES) throw IOException("App DNS file exceeds its bound")
+            String(buffer.array(), 0, buffer.position(), Charsets.US_ASCII)
+        }
+        if (!validDnsContents(text)) throw IOException("Existing App DNS content is invalid; it was not replaced")
+    }
+
+    private fun validDnsContents(text: String): Boolean {
+        val lines = text.removeSuffix("\n").split('\n')
+        return lines.size in 1..3 && lines.all { line ->
+            val address = DNS_NAMESERVER.matchEntire(line.removeSuffix("\r"))?.groupValues?.get(1) ?: return@all false
+            val server = try {
+                if (':' in address) {
+                    InetAddress.getByName(address)
+                } else {
+                    val octets = address.split('.')
+                    if (octets.size != 4 || octets.any { it.length !in 1..3 || it.toIntOrNull() !in 0..255 }) return@all false
+                    InetAddress.getByAddress(octets.map { it.toInt().toByte() }.toByteArray())
+                }
+            } catch (_: IOException) {
+                return@all false
+            }
+            !server.isAnyLocalAddress && !server.isLoopbackAddress && !server.isMulticastAddress && !server.isLinkLocalAddress
+        }
+    }
+
     private fun fixedFile(file: File, bytes: ByteArray) {
         if (Files.exists(file.toPath(), NOFOLLOW_LINKS)) {
             val attributes = Files.readAttributes(file.toPath(), BasicFileAttributes::class.java, NOFOLLOW_LINKS)
@@ -890,7 +933,9 @@ class ChrootInstanceInstaller internal constructor(
         const val JOURNAL_MAGIC = 0x414a4950
         // v1 contains install/remove (0/1); v2 also retains recovery removal requests (2).
         const val JOURNAL_VERSION = 2
-        const val DNS = "nameserver 223.5.5.5\nnameserver 223.6.6.6\n"
+        const val DNS = ChrootNetworkConfig.FALLBACK_RESOLV_CONF
+        const val MAX_DNS_BYTES = 4096
+        val DNS_NAMESERVER = Regex("nameserver[ \\t]+([0-9A-Fa-f:.]+)[ \\t]*")
         val NONCE = Regex("[0-9a-f]{24}")
         val PROFILE_ID = Regex("[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
         val CONFIG_DIRECTORIES = listOf("skills", "agents", "memory", "docs", "bin", "lib", "plugins", "scripts", "prompts.custom", "tool-output")

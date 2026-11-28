@@ -1,9 +1,11 @@
 package com.aicode.feature.agent.domain.container.chroot
 
 import android.content.Context
+import android.net.ConnectivityManager
 import android.os.Process as AndroidProcess
 import android.system.Os
 import android.system.OsConstants
+import com.aicode.core.net.AppProxy
 import com.aicode.feature.agent.domain.container.ContainerProfile
 import dagger.hilt.android.qualifiers.ApplicationContext
 import java.io.File
@@ -11,7 +13,9 @@ import java.io.IOException
 import java.nio.file.FileAlreadyExistsException
 import java.nio.file.Files
 import java.nio.file.LinkOption.NOFOLLOW_LINKS
+import java.nio.file.StandardCopyOption
 import java.nio.file.attribute.PosixFilePermissions
+import java.security.SecureRandom
 import java.util.Collections
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -22,12 +26,15 @@ internal data class ChrootAppSources(
     val homePath: String,
     val appIdentity: ChrootAppIdentity,
     val mounts: List<ChrootMount>,
-    val dns: String
+    val dns: String,
+    val proxyEnvironment: Map<String, String> = emptyMap()
 )
 
 @Singleton
 internal class ChrootAppSourceCapture @Inject constructor(@ApplicationContext context: Context) {
+    private val appContext = context.applicationContext
     private val filesDir = context.filesDir.canonicalFile
+    private val connectivity = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
 
     fun capture(profile: ContainerProfile, workspacePath: String): ChrootAppSources {
         if (!profile.isChroot || profile.extraBindings.isNotEmpty() || profile.extraArgs.isNotEmpty()) {
@@ -49,6 +56,9 @@ internal class ChrootAppSourceCapture @Inject constructor(@ApplicationContext co
         val expectedMarker = "${instance.id}\n${instance.device}\n${instance.inode}\n${instance.installGeneration}\n"
         if (readBounded(marker, 256) != expectedMarker) throw IOException("CHROOT home identity does not match the instance")
         val dnsFile = File(filesDir, "chroot-dns/${instance.id}/resolv.conf")
+        ChrootNetworkConfig.currentResolvConf(connectivity)?.let { refreshResolver(dnsFile, expectedMarker, it, identity.uid) }
+        val proxyEnvironment = AppProxy.proxyEnv(appContext)
+        refreshAptRuntimeConfig(File(home, ".aicode/apt-runtime.conf"), proxyEnvironment, identity.uid, expectedMarker)
         val mounts = mutableListOf(
             mount(home, "/root", false, true, identity.uid),
             mount(workspace, "/root/workspace", false, true, identity.uid, owned = false),
@@ -71,8 +81,105 @@ internal class ChrootAppSourceCapture @Inject constructor(@ApplicationContext co
             ByteArray(32) { 1 }, ChrootFileIdentity(instance.device, instance.inode), identity,
             ChrootIoMode.STDIO, 15_000, 0, "/root/workspace", listOf(profile.shellPath?.takeIf(String::isNotBlank) ?: "/bin/sh"),
             profile.env.map { "${it.key}=${it.value}" }, mounts)
-        return ChrootAppSources(frozen, workspace.path, home.path, identity, Collections.unmodifiableList(mounts), dns)
+        return ChrootAppSources(frozen, workspace.path, home.path, identity, Collections.unmodifiableList(mounts), dns,
+            Collections.unmodifiableMap(proxyEnvironment.toMap()))
     }
+
+    private fun refreshResolver(file: File, expectedMarker: String, contents: String, uid: Int) = synchronized(resolverLock) {
+        val parent = checkNotNull(file.parentFile)
+        val parentIdentity = captureIdentity(parent, true, uid, owned = true)
+        val marker = File(parent, ".instance")
+        captureIdentity(marker, false, uid, owned = true)
+        if (readBounded(marker, 256) != expectedMarker) throw IOException("CHROOT DNS source identity does not match the instance")
+        if (contents.toByteArray(Charsets.US_ASCII).size > 4096 || !contents.lines().all {
+                it.isEmpty() || it.startsWith("nameserver ") && it.substringAfter(' ').matches(DNS_ADDRESS)
+            } || !contents.contains("nameserver ")) {
+            throw IOException("Android network supplied an invalid DNS configuration")
+        }
+        val oldIdentity = captureIdentity(file, false, uid, owned = true)
+        if (Os.lstat(file.path).st_mode and 0x1ff != 0x180) throw IOException("CHROOT DNS source mode is invalid")
+        if (readBounded(file, 4096) == contents) return@synchronized
+        publishPrivateConfig(file, contents, uid, parentIdentity, oldIdentity) {
+            if (readBounded(marker, 256) != expectedMarker) throw IOException("CHROOT DNS source identity changed during refresh")
+        }
+    }
+
+    private fun publishPrivateConfig(
+        file: File,
+        content: String,
+        uid: Int,
+        parentIdentity: ChrootFileIdentity,
+        oldIdentity: ChrootFileIdentity?,
+        extraCheck: () -> Unit = {}
+    ) {
+        val parent = checkNotNull(file.parentFile)
+        val bytes = content.toByteArray(Charsets.US_ASCII)
+        if (bytes.size > 4096) throw IOException("CHROOT private network config exceeds its bound")
+        val temporary = File(parent, ".${file.name}-${randomHex()}")
+        var created = false
+        try {
+            val descriptor = Os.open(temporary.path, OsConstants.O_WRONLY or OsConstants.O_CREAT or OsConstants.O_EXCL or
+                OsConstants.O_CLOEXEC or OsConstants.O_NOFOLLOW, 0x180)
+            created = true
+            try {
+                var offset = 0
+                while (offset < bytes.size) {
+                    val written = Os.write(descriptor, bytes, offset, bytes.size - offset)
+                    if (written <= 0) throw IOException("Incomplete CHROOT private network config write")
+                    offset += written
+                }
+                Os.fsync(descriptor)
+                val stat = Os.fstat(descriptor)
+                if (!OsConstants.S_ISREG(stat.st_mode) || stat.st_uid != uid || stat.st_mode and 0x1ff != 0x180 ||
+                    stat.st_size != bytes.size.toLong()) throw IOException("CHROOT private network config identity is invalid")
+            } finally {
+                Os.close(descriptor)
+            }
+            if (captureIdentity(parent, true, uid, owned = true) != parentIdentity ||
+                oldIdentity != null && captureIdentity(file, false, uid, owned = true) != oldIdentity) {
+                throw IOException("CHROOT private network config source changed during refresh")
+            }
+            extraCheck()
+            Files.move(temporary.toPath(), file.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+            created = false
+            if (captureIdentity(parent, true, uid, owned = true) != parentIdentity ||
+                captureIdentity(file, false, uid, owned = true) == oldIdentity || readBounded(file, 4096) != content) {
+                throw IOException("CHROOT private network config changed during publication")
+            }
+            extraCheck()
+        } finally {
+            if (created) Files.deleteIfExists(temporary.toPath())
+        }
+    }
+
+    private fun refreshAptRuntimeConfig(file: File, proxy: Map<String, String>, uid: Int, expectedMarker: String) = synchronized(resolverLock) {
+        val parent = checkNotNull(file.parentFile)
+        val parentIdentity = captureIdentity(parent, true, uid, owned = true)
+        val home = checkNotNull(parent.parentFile)
+        val homeIdentity = captureIdentity(home, true, uid, owned = true)
+        val marker = File(home, ".instance")
+        captureIdentity(marker, false, uid, owned = true)
+        fun checkHomeIdentity() {
+            if (captureIdentity(home, true, uid, owned = true) != homeIdentity || readBounded(marker, 256) != expectedMarker) {
+                throw IOException("CHROOT APT runtime source identity does not match the instance")
+            }
+        }
+        checkHomeIdentity()
+        val content = ChrootNetworkConfig.aptRuntimeConfig(proxy)
+        val oldIdentity = if (Files.exists(file.toPath(), NOFOLLOW_LINKS)) {
+            val mode = Os.lstat(file.path).st_mode
+            if (mode and 0x1ff != 0x180) throw IOException("CHROOT APT runtime config mode is invalid")
+            captureIdentity(file, false, uid, owned = true)
+        } else null
+        if (oldIdentity != null && readBounded(file, 4096) == content) return@synchronized
+        if (captureIdentity(parent, true, uid, owned = true) != parentIdentity) {
+            throw IOException("CHROOT APT runtime directory changed during refresh")
+        }
+        publishPrivateConfig(file, content, uid, parentIdentity, oldIdentity, ::checkHomeIdentity)
+    }
+
+    private fun randomHex(): String = ByteArray(12).also(random::nextBytes)
+        .joinToString("") { "%02x".format(it.toInt() and 255) }
 
     private fun mount(
         file: File,
@@ -139,6 +246,9 @@ internal class ChrootAppSourceCapture @Inject constructor(@ApplicationContext co
     }
 
     private companion object {
+        val resolverLock = Any()
+        val DNS_ADDRESS = Regex("(?:[0-9]{1,3}\\.){3}[0-9]{1,3}|[0-9a-fA-F:]+")
+        val random = SecureRandom()
         val CONFIG_DIRECTORIES = listOf("skills", "agents", "memory", "docs", "bin", "lib", "plugins", "scripts", "prompts.custom", "tool-output")
         val READ_ONLY_CONFIG = setOf("skills", "agents", "docs", "bin", "lib", "prompts.custom")
     }

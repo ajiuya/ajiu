@@ -562,6 +562,34 @@ class FileChangeHubLifecycleTest {
     }
 
     @Test
+    fun finalizingAnOldObserverCannotStopItsReplacementOrCallCurrentLifecycleHooks() {
+        val root = temporary.newFolder("finalize-isolation")
+        @Suppress("DEPRECATION")
+        fun observer() = object : FileObserver(root.path, FileObserver.CLOSE_WRITE) {
+            override fun onEvent(event: Int, path: String?) = Unit
+        }
+        val old = observer()
+        old.startWatching()
+        old.stopWatching()
+        assertEquals(listOf(old), RecordingFileObserver.stopped.map { it.second })
+        RecordingFileObserver.reset()
+        val replacement = observer()
+        replacement.startWatching()
+        var stopHooks = 0
+        RecordingFileObserver.beforeStop = { stopHooks++ }
+        val finalize = FileObserver::class.java.getDeclaredMethod("finalize").apply { isAccessible = true }
+        repeat(2) { finalize.invoke(old) }
+        assertEquals(0, stopHooks)
+        assertTrue(RecordingFileObserver.stopped.isEmpty())
+        assertSame(replacement, RecordingFileObserver.active[root.path])
+        assertEquals(listOf("start" to root.path), RecordingFileObserver.order)
+        replacement.stopWatching()
+        assertEquals(1, stopHooks)
+        assertEquals(listOf(replacement), RecordingFileObserver.stopped.map { it.second })
+        assertTrue(RecordingFileObserver.active.isEmpty())
+    }
+
+    @Test
     fun staleQueuedWorkspaceStartDoesNotBlockNewSharedHostSubscriberBeforeOldSubscribersLeave() = runTest {
         val root = temporary.newFolder("workspace")
         val state = workspaceState(root)
@@ -1274,6 +1302,10 @@ class FileChangeHubLifecycleTest {
             order += "stop" to path
             active.remove(path)
         }
+        // This shadow owns no native watch. Real finalize() would call the shadow's
+        // explicit stop recorder after reset(), polluting another test's lifecycle.
+        // Keep explicit stop calls fully observable, including duplicate calls.
+        @Implementation protected fun finalize() = Unit
         companion object {
             val started = mutableListOf<Pair<String, FileObserver>>()
             val stopped = mutableListOf<Pair<String, FileObserver>>()
